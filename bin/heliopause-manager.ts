@@ -310,7 +310,7 @@ const { server } = await startManager({
   // switches it on; the rest is then required, so a half-configuration fails at startup instead of
   // at the moment somebody tries to approve something.
   //
-  // `HELIOPAUSE_OTP_USERS` maps a certificate name to a KeyStone user id — `ops-henry=<uuid>`. An
+  // `HELIOPAUSE_OTP_USERS` maps a certificate name to a KeyStone user id — `<cert-cn>=<uuid>`. An
   // OIDC principal needs no entry: its `sub` is that id already. A writer with no entry and no OIDC
   // identity cannot approve, which is the safe direction.
   ...(process.env.HELIOPAUSE_OTP_ISSUER_URL

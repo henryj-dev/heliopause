@@ -88,7 +88,7 @@ HELIOPAUSE_ARTIFACT_SIGNING_KEY_FILE=/etc/heliopause/artifact-signing.key
 
 매니저는 기동 시 이 파일을 읽고, 정규 파일이 아니거나 심볼릭 링크이거나 group/other 에 열려 있거나
 소유자가 다르거나 Ed25519 가 아니면 **리스닝 소켓을 열기 전에** 종료한다. 클러스터에서 돌면 이
-파일은 Secret 마운트이며 매니페스트는 `stardust-deploy` 에 있다.
+파일은 Secret 마운트이며 매니페스트는 이 저장소가 아니라 배포 저장소에 있다.
 
 **에이전트** — 공개키만, 링별 디렉터리로.
 
