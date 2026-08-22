@@ -50,7 +50,7 @@ function pki() {
   run("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", "rogue-ca.key", "-out", "rogue-ca.pem",
       "-days", "1", "-subj", "/CN=rogue-ca");
   run("req", "-newkey", "rsa:2048", "-nodes", "-keyout", "rogue.key", "-out", "rogue.csr",
-      "-subj", "/CN=ops-henry");
+      "-subj", "/CN=ops-alice");
   writeFileSync(join(dir, "rogue.ext"), "extendedKeyUsage=critical,clientAuth\n");
   run("x509", "-req", "-in", "rogue.csr", "-CA", "rogue-ca.pem", "-CAkey", "rogue-ca.key",
       "-CAcreateserial", "-out", "rogue.pem", "-days", "1", "-extfile", "rogue.ext");
@@ -66,7 +66,7 @@ function pki() {
 
   for (const [name, eku] of [["server", "serverAuth"], ["ops", "clientAuth"]] as const) {
     run("req", "-newkey", "rsa:2048", "-nodes", "-keyout", `${name}.key`, "-out", `${name}.csr`,
-        "-subj", `/CN=${name === "server" ? "manager" : "ops-henry"}`);
+        "-subj", `/CN=${name === "server" ? "manager" : "ops-alice"}`);
     writeFileSync(join(dir, `${name}.ext`),
       `extendedKeyUsage=critical,${eku}\n` + (name === "server" ? "subjectAltName=IP:127.0.0.1\n" : ""));
     run("x509", "-req", "-in", `${name}.csr`, "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial",
@@ -114,7 +114,7 @@ before(async () => {
     // about who may ask, not about what comes back.
     relays: [{ name: "dev", url: "https://127.0.0.1:1/", pkiDir: dir }],
     tls: { certFile: join(dir, "server.pem"), keyFile: join(dir, "server.key"), caFile: join(dir, "ca.pem") },
-    operatorCNs: ["ops-henry"],
+    operatorCNs: ["ops-alice"],
     timeoutMs: 200,
     policySite: policyModule,
   } as Parameters<typeof startManager>[0] & { policySite: string });
@@ -140,14 +140,14 @@ describe("who may change the fleet", () => {
 
   it("reports the certificate allowlists", async () => {
     const body = JSON.parse((await get("/authz", "operator")).body);
-    assert.deepEqual(body.certificate.operators, ["ops-henry"]);
+    assert.deepEqual(body.certificate.operators, ["ops-alice"]);
   });
 
   it("names the caller and whether they may write", async () => {
     // The chrome reads these off `/authz` so identity does not depend on `/plans`.
     // This suite has no writer CN — a button that exists to return 403 is noise.
     const body = JSON.parse((await get("/authz", "operator")).body);
-    assert.equal(body.you, "ops-henry");
+    assert.equal(body.you, "ops-alice");
     assert.equal(body.canWrite, false);
     assert.equal(typeof body.pendingPlans, "number");
     // No enrollment store in this suite. 0 would claim the store was read.
@@ -281,7 +281,7 @@ describe("the manager's HTTP surface", () => {
     // so the CN check refuses it on its own and the deletion is invisible.
     //
     // This is what actually depends on it. `rejectUnauthorized: false` lets this handshake complete,
-    // so the certificate reaches the handler and its subject really does say `ops-henry`. The only
+    // so the certificate reaches the handler and its subject really does say `ops-alice`. The only
     // thing between that and the whole fleet is the chain check.
     return get("/site", "rogue").then((r) => assert.equal(r.status, 401));
   });
@@ -397,7 +397,7 @@ describe("SNI — two certificates behind one port", () => {
           load: async () => publicBundle(),
         },
       },
-      operatorCNs: ["ops-henry"],
+      operatorCNs: ["ops-alice"],
       timeoutMs: 200,
     });
     port2 = (started.server.address() as { port: number }).port;
@@ -498,7 +498,7 @@ describe("the public certificate is optional at runtime", () => {
           load: async () => { throw new Error("dispatcher unreachable"); },
         },
       },
-      operatorCNs: ["ops-henry"],
+      operatorCNs: ["ops-alice"],
       timeoutMs: 200,
     });
     // Registered the moment the server exists, so a failing assertion below still closes it. A
@@ -556,7 +556,7 @@ describe("the public certificate is optional at runtime", () => {
           retrySec: 0.02,
         },
       },
-      operatorCNs: ["ops-henry"],
+      operatorCNs: ["ops-alice"],
       timeoutMs: 200,
     });
     t.after(() => started.server.close());
@@ -621,7 +621,7 @@ describe("the public certificate is optional at runtime", () => {
           },
         },
       },
-      operatorCNs: ["ops-henry"], timeoutMs: 200,
+      operatorCNs: ["ops-alice"], timeoutMs: 200,
     });
     t.after(() => started.server.close());
     const p = (started.server.address() as { port: number }).port;
@@ -643,7 +643,7 @@ describe("the public certificate is optional at runtime", () => {
         certFile: join(dir, "server.pem"), keyFile: join(dir, "server.key"), caFile: join(dir, "ca.pem"),
         public: { serverNames: ["rot.example.invalid"], load: async () => bundle("b", "fp-b") },
       },
-      operatorCNs: ["ops-henry"], timeoutMs: 200,
+      operatorCNs: ["ops-alice"], timeoutMs: 200,
     });
     t.after(() => second.server.close());
     const p2 = (second.server.address() as { port: number }).port;
@@ -669,7 +669,7 @@ describe("OIDC login routes", () => {
       port: 0, hostname: "127.0.0.1",
       relays: [{ name: "dev", url: "https://127.0.0.1:1/", pkiDir: dir }],
       tls: { certFile: join(dir, "server.pem"), keyFile: join(dir, "server.key"), caFile: join(dir, "ca.pem") },
-      operatorCNs: ["ops-henry"],
+      operatorCNs: ["ops-alice"],
       timeoutMs: 200,
       oidc: {
         issuer: "https://idp.example.invalid",
@@ -679,7 +679,7 @@ describe("OIDC login routes", () => {
         roleChangeEvent: ROLE_CHANGE_EVENT,
         operatorGroups: ["heliopause-operators"],
         writerGroups: ["heliopause-writers"],
-        aliases: new Map([["jang@example.invalid", "ops-henry"]]),
+        aliases: new Map([["jang@example.invalid", "ops-alice"]]),
         // An IdP that only ever serves its discovery document. Every case in this block is decided
         // by the manager before a token is involved; the exchange itself is covered in oidc.test.ts.
         fetchImpl: (async (u: string | URL) => {
@@ -873,7 +873,7 @@ describe("a real OIDC session, end to end", () => {
       port: 0, hostname: "127.0.0.1",
       relays: [{ name: "dev", url: "https://127.0.0.1:1/", pkiDir: dir }],
       tls: { certFile: join(dir, "server.pem"), keyFile: join(dir, "server.key"), caFile: join(dir, "ca.pem") },
-      operatorCNs: ["ops-henry"], writerCNs: ["ops-henry"],
+      operatorCNs: ["ops-alice"], writerCNs: ["ops-alice"],
       timeoutMs: 200,
       oidc: {
         issuer: "https://idp.example.invalid", clientId: "heliopause-manager",
@@ -883,13 +883,13 @@ describe("a real OIDC session, end to end", () => {
         // Solo approval switches the two-person rule off for a role. The constructor refuses it
         // without a second factor, which is why this harness also carries `otp`.
         soloApprovalRoles: ["heliopause-admins"],
-        aliases: new Map([["jang@example.invalid", "ops-henry"]]),
+        aliases: new Map([["jang@example.invalid", "ops-alice"]]),
         fetchImpl,
       },
       otp: {
         issuerUrl: "https://otp.example.invalid",
         serviceToken: "svc",
-        users: new Map([["ops-henry", "keystone-user-1"]]),
+        users: new Map([["ops-alice", "keystone-user-1"]]),
         // Always accepts. This block exists so `soloApprovalRoles` is configurable at all; what a
         // wrong code does is covered by its own harness below.
         fetchImpl: (async () => new Response(JSON.stringify({ ok: true }), { status: 200 })) as unknown as typeof fetch,
@@ -1275,7 +1275,7 @@ describe("a real OIDC session, end to end", () => {
     const cookie = ([] as string[]).concat(cb.headers["set-cookie"] as string[] ?? [])[0]!.split(";")[0]!;
     const plans = JSON.parse((await call("/plans", "GET", { cookie })).body);
     assert.equal(plans.canWrite, true, "this identity IS aliased, so it may write");
-    assert.equal(plans.you, "ops-henry", "and its name collapses onto the certificate's");
+    assert.equal(plans.you, "ops-alice", "and its name collapses onto the certificate's");
   });
 
   it("refuses a write from a session that is only in an operator group", async () => {
@@ -1317,7 +1317,7 @@ describe("a real OIDC session, end to end", () => {
     // Same cookie, same session — and it may no longer write.
     const after = JSON.parse((await call("/plans", "GET", { cookie })).body);
     assert.equal(after.canWrite, false, "the demotion must apply to the live session");
-    assert.equal(after.you, "ops-henry", "the name must survive, or the two-person rule breaks");
+    assert.equal(after.you, "ops-alice", "the name must survive, or the two-person rule breaks");
   });
 
   it("ends the session when the role change leaves no operator role", async () => {
@@ -1466,12 +1466,12 @@ describe("one-time codes on approve and publish", () => {
       port: 0, hostname: "127.0.0.1",
       relays: [{ name: "dev", url: "https://127.0.0.1:1/", pkiDir: dir }],
       tls: { certFile: join(dir, "server.pem"), keyFile: join(dir, "server.key"), caFile: join(dir, "ca.pem") },
-      operatorCNs: ["ops-henry"], writerCNs: ["ops-henry"],
+      operatorCNs: ["ops-alice"], writerCNs: ["ops-alice"],
       timeoutMs: 200,
       otp: {
         issuerUrl: "https://idp.example.invalid",
         serviceToken: "svc",
-        users: new Map([["ops-henry", "keystone-user-1"]]),
+        users: new Map([["ops-alice", "keystone-user-1"]]),
         fetchImpl: (async (_u: string | URL, init?: RequestInit) => {
           asked.push(JSON.parse(String(init?.body ?? "{}")));
           return new Response(JSON.stringify(idpAnswer.body), { status: idpAnswer.status });
@@ -1583,11 +1583,11 @@ describe("a writer with no IdP mapping", () => {
       port: 0, hostname: "127.0.0.1",
       relays: [{ name: "dev", url: "https://127.0.0.1:1/", pkiDir: dir }],
       tls: { certFile: join(dir, "server.pem"), keyFile: join(dir, "server.key"), caFile: join(dir, "ca.pem") },
-      operatorCNs: ["ops-henry"], writerCNs: ["ops-henry"],
+      operatorCNs: ["ops-alice"], writerCNs: ["ops-alice"],
       timeoutMs: 200,
       otp: {
         issuerUrl: "https://idp.example.invalid", serviceToken: "svc",
-        users: new Map(), // ops-henry is deliberately absent
+        users: new Map(), // ops-alice is deliberately absent
         fetchImpl: (async () => new Response("{}", { status: 200 })) as unknown as typeof fetch,
       },
     });
@@ -1683,7 +1683,7 @@ describe("the console can propose a plan, which is the step it could not take", 
       port: 0, hostname: "127.0.0.1",
       relays: [{ name: "dev", url: "https://127.0.0.1:1/", pkiDir: dir }],
       tls: { certFile: join(dir, "server.pem"), keyFile: join(dir, "server.key"), caFile: join(dir, "ca.pem") },
-      operatorCNs: ["ops-henry"], writerCNs: ["ops-henry"],
+      operatorCNs: ["ops-alice"], writerCNs: ["ops-alice"],
       timeoutMs: 2000,
       policySource: { url: `http://127.0.0.1:${rendererPort}` },
     });
@@ -1969,7 +1969,7 @@ describe("the console can propose a plan, which is the step it could not take", 
     // The generation names the commit the renderer reported — not something the browser chose.
     assert.equal(plan.generation, "abc1234");
     assert.match(plan.hash, /^sha256:[0-9a-f]{64}$/);
-    assert.equal(plan.proposedBy, "ops-henry");
+    assert.equal(plan.proposedBy, "ops-alice");
   });
 
   it("refuses a checkout it cannot name, and says which state it is in", async () => {

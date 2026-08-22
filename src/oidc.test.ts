@@ -33,7 +33,7 @@ function token(over: Record<string, unknown> = {}, head: Record<string, unknown>
   const payload = {
     iss: ISSUER, aud: CLIENT, sub: "user-1", nonce: NONCE,
     exp: now + 300, iat: now, email: "a@example.invalid",
-    preferred_username: "ops-henry", groups: ["fleet-operators"],
+    preferred_username: "ops-alice", groups: ["fleet-operators"],
     ...over,
   };
   const input = `${b64(header)}.${b64(payload)}`;
@@ -71,7 +71,7 @@ describe("id token verification", () => {
   it("accepts a token this test signed — the known positive", async () => {
     const id = await verifyIdToken(provider(), token(), CLIENT, NONCE);
     assert.equal(id.sub, "user-1");
-    assert.equal(id.username, "ops-henry");
+    assert.equal(id.username, "ops-alice");
     assert.deepEqual(id.groups, ["fleet-operators"]);
   });
 

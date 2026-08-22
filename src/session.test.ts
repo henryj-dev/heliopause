@@ -12,14 +12,14 @@ import {
 
 const ORIGIN = "https://console.example.com";
 const who: Principal = {
-  name: "ops-henry", sub: "idp-1", groups: ["fleet-operators"], via: "oidc", canWrite: false,
+  name: "ops-alice", sub: "idp-1", groups: ["fleet-operators"], via: "oidc", canWrite: false,
 };
 
 describe("the session store", () => {
   it("issues a session that can be looked up — the known positive", () => {
     const s = new SessionStore();
     const a = s.create(who);
-    assert.equal(s.get(a.id)?.principal.name, "ops-henry");
+    assert.equal(s.get(a.id)?.principal.name, "ops-alice");
     assert.equal(s.get(a.id)?.principal.via, "oidc");
   });
 

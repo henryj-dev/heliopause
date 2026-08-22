@@ -4,25 +4,25 @@ import { loginHref, LOGOUT_PATH, mayLabel, readWho, shouldAskOtp, viaLabel } fro
 
 describe("readWho", () => {
   it("reads the caller the chrome draws", () => {
-    const read = readWho({ you: "ops-henry", canWrite: true, csrf: "tok" });
+    const read = readWho({ you: "ops-alice", canWrite: true, csrf: "tok" });
     assert.deepEqual(read, {
       ok: true,
-      view: { you: "ops-henry", canWrite: true, csrf: "tok", pendingPlans: 0, pendingCsrs: 0, needsOtp: true },
+      view: { you: "ops-alice", canWrite: true, csrf: "tok", pendingPlans: 0, pendingCsrs: 0, needsOtp: true },
     });
   });
 
   it("treats a certificate caller as having no session token", () => {
-    const read = readWho({ you: "ops-henry", canWrite: false });
+    const read = readWho({ you: "ops-alice", canWrite: false });
     assert.deepEqual(read, {
       ok: true,
-      view: { you: "ops-henry", canWrite: false, csrf: null, pendingPlans: 0, pendingCsrs: 0, needsOtp: true },
+      view: { you: "ops-alice", canWrite: false, csrf: null, pendingPlans: 0, pendingCsrs: 0, needsOtp: true },
     });
   });
 
   it("keeps a missing pending count as zero, not as unread", () => {
-    const counted = readWho({ you: "ops-henry", canWrite: true, pendingPlans: 2, pendingCsrs: 3 });
-    const missing = readWho({ you: "ops-henry", canWrite: true });
-    const negative = readWho({ you: "ops-henry", canWrite: true, pendingPlans: -1, pendingCsrs: -1 });
+    const counted = readWho({ you: "ops-alice", canWrite: true, pendingPlans: 2, pendingCsrs: 3 });
+    const missing = readWho({ you: "ops-alice", canWrite: true });
+    const negative = readWho({ you: "ops-alice", canWrite: true, pendingPlans: -1, pendingCsrs: -1 });
     assert.equal(counted.ok && counted.view.pendingPlans, 2);
     assert.equal(counted.ok && counted.view.pendingCsrs, 3);
     assert.equal(missing.ok && missing.view.pendingPlans, 0);
@@ -32,9 +32,9 @@ describe("readWho", () => {
   });
 
   it("asks for a code when otp is configured, and when the field is missing", () => {
-    const configured = readWho({ you: "ops-henry", canWrite: true, otp: { issuer: "https://idp.example" } });
-    const none = readWho({ you: "ops-henry", canWrite: true, otp: null });
-    const missing = readWho({ you: "ops-henry", canWrite: true });
+    const configured = readWho({ you: "ops-alice", canWrite: true, otp: { issuer: "https://idp.example" } });
+    const none = readWho({ you: "ops-alice", canWrite: true, otp: null });
+    const missing = readWho({ you: "ops-alice", canWrite: true });
     assert.equal(configured.ok && configured.view.needsOtp, true);
     assert.equal(none.ok && none.view.needsOtp, false);
     assert.equal(missing.ok && missing.view.needsOtp, true);
@@ -43,14 +43,14 @@ describe("readWho", () => {
   });
 
   it("treats an empty csrf field as absent, not as a token", () => {
-    const read = readWho({ you: "ops-henry", canWrite: true, csrf: "" });
+    const read = readWho({ you: "ops-alice", canWrite: true, csrf: "" });
     assert.equal(read.ok && read.view.csrf, null);
   });
 
   it("refuses a body that does not name the caller", () => {
     assert.equal(readWho({ canWrite: true }).ok, false);
     assert.equal(readWho({ you: "", canWrite: true }).ok, false);
-    assert.equal(readWho({ you: "ops-henry" }).ok, false);
+    assert.equal(readWho({ you: "ops-alice" }).ok, false);
   });
 });
 

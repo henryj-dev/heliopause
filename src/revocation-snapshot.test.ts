@@ -12,7 +12,7 @@ import {
 import { revocationReplicationBody } from "./manager-server.ts";
 
 const row = {
-  fingerprint256: "a".repeat(64), subject: "CN=host-01", reason: "test", actor: "ops-henry",
+  fingerprint256: "a".repeat(64), subject: "CN=host-01", reason: "test", actor: "ops-alice",
   revokedAt: "2026-08-10T00:00:00.000Z",
 };
 

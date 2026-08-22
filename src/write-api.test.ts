@@ -63,7 +63,7 @@ function pki() {
 
   leaf("mgr-server", "manager", "serverAuth", "IP:127.0.0.1");
   leaf("relay-server", "relay", "serverAuth", "IP:127.0.0.1");
-  leaf("operator-henry", "ops-henry", "clientAuth");
+  leaf("operator-henry", "ops-alice", "clientAuth");
   leaf("operator-jae", "ops-jae", "clientAuth");
   leaf("operator-watcher", "ops-watcher", "clientAuth");
 
@@ -213,8 +213,8 @@ before(async () => {
       keyFile: join(dir, "relay-server.key"),
       caFile: join(dir, "ca.pem"),
     },
-    operatorCNs: ["hp-manager", "ops-henry"],
-    // The manager's identity, and deliberately not `ops-henry` — the relay's own check is what this
+    operatorCNs: ["hp-manager", "ops-alice"],
+    // The manager's identity, and deliberately not `ops-alice` — the relay's own check is what this
     // separation is for, and a test where both lists are equal cannot see it.
     publisherCNs: ["hp-manager"],
     revocationFile,
@@ -234,9 +234,9 @@ before(async () => {
       keyFile: join(dir, "mgr-server.key"),
       caFile: join(dir, "ca.pem"),
     },
-    operatorCNs: ["ops-henry", "ops-jae", "ops-watcher"],
+    operatorCNs: ["ops-alice", "ops-jae", "ops-watcher"],
     // `ops-watcher` is deliberately absent: a reader who may not write.
-    writerCNs: ["ops-henry", "ops-jae"],
+    writerCNs: ["ops-alice", "ops-jae"],
     enrollment: { storeFile: enrollmentFile },
     // This is the documented manager.env combination: the manager checks its full enrollment store
     // while publishing only a minimal projection to the relay. It must not parse the full file as a
@@ -275,8 +275,8 @@ describe("relay revocation state at startup", () => {
           keyFile: join(dir, "relay-server.key"),
           caFile: join(dir, "ca.pem"),
         },
-        operatorCNs: ["ops-henry"],
-        publisherCNs: ["ops-henry"],
+        operatorCNs: ["ops-alice"],
+        publisherCNs: ["ops-alice"],
         revocationFile: fresh,
         revocationWriterSocket,
         log: () => {},
@@ -299,8 +299,8 @@ describe("relay revocation state at startup", () => {
           keyFile: join(dir, "relay-server.key"),
           caFile: join(dir, "ca.pem"),
         },
-        operatorCNs: ["ops-henry"],
-        publisherCNs: ["ops-henry"],
+        operatorCNs: ["ops-alice"],
+        publisherCNs: ["ops-alice"],
         revocationFile: snapshot,
         revocationWriterSocket: join(dir, "missing-writer.sock"),
         log: () => {},
@@ -317,7 +317,7 @@ describe("relay revocation state at startup", () => {
       fingerprint256: "a".repeat(64),
       subject: "CN=gone",
       reason: "key compromise",
-      actor: "ops-henry",
+      actor: "ops-alice",
       revokedAt: "2026-08-10T00:00:00Z",
     };
     writeFileSync(populated, JSON.stringify({ schemaVersion: 1, revocations: [row] }));
@@ -333,8 +333,8 @@ describe("relay revocation state at startup", () => {
         keyFile: join(dir, "relay-server.key"),
         caFile: join(dir, "ca.pem"),
       },
-      operatorCNs: ["ops-henry"],
-      publisherCNs: ["ops-henry"],
+      operatorCNs: ["ops-alice"],
+      publisherCNs: ["ops-alice"],
       revocationFile: populated,
       revocationWriterSocket: socket,
       log: () => {},
@@ -546,7 +546,7 @@ describe("publishing reaches the relay", () => {
     assert.equal(r.status, 200, r.text);
     assert.deepEqual(
       [r.json.proposedBy, r.json.approvedBy, r.json.publishedBy],
-      ["ops-henry", "ops-jae", "ops-jae"],
+      ["ops-alice", "ops-jae", "ops-jae"],
       "the publisher need not be the proposer, but all three must be recorded",
     );
   });
@@ -614,7 +614,7 @@ describe("publishing reaches the relay", () => {
 describe("the relay's own check", () => {
   it("refuses a push from an operator who is not a publisher", async () => {
     // Defence in depth, and not redundant: the manager's writer list and the relay's publisher list
-    // are configured separately, on different machines. `ops-henry` may write via the manager and may
+    // are configured separately, on different machines. `ops-alice` may write via the manager and may
     // read this relay's status, and still must not push to it directly.
     const r = await call(relayPort, "/publish", "POST", bundle(), "henry");
     assert.equal(r.status, 403);
@@ -790,7 +790,7 @@ describe("listing plans", () => {
   // that request. These tests pin that the *display* is honest, not that the check lives here.
   it("tells the caller who they are and whether they may write", async () => {
     const w = await call<{ you: string; canWrite: boolean }>(managerPort, "/plans", "GET", undefined, "henry");
-    assert.equal(w.json.you, "ops-henry");
+    assert.equal(w.json.you, "ops-alice");
     assert.equal(w.json.canWrite, true);
 
     const r = await call<{ you: string; canWrite: boolean }>(managerPort, "/plans", "GET", undefined, "watcher");

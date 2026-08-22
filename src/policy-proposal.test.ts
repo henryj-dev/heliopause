@@ -60,7 +60,7 @@ describe("appJwt", () => {
 
 describe("branchName", () => {
   it("says who and when", () => {
-    assert.equal(branchName("ops-henry", "2026-08-13T04:05:06Z"), "policy/ops-henry/20260813-040506");
+    assert.equal(branchName("ops-alice", "2026-08-13T04:05:06Z"), "policy/ops-alice/20260813-040506");
   });
 
   // The name arrives from a certificate CN or an OIDC claim. A `/` would create a nested ref

@@ -12,7 +12,7 @@
 // ## The two-person rule is why names must collapse
 //
 // `approval.ts` refuses an approval with `plan.proposedBy === input.by` — a plain string comparison.
-// One human arriving as `ops-henry` by certificate and as `jang@…` by OIDC is two strings, so that
+// One human arriving as `ops-alice` by certificate and as `jang@…` by OIDC is two strings, so that
 // person could propose and approve alone. The rule would still be *there*, and would have stopped
 // being a rule.
 //
@@ -112,7 +112,7 @@ function lookupAlias(id: Identity, aliases: ReadonlyMap<string, string>): string
 }
 
 /**
- * Parse `a@b=ops-henry,c@d=ops-other` into the alias map.
+ * Parse `a@b=ops-alice,c@d=ops-other` into the alias map.
  *
  * Refuses malformed entries rather than skipping them. A typo that silently drops a mapping would
  * present as "my writes are refused and I do not know why", and the operator would be looking at a

@@ -19,14 +19,14 @@ const id = (over: Partial<Identity> = {}): Identity => ({
 const cfg = (over: Partial<OidcAuthzConfig> = {}): OidcAuthzConfig => ({
   operatorGroups: ["heliopause-operators"],
   writerGroups: ["heliopause-writers"],
-  aliases: new Map([["jang@example.invalid", "ops-henry"]]),
+  aliases: new Map([["jang@example.invalid", "ops-alice"]]),
   ...over,
 });
 
 describe("reading", () => {
   it("admits an identity in an operator group — the known positive", () => {
     const d = authorize(id(), cfg());
-    assert.equal(d.principal?.name, "ops-henry");
+    assert.equal(d.principal?.name, "ops-alice");
     assert.equal(d.principal?.via, "oidc");
     assert.equal(d.canWrite, false, "an operator group alone is not write access");
   });
@@ -57,7 +57,7 @@ describe("writing, and the two-person rule", () => {
   it("grants write to a writer whose identity is aliased to a certificate name", () => {
     const d = authorize(writer, cfg());
     assert.equal(d.canWrite, true);
-    assert.equal(d.principal?.name, "ops-henry", "the name must collapse onto the certificate's");
+    assert.equal(d.principal?.name, "ops-alice", "the name must collapse onto the certificate's");
   });
 
   it("refuses write to a writer with no alias, and says why", () => {
@@ -76,8 +76,8 @@ describe("writing, and the two-person rule", () => {
   });
 
   it("matches an alias by email, then username, then sub", () => {
-    const byUser = authorize(id({ email: null }), cfg({ aliases: new Map([["henry", "ops-henry"]]) }));
-    assert.equal(byUser.principal?.name, "ops-henry");
+    const byUser = authorize(id({ email: null }), cfg({ aliases: new Map([["henry", "ops-alice"]]) }));
+    assert.equal(byUser.principal?.name, "ops-alice");
     const bySub = authorize(id({ email: null, username: null }), cfg({ aliases: new Map([["idp-sub-1", "ops-x"]]) }));
     assert.equal(bySub.principal?.name, "ops-x");
   });

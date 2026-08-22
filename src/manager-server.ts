@@ -983,7 +983,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
   // nothing.
   //
   // **This is load-bearing on `peerCN` checking `socket.authorized`.** If that check is ever removed,
-  // this flag turns a CN into an unverified claim, and anyone may self-sign `CN=ops-henry`.
+  // this flag turns a CN into an unverified claim, and anyone may self-sign `CN=ops-alice`.
   // The public certificate, when one is configured. Read here rather than inside the callback: a
   // disk read per handshake would be a way to make the server slow by connecting to it, and a file
   // that has gone missing should fail at startup where somebody is watching.
@@ -1022,7 +1022,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         // caller did not present one.
         //
         // Measured in production 2026-08-06, same server and same certificate, SNI the only
-        // difference: by IP `200 {"you":"ops-henry"}`, by name `401 no client certificate`. It fails
+        // difference: by IP `200 {"you":"ops-alice"}`, by name `401 no client certificate`. It fails
         // closed, so it denied rather than admitted — and it looked exactly like a broken client,
         // which is where the time went.
         pub.ctx = createSecureContext({ cert: b.cert, key: b.key, ca });

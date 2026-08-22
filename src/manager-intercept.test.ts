@@ -17,7 +17,7 @@ function pki(): void {
     "-days", "1", "-subj", "/CN=test-ca");
   for (const [name, eku] of [["server", "serverAuth"], ["ops", "clientAuth"]] as const) {
     run("req", "-newkey", "rsa:2048", "-nodes", "-keyout", `${name}.key`, "-out", `${name}.csr`,
-      "-subj", `/CN=${name === "server" ? "manager" : "ops-henry"}`);
+      "-subj", `/CN=${name === "server" ? "manager" : "ops-alice"}`);
     writeFileSync(join(dir, `${name}.ext`),
       `extendedKeyUsage=critical,${eku}\n` + (name === "server" ? "subjectAltName=IP:127.0.0.1\n" : ""));
     run("x509", "-req", "-in", `${name}.csr`, "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial",
@@ -52,7 +52,7 @@ before(async () => {
     hostname: "127.0.0.1",
     relays: [{ name: "dev", url: "https://127.0.0.1:1/", pkiDir: dir }],
     tls: { certFile: join(dir, "server.pem"), keyFile: join(dir, "server.key"), caFile: join(dir, "ca.pem") },
-    operatorCNs: ["ops-henry"],
+    operatorCNs: ["ops-alice"],
     timeoutMs: 200,
     intercept: (req, res) => {
       const path = new URL(req.url ?? "/", "https://manager.invalid").pathname;

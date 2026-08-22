@@ -29,24 +29,24 @@ describe("bodies", () => {
   it("lets the server name the first branch and reuses one after that", () => {
     assert.equal(editBody("policies.json", "{}\n", ""), JSON.stringify({ path: "policies.json", content: "{}\n" }));
     assert.equal(
-      editBody("policies.json", "{}\n", "ops-henry/edit"),
-      JSON.stringify({ path: "policies.json", content: "{}\n", branch: "ops-henry/edit" }),
+      editBody("policies.json", "{}\n", "ops-alice/edit"),
+      JSON.stringify({ path: "policies.json", content: "{}\n", branch: "ops-alice/edit" }),
     );
   });
 
   it("proposes the branch, not a fleet target", () => {
-    assert.equal(proposePolicyBody("ops-henry/edit"), JSON.stringify({ branch: "ops-henry/edit" }));
+    assert.equal(proposePolicyBody("ops-alice/edit"), JSON.stringify({ branch: "ops-alice/edit" }));
     assert.equal(
-      proposePolicyBody("ops-henry/edit", "ssh: allow 2222"),
-      JSON.stringify({ branch: "ops-henry/edit", title: "ssh: allow 2222" }),
+      proposePolicyBody("ops-alice/edit", "ssh: allow 2222"),
+      JSON.stringify({ branch: "ops-alice/edit", title: "ssh: allow 2222" }),
     );
   });
 });
 
 describe("replies", () => {
   it("reads a commit the same way the classic editor did", () => {
-    const ok = readEditReply({ ok: true, branch: "ops-henry/edit", commit: "abcdef01deadbeef" });
-    assert.deepEqual(ok, { ok: true, branch: "ops-henry/edit", commit: "abcdef01deadbeef" });
+    const ok = readEditReply({ ok: true, branch: "ops-alice/edit", commit: "abcdef01deadbeef" });
+    assert.deepEqual(ok, { ok: true, branch: "ops-alice/edit", commit: "abcdef01deadbeef" });
     const fail = readEditReply({ error: "refusing to commit an empty file" });
     assert.deepEqual(fail, { ok: false, reason: "refusing to commit an empty file" });
   });

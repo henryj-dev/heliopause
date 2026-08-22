@@ -28,7 +28,7 @@ const at = (sec: number) => new Date(T0.getTime() + sec * 1000);
 /** A pending plan proposed by `henry`. */
 function pending() {
   const st = emptyApprovals();
-  propose(st, { hash: H, generation: "abc1234", summary: SUMMARY, by: "ops-henry", now: T0 });
+  propose(st, { hash: H, generation: "abc1234", summary: SUMMARY, by: "ops-alice", now: T0 });
   return st;
 }
 
@@ -45,14 +45,14 @@ function refusal(fn: () => unknown): ApprovalError {
 describe("proposing", () => {
   it("records who proposed it, from the certificate rather than the payload", () => {
     const st = pending();
-    assert.equal(st.plans.get(H)!.proposedBy, "ops-henry");
+    assert.equal(st.plans.get(H)!.proposedBy, "ops-alice");
     assert.equal(st.plans.get(H)!.approval, null);
   });
 
   it("refuses a hash that is not a sha256 digest", () => {
     const st = emptyApprovals();
     const e = refusal(() =>
-      propose(st, { hash: "../../etc/passwd", generation: "g", summary: SUMMARY, by: "ops-henry", now: T0 }),
+      propose(st, { hash: "../../etc/passwd", generation: "g", summary: SUMMARY, by: "ops-alice", now: T0 }),
     );
     assert.equal(e.status, 400);
   });
@@ -68,14 +68,14 @@ describe("proposing", () => {
   it("is idempotent for identical content", () => {
     // A CLI that retried after a timeout must not create a second plan.
     const st = pending();
-    propose(st, { hash: H, generation: "abc1234", summary: SUMMARY, by: "ops-henry", now: at(5) });
+    propose(st, { hash: H, generation: "abc1234", summary: SUMMARY, by: "ops-alice", now: at(5) });
     assert.equal(st.plans.size, 1);
   });
 
   it("does not let re-proposing reset an approval already given", () => {
     const st = pending();
     approve(st, { hash: H, by: "ops-jae", now: at(10) });
-    propose(st, { hash: H, generation: "abc1234", summary: SUMMARY, by: "ops-henry", now: at(20) });
+    propose(st, { hash: H, generation: "abc1234", summary: SUMMARY, by: "ops-alice", now: at(20) });
     assert.equal(st.plans.get(H)!.approval?.by, "ops-jae", "the approval was lost by a replay");
   });
 
@@ -84,8 +84,8 @@ describe("proposing", () => {
     // re-proposes henry's plan, becoming its proposer, which frees henry to approve his own work.
     const st = pending();
     propose(st, { hash: H, generation: "abc1234", summary: SUMMARY, by: "ops-jae", now: at(5) });
-    assert.equal(st.plans.get(H)!.proposedBy, "ops-henry");
-    const e = refusal(() => approve(st, { hash: H, by: "ops-henry", now: at(6) }));
+    assert.equal(st.plans.get(H)!.proposedBy, "ops-alice");
+    const e = refusal(() => approve(st, { hash: H, by: "ops-alice", now: at(6) }));
     assert.equal(e.status, 403);
   });
 
@@ -93,10 +93,10 @@ describe("proposing", () => {
     const st = emptyApprovals();
     const limits = { ttlSec: 600, maxPending: 2 };
     for (const c of ["a", "b"]) {
-      propose(st, { hash: `sha256:${c.repeat(64)}`, generation: "g", summary: SUMMARY, by: "ops-henry", now: T0 }, limits);
+      propose(st, { hash: `sha256:${c.repeat(64)}`, generation: "g", summary: SUMMARY, by: "ops-alice", now: T0 }, limits);
     }
     const e = refusal(() =>
-      propose(st, { hash: `sha256:${"c".repeat(64)}`, generation: "g", summary: SUMMARY, by: "ops-henry", now: T0 }, limits),
+      propose(st, { hash: `sha256:${"c".repeat(64)}`, generation: "g", summary: SUMMARY, by: "ops-alice", now: T0 }, limits),
     );
     assert.equal(e.status, 429);
   });
@@ -106,7 +106,7 @@ describe("approving", () => {
   it("refuses the proposer", () => {
     // The whole point of the mechanism.
     const st = pending();
-    const e = refusal(() => approve(st, { hash: H, by: "ops-henry", now: at(10) }));
+    const e = refusal(() => approve(st, { hash: H, by: "ops-alice", now: at(10) }));
     assert.equal(e.status, 403);
     assert.match(e.message, /cannot approve/);
     assert.equal(st.plans.get(H)!.approval, null);
@@ -138,16 +138,16 @@ describe("approving", () => {
 describe("publishing", () => {
   it("refuses a plan nobody approved", () => {
     const st = pending();
-    const e = refusal(() => claimForPublish(st, { hash: H, by: "ops-henry", now: at(10) }));
+    const e = refusal(() => claimForPublish(st, { hash: H, by: "ops-alice", now: at(10) }));
     assert.equal(e.status, 403);
   });
 
   it("lets an approved plan through once and refuses the second attempt", () => {
     const st = pending();
     approve(st, { hash: H, by: "ops-jae", now: at(10) });
-    const p = claimForPublish(st, { hash: H, by: "ops-henry", now: at(20) });
+    const p = claimForPublish(st, { hash: H, by: "ops-alice", now: at(20) });
     assert.equal(p.approval?.by, "ops-jae");
-    const e = refusal(() => claimForPublish(st, { hash: H, by: "ops-henry", now: at(30) }));
+    const e = refusal(() => claimForPublish(st, { hash: H, by: "ops-alice", now: at(30) }));
     assert.equal(e.status, 409);
   });
 
@@ -163,7 +163,7 @@ describe("publishing", () => {
     // "It expired" and "it never existed" send an operator to different places.
     const st = pending();
     approve(st, { hash: H, by: "ops-jae", now: at(10) });
-    const e = refusal(() => claimForPublish(st, { hash: H, by: "ops-henry", now: at(601) }));
+    const e = refusal(() => claimForPublish(st, { hash: H, by: "ops-alice", now: at(601) }));
     assert.equal(e.status, 410);
     assert.match(e.message, /expired/);
   });
@@ -173,16 +173,16 @@ describe("publishing", () => {
     // the rendering happened. Approving late must not extend the window.
     const st = pending();
     approve(st, { hash: H, by: "ops-jae", now: at(590) });
-    const e = refusal(() => claimForPublish(st, { hash: H, by: "ops-henry", now: at(605) }));
+    const e = refusal(() => claimForPublish(st, { hash: H, by: "ops-alice", now: at(605) }));
     assert.equal(e.status, 410);
   });
 
   it("releases a claim so a publish that reached nothing can be retried", () => {
     const st = pending();
     approve(st, { hash: H, by: "ops-jae", now: at(10) });
-    claimForPublish(st, { hash: H, by: "ops-henry", now: at(20) });
+    claimForPublish(st, { hash: H, by: "ops-alice", now: at(20) });
     release(st, H);
-    assert.ok(claimForPublish(st, { hash: H, by: "ops-henry", now: at(25) }));
+    assert.ok(claimForPublish(st, { hash: H, by: "ops-alice", now: at(25) }));
   });
 });
 
@@ -201,7 +201,7 @@ describe("expiry", () => {
 
   it("lists newest first", () => {
     const st = pending();
-    propose(st, { hash: H2, generation: "def", summary: SUMMARY, by: "ops-henry", now: at(5) });
+    propose(st, { hash: H2, generation: "def", summary: SUMMARY, by: "ops-alice", now: at(5) });
     assert.deepEqual(listPlans(st, at(10)).map((p) => p.hash), [H2, H]);
   });
 });
@@ -216,15 +216,15 @@ describe("solo approval — the two-person rule, switched off on purpose", () =>
 
   it("still refuses self-approval by default — every existing caller keeps that", () => {
     const st = emptyApprovals();
-    propose(st, { hash: A, generation: "g1", by: "ops-henry", now, summary });
-    assert.throws(() => approve(st, { hash: A, by: "ops-henry", now }), /cannot approve it/);
+    propose(st, { hash: A, generation: "g1", by: "ops-alice", now, summary });
+    assert.throws(() => approve(st, { hash: A, by: "ops-alice", now }), /cannot approve it/);
   });
 
   it("allows it when the caller says the approver may, and marks the record", () => {
     const st = emptyApprovals();
-    propose(st, { hash: A, generation: "g1", by: "ops-henry", now, summary });
-    const plan = approve(st, { hash: A, by: "ops-henry", now, mayApproveOwn: true });
-    assert.equal(plan.approval?.by, "ops-henry");
+    propose(st, { hash: A, generation: "g1", by: "ops-alice", now, summary });
+    const plan = approve(st, { hash: A, by: "ops-alice", now, mayApproveOwn: true });
+    assert.equal(plan.approval?.by, "ops-alice");
     assert.equal(plan.approval?.solo, true, "an audit must be able to see that one person did this alone");
   });
 
