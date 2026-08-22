@@ -47,8 +47,18 @@ jobs:
       # GitHub publishes every PR head (including a fork) under the base repository's refs/pull
       # namespace. Fetching that ref from the base repository with full history keeps both SCAN_BASE
       # and SCAN_HEAD in one object database, including conflicted PRs that have no /merge ref.
-      # Sparse checkout deliberately matches no candidate path: the scanner reads trees/blobs with
-      # ls-tree + cat-file, so no candidate filename or file needs to be materialized by checkout.
+      #
+      # Sparse checkout deliberately matches no candidate path: the scanner reads trees and blobs
+      # with ls-tree + cat-file, so no candidate filename or file needs to be materialized.
+      #
+      # **`filter` is why this works at all.** Setting `sparse-checkout` makes `actions/checkout`
+      # fetch with `--filter=blob:none`, and a blobless clone has no blobs to scan — the first
+      # `git cat-file blob` reaches for the network instead, finds the credentials this job
+      # deliberately does not keep, and dies with `could not read Username for
+      # 'https://github.com'`. Measured, on the first run that ever got past the missing
+      # `HELIOPAUSE_SITE_HOSTNAME_PATTERN`: this gate could not read a single byte it was created to
+      # read. `blob:limit=1g` keeps the checkout partial in form while fetching every blob that
+      # matters, so the scan runs entirely against local objects and needs no network.
       - name: fetch pull-request objects as inert data
         if: github.event_name == 'pull_request_target'
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -58,6 +68,7 @@ jobs:
           path: .candidate
           fetch-depth: 0
           persist-credentials: false
+          filter: blob:limit=1g
           sparse-checkout: .heliopause-no-candidate-files
           sparse-checkout-cone-mode: false
 
@@ -70,8 +81,29 @@ jobs:
           path: .candidate
           fetch-depth: 0
           persist-credentials: false
+          filter: blob:limit=1g
           sparse-checkout: .heliopause-no-candidate-files
           sparse-checkout-cone-mode: false
+
+      # Two assumptions above, both cheap to check and both silent when wrong.
+      #
+      # `filter` and `sparse-checkout` are documented as interacting, so the working tree could come
+      # back holding candidate files instead of nothing. And a scan that reads no blob passes: the
+      # gate's green is indistinguishable from an empty object database, which is exactly how the
+      # blobless clone above went unnoticed until the credential error made it loud.
+      - name: the checkout materialised no candidate file, and the blobs are local
+        working-directory: .candidate
+        run: |
+          set -euo pipefail
+          entries="$(ls -A . | { grep -vx '.git' || true; } | wc -l | tr -d ' ')"
+          test "$entries" = "0" \
+            || { echo "checkout materialised $entries candidate entr(y|ies) into the workspace"; exit 1; }
+          # `--missing=print` reports a promisor object instead of fetching it, so this counts what
+          # is absent without becoming the very network call the scan must not make.
+          missing="$(git rev-list --objects --all --missing=print | { grep -c '^?' || true; })"
+          test "$missing" = "0" \
+            || { echo "$missing object(s) absent locally — the scan would read nothing"; exit 1; }
+          echo "workspace entries: 0 · missing objects: 0 · paths in HEAD: $(git ls-tree -r --name-only HEAD | wc -l | tr -d ' ')"
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
