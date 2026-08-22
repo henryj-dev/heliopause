@@ -1,0 +1,11 @@
+{
+  "name": "@heliopause/relay",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Per-VPC relay process. Still the existing Node https listener — not Hono. Source stays at repo-root src/relay.ts until the file move.",
+  "license": "Apache-2.0",
+  "scripts": {
+    "start": "node ../../bin/heliopause-relay.ts"
+  }
+}

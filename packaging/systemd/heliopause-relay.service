@@ -1,0 +1,135 @@
+[Unit]
+Description=heliopause relay (serves artifacts, receives heartbeats)
+Documentation=https://github.com/henryj-dev/heliopause
+After=network-online.target
+Wants=network-online.target
+Requires=heliopause-revocation-writer.socket
+After=heliopause-revocation-writer.socket
+
+[Service]
+Type=simple
+# Node, not Bun. Bun enforces `requestCert` but cannot read the peer certificate, so under Bun the
+# relay could not tell which agent was calling and every heartbeat's `host` field would be an
+# unverified claim. Measured — see the header of src/relay.ts.
+ExecStart=/usr/bin/node /opt/heliopause/bin/heliopause-relay.ts
+EnvironmentFile=/etc/heliopause/relay.env
+
+Restart=always
+RestartSec=5s
+# Unlike the agent, the relay holds no rollback commitment — a relay that is down stalls the
+# rollout, which is visible and safe, so the default start limit is the right behaviour here.
+TimeoutStopSec=15s
+
+# ── privileges ────────────────────────────────────────────────────────────────
+#
+# Unlike the agent, this touches no kernel state: it reads files and serves HTTPS on 8443, which is
+# above 1024. So it needs no capabilities at all, and gets none.
+DynamicUser=yes
+SupplementaryGroups=heliopause-revocations
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+
+# `DynamicUser` allocates a UID at start, which means the private key must be readable through a
+# mechanism that does not depend on a fixed owner. `LoadCredential` copies it into a per-service
+# ramfs owned by that transient UID before the process starts, so the key is never world-readable
+# and never persists in a directory the service can write.
+#
+# Verified on gw-01 rather than assumed: with the key `0600 root:root`, the transient UID could not
+# read `/etc/heliopause/pki/relay.key` at all, and the relay still completed a mutual-TLS handshake
+# from the copy under `%d`. Note that `%d` is only substituted in unit directives, which is why
+# these three paths are set here and **not** in relay.env — an `Environment=` in the env file would
+# be taken literally and hand the process a path it cannot open.
+LoadCredential=cert:/etc/heliopause/pki/relay.pem
+LoadCredential=key:/etc/heliopause/pki/relay.key
+LoadCredential=ca:/etc/heliopause/pki/ca.pem
+Environment=HELIOPAUSE_CERT_FILE=%d/cert
+Environment=HELIOPAUSE_KEY_FILE=%d/key
+Environment=HELIOPAUSE_CA_FILE=%d/ca
+Environment=HELIOPAUSE_REVOCATION_FILE=/var/lib/heliopause-revocations/revocations.json
+Environment=HELIOPAUSE_REVOCATION_WRITER_SOCKET=/run/heliopause-revocation-writer.sock
+
+# Provision this file once with
+# `/usr/bin/node /opt/heliopause/bin/heliopause-revocations.ts init
+# /var/lib/heliopause-revocations/revocations.json` before enabling the socket and relay (see README
+# for the locked writer-account provisioning command). Testing it here makes deletion a hard startup
+# failure; it must never be interpreted as an empty denylist.
+ExecStartPre=/usr/bin/test -r /var/lib/heliopause-revocations/revocations.json
+
+# ── filesystem ────────────────────────────────────────────────────────────────
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# The artifact directory, writable — and it was `ReadOnlyPaths` until 2026-08-03. The old comment said
+# "published here by the manager and only ever read by the relay", which was true while artifacts
+# arrived by someone writing the directory over ssh and stopped being true the moment `POST /publish`
+# existed.
+#
+# ## Two layers said no, and fixing the first revealed the second
+#
+# `EROFS: read-only file system` came from this directive. Removing it produced
+# `EACCES: permission denied` from plain Unix ownership — `DynamicUser=yes` runs the relay under a
+# transient UID (measured: 64952) and the directory was `root:root`.
+#
+# **`StateDirectory`, not `chown`.** Chowning to the current UID works today and breaks silently on the
+# day systemd reassigns it, which would be a fresh instance of the failure mode this project keeps
+# finding: correct-looking, quiet, and only visible when something tries to write. `StateDirectory` is
+# systemd's designed counterpart to `DynamicUser` — it fixes ownership at every start, so the two
+# cannot drift apart.
+#
+# Its cost is a relocation: real data lives at `/var/lib/private/heliopause` and `/var/lib/heliopause`
+# becomes a symlink systemd maintains. Anything reading the path directly still works; anything
+# assuming a real directory there does not.
+#
+# ## What made this expensive to find
+#
+# The endpoint answered 500 on its first day, and **the probe meant to catch that could not.** Sending
+# a deliberately inconsistent bundle returns 400 from `validateBundle`, which runs *before* any write —
+# so "the endpoint exists, this CN is authorised, validation runs" was measured accurately while
+# nothing touched the filesystem. Same provider-perspective mistake as V45/V46, one level down: asking
+# "does my handler run" when the question is "can a generation actually land".
+#
+# The only probe that answers the real question is a publish that is expected to *succeed*.
+#
+# ## Why `ProtectSystem=strict` stays
+#
+# `StateDirectory` opens one path rather than removing the wall. Everything else stays read-only,
+# including `/opt/heliopause` where the relay's own code lives, so a compromised relay still cannot
+# rewrite its own binary.
+#
+# ## What the old comment was protecting, and why losing it is acceptable
+#
+# It argued that a relay which *cannot* write does not have to rely on the agents' digest check
+# catching a rewrite. That defence is genuinely weaker now. Two things make the trade worth it: the
+# digest check is real and each agent reverts on mismatch (`artifactMatches`), and the alternative —
+# publishing only by shell access to every gateway — makes the approval rule from 결정 4
+# unenforceable, because anyone who can write this directory has already bypassed it.
+StateDirectory=heliopause
+StateDirectoryMode=0700
+# A fixed locked writer account—not relay's transient UID—owns this directory. Unix ownership
+# removes relay's rename/unlink permission; the read-only mount rule remains a second independent
+# barrier. Binding one file is deliberately avoided because atomic rename would leave a stale inode.
+ReadOnlyPaths=/var/lib/heliopause-revocations
+
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+
+# `MemoryDenyWriteExecute` is **not** set: V8 is a JIT and writes executable pages by design. It is
+# set on the agent, which is Python and does not.
+
+# gw-01 has 948MB and also runs dnsmasq and WireGuard. A relay that is down stalls the rollout;
+# a relay that exhausts the host takes the VPC's DHCP and its mesh routing with it.
+MemoryMax=192M
+
+[Install]
+WantedBy=multi-user.target

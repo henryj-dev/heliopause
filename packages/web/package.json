@@ -1,0 +1,28 @@
+{
+  "name": "@heliopause/web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "SvelteKit console. Built to static files; the manager and workstation serve the same build. Does not import the heliopause library.",
+  "license": "Apache-2.0",
+  "scripts": {
+    "dev": "vite dev",
+    "build": "vite build",
+    "preview": "vite preview",
+    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+    "prepare": "svelte-kit sync",
+    "test": "node --test src/lib/i18n.test.ts src/lib/age.test.ts src/lib/poll.test.ts src/lib/domains/fleet/*.test.ts src/lib/domains/changes/*.test.ts src/lib/domains/enrollment/*.test.ts src/lib/domains/lookup/*.test.ts src/lib/domains/traffic/*.test.ts src/lib/domains/routing/*.test.ts src/lib/domains/policy/*.test.ts src/lib/shell/*.test.ts"
+  },
+  "dependencies": {
+    "@heliopause/i18n": "file:../i18n"
+  },
+  "devDependencies": {
+    "@sveltejs/adapter-static": "^3.0.10",
+    "@sveltejs/kit": "^2.70.2",
+    "@sveltejs/vite-plugin-svelte": "^7.3.0",
+    "svelte": "^5.56.9",
+    "svelte-check": "^4.7.6",
+    "typescript": "^5.6.0",
+    "vite": "^8.2.1"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "name": "@heliopause/i18n",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Shared English and Korean operator-console catalogue.",
+  "license": "Apache-2.0",
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}

@@ -1,0 +1,64 @@
+{
+  "name": "heliopause",
+  "version": "0.0.0",
+  "description": "A host firewall you can't lock yourself out of \u2014 declarative nftables with commit/confirm/auto-rollback",
+  "type": "module",
+  "license": "Apache-2.0",
+  "author": "mack-erel",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/henryj-dev/heliopause.git"
+  },
+  "keywords": [
+    "nftables",
+    "firewall",
+    "linux",
+    "infrastructure",
+    "rollback",
+    "commit-confirm"
+  ],
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "!src/*.test.ts",
+    "!src/test-util.ts",
+    "agent/heliopause-pull.py",
+    "agent/heliopause-enroll.py",
+    "bin",
+    "README.md",
+    "LICENSE"
+  ],
+  "workspaces": [
+    "packages/core",
+    "packages/agent",
+    "packages/relay",
+    "packages/manager",
+    "packages/i18n",
+    "packages/web",
+    "packages/workstation"
+  ],
+  "scripts": {
+    "test": "node --test \"src/*.test.ts\" \"policy/*.test.ts\" && npm test -w @heliopause/manager --if-present && npm test -w @heliopause/web --if-present",
+    "pki": "node bin/heliopause-pki.ts",
+    "publish": "node bin/heliopause-publish.ts",
+    "status": "node bin/heliopause-status.ts",
+    "typecheck": "tsc --noEmit",
+    "check:web": "npm run check -w @heliopause/web",
+    "e2e": "./scripts/e2e-roundtrip.sh",
+    "relay": "node bin/heliopause-relay.ts",
+    "rollback-test": "./scripts/rollback-test.sh",
+    "manager": "node bin/heliopause-manager.ts",
+    "approve": "node bin/heliopause-approve.ts",
+    "icons": "node scripts/build-icons.ts",
+    "icons:check": "node scripts/build-icons.ts --check",
+    "start:manager-scaffold": "npm run start -w @heliopause/manager",
+    "build:web": "npm run build -w @heliopause/web"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "lucide-static": "^1.31.0",
+    "typescript": "^5.6.0"
+  }
+}

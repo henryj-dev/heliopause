@@ -1,0 +1,126 @@
+[Unit]
+Description=heliopause firewall agent (pull)
+Documentation=https://github.com/henryj-dev/heliopause
+
+# `network.target` only, and deliberately **not** `network-online.target`.
+#
+# The agent's first act is to honour a rollback its previous incarnation may have committed to. The
+# case that matters is a host whose network was just severed by a bad ruleset — exactly the case
+# where waiting for the network to come online would wait forever. Ordering the recovery behind
+# connectivity would make the mechanism depend on the thing it exists to restore.
+After=network.target
+# nftables.service restores a saved ruleset at boot. If it ran after us it would replace what we
+# just applied; ordering after it means our table is added on top of whatever it laid down.
+After=nftables.service firewalld.service
+
+# ── restart rate limiting ─────────────────────────────────────────────────────
+#
+# In `[Unit]`, not `[Service]`. systemd parses `StartLimit*` here only; placed under `[Service]` it
+# is *ignored with a warning* while the file still verifies clean, so the limit stays at its default
+# and nothing announces it. Verified on systemd 257.
+#
+# Disabling the limit is deliberate and is not the usual advice. With the default, a host that
+# crash-loops five times is pinned in `failed` and systemd stops trying — and if the crash happened
+# while an applied ruleset was still unconfirmed, the rollback that would restore the host lives in
+# the code that now never runs again. For a firewall agent, restarting too often is a better
+# failure than being pinned, and one successful start is all the recovery needs.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/heliopause/agent/heliopause-pull.py
+EnvironmentFile=/etc/heliopause/agent.env
+
+# Always, including a clean exit. The agent's own exits are argument errors, which a restart cannot
+# fix — but the case that matters is the one it cannot report: killed mid-apply with a rollback
+# still owed. See StartLimitIntervalSec in [Unit].
+Restart=always
+RestartSec=5s
+
+# The agent waits on an event rather than sleeping, so it stops promptly. A short timeout keeps a
+# rolling restart from looking hung.
+TimeoutStopSec=20s
+KillSignal=SIGTERM
+
+# ── privileges ────────────────────────────────────────────────────────────────
+#
+# Root, because nft writes to the kernel. `CapabilityBoundingSet` is what makes that root narrow:
+# CAP_NET_ADMIN is the only capability nft and `nft monitor` need, so a compromise of this process
+# cannot load a module, trace another process, or write outside the paths named below.
+#
+# The workload half (schema 2) runs `kubectl` on the designated applier, and it needs **no extra
+# capability** — it is an HTTPS client talking to the API server. What it does need is read access to
+# a kubeconfig and a writable cache directory, both granted below.
+User=root
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+NoNewPrivileges=yes
+
+# ── filesystem ────────────────────────────────────────────────────────────────
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+# The two artifact trust rings, read-only. `ProtectSystem=strict` already makes /etc read-only, so
+# this is not what stops the agent writing them — it is what makes the dependency explicit at the
+# unit, next to the credentials it sits beside. The agent loads both at startup and exits if either
+# is missing, a symlink, or group/world writable, so a wrong mode here is a service that does not
+# come up rather than a host that quietly refuses generations later.
+ReadOnlyPaths=/etc/heliopause/trust
+
+# The shared unit is the non-applier profile: neither the k3s cluster-admin credential nor the
+# dedicated heliopause credential is visible. Install heliopause-agent-applier.conf on the one
+# designated applier; it resets this list and exposes only /etc/heliopause/kubeconfig.
+InaccessiblePaths=-/etc/rancher/k3s/k3s.yaml -/etc/kubernetes/admin.conf -/etc/heliopause/kubeconfig
+
+# **Only on the applier.** The drop-in exposes the dedicated credential read-only. k3s.yaml remains
+# hidden even there: its cluster-admin power is never needed for CiliumNetworkPolicy CRUD.
+# State, and only state. The rollback commitment lives here, so losing write access to it means
+# losing the ability to survive a restart mid-apply.
+#
+# **`heliopause-agent`, not `heliopause`** — the two services must not share a directory.
+# `StateDirectoryMode=0700` is applied to the directory systemd manages, and on a gateway that runs
+# both units the shared parent `/var/lib/heliopause` became `0700 root:root` the moment this unit
+# started. The relay runs under `DynamicUser`, so it could no longer traverse into
+# `artifacts/` — and it had been working until then, so starting the agent broke the relay
+# retroactively. The whole VPC stops receiving new generations, and the cause is in a different
+# unit's journal from the one that changed.
+#
+# Separate directories mean there is no shared permission boundary to get wrong:
+#   /var/lib/heliopause-agent/   0700, this unit's private state
+#   /var/lib/heliopause/artifacts/  root-owned, world-readable, ReadOnlyPaths in the relay
+StateDirectory=heliopause-agent
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/heliopause-agent
+
+# ── kernel and syscalls ───────────────────────────────────────────────────────
+#
+# Every directive below was run against real systemd 257 on Rocky 10 before being kept: `nft` was
+# made to create a table, add a chain, add a rule, dump it and delete it under exactly this set, and
+# `nft monitor` was made to stream a change — including the `# new generation N by process <pid>`
+# line the change monitor parses, which is the part a syscall filter could plausibly have broken.
+#
+# `ProtectKernelModules` is deliberately **absent**. Applying a ruleset whose expressions need a
+# module not yet loaded requires the kernel to autoload on this process's behalf; blocking that
+# turns a valid generation into an apply failure with no clue in the artifact. The narrow bounding
+# set above is what limits this process instead.
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# AF_NETLINK is how nft talks to the kernel; without it nothing here works.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+
+# No memory ceiling on purpose. These hosts have under a gigabyte, and an agent killed by its own
+# cgroup limit mid-apply is the scenario the on-disk rollback commitment exists to survive — better
+# not to manufacture it.
+
+[Install]
+WantedBy=multi-user.target

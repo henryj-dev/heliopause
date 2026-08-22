@@ -1,0 +1,13 @@
+[Unit]
+Description=heliopause monotonic revocation writer socket
+
+[Socket]
+ListenStream=/run/heliopause-revocation-writer.sock
+Accept=no
+SocketMode=0660
+SocketGroup=heliopause-revocations
+DirectoryMode=0755
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

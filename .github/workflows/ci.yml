@@ -1,0 +1,167 @@
+# What CI is for here: the checks that catch a firewall behaving differently than its plan says.
+#
+# The suites are split by what they need, not by speed. `test` and `typecheck` are pure and run
+# everywhere; `e2e` needs a real TLS handshake because identity binding cannot be unit-tested; and
+# `rollback` needs a real kernel because the thing under test is whether nftables actually reverts.
+# Collapsing them into one job would mean a machine without `nft` silently skipping the check that
+# matters most.
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  # A firewall tool's dependencies are few but its assumptions about the host are many — a kernel or
+  # nft change can break the rollback path without anything in this repository moving.
+  schedule:
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+# Only the newest run of this workflow for a given ref survives; pushing again cancels the run the
+# earlier commit started. A stale run that finishes after the newer one reports a verdict for code
+# nobody is looking at any more, and on a public repository the minutes are shared with everyone
+# else's pull requests.
+#
+# This used to carry a second reason — `rollback` and `e2e` bound the relay on a fixed port and
+# started privileged containers on a shared self-hosted machine, so two live runs collided. Every
+# job now gets its own ephemeral VM, so that collision is gone. The line stays for the reasons
+# above; the claim that no longer holds does not.
+#
+# `github.event_name` is part of the key on purpose. Without it the `push` and `pull_request` runs
+# of the same branch land in one group and cancel each other — and a cancelled run is not a passing
+# check, so whichever event arrived first leaves a required check dead on the pull request. Keeping
+# them apart means the duplicate run stays (see the `on:` block); it does not mean a superseded one
+# does.
+#
+# Cancelling `rollback` mid-flight is safe by construction: its ruleset lives in the container's own
+# network namespace, never the runner's, and `docker rm -f` in the EXIT trap runs on the SIGINT the
+# cancellation sends. A SIGKILL after the grace period leaves a stray container, not a locked host.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# ── Every job runs on a GitHub-hosted runner ─────────────────────────────────
+#
+# This workflow used to split by whether the pull request came from a fork, because two jobs ran on
+# a self-hosted machine of ours: a fork's `pull_request` runs the **candidate's** code, `npm ci`
+# executes lifecycle scripts from the branch's own package.json, and `rollback-test.sh` starts a
+# container with `--pid=host --cap-add=NET_ADMIN` — a container-escape primitive one step from the
+# machine that builds the firewall control plane. The split also had to be written out at each job,
+# because `runs-on` is evaluated before a job's environment exists and a variable there resolves to
+# empty, landing every job on the self-hosted runner while looking correct.
+#
+# All of that was the price of the self-hosted runner, and this repository no longer pays it. A
+# GitHub-hosted runner is an ephemeral VM discarded after one job, so a candidate's code has nothing
+# to persist into and nothing of ours to reach. That is also what lets `e2e` and `rollback` run for
+# a fork at all: they were skipped there, which meant the two checks with the strongest claim —
+# a real handshake and a real kernel — were exactly the ones an outside contribution never got.
+#
+# What this does not decide: `pull_request` still requires approval before it runs for an outside
+# contributor, and that setting belongs in the repository, not here. The default ("first-time
+# contributors") is the right floor now that no job touches our own hardware.
+#
+# `rollback` needs a real kernel and NET_ADMIN. A hosted Ubuntu runner is a full VM with root and
+# Docker, so it has both — the job's requirement was never the *specific* machine.
+
+jobs:
+  check:
+    name: types, unit tests, agent tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          # Type stripping runs .ts directly, so the Node version is the toolchain. 22 is the floor
+          # the code assumes; testing on it rather than on latest keeps that claim honest.
+          node-version: "22"
+      - run: npm ci
+      - run: npm run typecheck
+      # Svelte's template and component diagnostics are outside the root tsconfig.
+      # Keep this as a named gate so a passing library typecheck cannot hide a
+      # broken operator console.
+      - run: npm run check:web
+      - run: npm test
+      # Standard library only, so no install step. Pinned to the same interpreter the hosts run.
+      - name: agent tests
+        run: python3 agent/test_validate.py && python3 agent/test_enroll.py
+
+  e2e:
+    name: mTLS round trip
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+      - run: npm ci
+      # Identity binding depends on a real handshake presenting a real client certificate. The whole
+      # security argument for staged rollout rests on it: if the relay cannot tell which agent is
+      # calling, any host with a certificate can report as the canary and open the gate.
+      - run: ./scripts/e2e-roundtrip.sh
+
+  rollback:
+    name: auto-rollback against a real kernel
+    # The strongest capability any job here holds: a container with `--pid=host` and NET_ADMIN. On
+    # an ephemeral hosted VM that is a capability over a machine discarded when the job ends.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+      # The property under test is that a locking ruleset is actually reverted by the agent's timer.
+      # A mock cannot fail the way a kernel does, and this is the check that stands between a bad
+      # generation and a host nobody can reach.
+      - run: ./scripts/rollback-test.sh
+
+  leaks:
+    name: defense-in-depth leak scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Both scanners need commit objects, not only the checked-out HEAD. The custom scanner
+          # inspects every introduced commit so "add secret, delete it later" is still caught.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+
+      - name: scan every introduced commit for site data
+        env:
+          SCAN_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          SCAN_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: >-
+          node scripts/scan-public-history.mjs
+          --base "$SCAN_BASE" --head "$SCAN_HEAD" --default-branch "$DEFAULT_BRANCH"
+
+      # This job intentionally receives no repository secret and is not the merge gate: a candidate
+      # can alter a `pull_request` workflow. The default-branch `pull_request_target` workflow is the
+      # authoritative, out-of-tree scanner; this remains useful on pushes and schedules.
+
+      # General credential detection complements the site-inventory scanner above. A full checkout
+      # makes this history-aware.
+      #
+      # **The binary, not `gitleaks/gitleaks-action`.** That action refuses to run for a repository
+      # owned by an organisation without a paid licence — `[tiny-universe] is an organization.
+      # License key is required` — so the step passed on the canonical repository and failed forever
+      # on the fork, which is the one that builds and ships. The scanner itself is open source; only
+      # the wrapper is licensed.
+      #
+      # Pinned by version *and* checksum. An action is pinned by commit SHA; a downloaded binary has
+      # no such handle, and an unpinned release URL is a supply chain that changes under you.
+      - name: scan git history for credentials
+        env:
+          GITLEAKS_VERSION: "8.30.1"
+          GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+        run: |
+          set -euo pipefail
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL --retry 3 -o /tmp/gitleaks.tgz "$url"
+          echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tgz" | sha256sum -c -
+          tar xzf /tmp/gitleaks.tgz -C /tmp gitleaks
+          /tmp/gitleaks git --no-banner --redact --exit-code 1 .

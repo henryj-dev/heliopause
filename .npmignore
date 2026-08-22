@@ -1,0 +1,4 @@
+src/*.test.ts
+src/test-util.ts
+agent/test_*.py
+security-audits/

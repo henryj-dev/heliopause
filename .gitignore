@@ -1,0 +1,127 @@
+node_modules/
+dist/
+*.tsbuildinfo
+packages/web/build/
+packages/web/.svelte-kit/
+.DS_Store
+*.log
+.omc/
+
+# Git worktrees live here (see AGENTS.md — agents stay off the main tree). A worktree is a checkout of
+# this repository *inside* this repository, so without this line every worktree's files show up as
+# untracked changes in the main tree — and `git add -A` in a worktree would commit its siblings.
+.claude/worktrees/
+
+# The same seven names again, without the trailing slash. Not redundant: a worktree gets these as
+# **symlinks** into the main tree (`.claude/worktree-bootstrap.md`), and git treats a symlink as a
+# file, so `docs/` and `pki*/` below do not match one. Measured — all of them showed as untracked in
+# a fresh worktree, one `git add -A` away from committing host-absolute paths into `docs`, `policy`,
+# and the PKI directories. Those are exactly the site-specific material the rules further down
+# exist to keep out of a published repository, so the leak has to be closed on both spellings.
+#
+# ⚠️ **This list and `symlinkDirectories` in `.claude/settings.json` are two halves of one thing.**
+# `pki` and `pki-util` were in neither for as long as they existed: a worktree session could not read
+# the fleet at all, because `pki/` is the **dev** VPC and the manager verifies client certificates
+# against that CA. The symptom was not "permission denied" — it was `no client certificate`, which
+# reads as a broken client. Adding a name to one list without the other reopens exactly this.
+node_modules
+docs
+/policy
+pki
+pki-prod
+pki-util
+pki-signing
+
+# Private keys and issued certificates. `heliopause-pki` writes these, and the natural place to run
+# it is the repository root — so without these lines a CA key is one `git add -A` away from being
+# published. The CA key is the trust root for the whole fleet: whoever holds it can mint an agent
+# identity, and whatever an agent accepts as its relay gets to set that host's firewall.
+*.key
+*.pem
+*.csr
+*.srl
+*.p12
+*.pfx
+*.pkcs12
+*.jks
+*.keystore
+*.kdb
+*.kdbx
+*.mobileprovision
+*.der
+*.pk8
+*.p8
+pki*/
+security-audits/
+
+# Artifact directories produced by `heliopause-publish` — derived from policy/ plus a commit id, so
+# committing them would create a second source of truth for what a generation contains.
+artifacts/
+
+# Soak samples from scripts/observe.sh — a local record of one run, not project state.
+observe.log
+
+# Geofeed snapshots from `heliopause-feed refresh` — third-party data, not project state.
+#
+# Ignored for the same reason `artifacts/` is: a snapshot is fetched, not authored, and committing it
+# would create a second source of truth for what a feed said. The registration that decides *which*
+# feeds exist is tracked (`src/feeds.ts`); what those URLs happened to return is not.
+#
+# These are not site-specific — Cloudflare's published ranges are the same for everyone — so the
+# reason here is provenance, not exposure.
+snapshots/
+
+# ── Site-specific material ────────────────────────────────────────────────────
+#
+# Deliberately untracked, not merely tidied away. This repository is published; these files are a
+# map of one specific network.
+#
+# `docs/` holds a deployment design for one real network: measured public addresses, per-host open
+# port inventories, the operator's home egress address, and a record of which hosts were
+# unprotected and when. Individually each entry is a fact worth recording. Published together they
+# are a target list with addresses attached, and the most sensitive entries are the ones that make
+# the record valuable — "this host serves mail publicly and had no firewall until 2026-08-01" is
+# exactly what the design work needed to say and exactly what must not be public.
+#
+# Keeping them out of git rather than sanitising them is the choice that lasts. Sanitising means
+# re-writing several hundred measurements and never being sure one was missed, then paying that cost
+# again on every future measurement. Untracked, the record stays complete and honest, and there is
+# no ongoing approval step where a slip publishes an address.
+#
+# `policy/` is the same class of thing: it names real hosts, real addresses, and the management
+# source addresses that reach them.
+#
+# The tests belong with the policy they test. `policy/dev-runners.test.ts` imports `./dev.ts`, so
+# tracking the test while ignoring its subject gives a public clone a suite that cannot run —
+# verified by cloning and running it.
+#
+# ## Why the whole directory, not a list of files (2026-08-05)
+#
+# This listed the six policy files by name. That covered them exactly and was one new file away from
+# failing open: `policy/staging.ts` would have been tracked by default, and nothing would have said
+# so. An ignore rule for site data has to be a directory — the cost of being wrong is not symmetric.
+#
+# It also hides `policy/.git`. **`policy/` is now its own repository** and that is not cosmetic: the
+# site module's directory is what `generationId` runs `git -C` against, so while policy sat ignored
+# inside this repository every publish needed `--allow-dirty` and every generation carried a `-dirty`
+# suffix — the rules running on the fleet were in no commit anywhere. Now the id is that repository's
+# HEAD and names the exact policy that produced the rules. Keep the two histories apart: this one is
+# published, that one is not.
+#
+# ## Two things this comment used to promise and did not have
+#
+# It said `policy/example.ts` was "the tracked stand-in that shows the shape without describing
+# anywhere real." **There is no such file** — nothing under `policy/` is tracked, so a public clone
+# gets an empty directory and no worked example. Worth writing; not written.
+#
+# It also said to point `policyStore` in your config at a private repository. **`policyStore` has no
+# consumer** — the type is declared in `src/config.ts` and read by nothing, and `heliopause-publish`
+# parses no such flag. What actually works is the site module's path: publish from inside the policy
+# repository and the id comes from there.
+docs/
+scripts/observe.targets
+scripts/observe-peers.targets
+observe-peers.log
+# Only the checkout at the repo root. `packages/web/src/routes/policy/` is the Svelte
+# console (`/app/policy/files`) and must stay tracked.
+/policy/

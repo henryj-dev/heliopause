@@ -1,0 +1,96 @@
+/* Copied from src/ — do not edit values here. The old console is the other copy; a parity test keeps them equal. */
+
+:root{
+  --font-mono:'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --font-sans:'IBM Plex Sans KR','IBM Plex Sans',system-ui,-apple-system,'Apple SD Gothic Neo','Noto Sans KR',sans-serif;
+
+  --n-0:oklch(0.995 0.002 240); --n-1:oklch(0.978 0.003 240); --n-2:oklch(0.955 0.004 240);
+  --n-3:oklch(0.920 0.006 240); --n-4:oklch(0.868 0.008 240); --n-5:oklch(0.775 0.010 240);
+  --n-6:oklch(0.660 0.012 240); --n-7:oklch(0.548 0.014 240); --n-8:oklch(0.442 0.016 240);
+  --n-9:oklch(0.330 0.016 240); --n-10:oklch(0.232 0.014 240); --n-11:oklch(0.152 0.012 240);
+
+  --surface-base:var(--n-1); --surface-card:var(--n-0); --surface-elevated:var(--n-0);
+  --surface-input:var(--n-0); --surface-sunken:var(--n-2); --surface-overlay:var(--n-0);
+  --surface-scrim:oklch(0.30 0.02 240 / 0.34); --scrim-blur:2px;
+  --text-1:var(--n-11); --text-2:var(--n-8); --text-3:var(--n-6); --text-off:var(--n-5);
+  --bd-1:var(--n-3); --bd-2:var(--n-5); --bd-strong:var(--n-7);
+
+  --accent:oklch(0.505 0.088 208); --accent-hover:oklch(0.435 0.090 208);
+  --accent-on:oklch(0.99 0.005 208); --accent-bg:oklch(0.955 0.026 208); --accent-bd:oklch(0.800 0.055 208);
+  --focus:oklch(0.505 0.110 208);
+  --ok-fg:oklch(0.470 0.085 155); --ok-bg:oklch(0.960 0.024 155); --ok-bd:oklch(0.810 0.050 155);
+  --warn-fg:oklch(0.545 0.115 72); --warn-bg:oklch(0.965 0.038 78); --warn-bd:oklch(0.820 0.080 75);
+  --danger-fg:oklch(0.505 0.165 26); --danger-bg:oklch(0.962 0.028 26); --danger-bd:oklch(0.810 0.075 26);
+  --info-fg:oklch(0.485 0.110 258); --info-bg:oklch(0.960 0.028 258); --info-bd:oklch(0.805 0.060 258);
+  --mute-fg:var(--n-7); --mute-bg:var(--n-2); --mute-bd:var(--n-4);
+  --live-decay:oklch(0.505 0.088 208 / 0.14);
+  --hatch:oklch(0.548 0.014 240 / 0.30);
+
+  --r-sm:2px; --r-md:3px; --r-lg:4px; --r-full:999px;
+  --bw-1:1px; --bw-2:2px;
+  --sh-0:none; --sh-1:0 1px 2px oklch(0.30 0.02 240 / 0.07);
+  --sh-overlay:0 12px 32px oklch(0.25 0.02 240 / 0.16), 0 1px 0 var(--bd-1);
+  --sp-1:4px; --sp-2:8px; --sp-3:12px; --sp-4:16px; --sp-5:24px; --sp-6:32px; --sp-7:48px;
+  --dur-1:80ms; --dur-2:140ms; --dur-3:240ms; --dur-decay:1400ms;
+  --ease:cubic-bezier(.2,.6,.3,1);
+  --z-dropdown:100; --z-popover:200; --z-drawer:300; --z-modal:400; --z-palette:500; --z-toast:600; --z-tooltip:700;
+
+  --row-py:6px; --cell-px:10px; --stack:8px; --ctl-h:28px; --fs-cell:13px; --lh-cell:1.45; --sec-gap:20px;
+
+  /* 껍데기의 치수. stardust 의 `app.css` 와 같은 이름·같은 값이다. 밀도 토큰과 **함께 두지
+     않는다** — 밀도는 행의 패딩만 움직이고, 크롬은 표가 촘촘해진다고 같이 움직이면 안 된다.
+     표만 바뀌어야 할 때 페이지 전체가 크기를 바꾼 것처럼 보인다.
+
+     stardust 는 `--sb-w` 를 한 겹 더 두고 `--sb-collapsed: 60px` 로 갈아끼워 사이드를 접는다.
+     그 두 이름은 **여기 없다.** 접기에는 토글이 필요하고 토글에는 스크립트가 필요한데 정책
+     화면은 스크립트를 안 싣는다 — 부르는 데가 없는 이름을 미리 두는 것은 이 저장소가 일곱 번
+     당한 모양이고, `design-tokens.test.ts` 가 실제로 그걸 잡았다. 접기를 넣는 날 함께 넣는다. */
+  --topbar-h:42px; --sb-expanded:184px;
+}
+:root[data-density="compact"]{ --row-py:3px; --cell-px:8px; --stack:6px; --ctl-h:24px; --fs-cell:12px; --lh-cell:1.35; --sec-gap:14px; }
+:root[data-density="comfortable"]{ --row-py:10px; --cell-px:14px; --stack:12px; --ctl-h:32px; --fs-cell:13.5px; --lh-cell:1.55; --sec-gap:28px; }
+
+@media (prefers-color-scheme: dark){ :root:not([data-theme="light"]){
+  --n-0:oklch(0.158 0.010 240); --n-1:oklch(0.188 0.011 240); --n-2:oklch(0.222 0.012 240);
+  --n-3:oklch(0.272 0.013 240); --n-4:oklch(0.330 0.014 240); --n-5:oklch(0.410 0.014 240);
+  --n-6:oklch(0.520 0.014 240); --n-7:oklch(0.628 0.013 240); --n-8:oklch(0.726 0.011 240);
+  --n-9:oklch(0.812 0.008 240); --n-10:oklch(0.892 0.006 240); --n-11:oklch(0.958 0.004 240);
+  --surface-base:var(--n-0); --surface-card:var(--n-1); --surface-elevated:var(--n-2);
+  --surface-input:oklch(0.132 0.010 240); --surface-sunken:oklch(0.132 0.010 240); --surface-overlay:var(--n-2);
+  --surface-scrim:oklch(0.10 0.01 240 / 0.62);
+  --bd-1:var(--n-3); --bd-2:var(--n-4); --bd-strong:var(--n-6);
+  --accent:oklch(0.760 0.098 206); --accent-hover:oklch(0.830 0.100 206);
+  --accent-on:oklch(0.150 0.020 206); --accent-bg:oklch(0.278 0.048 206); --accent-bd:oklch(0.400 0.062 206);
+  --focus:oklch(0.780 0.110 206);
+  --ok-fg:oklch(0.755 0.095 155); --ok-bg:oklch(0.262 0.042 155); --ok-bd:oklch(0.375 0.055 155);
+  --warn-fg:oklch(0.810 0.125 80); --warn-bg:oklch(0.288 0.055 72); --warn-bd:oklch(0.412 0.072 74);
+  --danger-fg:oklch(0.712 0.150 26); --danger-bg:oklch(0.282 0.070 26); --danger-bd:oklch(0.408 0.098 26);
+  --info-fg:oklch(0.742 0.105 258); --info-bg:oklch(0.278 0.050 258); --info-bd:oklch(0.398 0.068 258);
+  --live-decay:oklch(0.760 0.098 206 / 0.16);
+  --hatch:oklch(0.628 0.013 240 / 0.34);
+  --sh-overlay:0 16px 40px oklch(0.05 0.01 240 / 0.55), 0 0 0 1px var(--bd-2);
+}}
+:root[data-theme="dark"]{
+  --n-0:oklch(0.158 0.010 240); --n-1:oklch(0.188 0.011 240); --n-2:oklch(0.222 0.012 240);
+  --n-3:oklch(0.272 0.013 240); --n-4:oklch(0.330 0.014 240); --n-5:oklch(0.410 0.014 240);
+  --n-6:oklch(0.520 0.014 240); --n-7:oklch(0.628 0.013 240); --n-8:oklch(0.726 0.011 240);
+  --n-9:oklch(0.812 0.008 240); --n-10:oklch(0.892 0.006 240); --n-11:oklch(0.958 0.004 240);
+  --surface-base:var(--n-0); --surface-card:var(--n-1); --surface-elevated:var(--n-2);
+  --surface-input:oklch(0.132 0.010 240); --surface-sunken:oklch(0.132 0.010 240); --surface-overlay:var(--n-2);
+  --surface-scrim:oklch(0.10 0.01 240 / 0.62);
+  --bd-1:var(--n-3); --bd-2:var(--n-4); --bd-strong:var(--n-6);
+  --accent:oklch(0.760 0.098 206); --accent-hover:oklch(0.830 0.100 206);
+  --accent-on:oklch(0.150 0.020 206); --accent-bg:oklch(0.278 0.048 206); --accent-bd:oklch(0.400 0.062 206);
+  --focus:oklch(0.780 0.110 206);
+  --ok-fg:oklch(0.755 0.095 155); --ok-bg:oklch(0.262 0.042 155); --ok-bd:oklch(0.375 0.055 155);
+  --warn-fg:oklch(0.810 0.125 80); --warn-bg:oklch(0.288 0.055 72); --warn-bd:oklch(0.412 0.072 74);
+  --danger-fg:oklch(0.712 0.150 26); --danger-bg:oklch(0.282 0.070 26); --danger-bd:oklch(0.408 0.098 26);
+  --info-fg:oklch(0.742 0.105 258); --info-bg:oklch(0.278 0.050 258); --info-bd:oklch(0.398 0.068 258);
+  --live-decay:oklch(0.760 0.098 206 / 0.16);
+  --hatch:oklch(0.628 0.013 240 / 0.34);
+  --sh-overlay:0 16px 40px oklch(0.05 0.01 240 / 0.55), 0 0 0 1px var(--bd-2);
+}
+@keyframes tu-pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.42;transform:scale(.82)}}
+@keyframes tu-spin{to{transform:rotate(360deg)}}
+@keyframes tu-decay{from{background:var(--live-decay)}to{background:transparent}}
+@media (prefers-reduced-motion: reduce){*{animation-duration:.001ms !important;animation-iteration-count:1 !important;transition-duration:.001ms !important}}

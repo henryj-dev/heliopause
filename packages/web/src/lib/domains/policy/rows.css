@@ -1,0 +1,28 @@
+/* The policies/rules tables: only the rule column may wrap, and even
+   there the name is one line and the note is two. Other cells stay on
+   one line so a long CIDR list widens the table instead of the row. */
+
+.policy-rows td:first-child {
+  max-width: 22rem;
+}
+.policy-rows td:not(:first-child) {
+  white-space: nowrap;
+}
+.policy-rows .name,
+.policy-rows .id {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.policy-rows .notes {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
+.policy-rows td:not(:first-child) .chips {
+  flex-wrap: nowrap;
+}
+.policy-rows tr.hit-bad { background: var(--danger-bg); }
+.policy-rows tr.hit-warn { background: var(--warn-bg); }

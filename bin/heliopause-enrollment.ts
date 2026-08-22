@@ -1,0 +1,138 @@
+#!/usr/bin/env node
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { resolve } from "node:path";
+import {
+  createNodeToken, initializeEnrollmentDocument, requireEnrollmentDocument, rejectNodeCsr,
+  revokeNodeToken, storeNodeCertificate, type CsrStatus,
+  revokeCertificate,
+  withEnrollmentTransaction,
+} from "../src/enrollment-store.ts";
+
+import { installCliLanguage } from "../src/operator-i18n.ts";
+
+installCliLanguage();
+const args = process.argv.slice(2);
+const positional = args.filter((arg) => !arg.startsWith("--"));
+const flags = new Map(args.filter((arg) => arg.startsWith("--")).map((arg) => {
+  const [key, ...value] = arg.slice(2).split("="); return [key!, value.length ? value.join("=") : "true"];
+}));
+const [command, store, subject] = positional;
+const usage = `usage:
+  heliopause-enrollment init <store.json>
+  heliopause-enrollment token-create <store.json> <hostname> [--label=TEXT] [--actor=NAME] [--ttl-sec=SECONDS] [--keep-existing]
+  heliopause-enrollment token-list <store.json> [--json]
+  heliopause-enrollment token-revoke <store.json> <token-id> [--actor=NAME]
+  heliopause-enrollment csr-list <store.json> [--status=pending|conflict|rejected|signed] [--json]
+  heliopause-enrollment csr-show <store.json> <request-id> [--json]
+  heliopause-enrollment csr-export <store.json> <request-id> --out=FILE
+  heliopause-enrollment csr-reject <store.json> <request-id> --reason=TEXT [--actor=NAME]
+  heliopause-enrollment cert-upload <store.json> <request-id> --cert=FILE --ca=FILE --ca-name=NAME [--actor=NAME]
+  heliopause-enrollment audit <store.json> [--json]
+  heliopause-enrollment cert-revoke <store.json> --cert=FILE --reason=TEXT [--actor=NAME]
+  heliopause-enrollment revocation-list <store.json> [--json]
+
+Use an https manager URL instead of <store.json> for remote operation, with
+--pki=DIR [--operator=NAME] [--otp=CODE]. Remote cert-upload needs --cert and --ca-name; the
+manager reads the trusted CA from HELIOPAUSE_ENROLLMENT_TRUSTED_CAS.`;
+
+const requiredFlag = (name: string): string => { const value = flags.get(name); if (!value || value === "true") throw new Error(`--${name}=VALUE is required`); return value; };
+const actor = (): string => flags.get("actor")?.trim().slice(0, 120) || "operator";
+const persist = <T>(fn: (document: ReturnType<typeof requireEnrollmentDocument>) => T): T =>
+  withEnrollmentTransaction(store!, fn);
+const publicToken = (row: ReturnType<typeof requireEnrollmentDocument>["tokens"][number]) => ({
+  id: row.id, hostname: row.hostname, label: row.label, createdBy: row.createdBy,
+  createdAt: row.createdAt, expiresAt: row.expiresAt, lastUsedAt: row.lastUsedAt, revokedAt: row.revokedAt,
+});
+
+async function remote(): Promise<void> {
+  const { api, operatorCreds } = await import("../src/api-client.ts");
+  const creds = operatorCreds(resolve(flags.get("pki") ?? "./pki"), flags.get("operator"));
+  const call = <T>(path: string, method: "GET" | "POST", body?: unknown) => api<T>(store!, path, method, body, creds);
+  const otp = flags.get("otp");
+  if (command === "token-list") {
+    const answer = await call<{ tokens: unknown[] }>("/enrollment/tokens", "GET"); console.log(JSON.stringify(answer, null, 2));
+  } else if (command === "token-create") {
+    if (!subject) throw new Error(usage); const ttlRaw = flags.get("ttl-sec");
+    const answer = await call<{ token: string; row: { id: string; hostname: string } }>("/enrollment/tokens", "POST", {
+      hostname: subject, label: flags.get("label"), revokeExisting: !flags.has("keep-existing"),
+      ...(ttlRaw ? { ttlSec: Number(ttlRaw) } : {}), otp,
+    });
+    console.log(`created node token ${answer.row.id} for ${answer.row.hostname}`); console.log(answer.token); console.log("  plaintext is shown once");
+  } else if (command === "token-revoke") {
+    if (!subject) throw new Error(usage); await call(`/enrollment/tokens/${encodeURIComponent(subject)}/revoke`, "POST", { otp }); console.log(`revoked ${subject}`);
+  } else if (command === "csr-list" || command === "csr-show" || command === "csr-export") {
+    const status = flags.get("status"); const answer = await call<{ requests: Array<Record<string, unknown> & { id: string; csrPem: string }> }>(`/enrollment/requests${status ? `?status=${encodeURIComponent(status)}` : ""}`, "GET");
+    const rows = subject ? answer.requests.filter((row) => row.id === subject) : answer.requests;
+    if (subject && rows.length === 0) throw new Error(`CSR ${subject} not found`);
+    if (command === "csr-export") { const out = requiredFlag("out"); if (existsSync(out)) throw new Error(`refusing to overwrite ${out}`); writeFileSync(out, rows[0]!.csrPem, { mode: 0o644, flag: "wx" }); console.log(`exported ${subject} to ${out}`); }
+    else console.log(JSON.stringify({ requests: rows }, null, 2));
+  } else if (command === "csr-reject") {
+    if (!subject) throw new Error(usage); await call(`/enrollment/requests/${encodeURIComponent(subject)}/reject`, "POST", { reason: requiredFlag("reason"), otp }); console.log(`rejected ${subject}`);
+  } else if (command === "cert-upload") {
+    if (!subject) throw new Error(usage); await call(`/enrollment/requests/${encodeURIComponent(subject)}/certificate`, "POST", { certificatePem: readFileSync(requiredFlag("cert"), "utf8"), caName: requiredFlag("ca-name"), otp }); console.log(`uploaded certificate for ${subject}`);
+  } else if (command === "audit") {
+    console.log(JSON.stringify(await call("/enrollment/audit", "GET"), null, 2));
+  } else if (command === "cert-revoke") {
+    const answer = await call<{ revocation: { fingerprint256: string } }>("/enrollment/revocations", "POST", { certificatePem: readFileSync(requiredFlag("cert"), "utf8"), reason: requiredFlag("reason"), otp });
+    console.log(`revoked certificate sha256:${answer.revocation.fingerprint256}`);
+  } else if (command === "revocation-list") {
+    console.log(JSON.stringify(await call("/enrollment/revocations", "GET"), null, 2));
+  } else throw new Error(usage);
+}
+
+try {
+  if (!command || !store || args.includes("--help")) throw new Error(usage);
+  if (store.startsWith("https://")) {
+    await remote();
+  } else if (command === "init") {
+    initializeEnrollmentDocument(store); console.log(`created ${store}`);
+  } else if (command === "token-create") {
+    if (!subject) throw new Error(usage);
+    const ttlRaw = flags.get("ttl-sec");
+    const result = persist((document) => createNodeToken(document, { hostname: subject, label: flags.get("label"), createdBy: actor(),
+      revokeExisting: !flags.has("keep-existing"), ...(ttlRaw ? { ttlSec: Number(ttlRaw) } : {}) }));
+    console.log(`created node token ${result.row.id} for ${result.row.hostname}`);
+    console.log(result.token); console.log("  plaintext is shown once; the store contains only its SHA-256 hash");
+  } else if (command === "token-list") {
+    const rows = requireEnrollmentDocument(store).tokens.map(publicToken);
+    if (flags.has("json")) console.log(JSON.stringify({ tokens: rows }, null, 2));
+    else rows.forEach((row) => console.log(`${row.id}\t${row.revokedAt ? "revoked" : "active"}\t${row.hostname}\t${row.lastUsedAt ?? "never used"}\t${row.label ?? ""}`));
+  } else if (command === "token-revoke") {
+    if (!subject) throw new Error(usage); const row = persist((document) => revokeNodeToken(document, subject, actor())); console.log(`revoked ${row.id} for ${row.hostname}`);
+  } else if (command === "csr-list") {
+    const status = flags.get("status") as CsrStatus | undefined;
+    if (status && !["pending", "conflict", "rejected", "signed"].includes(status)) throw new Error("invalid --status");
+    const rows = requireEnrollmentDocument(store).requests.filter((row) => !status || row.status === status);
+    if (flags.has("json")) console.log(JSON.stringify({ requests: rows }, null, 2));
+    else rows.forEach((row) => console.log(`${row.id}\t${row.status}\t${row.hostname}\t${row.csrSha256}\t${row.createdAt}`));
+  } else if (command === "csr-show") {
+    if (!subject) throw new Error(usage); const row = requireEnrollmentDocument(store).requests.find((request) => request.id === subject); if (!row) throw new Error(`CSR ${subject} not found`);
+    if (flags.has("json")) console.log(JSON.stringify(row, null, 2));
+    else console.log(`${row.id}\n  host       ${row.hostname}\n  status     ${row.status}\n  csr sha    ${row.csrSha256}\n  public key ${row.publicKeySha256}\n  token      ${row.nodeTokenId}\n  source     ${row.sourceIp ?? "not reported"}\n  created    ${row.createdAt}\n  decided    ${row.decidedAt ?? "pending"} ${row.decidedBy ?? ""}\n  reason     ${row.decisionReason ?? ""}`);
+  } else if (command === "csr-export") {
+    if (!subject) throw new Error(usage); const out = requiredFlag("out"); if (existsSync(out)) throw new Error(`refusing to overwrite ${out}`);
+    const row = requireEnrollmentDocument(store).requests.find((request) => request.id === subject); if (!row) throw new Error(`CSR ${subject} not found`);
+    writeFileSync(out, row.csrPem, { mode: 0o644, flag: "wx" }); console.log(`exported ${subject} to ${out}`); console.log(`  sha256 ${row.csrSha256}`);
+  } else if (command === "csr-reject") {
+    if (!subject) throw new Error(usage); const row = persist((document) => rejectNodeCsr(document, subject, actor(), requiredFlag("reason"))); console.log(`rejected ${row.id} for ${row.hostname}`);
+  } else if (command === "cert-upload") {
+    if (!subject) throw new Error(usage);
+    const row = persist((document) => storeNodeCertificate(document, { requestId: subject,
+      certificatePem: readFileSync(requiredFlag("cert"), "utf8"), caPem: readFileSync(requiredFlag("ca"), "utf8"),
+      caName: requiredFlag("ca-name"), actor: actor() }));
+    console.log(`uploaded certificate for ${row.hostname}`); console.log(`  request ${row.id}\n  sha256  ${row.certificateSha256}\n  expires ${row.certificateNotAfter}`);
+  } else if (command === "audit") {
+    const rows = requireEnrollmentDocument(store).audit;
+    if (flags.has("json")) console.log(JSON.stringify({ events: rows }, null, 2));
+    else rows.forEach((row) => console.log(`${row.at}\t${row.actor}\t${row.action}\t${row.target}\t${JSON.stringify(row.detail)}`));
+  } else if (command === "cert-revoke") {
+    const row = persist((document) => revokeCertificate(document, { certificatePem: readFileSync(requiredFlag("cert"), "utf8"), reason: requiredFlag("reason"), actor: actor() }));
+    console.log(`revoked certificate sha256:${row.fingerprint256}`);
+  } else if (command === "revocation-list") {
+    const rows = requireEnrollmentDocument(store).revocations;
+    if (flags.has("json")) console.log(JSON.stringify({ revocations: rows }, null, 2));
+    else rows.forEach((row) => console.log(`${row.fingerprint256}\t${row.revokedAt}\t${row.subject ?? ""}\t${row.reason}`));
+  } else throw new Error(usage);
+} catch (e) {
+  console.error((e as Error).message); process.exitCode = 2;
+}

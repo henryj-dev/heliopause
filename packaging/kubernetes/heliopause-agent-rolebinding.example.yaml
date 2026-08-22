@@ -1,0 +1,15 @@
+# Copy once per HELIOPAUSE_K8S_NAMESPACES entry and replace REPLACE-ME before applying.
+# Keeping this an invalid namespace is deliberate: applying the example verbatim must fail closed.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: heliopause-workload-applier
+  namespace: REPLACE-ME
+subjects:
+  - kind: ServiceAccount
+    name: heliopause-agent
+    namespace: heliopause-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: heliopause-workload-applier

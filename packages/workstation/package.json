@@ -1,0 +1,11 @@
+{
+  "name": "@heliopause/workstation",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Operator laptop surface: local UI and CLI. Loopback, no authentication. Serves the same web build as the manager once that build exists.",
+  "license": "Apache-2.0",
+  "scripts": {
+    "start": "node ../../bin/heliopause-ui.ts"
+  }
+}

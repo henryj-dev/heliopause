@@ -1,0 +1,23 @@
+// Browser-facing import boundary for the shared operator-console catalogue.
+export {
+  LANGS,
+  LANG_NAME,
+  MESSAGES,
+  actionWord,
+  certaintyWord,
+  contradictionKind,
+  crumbLabel,
+  denyModeWord,
+  directionWord,
+  endpointKind,
+  hostStateWord,
+  layerWord,
+  originWord,
+  pickLang,
+  protoWord,
+  t,
+  whereWord,
+  type Catalogue,
+  type Lang,
+  type MessageKey,
+} from "@heliopause/i18n";

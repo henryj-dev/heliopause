@@ -1,0 +1,73 @@
+/* Copied from src/ — do not edit values here. The old console is the other copy; a parity test keeps them equal. */
+
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{background:var(--surface-base);color:var(--text-1);font-family:var(--font-sans);font-size:var(--fs-cell);line-height:1.6;-webkit-font-smoothing:antialiased}
+a{color:var(--accent);text-underline-offset:3px}
+a:hover{color:var(--accent-hover)}
+:focus-visible{outline:2px solid var(--focus);outline-offset:1px;border-radius:1px}
+
+/* 관측이 없는 칸. 사선은 색이 아니므로 색 없이도 읽힌다. */
+.hatch{background-image:repeating-linear-gradient(135deg,var(--hatch) 0 1px,transparent 1px 5px)}
+
+/* 표. 고정 행 높이가 없다 — 패딩만 있고, 그 패딩은 밀도 토큰이 정한다. */
+.scroll{overflow-x:auto;background:var(--surface-card);border:1px solid var(--bd-1);border-radius:var(--r-md)}
+table{width:100%;border-collapse:collapse}
+th{font-family:var(--font-mono);font-size:11px;font-weight:500;letter-spacing:.08em;text-transform:uppercase;color:var(--text-3);text-align:left;padding:6px var(--cell-px);border-bottom:1px solid var(--bd-2);white-space:nowrap}
+td{font-size:var(--fs-cell);line-height:var(--lh-cell);padding:var(--row-py) var(--cell-px);border-bottom:1px solid var(--bd-1);vertical-align:top}
+tbody tr:last-child td{border-bottom:0}
+
+/* 결함 칩 — 기호 + 낱말. 한국어가 짧고 영어가 길어도 줄바꿈만 늘어난다. */
+.chip{display:inline-flex;align-items:center;gap:5px;font-family:var(--font-mono);font-size:11px;
+  padding:1px 7px;border-radius:var(--r-full);border:1px solid var(--bd-2);color:var(--text-2);white-space:nowrap}
+.chip.ok{background:var(--ok-bg);color:var(--ok-fg);border-color:var(--ok-bd)}
+.chip.warn{background:var(--warn-bg);color:var(--warn-fg);border-color:var(--warn-bd)}
+.chip.bad{background:var(--danger-bg);color:var(--danger-fg);border-color:var(--danger-fg);font-weight:600}
+.chip.info{background:var(--info-bg);color:var(--info-fg);border-color:var(--info-bd)}
+.chip.mute{background:var(--mute-bg);color:var(--mute-fg);border-color:var(--mute-bd)}
+/* 안 봤다. 점선 + 해치이고 배경색이 없다 — 「값이 나쁘다」가 아니라 「값이 없다」이기 때문이다. */
+.chip.none{background:transparent;border-style:dashed;border-color:var(--bd-strong);color:var(--text-2)}
+.chips{display:flex;flex-wrap:wrap;gap:4px}
+
+/* 배너 — 사라지지 않는다. 토스트는 이 콘솔에 없다. */
+.banner{padding:9px 12px;border:1px solid var(--bd-2);border-radius:var(--r-md);
+  display:flex;flex-wrap:wrap;align-items:center;gap:10px;line-height:1.6}
+.banner.ok{background:var(--ok-bg);border-color:var(--ok-bd)}
+.banner.warn{background:var(--warn-bg);border-color:var(--warn-bd)}
+.banner.bad{background:var(--danger-bg);border-color:var(--danger-bd)}
+.banner.info{background:var(--info-bg);border-color:var(--info-bd)}
+.banner .lead{display:inline-flex;align-items:center;gap:6px;font-family:var(--font-mono);font-weight:600}
+.banner.ok .lead{color:var(--ok-fg)} .banner.warn .lead{color:var(--warn-fg)}
+.banner.bad .lead{color:var(--danger-fg)} .banner.info .lead{color:var(--info-fg)}
+
+.card{background:var(--surface-card);border:1px solid var(--bd-1);border-radius:var(--r-md);padding:11px 13px}
+
+/* semantic 3색조 — 옛 클래스 이름을 토큰 위에 다시 얹는다.
+   이름을 안 바꾼 것은 의도다: 이 세 글자는 두 파일의 렌더러 수십 곳에 있고, 한꺼번에 바꾸는
+   변경은 「시안 적용」이 아니라 「전면 개작」이 된다. 값은 전부 토큰에서 온다. */
+.ok{color:var(--ok-fg)} .warn{color:var(--warn-fg)} .bad{color:var(--danger-fg)}
+.dim{color:var(--text-2)} .off{color:var(--text-off)}
+/* 해시·주소는 어디서 끊겨도 읽히므로 넘치기 전에 끊는다. 이름은 아니다 — `k8s-a1.prod` 가
+   `k8s-a1.p / rod` 로 끊기면 그건 다른 호스트로 읽힌다. 그래서 이름 칸은 .name 을 쓴다. */
+.mono{font-family:var(--font-mono);word-break:break-all}
+.name{font-family:var(--font-mono);font-weight:600;white-space:nowrap}
+.num{font-family:var(--font-mono);font-variant-numeric:tabular-nums}
+.pill{display:inline-block;padding:1px 7px;border:1px solid var(--bd-2);border-radius:var(--r-full);
+  font-family:var(--font-mono);font-size:11px}
+
+/* 컨트롤. 시안의 위험도 규칙: 채워진 위험색 + 표식을 갖는 것은 publish 하나뿐이다. */
+button,.btn{display:inline-flex;align-items:center;gap:6px;height:var(--ctl-h);padding:0 11px;
+  font-family:var(--font-mono);font-size:12px;background:transparent;color:var(--text-1);
+  border:1px solid var(--bd-strong);border-radius:var(--r-md);cursor:pointer}
+button:hover{border-color:var(--accent)}
+button:disabled{color:var(--text-off);border-style:dashed;border-color:var(--bd-2);cursor:not-allowed}
+button[data-act="publish"]{background:var(--danger-fg);color:var(--n-0);border-color:var(--danger-fg);font-weight:600}
+button[data-act="publish"]:disabled{background:transparent;color:var(--text-off);border-color:var(--bd-2)}
+input,select,textarea{height:var(--ctl-h);padding:0 8px;font-family:var(--font-mono);font-size:12px;
+  background:var(--surface-input);color:var(--text-1);border:1px solid var(--bd-2);border-radius:var(--r-md)}
+textarea{height:auto;padding:8px}
+
+/* 요청이 나가 있는 동안. 시안은 회전하는 테두리를 쓰는데, 여기서는 같은 회전을 아이콘에 건다. */
+.spin{animation:tu-spin .9s linear infinite}
+/* 폴링이 살아 있다는 표시. 값이 아니라 맥박이므로 숫자 옆에 둔다. */
+.live{width:6px;height:6px;border-radius:var(--r-full);background:var(--ok-fg);animation:tu-pulse 1.6s var(--ease) infinite;display:inline-block}

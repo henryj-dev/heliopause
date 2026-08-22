@@ -1,0 +1,99 @@
+# The manager, as a container image.
+#
+# ## Two stages, one runtime contract
+#
+# The manager process still has **no npm install**. Node 22 strips types and runs `.ts` directly.
+# The first stage exists only to compile the SvelteKit console into static files; Vite and Hono
+# are discarded with it. Copying those tools into the runtime image would put a frontend
+# toolchain next to the artifact signing key.
+#
+# ## Why the runtime source is copied rather than installed
+#
+# `npm ci` would fetch `typescript` and `@types/node`, and neither is needed to *run* anything: they
+# are there for `tsc --noEmit` and editor support. Copying `src/` plus the static console keeps
+# the running image at zero runtime npm dependencies.
+FROM node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32 AS web
+
+WORKDIR /src
+COPY package.json package-lock.json ./
+COPY packages/core/package.json packages/core/
+COPY packages/agent/package.json packages/agent/
+COPY packages/relay/package.json packages/relay/
+COPY packages/manager/package.json packages/manager/
+COPY packages/i18n/package.json packages/i18n/
+COPY packages/web/package.json packages/web/
+COPY packages/workstation/package.json packages/workstation/
+RUN npm ci --ignore-scripts
+COPY packages/i18n packages/i18n
+COPY packages/web packages/web
+RUN npm run build -w @heliopause/web
+
+FROM node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32
+
+# Standalone enrollment validates CSRs and signed client certificates with the OpenSSL CLI. Keep it
+# in the runtime image: omitting it makes every node CSR fail after reaching the manager.
+#
+# `git` and `openssh-client` are for the policy renderer's pod — the sync container clones the
+# policy repository over SSH, and `collectPolicySource` reads the commit and the history table off
+# that checkout. Without them the console loses the two columns that tie a rendered page to a
+# commit, and the clone does not happen at all.
+#
+# **These were removed by the audit and are back on purpose.** They went out with the sync sidecar
+# when `/policy` was deleted from the manager; the sidecar is now its own pod, holding no
+# credential, and needs them again. The cost is that the *manager* container carries two binaries
+# it never runs — the same image serves both. A second, git-bearing image would keep it leaner at
+# the price of another thing to pull, another pull credential and another supply chain for one
+# `git clone`, which is the trade this project already weighed once and declined.
+RUN apk add --no-cache openssl git openssh-client
+
+# Not root. The manager reads certificates and talks HTTPS; it needs no privilege beyond that, and
+# the relay and agent are the components that legitimately need more.
+#
+# A **numeric** UID, not a name. Kubernetes `runAsNonRoot` verifies the image's user before starting
+# the container, and it cannot resolve a name against the image's /etc/passwd — measured:
+# "image has non-numeric user (heliopause), cannot verify user is non-root". A named user is fine
+# under plain docker and fails exactly where the guarantee matters.
+RUN addgroup -g 10001 -S heliopause && adduser -u 10001 -S -G heliopause heliopause
+
+WORKDIR /opt/heliopause
+
+# 🔴 **The policy checkout mounts here, and the path is not free to choose.** A site module imports
+# the model with `../src`, and Node resolves that against the *module's* own location — so a
+# checkout mounted at `/policy` makes `dev.ts` reach for `/src`, which is not in this image, and
+# the console answers 503 with a module-resolution error that names neither the mount nor the
+# reason.
+#
+# This directory and this warning were deleted with the sync sidecar and the mistake was made
+# immediately afterwards: the renderer's first deployment mounted at `/policy`.
+#
+# Created empty and owned, so a pod without a sync container starts normally.
+RUN mkdir -p /opt/heliopause/policy && chown 10001:10001 /opt/heliopause/policy
+
+# Only what runs. `bin/` is the entry point and `src/` is the library it imports; tests, policy and
+# docs have no business in a running image — and `policy/` in particular is site data that must not
+# be baked into an artifact that gets pushed to a registry.
+#
+# 🔴 **This list is named, not a directory, so a new entry point is invisible until it is added.**
+# `heliopause-policy-render.ts` was merged, built, tagged and rolled out without ever being in the
+# image; the pod crash-looped on `Cannot find module` and nothing before that moment noticed —
+# the file existed in the repository, the tests passed, the build was green. `package-security.test.ts`
+# checks this list now.
+#
+# One image, several entry points. The deployment picks with `command:` — the manager is the default,
+# and `heliopause-policy-render.ts` runs in its own pod with no credentials so that the policy
+# repository's code has nothing to reach (audit C1).
+COPY --chown=heliopause:heliopause src/ ./src/
+COPY --chown=heliopause:heliopause packages/i18n/ ./packages/i18n/
+COPY --chown=heliopause:heliopause \
+  bin/heliopause-manager.ts \
+  bin/heliopause-enrollment.ts \
+  bin/heliopause-policy-render.ts \
+  ./bin/
+COPY --from=web --chown=heliopause:heliopause /src/packages/web/build ./packages/web/build
+
+USER 10001:10001
+
+# Everything else is configuration: HELIOPAUSE_RELAYS, the TLS paths, and HELIOPAUSE_OPERATOR_CNS.
+# The entry point refuses to start if the operator list is empty, so a misconfigured deployment
+# fails loudly rather than serving the fleet view to anyone with a certificate.
+ENTRYPOINT ["node", "/opt/heliopause/bin/heliopause-manager.ts"]

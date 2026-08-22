@@ -1,0 +1,65 @@
+# What must not reach a container image.
+#
+# ## Why this file exists
+#
+# `Dockerfile.manager` says tests, policy and docs "have no business in a running image", and copies
+# `src/` wholesale — so 14 test files (232 KB of 600 KB) shipped anyway. The comment described an
+# intention that nothing enforced. Measured by listing the built image.
+#
+# The size is not the point. `policy/` is the one that matters: it is a map of the site's addresses and
+# open ports, and this image is pushed to a registry. It was not reaching the image only because the
+# Dockerfile copies `src/` and `bin/heliopause-manager.ts` by name — a single future `COPY . .` would
+# have put the whole site into a registry artifact, and nothing would have said so.
+#
+# So the exclusions are stated here as well as implied by the copy list. Defence in depth for the one
+# case where the failure is silent and irreversible: once pushed, a layer has been distributed.
+
+# ── Site data — must never be in an image ─────────────────────────────────────
+policy/
+docs/
+pki*/
+artifacts/
+security-audits/
+**/*.p12
+**/*.pfx
+**/*.pkcs12
+**/*.jks
+**/*.keystore
+**/*.kdb
+**/*.kdbx
+**/*.mobileprovision
+**/*.der
+**/*.pk8
+**/*.p8
+**/*.key
+**/*.pem
+**/*.csr
+**/*.srl
+
+# ## Patterns need `**/`
+#
+# `.dockerignore` matches against the whole path from the context root with Go's `filepath.Match`,
+# which does not cross directory separators. So `*.test.ts` excludes only test files sitting at the
+# root — `src/nft.test.ts` sails straight through. Written that way first and measured: the rebuilt
+# image still carried all 14 test files, identical byte count, no error anywhere.
+
+# ── Tests — not part of the runtime ───────────────────────────────────────────
+# The manager runs `bin/heliopause-manager.ts` and the library it imports. A test file in a running
+# image is dead weight that still gets scanned by every vulnerability tool pointed at the registry.
+**/*.test.ts
+src/test-util.ts
+
+# ── Build and tooling context ─────────────────────────────────────────────────
+.git/
+.github/
+node_modules/
+scripts/
+packaging/
+agent/
+**/*.md
+tsconfig.json
+# package-lock.json stays in the context. The web stage runs `npm ci` and that
+# command reads the lockfile; excluding it was right when the image had no npm
+# install. The first live C-pipeline of this Dockerfile failed on
+# `COPY package.json package-lock.json ./` with "/package-lock.json": not found.
+# The lockfile is not a secret, and the runtime stage still does not copy it.

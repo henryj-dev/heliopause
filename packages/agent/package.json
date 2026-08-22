@@ -1,0 +1,10 @@
+{
+  "name": "@heliopause/agent",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Host pull agent. Python standard library only — this package.json is the workspace box and test runner, not a Node runtime.",
+  "license": "Apache-2.0",
+  "scripts": {
+    "test": "python3 ../../agent/test_validate.py && python3 ../../agent/test_enroll.py"
+  }
+}

@@ -1,0 +1,100 @@
+# Security boundary: `pull_request_target` loads this workflow from the default branch, never from
+# the candidate commit. It may inspect candidate Git objects but must never execute candidate code,
+# Actions, hooks, package scripts, or configuration.
+name: trusted site-data leak gate
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  schedule:
+    - cron: "43 5 * * 2"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Newest run per pull request wins; a `synchronize` push cancels the scan still running for the
+# commit it replaced. The scanner reads Git objects and writes nothing, so there is no half-applied
+# state a cancellation could leave behind.
+#
+# The key stays keyed on the pull request number rather than a branch name: a fork's branch may be
+# called anything, including the name of one of ours, and no candidate should be able to cancel this
+# gate's run for a different pull request.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    name: trusted site-data leak gate
+    # Hosted, like every job in `ci.yml`. This one had a self-hosted label hardcoded while `ci.yml`
+    # was routing fork pull requests away from that machine, so `pull_request_target` — which fires
+    # for **every** fork pull request — reopened the half that file had closed. Both workflows now
+    # run on ephemeral VMs and the question does not arise; this job reads Git objects and runs
+    # Node, and never needed a particular machine.
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout trusted scanner from the protected default branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.event.repository.default_branch }}
+          path: .trusted-scanner
+          persist-credentials: false
+          sparse-checkout: scripts/scan-public-history.mjs
+          sparse-checkout-cone-mode: false
+
+      # GitHub publishes every PR head (including a fork) under the base repository's refs/pull
+      # namespace. Fetching that ref from the base repository with full history keeps both SCAN_BASE
+      # and SCAN_HEAD in one object database, including conflicted PRs that have no /merge ref.
+      # Sparse checkout deliberately matches no candidate path: the scanner reads trees/blobs with
+      # ls-tree + cat-file, so no candidate filename or file needs to be materialized by checkout.
+      - name: fetch pull-request objects as inert data
+        if: github.event_name == 'pull_request_target'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ github.repository }}
+          ref: refs/pull/${{ github.event.pull_request.number }}/head
+          path: .candidate
+          fetch-depth: 0
+          persist-credentials: false
+          sparse-checkout: .heliopause-no-candidate-files
+          sparse-checkout-cone-mode: false
+
+      - name: fetch default-branch objects for scheduled scan
+        if: github.event_name != 'pull_request_target'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.event.repository.default_branch }}
+          path: .candidate
+          fetch-depth: 0
+          persist-credentials: false
+          sparse-checkout: .heliopause-no-candidate-files
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+
+      - name: scan pull-request Git objects with protected code
+        if: github.event_name == 'pull_request_target'
+        working-directory: .candidate
+        env:
+          # This value never enters a command line or output. Findings expose only a hashed source
+          # label and a finding class, never the matching hostname, blob contents, or candidate path.
+          HELIOPAUSE_SITE_HOSTNAME_PATTERN: ${{ secrets.HELIOPAUSE_SITE_HOSTNAME_PATTERN }}
+          SCAN_BASE: ${{ github.event.pull_request.base.sha }}
+          SCAN_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: >-
+          node "$GITHUB_WORKSPACE/.trusted-scanner/scripts/scan-public-history.mjs"
+          --base "$SCAN_BASE" --head "$SCAN_HEAD" --require-hostname-pattern
+
+      - name: scan all reachable default-branch history
+        if: github.event_name != 'pull_request_target'
+        working-directory: .candidate
+        env:
+          HELIOPAUSE_SITE_HOSTNAME_PATTERN: ${{ secrets.HELIOPAUSE_SITE_HOSTNAME_PATTERN }}
+        run: >-
+          node "$GITHUB_WORKSPACE/.trusted-scanner/scripts/scan-public-history.mjs"
+          --all --require-hostname-pattern

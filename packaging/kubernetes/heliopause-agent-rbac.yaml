@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: heliopause-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: heliopause-agent
+  namespace: heliopause-system
+---
+# This ClusterRole grants nothing until a RoleBinding in a workload namespace references it.
+# Do not create a ClusterRoleBinding: that would turn the local namespace allowlist into theatre.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: heliopause-workload-applier
+rules:
+  - apiGroups: ["cilium.io"]
+    resources: ["ciliumnetworkpolicies"]
+    verbs: ["get", "create", "update", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]

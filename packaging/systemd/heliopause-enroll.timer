@@ -1,0 +1,12 @@
+[Unit]
+Description=retry heliopause host certificate enrollment
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=5min
+RandomizedDelaySec=30s
+Persistent=true
+Unit=heliopause-enroll.service
+
+[Install]
+WantedBy=timers.target

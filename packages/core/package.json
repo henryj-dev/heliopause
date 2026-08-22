@@ -1,0 +1,11 @@
+{
+  "name": "@heliopause/core",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Workspace box for the heliopause library. Source still lives at repo-root src/ until the file move. The published name remains the root package `heliopause`.",
+  "license": "Apache-2.0",
+  "exports": {
+    ".": "../../src/index.ts"
+  }
+}
