@@ -79,6 +79,30 @@ updates:
       # `^22` range in package.json.
       - dependency-name: "@types/node"
         update-types: ["version-update:semver-major"]
+
+      # TypeScript 7 — the native port. Held, and the reason is upstream rather than us.
+      #
+      # This decision was first recorded only in dependabot's own ignore state, set from a pull
+      # request comment. That is invisible: nothing in the repository said 7.x was being withheld or
+      # why, and the next person would rediscover it by wondering where the pull requests went. A
+      # decision that shapes the toolchain belongs in a file that a diff can show.
+      #
+      # Measured 2026-08-23, against this tree: `tsc --noEmit` under 7.0.2 is **clean**, and 7.0.2
+      # still rejects all six planted defects that were used to accept 6.x (string to number, a
+      # possibly-undefined index, a missing property, a short call, an unnarrowed union, an optional
+      # dereference). So the compiler is not the problem.
+      #
+      # `svelte-check` is. It refuses to run under 7 and says what it needs: *"TypeScript 7 support
+      # currently requires both TypeScript 7 and TypeScript 6 installed in your project, and requires
+      # using the --tsgo flag"* — i.e. `typescript@~6` plus `@typescript/native@npm:typescript@7`.
+      # Taking 7 today therefore means carrying two compilers so that the console check can use a
+      # flagged path, while `npm run typecheck` goes on using 6. That is not a migration to 7; it is
+      # a second compiler bought for nothing, since 6 and 7 reject the same things here.
+      #
+      # **Revisit when svelte-check runs on 7 alone.** Then this block comes out and the bump is an
+      # ordinary major with its own pull request.
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
     open-pull-requests-limit: 5
     commit-message:
       prefix: chore(deps)
