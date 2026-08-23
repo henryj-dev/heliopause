@@ -26,7 +26,8 @@ import {
   type KeyLike,
   type KeyObject,
 } from "node:crypto";
-import { lstat, mkdir, open, readFile, rename, rm } from "node:fs/promises";
+import { constants } from "node:fs";
+import { mkdir, open, rename, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { bundleHash, planHash, validateBundle, type PlanBundle } from "./bundle.ts";
 import {
@@ -456,14 +457,43 @@ export async function writeAuthorizedArtifactBundle(dir: string, input: unknown)
 
 export async function loadAuthorizedArtifactBundle(dir: string): Promise<AuthorizedArtifactBundle> {
   const path = join(dir, AUTHORIZED_ARTIFACT_BUNDLE_FILE);
-  const info = await lstat(path);
-  if (!info.isFile() || info.isSymbolicLink()) {
-    throw new ArtifactSignatureError("authorized artifact bundle is not a regular file");
+  // 🔴 **Check and read the same open file, not the same path twice.**
+  //
+  // This used to `lstat(path)`, refuse a symlink, then `readFile(path)` — and `readFile` follows
+  // links. Between the two calls the name can be replaced, so the thing refused and the thing read
+  // were never guaranteed to be the same object. The size limit survived that (it is re-checked on
+  // the bytes actually read, below), but **the symlink refusal did not**: it was the one check here
+  // that a swap could step around, and it guards what this function is for — deciding that a
+  // generation was authorized.
+  //
+  // `O_NOFOLLOW` makes the kernel refuse the open itself if the final component is a link, and
+  // everything after is asked of the descriptor rather than the name. `O_NOFOLLOW` is POSIX; on a
+  // platform without it the constant is undefined and the `?? 0` leaves the old behaviour rather
+  // than throwing at import time — the agent and the manager both run on Linux, and a build that
+  // silently could not open its own bundle would be a worse failure than the race.
+  const handle = await open(path, (constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))).catch(
+    (error: NodeJS.ErrnoException) => {
+      if (error.code === "ELOOP" || error.code === "EMLINK") {
+        throw new ArtifactSignatureError("authorized artifact bundle is not a regular file");
+      }
+      throw error;
+    },
+  );
+  let encoded: Buffer;
+  try {
+    const info = await handle.stat();
+    if (!info.isFile()) {
+      throw new ArtifactSignatureError("authorized artifact bundle is not a regular file");
+    }
+    if (info.size > MAX_AUTHORIZED_ARTIFACT_BUNDLE_BYTES) {
+      throw new ArtifactSignatureError("authorized artifact bundle exceeds its byte limit");
+    }
+    encoded = await handle.readFile();
+  } finally {
+    await handle.close().catch(() => undefined);
   }
-  if (info.size > MAX_AUTHORIZED_ARTIFACT_BUNDLE_BYTES) {
-    throw new ArtifactSignatureError("authorized artifact bundle exceeds its byte limit");
-  }
-  const encoded = await readFile(path);
+  // Still re-checked on the bytes in hand: the file can grow between the `stat` and the read even
+  // when both are on this descriptor.
   if (encoded.length > MAX_AUTHORIZED_ARTIFACT_BUNDLE_BYTES) {
     throw new ArtifactSignatureError("authorized artifact bundle exceeds its byte limit");
   }
