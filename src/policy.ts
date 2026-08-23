@@ -169,7 +169,18 @@ const DEVICE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
  * membership where the data is. What is worth refusing early is the value that is not an address at
  * all, because that one reads as a typo'd user and would expand to nothing.
  */
-const USER_EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+// 🔴 The domain half is split on dots on purpose, and the reason is cost, not grammar. The earlier
+// shape was `@[^\s@]+\.[^\s@]+$`, where **both sides of the `\.` can match a dot** — so a value with
+// many dots and no way to satisfy the anchor has a quadratic number of splits to try before the
+// engine gives up. Measured on the shape CodeQL named (`a@` + `a.`×n + a trailing space, which
+// cannot match): n=16,000 → 438 ms, n=32,000 → 2.0 s, n=64,000 → 6.3 s. This one: 0.2 ms, 0.6 ms,
+// 1.0 ms. A policy value is operator-written, but "operator-written" is not "short", and a validator
+// that stalls the manager on a bad paste is a poor way to say "that is not an address".
+//
+// Excluding the dot from the segments narrows what is accepted, in the direction this check already
+// wanted: `a@b..c`, `a@..b`, `a@b...c` and `a@b.c.` were accepted before and are not addresses.
+// Every real shape still passes — subdomains, `+tag`, non-ASCII, dots in the local part.
+const USER_EMAIL = /^[^\s@]+@[^\s@.]+(?:\.[^\s@.]+)+$/;
 
 /** The two kinds that name an identity rather than an address. */
 
