@@ -161,8 +161,12 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           # No `npm ci` and no cache: the relay and the agent import only `src/`, so this job needs
-          # the interpreter and nothing from the registry.
+          # the interpreter and nothing from the registry. `package-manager-cache: false` is what
+          # makes the second half of that true — setup-node v7 turns caching on by itself when
+          # package.json declares a `packageManager`, so leaving the input off would make this
+          # comment depend on a field in another file that nobody would connect to it.
           node-version: "22"
+          package-manager-cache: false
       # The property under test is that a locking ruleset is actually reverted by the agent's timer.
       # A mock cannot fail the way a kernel does, and this is the check that stands between a bad
       # generation and a host nobody can reach.

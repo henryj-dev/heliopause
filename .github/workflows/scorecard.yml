@@ -1,0 +1,76 @@
+# OpenSSF Scorecard — the outside view of this repository's supply chain.
+#
+# I argued against adding this once, on the grounds that most of what it grades is already covered:
+# actions pinned by SHA, binaries pinned by checksum, dependabot on, branch protection with required
+# checks, CodeQL running, a SECURITY.md that says where reports go. That argument was about the
+# *score*, and it was answering the wrong question.
+#
+# What this actually buys is the checks nothing else here performs, and they are the ones about
+# **settings rather than files**. Every other gate in this repository reads the tree; a tree cannot
+# tell you that branch protection was relaxed, that a token was granted write scope, or that a new
+# workflow acquired a dangerous permission. Those are exactly the things that change quietly,
+# because changing them leaves no diff. Scorecard reads them from the outside, weekly, and says so.
+#
+# It also grades things this repository will legitimately score badly on — no signed releases (there
+# are no releases), no fuzzing, few maintainers. **A low number is not a defect here.** The value is
+# in the per-check output, not the total, and nothing gates on it.
+name: scorecard
+
+on:
+  # Weekly. The thing it watches is repository configuration, which drifts on a human timescale.
+  schedule:
+    - cron: "37 3 * * 5"
+  # Branch protection is one of the checks, and its own settings live outside the tree — so a push
+  # to the default branch is the only in-repo event that reliably follows an administrative change.
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  analysis:
+    name: scorecard
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      # Upload the result to the Security tab, which is what makes the per-check detail readable
+      # instead of a number in a log.
+      security-events: write
+      # Scorecard reads workflow run metadata for its CI-tests and token-permissions checks.
+      actions: read
+      contents: read
+      # OIDC, so the publish step below authenticates as this repository rather than with a token
+      # this workflow would otherwise have to hold.
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: run analysis
+        uses: ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc # v2.4.4
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          # `false`, deliberately. Publishing sends the result to OpenSSF's public API so a badge can
+          # read it — a separate act from running the analysis, and one that puts this repository's
+          # posture on a third-party endpoint. The findings are already public in the Security tab of
+          # a public repository; there is nothing here a badge adds that a reader cannot see.
+          publish_results: false
+
+      # Kept as an artifact as well as a SARIF upload: code scanning keeps only the alerts it can
+      # map to a rule, and the parts of a Scorecard run worth reading — the per-check reasoning —
+      # are in the file.
+      - name: keep the raw result
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: scorecard-sarif
+          path: results.sarif
+          retention-days: 30
+
+      - name: upload to the Security tab
+        uses: github/codeql-action/upload-sarif@c16c0f3f2812ec4bb3750a5ed64873fe2ce0fbef # codeql-bundle-v2.26.3
+        with:
+          sarif_file: results.sarif
