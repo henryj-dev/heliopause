@@ -31,6 +31,18 @@ def build(script_src):
     root = tempfile.mkdtemp(prefix="repo-", dir=TMP)
     origin, work, up = (os.path.join(root, n) for n in ("origin.git", "work", "up"))
     subprocess.run(["git", "init", "-q", "--bare", origin], check=True)
+    # 🔴 bare 쪽 HEAD 도 **픽스처가 정한다.** 이 줄이 없으면 기본 브랜치 이름을 git **빌드**가
+    #    정하고, 그 값은 머신마다 다르다 — 실측: Apple Git 2.50 은 `init.defaultBranch` 가
+    #    없어도 `main`, GitHub 러너의 git 은 `master`. 후자에서는 이 bare 의 HEAD 가 존재하지
+    #    않는 `refs/heads/master` 로 남는다.
+    #    그때 `git clone` 은 **경고 한 줄만 내고 성공한다**
+    #    (`remote HEAD refers to nonexistent ref, unable to checkout`) — 아무것도 체크아웃하지
+    #    않은 채로. `check=True` 로도 안 잡힌다. 실패는 한참 뒤 `work/A.md` 가 없다는
+    #    FileNotFoundError 로 나타나 **「당기지 못했다」로 읽힌다** — 훅은 멀쩡한데 픽스처가
+    #    깨진 모양이고, 이 검사에서 가장 헷갈리는 거짓 신호다.
+    #    heliopause 가 이 스위트를 CI 에 넣은 첫날 이렇게 죽었다(2026-08-23).
+    #    `test-pre-commit.py` ⑨ 에 같은 교훈이 이미 적혀 있었다 — 그 파일만 지키고 있었다.
+    git(origin, "symbolic-ref", "HEAD", "refs/heads/main")
     subprocess.run(["git", "init", "-q", up], check=True)
     for k, v in (("user.email", "t@t"), ("user.name", "t")):
         git(up, "config", k, v)
@@ -219,9 +231,17 @@ try:
 
     # ⑥ 변이 — `git pull` 로 되돌리면 동시 실행이 정말 깨지는가.
     #    ⑤가 공허하지 않다는 증거이자, 이 수정이 고친 것이 무엇인지의 기록이다.
-    mut_pull = src.replace('git(main_tree, "merge", "--ff-only", upstream)',
-                           'git(main_tree, "pull", "--ff-only")')
-    assert mut_pull != src, "변이가 안 심겼다 — 이 검사는 무의미하다"
+    # ⚠️ **재시도도 함께 걷어내야 한다.** 이 변이는 「`merge --ff-only` 로 바꾸기 전의 코드」를
+    #    복원하는 것이어야 그 시절에 실측된 8/8 과 같은 것을 잰다. 재시도를 남겨 두면 변이본이
+    #    경합이 잦아든 뒤 `pull` 을 다시 시도해 **스스로 낫는다** — 그러면 이 공허성 검사가
+    #    바로 아래 문단이 피하겠다고 적어 둔 그 「깜빡이는 검사」가 된다. 실측: 이 기계의
+    #    평범한 환경에서는 통과하고 다른 git 설정에서는 실패했다.
+    mut_pull = src.replace("    for attempt in range(RECHECK_ATTEMPTS):",
+                           "    for attempt in range(0):")
+    assert mut_pull != src, "재시도 루프를 못 찾았다 — 변이가 옛 코드가 아니다"
+    mut_pull = mut_pull.replace('git(main_tree, "merge", "--ff-only", upstream)',
+                                'git(main_tree, "pull", "--ff-only")')
+    assert 'git(main_tree, "merge"' not in mut_pull, "변이가 안 심겼다 — 이 검사는 무의미하다"
     # ⚠️ 최대 3회까지 본다. 경합이라 이론상 한 라운드가 통째로 비껴갈 수 있는데(먼저 성공한
     #    프로세스가 있으면 나머지는 「이미 최신」으로 정당하게 끝난다), **깜빡이는 검사는
     #    없느니만 못하다**. 실측으론 8/8 이 3라운드 내내 깨졌다.
