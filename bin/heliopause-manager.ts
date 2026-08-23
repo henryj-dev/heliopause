@@ -89,21 +89,26 @@ function parsePairs(spec: string, name: string): Map<string, string> {
   for (const entry of spec.split(",").map((s) => s.trim()).filter(Boolean)) {
     ordinal += 1;
     const eq = entry.indexOf("=");
-    // 🔴 **The entry itself never reaches the log.** One caller is `HELIOPAUSE_OTP_USERS`, whose
-    // values are shared OTP secrets, and this branch fires on exactly the inputs where we cannot
-    // tell which half we are holding — a secret containing a comma splits into a fragment with no
-    // `=`, and printing the "malformed entry" then writes that fragment to stderr and into
-    // journald. A misconfiguration must not be the thing that publishes the secret.
+    // 🔴 **No part of a malformed entry reaches the log — position only.** One caller is
+    // `HELIOPAUSE_OTP_USERS`, whose values are shared OTP secrets, and these two branches fire on
+    // exactly the inputs where the entry is not the shape we can reason about. A secret containing
+    // a comma splits into a fragment with no `=`; printing "malformed entry <fragment>" writes that
+    // secret to stderr and into journald. A misconfiguration must not be the thing that publishes
+    // the secret.
     //
-    // The ordinal is enough to fix it: the operator has the variable in front of them and can count
-    // commas. Where the key is known to be a key — there is an `=`, the value is just empty — say
-    // it, because "which one" is the whole question and the key half is not the secret.
+    // A first draft named the key in the second branch, on the argument that a key half is not a
+    // secret. It is not safe, and the reason is the same sentence as above: **an entry we are
+    // refusing is one whose halves we cannot vouch for.** A transposed `<secret>=` has the secret
+    // sitting in the key position, and that is precisely a case this branch catches.
+    //
+    // The ordinal is enough to act on: the operator has the variable in front of them and can count
+    // commas. The two messages stay distinct so they still say *what* is wrong.
     if (eq <= 0) {
       console.error(`[manager] ${name}: entry ${ordinal} is malformed — expected <key>=<value>`);
       process.exit(2);
     }
     if (eq === entry.length - 1) {
-      console.error(`[manager] ${name}: entry ${ordinal} (${JSON.stringify(entry.slice(0, eq).trim())}) has an empty value — expected <key>=<value>`);
+      console.error(`[manager] ${name}: entry ${ordinal} has an empty value — expected <key>=<value>`);
       process.exit(2);
     }
     const k = entry.slice(0, eq).trim();
