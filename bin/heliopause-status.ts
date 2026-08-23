@@ -118,6 +118,28 @@ function operatorFiles(): { cert: Buffer; key: Buffer; ca: Buffer; name: string 
   };
 }
 
+/**
+ * Strip control characters out of anything a server said before it reaches the terminal.
+ *
+ * This page is a table an operator reads to decide whether the fleet is healthy, and every string
+ * in it — hostname, generation id, problem text — comes from the relay or the manager. A newline in
+ * a hostname forges a row; an `\x1b[` sequence repaints one, and this renderer already writes real
+ * ANSI (`c(RED, …)`), so an injected sequence is indistinguishable from the tool's own colour. The
+ * failure that matters here is not a crash: it is a status display that says "healthy" about a host
+ * whose row was overwritten.
+ *
+ * Applied where the server's bytes first become values — the `JSON.parse` reviver below and the
+ * non-200 body — so no renderer has to remember. `\n` and `\t` go too: no field in a fleet or site
+ * view legitimately holds one, and they are the forgery primitive in a column layout. U+FFFD rather
+ * than deletion, so a value that was tampered with looks tampered with instead of merely odd.
+ *
+ * Not a defence against a relay that lies in ordinary text — it can still report a host as healthy.
+ * That is the trust the client certificate establishes and this cannot second-guess. What it stops
+ * is a relay rewriting *other* rows than its own.
+ */
+const CONTROL_CHARS = /[\u0000-\u001F\u007F-\u009F]/g;
+const scrub = (text: string): string => text.replace(CONTROL_CHARS, "\uFFFD");
+
 async function fetchView<T>(path: string): Promise<T> {
   const { cert, key, ca } = operatorFiles();
   const url = new URL(path, relayUrl);
@@ -152,10 +174,12 @@ async function fetchView<T>(path: string): Promise<T> {
                     ? "\n  This URL has no /site — it is probably a relay. Drop --site."
                     : "\n  This URL has no /status — it is probably a manager. Add --site."
                   : "";
-            return fail(new Error(`${siteMode ? "manager" : "relay"} returned ${res.statusCode}: ${body}${hint}`));
+            return fail(new Error(`${siteMode ? "manager" : "relay"} returned ${res.statusCode}: ${scrub(body)}${hint}`));
           }
           try {
-            ok(JSON.parse(body) as T);
+            // The reviver is the choke point: every string in the response passes through it once,
+            // before any renderer or `--json` dump can see it.
+            ok(JSON.parse(body, (_key, value) => (typeof value === "string" ? scrub(value) : value)) as T);
           } catch (e) {
             fail(new Error(`${siteMode ? "manager" : "relay"} returned unparseable JSON: ${(e as Error).message}`));
           }
