@@ -153,13 +153,24 @@ try:
     outs4 = run_many(hook4, 8)
     check("동시 8개에서도 실제로 당긴다",
           open(os.path.join(work4, "A.md")).read().strip() == "v5")
-    check("동시 실행을 실패로 보고하지 않는다", not [o for o in outs4 if "실패" in o])
+    # ⚠️ 본 것을 label 에 싣는다. 「실패 1 건」만 적고 무엇을 봤는지 안 적는 검사는, 재현되지
+    #    않는 머신(여기서는 CI)에서 깨지면 한 번의 왕복을 통째로 버리게 한다 — 실제로 그랬다.
+    bad4 = [o for o in outs4 if "실패" in o]
+    check("동시 실행을 실패로 보고하지 않는다"
+          + (f" — 본 것: {bad4[0][:120]}" if bad4 else ""), not bad4)
 
     # ⑥ 변이 — `git pull` 로 되돌리면 동시 실행이 정말 깨지는가.
     #    ⑤가 공허하지 않다는 증거이자, 이 수정이 고친 것이 무엇인지의 기록이다.
-    mut_pull = src.replace('git(main_tree, "merge", "--ff-only", upstream)',
-                           'git(main_tree, "pull", "--ff-only")')
-    assert mut_pull != src, "변이가 안 심겼다 — 이 검사는 무의미하다"
+    #
+    #    ⚠️ 재시도 루프도 **함께** 걷어내야 한다. 안 걷어내면 변이본이 2초 동안 `pull` 을 다시
+    #    시도하다 경합이 잦아든 뒤 성공해 버릴 수 있고, 그러면 이 공허성 검사가 **깜빡인다** —
+    #    바로 아래 문단이 피하려는 것이다. 변이는 「`merge --ff-only` 이전의 코드」를 그대로
+    #    복원하는 것이어야 그 시절에 실측된 8/8 과 같은 것을 잰다.
+    mut_pull = src.replace("for _ in range(20):", "for _ in range(0):")
+    assert mut_pull != src, "재시도 루프를 못 찾았다 — 변이가 옛 코드가 아니다"
+    mut_pull = mut_pull.replace('git(main_tree, "merge", "--ff-only", upstream)',
+                                'git(main_tree, "pull", "--ff-only")')
+    assert 'git(main_tree, "merge"' not in mut_pull, "변이가 안 심겼다 — 이 검사는 무의미하다"
     # ⚠️ 최대 3회까지 본다. 경합이라 이론상 한 라운드가 통째로 비껴갈 수 있는데(먼저 성공한
     #    프로세스가 있으면 나머지는 「이미 최신」으로 정당하게 끝난다), **깜빡이는 검사는
     #    없느니만 못하다**. 실측으론 8/8 이 3라운드 내내 깨졌다.

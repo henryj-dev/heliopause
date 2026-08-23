@@ -85,6 +85,12 @@ def fast_forward_main(git, main_tree):
     업스트림과 같은지 본다 — 같으면 목적은 달성됐다. 이 확인이 없으면 트리는 멀쩡한데
     로그만 「최신화 실패」로 도배되는, 사람을 헛짚게 하는 기록이 남는다.
 
+    🔴 **그 확인을 한 번만 하면 부족하다.** 이긴 쪽의 merge 가 **아직 끝나지 않은** 순간에
+    읽으면 HEAD 는 여전히 옛것이라, 위 문단이 막으려던 그 기록이 창만 좁아진 채 남는다.
+    실측(2026-08-23, CI 첫 실행): 4 vCPU 러너에서 8개 동시 실행 중 1건이 이 창에 걸렸다.
+    그래서 짧게(0.1초 × 20) 다시 본다 — **실패 경로에서만** 도는 지연이고, 목적이 달성된
+    것을 보는 즉시 끝난다. 세션 종료 쪽이 더 몰리므로 여기에 특히 필요하다.
+
     ⚠️ 이 함수는 `session-start-pull.py` 와 **일부러 중복**돼 있다. 검사 하네스가 훅
     스크립트 **한 파일만** 격리 저장소에 심어 돌리므로 공용 모듈로 빼면 그 자리가 깨진다.
     """
@@ -103,10 +109,16 @@ def fast_forward_main(git, main_tree):
     rc, out = git(main_tree, "merge", "--ff-only", upstream)
     if rc == 0:
         return True, (out.splitlines() or ["ok"])[0][:80]
-    _, head2 = git(main_tree, "rev-parse", "HEAD")
-    _, target2 = git(main_tree, "rev-parse", upstream)
-    if head2 == target2:
-        return True, None                # 경합에서 졌을 뿐 — 다른 세션이 이미 올렸다
+    for _ in range(20):                  # 최대 2초, 실패 경로에서만
+        _, head2 = git(main_tree, "rev-parse", "HEAD")
+        _, target2 = git(main_tree, "rev-parse", upstream)
+        if head2 == target2:
+            return True, None            # 경합에서 졌을 뿐 — 다른 세션이 이미 올렸다
+        # 락을 놓친 것뿐일 수도 있다. 이긴 쪽이 끝났다면 이번엔 우리가 잡는다.
+        rc2, out2 = git(main_tree, "merge", "--ff-only", upstream)
+        if rc2 == 0:
+            return True, (out2.splitlines() or ["ok"])[0][:80]
+        time.sleep(0.1)
     return False, (out.splitlines() or ["merge 실패"])[0][:80]
 
 
