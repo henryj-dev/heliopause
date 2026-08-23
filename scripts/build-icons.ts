@@ -44,9 +44,25 @@ export function innerMarkup(svg: string): string {
   if (open === -1 || close === -1 || close < open) {
     throw new Error("이 파일은 <svg> 하나로 감싸여 있지 않다");
   }
-  return svg
-    .slice(open + 1, close)
-    .replace(/<!--[\s\S]*?-->/g, "")
+  // ⚠️ 주석 제거는 **한 번 돌려서는 끝나지 않는다.** `<!--<!---->` 처럼 겹쳐 놓으면 안쪽이
+  //    지워지면서 바깥 `<!--` 가 남는다 — 한 번만 돌리는 치환의 고전적인 결함이다.
+  //    그래서 더 이상 안 줄어들 때까지 돌리고, **그러고도 `<!--` 가 남아 있으면 던진다.**
+  //
+  //    이 자리는 「검사가 아니라 장식」이 되기 쉬운 자리라 분명히 해 둔다: 이것은 적대적인 SVG
+  //    에 대한 방어가 **아니다.** `innerMarkup` 은 `<svg>` 안쪽을 그대로 가져오므로
+  //    lucide-static 을 쥔 쪽은 어차피 무엇이든 넣을 수 있고, 그 신뢰는 버전 고정과 **생성물이
+  //    커밋되어 diff 로 읽힌다**는 사실이 지고 있다(콘솔이 CDN 을 안 쓰는 이유와 같다).
+  //    여기서 던지는 것은 그 diff 에 「닫히지 않은 주석」이 조용히 실려 가지 않게 하기 위한
+  //    것이고, 그것이 이 줄이 할 수 있는 전부다.
+  let inner = svg.slice(open + 1, close);
+  for (let previous = ""; previous !== inner; ) {
+    previous = inner;
+    inner = inner.replace(/<!--[\s\S]*?-->/g, "");
+  }
+  if (inner.includes("<!--")) {
+    throw new Error("SVG 안쪽에 닫히지 않은 주석이 남았다 — 생성물에 그대로 실릴 수 없다");
+  }
+  return inner
     .split("\n")
     .map((l) => l.trim())
     .filter((l) => l !== "")
