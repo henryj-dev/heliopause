@@ -184,6 +184,89 @@ try:
           open(os.path.join(work, "A.md")).read().strip() == "v2")
     check("동시 실행을 실패로 보고하지 않는다", all(ok for ok, _ in res))
 
+    # 「경합에서 졌나」 재확인의 두 창 — 타이밍이 아니라 **git 대역**으로 고정한다.
+    #
+    # ⚠️ 위의 동시 8개는 이 두 창을 못 잡는다. 이 기계에서는 32 스레드 20 라운드에도
+    #    한 번도 안 걸렸고, parallax 의 CI 에서는 11회 중 1회 걸렸다 — 즉 **재현이
+    #    기계에 달린** 검사라 그것만으로는 회귀를 막지 못한다. 진 쪽이 실제로 보는
+    #    상태를 그대로 먹이면 타이밍 없이 결정적으로 잰다.
+    def ff_with(second_read, merge_rc=1):
+        """merge 는 실패하고, 그 뒤 재확인이 `second_read` 를 보는 상황."""
+        BEHIND, AHEAD = "aaaaaaa", "bbbbbbb"
+        state = {"reads": 0}
+
+        def fake(cwd, *args):
+            if args[:2] == ("rev-parse", "--abbrev-ref"):
+                return 0, "origin/main"
+            if args[0] == "rev-parse":
+                state["reads"] += 1
+                if state["reads"] <= 2:          # merge 이전의 두 번
+                    return 0, (BEHIND if args[1] == "HEAD" else AHEAD)
+                return second_read(args[1], state["reads"])
+            if args[0] == "merge":
+                return merge_rc, "fatal: Unable to create '.../index.lock': File exists."
+            return 0, ""
+        return sec.fast_forward_main(fake, "/x")
+
+    # 창 1 — 이긴 쪽이 아직 ref 를 안 올렸다. 잠시 뒤 올라온다.
+    #         한 번만 읽으면 실패로 적는다. 재시도가 있으면 사실대로 「졌을 뿐」이 된다.
+    def late(ref, reads):
+        if reads <= 4:                            # 첫 재확인에는 아직 안 보인다
+            return 0, ("aaaaaaa" if ref == "HEAD" else "bbbbbbb")
+        return 0, "bbbbbbb"                       # 그다음부터는 이긴 쪽의 결과가 보인다
+    ok_late, _ = ff_with(late)
+    check("이긴 쪽의 ref 갱신이 늦어도 실패로 적지 않는다", ok_late)
+
+    # 창 2 — 🔴 재확인의 `rev-parse` 자체가 죽는다. 반환 코드를 안 보면 두 호출이 **같은
+    #         에러 문자열**을 돌려줘 「같다」로 읽히고, 트리가 뒤처진 채 성공이 보고된다.
+    ok_broken, _ = ff_with(lambda ref, reads: (128, "fatal: unable to read ref"))
+    check("재확인을 못 하면 성공이라고 하지 않는다", not ok_broken)
+
+    # 그리고 진짜로 뒤처진 채로 계속 다르면 실패여야 한다 — 재시도가 판정을 무르게
+    # 만들지 않았는지.
+    ok_stuck, _ = ff_with(lambda ref, reads: (0, "aaaaaaa" if ref == "HEAD" else "bbbbbbb"))
+    check("끝까지 다르면 실패로 적는다", not ok_stuck)
+
+    # ⚠️ **위 셋은 「남이 이미 올렸는가」만 묻는다.** 락을 놓쳐 실패했는데 아무도 이기지
+    #    않았다면 HEAD 는 끝까지 업스트림과 다르고, 다시 읽는 것만으로는 영원히 실패다 —
+    #    한 번 더 시도했으면 성공했을 자리에서. merge 가 처음엔 실패하고 그 다음엔
+    #    성공하는 대역으로 그 자리를 고정한다.
+    def ff_retry():
+        state = {"merges": 0}
+
+        def fake(cwd, *args):
+            if args[:2] == ("rev-parse", "--abbrev-ref"):
+                return 0, "origin/main"
+            if args[0] == "rev-parse":
+                return 0, ("aaaaaaa" if args[1] == "HEAD" else "bbbbbbb")
+            if args[0] == "merge":
+                state["merges"] += 1
+                if state["merges"] == 1:
+                    return 1, "fatal: Unable to create '.../index.lock': File exists."
+                return 0, "Updating aaaaaaa..bbbbbbb"
+            return 0, ""
+        return sec.fast_forward_main(fake, "/x"), state
+
+    (ok_retry, _m), st_retry = ff_retry()
+    check("락을 놓쳤을 뿐이면 다시 시도해서 실제로 당긴다", ok_retry and st_retry["merges"] >= 2)
+
+    # 변이 검사 — 위 셋이 공허하지 않은가. rc 확인을 지우면 창 2 가 통과해 버려야 한다.
+    src_ff = open(SCRIPT, encoding="utf-8").read()
+    mut_ff = src_ff.replace("        if rc_head or rc_target:\n            continue",
+                            "        if False:\n            continue")
+    assert mut_ff != src_ff, "변이가 안 심겼다 — 이 검사는 무의미하다"
+    MUT3 = SCRIPT.replace(".py", "_mut3.py")
+    open(MUT3, "w", encoding="utf-8").write(mut_ff)
+    spec3 = importlib.util.spec_from_file_location("sec3", MUT3)
+    sec3 = importlib.util.module_from_spec(spec3); spec3.loader.exec_module(sec3)
+    # ⚠️ `saved` 라는 이름을 쓰지 말 것 — 이 파일 끝에서 소유자 기록 복원에 쓰는 dict 가
+    #    그 이름이다. 처음에 겹쳐 써서 `saved.items()` 가 모듈을 만나 죽었다.
+    sec_real, sec = sec, sec3
+    ok_mut, _ = ff_with(lambda ref, reads: (128, "fatal: unable to read ref"))
+    sec = sec_real
+    os.remove(MUT3)
+    check("변이본(rc 무시)은 모르는 채로 성공을 보고한다(검사가 공허하지 않음)", ok_mut)
+
     # 업스트림이 없으면 아무것도 안 한다 — `origin/HEAD` 로 폴백하면 메인이 어쩌다 다른
     # 브랜치에 있을 때 그 브랜치를 기본 브랜치 끝으로 조용히 민다(`git pull` 은 안 그런다).
     solo = isolated_behind()

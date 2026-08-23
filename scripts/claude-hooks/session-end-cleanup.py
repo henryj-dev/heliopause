@@ -84,15 +84,11 @@ def fast_forward_main(git, main_tree):
     **다른 프로세스가 먼저 성공했다**는 뜻이다. 그래서 실패하면 HEAD 를 다시 읽어
     업스트림과 같은지 본다 — 같으면 목적은 달성됐다. 이 확인이 없으면 트리는 멀쩡한데
     로그만 「최신화 실패」로 도배되는, 사람을 헛짚게 하는 기록이 남는다.
-
-    🔴 **그 확인을 한 번만 하면 부족하다.** 이긴 쪽의 merge 가 **아직 끝나지 않은** 순간에
-    읽으면 HEAD 는 여전히 옛것이라, 위 문단이 막으려던 그 기록이 창만 좁아진 채 남는다.
-    실측(2026-08-23, CI 첫 실행): 4 vCPU 러너에서 8개 동시 실행 중 1건이 이 창에 걸렸다.
-    그래서 짧게(0.1초 × 20) 다시 본다 — **실패 경로에서만** 도는 지연이고, 목적이 달성된
-    것을 보는 즉시 끝난다. 세션 종료 쪽이 더 몰리므로 여기에 특히 필요하다.
+    그 재확인이 어떻게 틀렸었는지는 `_lost_the_race` 에 있다.
 
     ⚠️ 이 함수는 `session-start-pull.py` 와 **일부러 중복**돼 있다. 검사 하네스가 훅
     스크립트 **한 파일만** 격리 저장소에 심어 돌리므로 공용 모듈로 빼면 그 자리가 깨진다.
+    같은 이유로 `_lost_the_race` 도 양쪽에 각각 있다 — **한쪽만 고치지 말 것.**
     """
     # 대상은 **현재 브랜치의 업스트림**이다. `origin/HEAD` 로 폴백하지 말 것 — 메인이
     # 어쩌다 다른 브랜치에 있으면 그 브랜치를 기본 브랜치 끝으로 조용히 밀어 버린다.
@@ -109,17 +105,53 @@ def fast_forward_main(git, main_tree):
     rc, out = git(main_tree, "merge", "--ff-only", upstream)
     if rc == 0:
         return True, (out.splitlines() or ["ok"])[0][:80]
-    for _ in range(20):                  # 최대 2초, 실패 경로에서만
-        _, head2 = git(main_tree, "rev-parse", "HEAD")
-        _, target2 = git(main_tree, "rev-parse", upstream)
+    return _lost_the_race(git, main_tree, upstream, out)
+
+
+# 재확인 횟수와 간격. 합쳐서 0.4 초 — 세션 종료 경로라 사람을 기다리게 하지 않으면서,
+# 이긴 쪽이 ref 를 갱신할 시간으로는 넉넉하다.
+RECHECK_ATTEMPTS = 5
+RECHECK_DELAY_S = 0.1
+
+
+def _lost_the_race(git, main_tree, upstream, merge_output):
+    """merge 가 실패했다. **다른 세션이 이미 올렸기 때문인가?**
+
+    이 확인은 원래 즉시 한 번 읽는 것이었고, 그래서 **두 방향으로** 틀렸다. 둘 다
+    2026-08-23 에 parallax 의 CI 가 이 스위트를 처음 실제로 돌리기 시작하면서 드러났다.
+
+    🔴 **낙관 방향이 더 나쁘다.** 경합 중에는 `rev-parse` 자체가 죽을 수 있는데, 반환
+    코드를 안 보면 두 호출이 **같은 에러 문자열**을 돌려준다. 그러면 `head2 == target2`
+    가 참이 되어 「남이 올렸다」로 읽고 **모르는 채로 성공을 보고한다** — 트리가 실제로
+    뒤처져 있어도 그렇다. 그래서 rc 를 본다. 못 읽었으면 같다고도 다르다고도 하지 않는다.
+
+    ⚠️ 비관 방향은 시끄러울 뿐이다. 이긴 쪽이 merge 를 끝냈지만 **아직 ref 를 갱신하기
+    전**에 진 쪽이 읽으면 「아직 아니다」가 되어 실패로 적는다. 트리는 곧 최신이 되는데
+    로그만 「최신화 실패」로 남는다 — 위 docstring 이 없애려던 바로 그 기록이, 그 창에서
+    다시 생긴다. parallax CI 에서 8 스레드 동시 실행이 **11회 중 1회** 이 창에 걸렸다.
+    그래서 한 번이 아니라 짧게 재시도한다.
+
+    두 창 모두 `test-session-end-cleanup.py` 가 git 대역으로 **결정적으로** 고정한다.
+    타이밍으로는 재현되지 않는다 — 이 기계에서 32 스레드 20 라운드에도 0 회였다.
+    """
+    for attempt in range(RECHECK_ATTEMPTS):
+        if attempt:
+            time.sleep(RECHECK_DELAY_S)
+        rc_head, head2 = git(main_tree, "rev-parse", "HEAD")
+        rc_target, target2 = git(main_tree, "rev-parse", upstream)
+        if rc_head or rc_target:
+            continue                     # 못 읽었다 — 판단하지 않는다
         if head2 == target2:
             return True, None            # 경합에서 졌을 뿐 — 다른 세션이 이미 올렸다
-        # 락을 놓친 것뿐일 수도 있다. 이긴 쪽이 끝났다면 이번엔 우리가 잡는다.
-        rc2, out2 = git(main_tree, "merge", "--ff-only", upstream)
-        if rc2 == 0:
-            return True, (out2.splitlines() or ["ok"])[0][:80]
-        time.sleep(0.1)
-    return False, (out.splitlines() or ["merge 실패"])[0][:80]
+        # ⚠️ **다시 읽는 것만으로는 부족한 경우가 하나 남는다.** 위 두 줄은 「남이 이미
+        #    올렸는가」만 답한다. 우리 merge 가 `index.lock` 을 놓쳐 실패했는데 **아무도
+        #    이기지 않았다면**, HEAD 는 영원히 업스트림과 다르고 이 루프는 몇 번을 읽어도
+        #    실패로 끝난다 — 한 번 더 시도했으면 성공했을 자리에서. 락을 놓친 것뿐이면
+        #    이번엔 우리가 잡는다.
+        rc_retry, out_retry = git(main_tree, "merge", "--ff-only", upstream)
+        if rc_retry == 0:
+            return True, (out_retry.splitlines() or ["ok"])[0][:80]
+    return False, (merge_output.splitlines() or ["merge 실패"])[0][:80]
 
 
 def main():

@@ -68,6 +68,18 @@ CASES = [
     ("메인에서 git add",                   "S1", MAIN,   "Bash", {"command": "git add ."},                 "DENY"),
     ("다른 세션도 똑같이 막힌다",            "S2", MAIN,   "Edit", {"file_path": f"{MAIN}/PLAN.md"},        "DENY"),
     ("밖에서 -C 로 메인을 노려도 막힌다",     "S2", "/tmp", "Bash", {"command": f"git -C {MAIN} commit -m x"}, "DENY"),
+    # 🔴 **경로가 여럿이면 앞의 하나가 판정을 대표하지 않는다.** 예전에는 첫 번째로 존재하는
+    #    경로로 대상 저장소를 정하고 끝냈다. 그래서 **다른 저장소의 경로를 앞에 세우면**
+    #    「우리 메인이 아니다」로 빠지고, 뒤에 붙은 우리 트리의 추적 파일이 그대로 실려 갔다.
+    #    순서를 뒤집으면 막혔다 — 판정이 인자 순서에 달려 있었다.
+    #    ⚠️ 이 저장소에서는 `docs/`·`policy/` 심링크가 실물로 그 모양을 만든다. 여기서는
+    #    중첩 저장소 픽스처로 잰다 — 심링크가 없는 체크아웃에서도 같은 것을 재야 한다.
+    ("섞임 — 남의 저장소가 앞, 우리 메인이 뒤",  "S1", MAIN, "Write",
+     {"files": [f"{FOREIGN}/x.md", f"{MAIN}/README.md"], "content": "x"},                "DENY"),
+    ("섞임 — 순서를 뒤집어도 같다",             "S1", MAIN, "Write",
+     {"files": [f"{MAIN}/README.md", f"{FOREIGN}/x.md"], "content": "x"},                "DENY"),
+    ("남의 저장소만이면 그대로 통과",            "S1", MAIN, "Write",
+     {"files": [f"{FOREIGN}/x.md", f"{FOREIGN}/y.md"], "content": "x"},                  "ALLOW"),
     # 메인 트리 — 읽기와 최신화는 통과해야 한다
     ("메인에서 Read",                      "S1", MAIN,   "Read", {"file_path": f"{MAIN}/PLAN.md"},        "ALLOW"),
     ("메인에서 git status",                "S1", MAIN,   "Bash", {"command": "git status --short"},        "ALLOW"),

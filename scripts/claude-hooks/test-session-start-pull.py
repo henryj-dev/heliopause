@@ -31,18 +31,6 @@ def build(script_src):
     root = tempfile.mkdtemp(prefix="repo-", dir=TMP)
     origin, work, up = (os.path.join(root, n) for n in ("origin.git", "work", "up"))
     subprocess.run(["git", "init", "-q", "--bare", origin], check=True)
-    # 🔴 bare 쪽 HEAD 도 **픽스처가 정한다**. 이 줄이 없으면 기본 브랜치 이름은 git **빌드**가
-    #    정하고, 그 값은 머신마다 다르다 — 실측: Apple Git 2.50 은 `init.defaultBranch` 가
-    #    없어도 `main`, GitHub 러너의 git 은 `master`. 후자에서는 이 bare 의 HEAD 가 존재하지
-    #    않는 `refs/heads/master` 로 남는다.
-    #    그때 `git clone` 은 **경고 한 줄만 내고 성공한다**
-    #    (`remote HEAD refers to nonexistent ref, unable to checkout`) — 아무것도 체크아웃하지
-    #    않은 채로. `check=True` 로도 안 잡힌다. 실패는 한참 뒤 `work/A.md` 가 없다는
-    #    FileNotFoundError 로 나타나 **「당기지 못했다」로 읽힌다** — 훅은 멀쩡한데 픽스처가
-    #    깨진 모양이고, 이 검사에서 가장 헷갈리는 거짓 신호다.
-    #    2026-08-23 CI 첫 실행에서 실제로 이렇게 죽었다. `test-pre-commit.py` ⑨ 에 같은 교훈이
-    #    이미 적혀 있었다 — 그 파일만 지키고 있었던 것이다.
-    git(origin, "symbolic-ref", "HEAD", "refs/heads/main")
     subprocess.run(["git", "init", "-q", up], check=True)
     for k, v in (("user.email", "t@t"), ("user.name", "t")):
         git(up, "config", k, v)
@@ -153,24 +141,87 @@ try:
     outs4 = run_many(hook4, 8)
     check("동시 8개에서도 실제로 당긴다",
           open(os.path.join(work4, "A.md")).read().strip() == "v5")
-    # ⚠️ 본 것을 label 에 싣는다. 「실패 1 건」만 적고 무엇을 봤는지 안 적는 검사는, 재현되지
-    #    않는 머신(여기서는 CI)에서 깨지면 한 번의 왕복을 통째로 버리게 한다 — 실제로 그랬다.
-    bad4 = [o for o in outs4 if "실패" in o]
-    check("동시 실행을 실패로 보고하지 않는다"
-          + (f" — 본 것: {bad4[0][:120]}" if bad4 else ""), not bad4)
+    check("동시 실행을 실패로 보고하지 않는다", not [o for o in outs4 if "실패" in o])
+
+    # ⑤-1 「경합에서 졌나」 재확인의 두 창 — git 대역으로 **결정적으로** 잰다.
+    #
+    # ⚠️ 이 함수는 `session-end-cleanup.py` 에 일부러 복제돼 있고, 그쪽 스위트에 같은
+    #    검사가 있다. **양쪽에 다 두는 것이 요점이다** — 한쪽만 있으면 다른 쪽 사본이
+    #    조용히 옛 판정으로 되돌아가도 아무도 모른다. 그 복제가 이 코드의 전제다.
+    # ⚠️ ⑤의 동시 8개로는 이 둘을 못 잡는다. 재현이 기계 속도에 달려 있어서다 —
+    #    이 기계 32 스레드 20 라운드 0회, parallax CI 11회 중 1회.
+    import importlib.util
+    spec_ff = importlib.util.spec_from_file_location("sp_ff", SCRIPT)
+    sp = importlib.util.module_from_spec(spec_ff); spec_ff.loader.exec_module(sp)
+
+    def ff_with(second_read, module=None):
+        state = {"reads": 0}
+
+        def fake(cwd, *args):
+            if args[:2] == ("rev-parse", "--abbrev-ref"):
+                return 0, "origin/main"
+            if args[0] == "rev-parse":
+                state["reads"] += 1
+                if state["reads"] <= 2:
+                    return 0, ("aaaaaaa" if args[1] == "HEAD" else "bbbbbbb")
+                return second_read(args[1], state["reads"])
+            if args[0] == "merge":
+                return 1, "fatal: Unable to create '.../index.lock': File exists."
+            return 0, ""
+        return (module or sp).fast_forward_main(fake, "/x")
+
+    def late(ref, reads):
+        if reads <= 4:
+            return 0, ("aaaaaaa" if ref == "HEAD" else "bbbbbbb")
+        return 0, "bbbbbbb"
+    check("이긴 쪽의 ref 갱신이 늦어도 실패로 적지 않는다", ff_with(late)[0])
+    broken = lambda ref, reads: (128, "fatal: unable to read ref")
+    check("재확인을 못 하면 성공이라고 하지 않는다", not ff_with(broken)[0])
+    check("끝까지 다르면 실패로 적는다",
+          not ff_with(lambda ref, reads: (0, "aaaaaaa" if ref == "HEAD" else "bbbbbbb"))[0])
+
+    # ⚠️ **위 셋은 「남이 이미 올렸는가」만 묻는다.** 락을 놓쳐 실패했는데 **아무도 이기지
+    #    않은** 경우는 그 질문으로 답이 안 나온다 — HEAD 는 영원히 업스트림과 다르고,
+    #    몇 번을 다시 읽어도 실패다. 한 번 더 시도했으면 성공했을 자리에서.
+    #    merge 가 처음엔 실패하고 그 다음엔 성공하는 대역으로 그 자리를 고정한다.
+    def ff_retry(module=None):
+        state = {"reads": 0, "merges": 0}
+
+        def fake(cwd, *args):
+            if args[:2] == ("rev-parse", "--abbrev-ref"):
+                return 0, "origin/main"
+            if args[0] == "rev-parse":
+                state["reads"] += 1
+                # 끝까지 뒤처진 채로 보인다 — 이긴 쪽은 없다.
+                return 0, ("aaaaaaa" if args[1] == "HEAD" else "bbbbbbb")
+            if args[0] == "merge":
+                state["merges"] += 1
+                if state["merges"] == 1:
+                    return 1, "fatal: Unable to create '.../index.lock': File exists."
+                return 0, "Updating aaaaaaa..bbbbbbb"
+            return 0, ""
+        return (module or sp).fast_forward_main(fake, "/x"), state
+
+    (ok_retry, _msg), st = ff_retry()
+    check("락을 놓쳤을 뿐이면 다시 시도해서 실제로 당긴다", ok_retry and st["merges"] >= 2)
+
+    # 변이 — rc 확인을 지우면 「모르는 채로 성공」이 돌아와야 한다.
+    mut_rc = src.replace("        if rc_head or rc_target:\n            continue",
+                         "        if False:\n            continue")
+    assert mut_rc != src, "변이가 안 심겼다 — 이 검사는 무의미하다"
+    MUTRC = SCRIPT.replace(".py", "_mutrc.py")
+    open(MUTRC, "w", encoding="utf-8").write(mut_rc)
+    spec_rc = importlib.util.spec_from_file_location("sp_rc", MUTRC)
+    sp_rc = importlib.util.module_from_spec(spec_rc); spec_rc.loader.exec_module(sp_rc)
+    check("변이본(rc 무시)은 모르는 채로 성공을 보고한다(검사가 공허하지 않음)",
+          ff_with(broken, sp_rc)[0])
+    os.remove(MUTRC)
 
     # ⑥ 변이 — `git pull` 로 되돌리면 동시 실행이 정말 깨지는가.
     #    ⑤가 공허하지 않다는 증거이자, 이 수정이 고친 것이 무엇인지의 기록이다.
-    #
-    #    ⚠️ 재시도 루프도 **함께** 걷어내야 한다. 안 걷어내면 변이본이 2초 동안 `pull` 을 다시
-    #    시도하다 경합이 잦아든 뒤 성공해 버릴 수 있고, 그러면 이 공허성 검사가 **깜빡인다** —
-    #    바로 아래 문단이 피하려는 것이다. 변이는 「`merge --ff-only` 이전의 코드」를 그대로
-    #    복원하는 것이어야 그 시절에 실측된 8/8 과 같은 것을 잰다.
-    mut_pull = src.replace("for _ in range(20):", "for _ in range(0):")
-    assert mut_pull != src, "재시도 루프를 못 찾았다 — 변이가 옛 코드가 아니다"
-    mut_pull = mut_pull.replace('git(main_tree, "merge", "--ff-only", upstream)',
-                                'git(main_tree, "pull", "--ff-only")')
-    assert 'git(main_tree, "merge"' not in mut_pull, "변이가 안 심겼다 — 이 검사는 무의미하다"
+    mut_pull = src.replace('git(main_tree, "merge", "--ff-only", upstream)',
+                           'git(main_tree, "pull", "--ff-only")')
+    assert mut_pull != src, "변이가 안 심겼다 — 이 검사는 무의미하다"
     # ⚠️ 최대 3회까지 본다. 경합이라 이론상 한 라운드가 통째로 비껴갈 수 있는데(먼저 성공한
     #    프로세스가 있으면 나머지는 「이미 최신」으로 정당하게 끝난다), **깜빡이는 검사는
     #    없느니만 못하다**. 실측으론 8/8 이 3라운드 내내 깨졌다.

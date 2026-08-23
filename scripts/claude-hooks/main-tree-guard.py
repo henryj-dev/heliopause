@@ -237,13 +237,25 @@ def shell_command(tool_input):
     문자열만 가정하면 배열이 통째로 무시되어 **가드가 조용히 안 돈다** — 「막는 훅이 있다」와
     「막는다」가 갈리는 자리다. 그래서 여기서 한 모양으로 모은다.
     """
+    # 🔴 **패치인지 먼저 묻는다 — 문자열이든 배열이든.** 이 판정이 아래 문자열 분기에만
+    #    있었고, 그래서 배열로 온 패치는 **본문이 그대로 셸 명령이 됐다**. `relevant()` 는
+    #    그것을 MUTATING 에 대 보고 안 걸리면 거기서 끝내므로, `edit_paths()` 의 경로 추출은
+    #    **도달하지 못한다.** 실측(수정 전):
+    #
+    #        {"command": "*** Begin Patch\n*** Update File: README.md\n…"}            → 거부
+    #        {"command": ["/bin/zsh","-lc","*** Begin Patch\n*** Update File: …"]}   → 통과
+    #        {"command": "*** Update File: README.md\n…"}                            → 통과
+    #
+    #    앞의 둘은 같은 패치다. 모양만 바꾸면 가드가 안 본다.
+    if patch_text(tool_input):
+        return ""
     c = tool_input.get("command")
     if isinstance(c, str):
         # 🔴 **`command` 가 셸 명령이라는 보장이 없다** (2026-08-15 codex 실측):
         #    `apply_patch` 는 **패치 본문을 `command` 에** 담아 보낸다. 그것을 셸 명령으로
         #    읽으면 MUTATING 정규식에 안 걸려 **편집이 통째로 통과한다** — 실제로 메인
         #    트리에 파일이 생겼다. 같은 키가 두 가지 뜻을 갖는다는 것을 여기서 가른다.
-        return "" if PATCH_MARK in c else c
+        return c
     if isinstance(c, (list, tuple)):
         parts = [str(x) for x in c]
         # `["/bin/zsh", "-lc", "<스크립트>"]` — 셸 플래그 **뒤의 한 덩어리가 스크립트**다.
@@ -260,6 +272,41 @@ def shell_command(tool_input):
 PATCH_PATH = re.compile(r"^\*\*\*\s+(?:Add|Update|Delete)\s+File:\s*(.+?)\s*$", re.M)
 PATCH_MARK = "*** Begin Patch"          # 2026-08-15 codex 실측 형식
 
+# 패치 본문이 실려 올 수 있는 키들. `command` 가 여기 있는 것이 요점이다 — codex 의
+# `apply_patch` 는 패치를 그 키로 보낸다(실측).
+PATCH_KEYS = ("command", "input", "patch", "content", "diff")
+
+
+def patch_text(tool_input):
+    """이 호출이 들고 있는 **패치 본문**. 없으면 `""`.
+
+    🔴 **「패치인가」를 묻는 곳이 세 군데였고 답이 두 가지였다.** `edit_paths()` 는
+    `PATCH_PATH`(`*** Update File:` 류)로 알아보는데 `shell_command()` 와
+    `writes_content()` 는 `PATCH_MARK`(`*** Begin Patch`)로만 알아봤다. 봉투 머리말이
+    없는 본문은 한쪽에는 패치이고 다른 쪽에는 셸 명령이다 — 그리고 관문인 `relevant()` 는
+    후자를 믿는다.
+
+    🔴 게다가 둘 다 `isinstance(v, str)` 만 봤다. 하네스에 따라 `command` 는
+    `["/bin/zsh","-lc","<본문>"]` 같은 **배열**로 온다. 그러면 봉투 머리말이 멀쩡히 있어도
+    아무도 그것을 안 본다. `shell_command()` 가 배열을 풀어 본문을 셸 명령으로 돌려주고,
+    거기서 판정이 끝난다.
+
+    그래서 **한 함수가 두 신호를 다 보고, 두 모양을 다 본다.** 둘 중 하나라도 걸리면 패치다.
+    넓게 잡는 방향이라 오탐은 「셸 명령을 패치로 오인」인데, 그 경우 판정은 경로+내용
+    쪽으로 넘어가 **막는 쪽**으로 떨어진다. 이 가드에서 틀려도 되는 방향은 그쪽뿐이다.
+    """
+    for key in PATCH_KEYS:
+        v = tool_input.get(key)
+        if isinstance(v, str):
+            text = v
+        elif isinstance(v, (list, tuple)):
+            text = "\n".join(str(x) for x in v)
+        else:
+            continue
+        if text and (PATCH_MARK in text or PATCH_PATH.search(text)):
+            return text
+    return ""
+
 
 def writes_content(tool_input):
     """**새로 쓸 내용**이 실려 있는가. 읽기와 쓰기를 가르는 것은 경로가 아니라 이것이다.
@@ -272,10 +319,10 @@ def writes_content(tool_input):
               "edits", "replacements"):
         if tool_input.get(k) not in (None, "", [], {}):
             return True
-    for k in ("input", "command"):       # codex 는 패치를 `command` 로 보낸다(실측)
-        v = tool_input.get(k)
-        if isinstance(v, str) and PATCH_MARK in v:
-            return True
+    # 패치를 들고 있으면 쓰기다 — 어느 키로, 어느 모양으로 왔든. `patch_text` 가 그 판정을
+    # 혼자 갖는다(예전에는 여기서도 문자열 + `*** Begin Patch` 만 봤다).
+    if patch_text(tool_input):
+        return True
     return False
 
 
@@ -293,10 +340,9 @@ def edit_paths(tool_input):
             out.append(v)
     # ⚠️ `command` 가 여기 들어 있는 것이 요점이다 — codex 의 `apply_patch` 는 패치를
     #    **`command` 로** 보낸다(실측). 「명령 키니까 셸이겠지」로 넘기면 편집이 통과한다.
-    for k in ("command", "input", "patch", "content", "diff"):
-        v = tool_input.get(k)
-        if isinstance(v, str) and "*** " in v:
-            out += PATCH_PATH.findall(v)
+    body = patch_text(tool_input)
+    if body:
+        out += PATCH_PATH.findall(body)
     files = tool_input.get("files") or tool_input.get("changes")
     if isinstance(files, (list, tuple)):
         for f in files:
@@ -356,10 +402,11 @@ def target_cwd(tool, tool_input, cwd):
         return base
     # 🔴 **경로가 여럿이면 「우리 메인인 것」이 이긴다 — 첫 번째가 아니라.**
     #
-    #    예전에는 첫 번째로 존재하는 경로 하나로 대상 저장소를 정하고 끝냈다. 이 저장소에서
-    #    `docs/`·`policy/` 는 **다른 저장소로 걸린 심링크**라, 그것을 앞에 세운 다중 경로
-    #    편집은 「우리 메인이 아니다」 분기로 빠져 **뒤에 붙은 추적 파일이 그대로 실려
-    #    갔다.** 실측 재현:
+    #    예전에는 첫 번째로 존재하는 경로 하나로 대상 저장소를 정하고 끝냈다. 저장소 안에
+    #    **다른 저장소를 가리키는 경로**가 있으면(중첩 체크아웃, 또는 밖으로 걸린 심링크 —
+    #    heliopause 의 `docs/`·`policy/` 가 그렇다) 그것을 앞에 세운 다중 경로 편집은
+    #    「우리 메인이 아니다」 분기로 빠져 **뒤에 붙은 추적 파일이 그대로 실려 갔다.**
+    #    실측 재현:
     #
     #        {"tool_name":"Write","tool_input":{"files":["<repo>/docs/x.md",
     #                                                    "<repo>/README.md"],"content":"x"}}
@@ -411,6 +458,48 @@ def relevant(tool, tool_input):
         return False
     # 모르는 이름이어도 **내용을 들고 파일을 가리키면** 편집이다.
     return bool(edit_paths(tool_input)) and writes_content(tool_input)
+
+
+def ignored_only(tool, tool_input, cwd):
+    """이 호출이 쓰려는 경로가 **전부 git 이 무시하는 것**인가.
+
+    이 가드가 막는 이유는 파일 머리에 적힌 하나다 — **인덱스가 공유 자원**이라 남의
+    미완성 변경이 내 커밋에 딸려 온다. 그런데 `.gitignore` 에 걸린 경로는 **인덱스에
+    들어갈 수 없다.** `git add` 가 안 받고, 남의 커밋에 실릴 수도 없다. 그러니 그 경로에
+    대해서는 **막을 근거 자체가 없다.**
+
+    🔴 2026-08-17 에 이것이 실제로 고칠 방법을 없앴다. 이 저장소는 `docs/` 와 `policy/` 를
+    추적하지 않고(사이트 지도라 공개 예정 저장소에 안 넣는다) `.claude/settings.json` 의
+    `symlinkDirectories` 로 **워크트리에 심링크로 건다.** 그래서 워크트리 안에서 고쳐도
+    경로가 메인으로 풀려 **양쪽이 다 막혔다** — 그날 세 번 막혔고, 우회는 구제 파일뿐인데
+    그건 사용자 승인이 필요하다. 추적도 안 되는 파일 한 줄을 고치는 데 그 무게는 안 맞는다.
+
+    ⚠️ **경로가 하나라도 추적 대상이면 통째로 막는다.** 한 호출이 무시되는 것과 추적되는
+    것을 같이 건드리면 그것은 추적 파일 편집이다.
+
+    ⚠️ **경로가 없으면 막는다.** `git commit`·`add` 같은 명령은 여기 걸리면 안 되는데,
+    `edit_paths` 가 그것들에 빈 목록을 주므로 아래 `if not paths` 가 그 자리를 지킨다.
+    **「막는 쪽」만 검사하면 이 오탐이 안 잡힌다** — 파일 머리의 그 경고가 여기에도 적용된다.
+
+    두 가지를 **함께** 묻는다. `check-ignore` 는 인덱스를 안 보므로 추적 중인 파일에도
+    무시 규칙이 겹치면 0 을 줄 수 있다. 그래서 「무시된다」와 「추적되지 않는다」 둘 다
+    참일 때만 통과시킨다 — 한쪽만 보면 방향이 반만 고정된다.
+    """
+    if tool not in ("Edit", "Write", "NotebookEdit") and not writes_content(tool_input):
+        return False
+    paths = edit_paths(tool_input)
+    if not paths:
+        return False                    # 경로를 모르면 통과시키지 않는다
+    for p in paths:
+        ap = p if os.path.isabs(p) else os.path.join(cwd, p)
+        # `git()` 은 실패·시간초과에 `None` 을 준다. 무시된 경로는 returncode 0 에
+        # 빈 출력이라 `""` — `is not None` 으로 봐야 한다. 실패는 전부 「모른다」이고,
+        # 모르면 막는 쪽으로 떨어진다.
+        if git(cwd, "check-ignore", "-q", "--", ap) is None:
+            return False
+        if git(cwd, "ls-files", "--error-unmatch", "--", ap) is not None:
+            return False
+    return True
 
 
 def proc_start(pid):
@@ -469,48 +558,6 @@ def record_owner(common, tcwd, sid):
             os.replace(tmp, p)
     except Exception:
         pass
-
-
-def ignored_only(tool, tool_input, cwd):
-    """이 호출이 쓰려는 경로가 **전부 git 이 무시하는 것**인가.
-
-    이 가드가 막는 이유는 파일 머리에 적힌 하나다 — **인덱스가 공유 자원**이라 남의
-    미완성 변경이 내 커밋에 딸려 온다. 그런데 `.gitignore` 에 걸린 경로는 **인덱스에
-    들어갈 수 없다.** `git add` 가 안 받고, 남의 커밋에 실릴 수도 없다. 그러니 그 경로에
-    대해서는 **막을 근거 자체가 없다.**
-
-    🔴 2026-08-17 에 이것이 실제로 고칠 방법을 없앴다. 이 저장소는 `docs/` 와 `policy/` 를
-    추적하지 않고(사이트 지도라 공개 예정 저장소에 안 넣는다) `.claude/settings.json` 의
-    `symlinkDirectories` 로 **워크트리에 심링크로 건다.** 그래서 워크트리 안에서 고쳐도
-    경로가 메인으로 풀려 **양쪽이 다 막혔다** — 그날 세 번 막혔고, 우회는 구제 파일뿐인데
-    그건 사용자 승인이 필요하다. 추적도 안 되는 파일 한 줄을 고치는 데 그 무게는 안 맞는다.
-
-    ⚠️ **경로가 하나라도 추적 대상이면 통째로 막는다.** 한 호출이 무시되는 것과 추적되는
-    것을 같이 건드리면 그것은 추적 파일 편집이다.
-
-    ⚠️ **경로가 없으면 막는다.** `git commit`·`add` 같은 명령은 여기 걸리면 안 되는데,
-    `edit_paths` 가 그것들에 빈 목록을 주므로 아래 `if not paths` 가 그 자리를 지킨다.
-    **「막는 쪽」만 검사하면 이 오탐이 안 잡힌다** — 파일 머리의 그 경고가 여기에도 적용된다.
-
-    두 가지를 **함께** 묻는다. `check-ignore` 는 인덱스를 안 보므로 추적 중인 파일에도
-    무시 규칙이 겹치면 0 을 줄 수 있다. 그래서 「무시된다」와 「추적되지 않는다」 둘 다
-    참일 때만 통과시킨다 — 한쪽만 보면 방향이 반만 고정된다.
-    """
-    if tool not in ("Edit", "Write", "NotebookEdit") and not writes_content(tool_input):
-        return False
-    paths = edit_paths(tool_input)
-    if not paths:
-        return False                    # 경로를 모르면 통과시키지 않는다
-    for p in paths:
-        ap = p if os.path.isabs(p) else os.path.join(cwd, p)
-        # `git()` 은 실패·시간초과에 `None` 을 준다. 무시된 경로는 returncode 0 에
-        # 빈 출력이라 `""` — `is not None` 으로 봐야 한다. 실패는 전부 「모른다」이고,
-        # 모르면 막는 쪽으로 떨어진다.
-        if git(cwd, "check-ignore", "-q", "--", ap) is None:
-            return False
-        if git(cwd, "ls-files", "--error-unmatch", "--", ap) is not None:
-            return False
-    return True
 
 
 def main():

@@ -116,6 +116,60 @@ rc, out = run(G, {"tool_name": "apply_patch",
                   "cwd": WT or MAIN, "session_id": "T"}, WT or MAIN)
 check("apply_patch(command 키) 워크트리 → 통과", ("deny" not in out) if WT else True)
 
+# ── 같은 패치, 다른 모양 ──────────────────────────────────────────────────────
+#
+# 🔴 **위 두 케이스가 예전에 재던 전부였고, 그것이 마침 유일하게 되던 모양이었다.**
+#    「이것이 패치인가」를 묻는 곳이 셋인데 답이 둘이었다: `edit_paths()` 는
+#    `*** Update File:` 류로 알아보고, `shell_command()`·`writes_content()` 는
+#    `*** Begin Patch` 로만 알아봤다. 게다가 뒤의 둘은 `isinstance(v, str)` 만 봤다.
+#    그래서 **같은 편집이라도 모양만 바꾸면 지나갔다** — 관문인 `relevant()` 가 본문을
+#    셸 명령으로 읽고, MUTATING 에 안 걸리니 거기서 끝냈기 때문이다. 경로 추출은
+#    올바른데 도달하지 못했다.
+#
+# ⚠️ 아래는 런처가 아니라 **이 파일 옆의 사본**을 직접 부른다. 런처는
+#    `git rev-parse --show-toplevel` 로 스크립트를 찾으므로 워크트리에서 부르면
+#    **메인 트리의 사본**을 재고, 그러면 검토 중인 수정이 아니라 옛 사본을 재게 된다.
+#    위 케이스들은 배선을 재는 것이라 런처가 맞고, 여기는 판정을 재는 것이라 사본이 맞다.
+LOCAL_GUARD = os.path.join(HERE, "main-tree-guard.py")
+
+
+def judge(tool_input, cwd):
+    """이 파일 옆의 가드에 물어본다. `True` 면 거부."""
+    p = subprocess.run([sys.executable, LOCAL_GUARD],
+                       input=json.dumps({"tool_name": "apply_patch", "tool_input": tool_input,
+                                         "cwd": cwd, "session_id": "T"}),
+                       capture_output=True, text=True, cwd=cwd)
+    return "deny" in p.stdout
+
+
+ENVELOPE = f"*** Begin Patch\n*** Add File: {MAIN}/_probe.txt\n+x\n*** End Patch"
+
+check("apply_patch 가 배열로 와도 메인 편집 → deny",
+      judge({"command": ["/bin/zsh", "-lc", ENVELOPE]}, MAIN))
+check("셸 플래그 없는 배열도 메인 편집 → deny",
+      judge({"command": ["apply_patch", ENVELOPE]}, MAIN))
+check("봉투 머리말 없는 패치도 메인 편집 → deny",
+      judge({"command": f"*** Update File: {MAIN}/PLAN.md\n@@\n+x\n"}, MAIN))
+check("Delete File 도 메인 편집 → deny",
+      judge({"command": f"*** Delete File: {MAIN}/PLAN.md\n"}, MAIN))
+check("`input` 키로 온 패치도 메인 편집 → deny",
+      judge({"input": ENVELOPE}, MAIN))
+
+# ⚠️ **막는 쪽만 재면 「전부 막는 훅」도 통과한다.** 같은 모양들이 워크트리에서는 지나가야
+#    한다 — 넓힌 판정이 워크트리 작업을 막기 시작하면 그것이 다음 사고다.
+if WT:
+    WT_ENVELOPE = f"*** Begin Patch\n*** Update File: {WT}/PLAN.md\n+x\n*** End Patch"
+    check("배열 apply_patch 도 워크트리 → 통과",
+          not judge({"command": ["/bin/zsh", "-lc", WT_ENVELOPE]}, WT))
+    check("머리말 없는 패치도 워크트리 → 통과",
+          not judge({"command": f"*** Update File: {WT}/PLAN.md\n@@\n+x\n"}, WT))
+
+# ⚠️ 그리고 **패치가 아닌 것을 패치로 오인하지 않는가.** 넓힌 신호가 평범한 읽기 명령까지
+#    삼키면 메인에서 `git status` 조차 못 하게 된다 — 2026-08-14 에 실제로 겪은 모양이다.
+rc, out = run(G, {"tool_name": "shell", "tool_input": {"command": "git status --short"},
+                  "cwd": MAIN, "session_id": "T"}, MAIN)
+check("패치 신호를 넓혀도 평범한 읽기는 통과", "deny" not in out)
+
 # fail-open — 저장소 밖에서 불려도 조용히 통과해야 한다(훅이 남의 작업을 막으면 안 된다)
 rc, out = run(G, {"tool_name": "Edit", "tool_input": {"file_path": "/tmp/x.md"},
                   "cwd": "/tmp", "session_id": "T"}, "/tmp")
