@@ -5,7 +5,7 @@
 ```bash
 npm ci
 npm run typecheck          # tsc --noEmit
-npm test                   # renderers, protocol, gating, relay, publisher, PKI
+npm test                   # renderers, protocol, gating, relay, publisher, PKI, example, console
 npm run check:web          # Svelte template and component diagnostics — outside the root tsconfig
 npm run build:web          # the console the manager serves. Type-checking it does not build it
 npm run icons:check        # every icon name still exists in lucide-static
@@ -22,6 +22,11 @@ Two suites need more than a checkout:
 
 There is no build step. Node 22 strips types and runs `.ts` directly, which is why the runtime
 version is part of the contract rather than an implementation detail.
+
+`npm test` is one command over three workspaces: the root `node --test` run (`src/`, `examples/`
+and, where it exists, `policy/`), then `@heliopause/manager`, then `@heliopause/web`. Measured
+2026-08-23 on a public checkout: **1,714** tests. An operational checkout that symlinks a private
+`policy/` reports **1,801** — see "The repository split" below for why the difference is silent.
 
 ## What this project is careful about
 
@@ -92,6 +97,10 @@ Where a defect was measured, include the measurement. Conventional-commit prefix
 ## Before opening a pull request
 
 - `npm run typecheck && npm test && python3 agent/test_validate.py && python3 agent/test_enroll.py`
+- If the change touches the console: `npm run check:web && npm run build:web && npm run icons:check`.
+  CI gates all three, and each catches something the others cannot — a passing library typecheck
+  hides a broken Svelte template, a passing `check:web` hides a broken adapter, and a renamed
+  Lucide icon renders as an empty box rather than an error.
 - New tests verified to fail against the defect they cover
 - No site-specific data in tracked files
 - Comments say why
@@ -137,6 +146,15 @@ and asserts the properties the README claims — only its own table is touched,
 `ct state established,related` comes first, the management path survives a dropping input hook, a
 narrow rule keeps its source match. It is the file to copy when starting a real policy, and the
 first thing to change in it is every address.
+
+It also exports `site` (an alias of the descriptively named `exampleSite`), because both CLIs load
+a site module by that exact name and throw on anything else. Without the alias the file that exists
+to be runnable could only be run from a test:
+
+```bash
+node bin/heliopause-publish.ts examples/site.ts ./artifacts --dry-run --allow-dirty
+node bin/heliopause-ui.ts examples/site.ts
+```
 
 It is under `examples/` rather than `policy/` for a measured reason recorded in `.gitignore`: a
 tracked file under `policy/` makes `git checkout` replace the `policy` symlink with a real

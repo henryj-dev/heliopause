@@ -1,7 +1,7 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import { renderHostRuleset } from "../src/nft.ts";
-import { exampleConfig, exampleHosts, exampleSite } from "./site.ts";
+import { exampleConfig, exampleHosts, exampleSite, site } from "./site.ts";
 
 /**
  * The example is only worth shipping if it renders, so this renders it.
@@ -127,5 +127,14 @@ describe("the example stays an example", () => {
   test("the exported site is the shape a publisher takes", () => {
     assert.equal(exampleSite.cfg, exampleConfig);
     assert.deepEqual(exampleSite.hosts, exampleHosts);
+  });
+
+  test("it is exported under the name the CLIs actually load", () => {
+    // `heliopause-publish` and `heliopause-ui` both read `mod.site` and throw
+    // "does not export `site`" on anything else. Measured: with only `exampleSite` exported, both
+    // refused this file — the worked example could be run from a test and from nowhere an operator
+    // would stand. Asserting the alias here means renaming it away fails a test rather than
+    // quietly making the README's quick start wrong.
+    assert.equal(site, exampleSite);
   });
 });

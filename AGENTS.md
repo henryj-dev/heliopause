@@ -55,7 +55,8 @@
 **`policy/` 가 없으면 `npm test` 는 깨지지 않는다 — 조용히 좁아진다.** 여기에는 오래
 「깨진다」라고 적혀 있었다. 실측하면 아니다: `node --test` 는 아무것도 맞지 않는 글롭을 그냥
 넘긴다. node 22(CI 가 고정한 버전)에서 `policy/` 없는 깨끗한 체크아웃이 통과했고, node 26 에서도
-같다. 달라지는 것은 **수**다 — 이 트리에서 1,583, `policy/` 없이 1,496. 87개가 말없이 사라진다.
+같다. 달라지는 것은 **수**다 — 이 트리에서 1,609, `policy/` 없이 1,522(2026-08-23 실측, 루트
+`node --test` 기준). 87개가 말없이 사라진다.
 
 그래서 위험은 반대 방향이다. 심링크를 안 건 워크트리에서 초록불을 보고 「정책까지 통과했다」고
 읽게 된다. 정책을 건드렸다면 그 87개가 실제로 돌았는지 수를 보고 확인할 것.
@@ -68,7 +69,10 @@
 ## 검사
 
 ```bash
-npm test                                                  # node --test (src + policy)
+npm test                                                  # node --test (src + examples + policy)
+                                                          #   + @heliopause/manager + @heliopause/web
+python3 agent/test_validate.py                            # 에이전트 검증기·롤백 상태기계
+python3 agent/test_enroll.py                              # 호스트 생성 키 · 지속 CSR 등록
 npm run typecheck
 npm run check:web                                         # Svelte 진단 (루트 tsconfig 밖)
 npm run build:web                                         # 타입 통과와 빌드 성공은 다른 것이다

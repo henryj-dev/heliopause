@@ -167,3 +167,16 @@ export const exampleSite = {
   cfg: exampleConfig,
   hosts: exampleHosts,
 };
+
+/**
+ * The name the CLIs actually look for.
+ *
+ * `heliopause-publish` and `heliopause-ui` both do `mod.site` and throw
+ * `does not export \`site\`` on anything else — so without this alias the file that exists to be
+ * "the one a public clone can actually run" could not be run by either of them. Measured: it threw.
+ *
+ * `exampleSite` stays because the test names it, and because a reader copying this file wants the
+ * descriptive name in front of them. Two names for one object is cheap; a worked example that only
+ * works from a test is not.
+ */
+export const site = exampleSite;

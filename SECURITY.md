@@ -130,9 +130,11 @@ its readers that a disclosure remediation is still outstanding when it is not.
 
 Measured 2026-08-23:
 
-- Reachable history is 33 commits beginning at this repository's initial import. That is the shape
-  route 1 below produces — a fresh repository from a scanned tree — rather than a rewrite of an
-  older one. Recorded here as the observed state; this file did not perform it.
+- Reachable history begins at this repository's initial import — 37 commits when this was last
+  measured, and the count grows with ordinary work. The load-bearing half is the *beginning*, not
+  the number: that is the shape route 1 below produces — a fresh repository from a scanned tree —
+  rather than a rewrite of an older one. Recorded here as the observed state; this file did not
+  perform it.
 - `scripts/scan-public-history.mjs --all --require-hostname-pattern` **passes** over all of it. Run
   through the `trusted site-data leak gate` workflow, because that is the only place the hostname
   pattern exists. The address, key-material and credential classes also pass when the scanner is

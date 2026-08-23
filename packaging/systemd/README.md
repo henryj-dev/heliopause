@@ -89,10 +89,23 @@ selector 집행 확인에 필요한 Pod get/list뿐이다. 전용 kubeconfig는 
 Cilium Pod 안에서 명령을 실행할 권한은 CNP CRUD보다 훨씬 크다. 별도 보안 검토로 해당 권한을
 명시적으로 부여한 배포만 `HELIOPAUSE_CILIUM_EXPOSURE=1`을 설정한다.
 
-새 호스트는 개인키를 중앙으로 복사하는 대신 등록 타이머를 먼저 실행할 수 있다. Dispatcher가
-발급한 일회성 `stnode_…` 토큰을 `/etc/heliopause/enroll-token`에 `0600 root:root`로 놓고,
-`agent.env`의 enrollment 항목을 채운다. 스크립트는 P-256 키와 CSR을 한 번만 만들며 승인
-대기 중에는 같은 요청 ID만 조회한다.
+새 호스트는 개인키를 중앙으로 복사하는 대신 등록 타이머를 먼저 실행할 수 있다. 일회성
+`stnode_…` 토큰을 `/etc/heliopause/enroll-token`에 `0600 root:root`로 놓고, `agent.env`의
+enrollment 항목을 채운다. 스크립트는 P-256 키와 CSR을 한 번만 만들며 승인 대기 중에는 같은
+요청 ID만 조회한다.
+
+**토큰 발급에 외부 시스템은 필요 없다.** 매니저에 `HELIOPAUSE_ENROLLMENT_STORE` 를 걸면 등록
+저장소가 곧 발급처다 — Dispatcher·데이터베이스·IdP 중 무엇도 전제하지 않는다. 예전 판에는
+"Dispatcher가 발급한" 이라고 적혀 있었고 그것은 지금 틀린 문장이다.
+
+```bash
+node bin/heliopause-enrollment.ts init ./enrollment.json          # 배포당 딱 한 번
+node bin/heliopause-enrollment.ts token-create ./enrollment.json host-01.example --actor=ops-alice
+```
+
+`init` 은 기존 파일을 덮어쓰지 않고, 매니저와 모든 쓰기 명령은 없거나 깨진 저장소를 거부한다 —
+지워진 폐기 원장을 무해한 첫 기동으로 넘겨짚지 않는다. 인증서 폐기가 한 번이라도 들어간 뒤에는
+`init` 을 다시 돌리지 말고 백업에서 복원할 것.
 
 ```bash
 install -m 644 agent/heliopause-enroll.py /opt/heliopause/agent/
@@ -100,9 +113,22 @@ install -m 644 packaging/systemd/heliopause-enroll.{service,timer} /etc/systemd/
 systemctl daemon-reload && systemctl enable --now heliopause-enroll.timer
 ```
 
-CSR은 dashboard의 **Infra → Certificates**에서 DER SHA-256 지문을 대조해 승인하고, 오프라인
-서명기로 발급한 인증서를 업로드한다. 설치 완료 뒤에는 상태 파일을 `completed`로 기록하여
-타이머가 Dispatcher를 다시 호출하지 않는다. 그 뒤 토큰 파일을 제거하고 agent를 시작한다.
+CSR은 매니저 콘솔의 **등록**(`/app/enrollment`, 상태별로 `pending`·`conflict`·`rejected`·
+`signed`) 화면에서 DER SHA-256 지문을 **별도 채널로** 대조해 승인하고, 오프라인 서명기로 발급한
+인증서를 업로드한다. 콘솔 없이 같은 일을 하는 CLI 는 아래와 같다.
+
+```bash
+node bin/heliopause-enrollment.ts csr-list https://manager.example:8444 --pki=./pki
+node bin/heliopause-pki.ts sign-csr ./offline-ca ./host.csr ./host.pem \
+  --name=host-01.example --expect-sha256=<위에서 대조한 지문>
+node bin/heliopause-enrollment.ts cert-upload https://manager.example:8444 REQUEST_ID \
+  --cert=./host.pem --ca-name=site --pki=./pki
+```
+
+`--expect-sha256` 은 선택이 아니다 — 지문 없이 서명하면 대조 단계가 통째로 사라진다.
+
+설치 완료 뒤에는 상태 파일을 `completed`로 기록하여 타이머가 등록 엔드포인트를 다시 호출하지
+않는다. 그 뒤 토큰 파일을 제거하고 agent를 시작한다.
 
 중계자 — gw만:
 
