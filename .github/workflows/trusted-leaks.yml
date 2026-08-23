@@ -3,7 +3,13 @@
 # Actions, hooks, package scripts, or configuration.
 name: trusted site-data leak gate
 
-on:
+# `zizmor: ignore[dangerous-triggers]` — `pull_request_target` is flagged because it is almost always
+# used to run candidate code with a repository token. That is precisely what the block comment above
+# forbids and what the `sparse-checkout` of a path that matches nothing enforces: the candidate is
+# fetched as inert Git objects and the only code executed is the scanner checked out from the
+# protected default branch. This trigger is the whole point of the file, so the suppression is a
+# statement about this workflow, not a silenced rule.
+on: # zizmor: ignore[dangerous-triggers]
   pull_request_target:
     types: [opened, synchronize, reopened]
   schedule:
@@ -33,6 +39,9 @@ jobs:
     # run on ephemeral VMs and the question does not arise; this job reads Git objects and runs
     # Node, and never needed a particular machine.
     runs-on: ubuntu-latest
+    # This is the required merge gate, so a hang here is not merely a bill — it is a pull request
+    # that can never go green. A bounded failure is reviewable; an indefinite pending one is not.
+    timeout-minutes: 20
     steps:
       - name: checkout trusted scanner from the protected default branch
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -95,6 +104,10 @@ jobs:
         working-directory: .candidate
         run: |
           set -euo pipefail
+          # shellcheck disable=SC2012  # `find` over `ls` is about filenames containing newlines.
+          # Here that miscount can only go one way — a newline splits one entry into two, raising
+          # the count — and this test fails on any count above zero. A hostile filename makes the
+          # gate stricter, never laxer, which is the direction this check has to be wrong in.
           entries="$(ls -A . | { grep -vx '.git' || true; } | wc -l | tr -d ' ')"
           test "$entries" = "0" \
             || { echo "checkout materialised $entries candidate entr(y|ies) into the workspace"; exit 1; }
