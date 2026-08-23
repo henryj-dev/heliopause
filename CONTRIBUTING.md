@@ -126,10 +126,21 @@ parses cookies — never runs, and there is no path to the vulnerable code. Ther
 until upstream bumps it; `npm audit fix --force` "resolves" it by breaking Kit. Recorded here so
 the next person does not spend the afternoon re-deriving it.
 
-What none of this covers: the policy suite. `policy/` is untracked (see the split above), and
+What none of this covers: the site policy suite. `policy/` is untracked (see the split above), and
 `node --test` passes a glob that matches nothing rather than failing on it — so a public checkout
 runs a smaller suite and says so nowhere. If a change touches rendering, expect the site-side tests
 to run somewhere this repository cannot see.
+
+`examples/site.ts` is what a public checkout *does* have: a complete site module, two hosts, a
+staged rollout, every address an RFC 5737 documentation range. `examples/site.test.ts` renders it
+and asserts the properties the README claims — only its own table is touched,
+`ct state established,related` comes first, the management path survives a dropping input hook, a
+narrow rule keeps its source match. It is the file to copy when starting a real policy, and the
+first thing to change in it is every address.
+
+It is under `examples/` rather than `policy/` for a measured reason recorded in `.gitignore`: a
+tracked file under `policy/` makes `git checkout` replace the `policy` symlink with a real
+directory, silently, and take the site policy out of the working tree with it.
 
 ## Reporting a vulnerability
 

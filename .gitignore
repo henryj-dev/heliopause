@@ -108,11 +108,19 @@ snapshots/
 # HEAD and names the exact policy that produced the rules. Keep the two histories apart: this one is
 # published, that one is not.
 #
-# ## Two things this comment used to promise and did not have
+# ## The worked example lives in `examples/`, and it cannot live here
 #
-# It said `policy/example.ts` was "the tracked stand-in that shows the shape without describing
-# anywhere real." **There is no such file** — nothing under `policy/` is tracked, so a public clone
-# gets an empty directory and no worked example. Worth writing; not written.
+# This comment used to promise `policy/example.ts` — "the tracked stand-in that shows the shape
+# without describing anywhere real" — and there was no such file. The example now exists, as
+# `examples/site.ts` plus `examples/site.test.ts`, and `npm test` runs it.
+#
+# 🔴 **It is not under `policy/`, and that is not a preference.** Operational checkouts symlink
+# `policy` at the private policy repository, and git will not leave a symlink standing where it has
+# to materialise a tracked path. Measured 2026-08-23: with `policy` a symlink and
+# `policy/example.ts` tracked, `git checkout -- policy/example.ts` **replaces the symlink with a
+# real directory and exits 0** — no warning, no error. In a live checkout that silently detaches
+# 7 MB of real policy, and the first symptom is `npm test` reporting a smaller number while still
+# printing green. An ordinary `git pull` would have been enough to do it.
 #
 # It also said to point `policyStore` in your config at a private repository. **`policyStore` has no
 # consumer** — the type is declared in `src/config.ts` and read by nothing, and `heliopause-publish`
