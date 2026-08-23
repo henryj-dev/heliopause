@@ -17,6 +17,7 @@ import { closeSync, constants, fstatSync, openSync, readFileSync } from "node:fs
 import { createPrivateKey, createPublicKey } from "node:crypto";
 import { artifactSigningKeyId, privateKeyFileModeError, privateKeyFileOwnerError } from "../src/artifact-signature.ts";
 import { fetchCert } from "../src/cert-api.ts";
+import { EnvSpecError, parsePairs, parseRelays } from "../src/env-spec.ts";
 import { startManager } from "../src/manager-server.ts";
 import type { RelaySource } from "../src/manager.ts";
 import { resolveWebRoot, serveConsole } from "../src/web-console.ts";
@@ -37,92 +38,40 @@ const env = (name: string, fallback?: string): string => {
 };
 
 /**
- * `dev=https://10.0.0.1:8443=./pki,prod=https://10.0.1.1:8443=./pki-prod`
- *
- * Three fields because each VPC has its own CA (V39): the manager presents a different operator
- * certificate to each relay and verifies each against that VPC's own anchor. One shared PKI would
- * reach exactly one VPC and report the others as unreachable — measured while wiring this up.
- *
- * Named rather than positional so a site view can say which VPC is unreachable. "relay 2 is down" is
- * not something an operator can act on at three in the morning.
+ * Both environment specs are parsed in `src/env-spec.ts` — they were here, where nothing could
+ * import them and so nothing could test them, and the `parsePairs` disclosure fix shipped without a
+ * regression test for exactly that reason. They throw `EnvSpecError`; turning one into a message
+ * and an exit is this file's job, below.
  */
-function parseRelays(spec: string): RelaySource[] {
-  const out: RelaySource[] = [];
-  for (const entry of spec.split(",").map((s) => s.trim()).filter(Boolean)) {
-    const parts = entry.split("=");
-    if (parts.length !== 3 || parts.some((p) => !p)) {
-      console.error(
-        `[manager] malformed relay entry ${JSON.stringify(entry)} — expected name=url=pkiDir`,
-      );
-      process.exit(2);
-    }
-    const [name, url, pkiDir] = parts as [string, string, string];
-    if (!url.startsWith("https://")) {
-      // Refused rather than upgraded. The site view names every host in the fleet, and it travels
-      // over this connection.
-      console.error(`[manager] relay ${name} must be https — got ${JSON.stringify(url)}`);
-      process.exit(2);
-    }
-    out.push({ name, url, pkiDir });
-  }
-  if (out.length === 0) {
-    console.error("[manager] HELIOPAUSE_RELAYS is empty — there is nothing to aggregate");
+const refuse = (error: unknown): never => {
+  if (error instanceof EnvSpecError) {
+    console.error(`[manager] ${error.message}`);
     process.exit(2);
   }
-  return out;
-}
+  throw error;
+};
 
-/**
- * `a=1,b=2` into a map, refusing anything malformed.
- *
- * Refusing rather than skipping. A dropped mapping here presents as "my approvals are refused and I
- * do not know why", with the operator looking at a configuration line that appears correct — the
- * same failure mode `parseAliases` exists to avoid, and worth avoiding the same way.
- */
 /** A comma-separated environment list, trimmed and without empties. */
 const list = (name: string): string[] =>
   (process.env[name] ?? "").split(",").map((x) => x.trim()).filter(Boolean);
 
-function parsePairs(spec: string, name: string): Map<string, string> {
-  const out = new Map<string, string>();
-  let ordinal = 0;
-  for (const entry of spec.split(",").map((s) => s.trim()).filter(Boolean)) {
-    ordinal += 1;
-    const eq = entry.indexOf("=");
-    // 🔴 **No part of a malformed entry reaches the log — position only.** One caller is
-    // `HELIOPAUSE_OTP_USERS`, whose values are shared OTP secrets, and these two branches fire on
-    // exactly the inputs where the entry is not the shape we can reason about. A secret containing
-    // a comma splits into a fragment with no `=`; printing "malformed entry <fragment>" writes that
-    // secret to stderr and into journald. A misconfiguration must not be the thing that publishes
-    // the secret.
-    //
-    // A first draft named the key in the second branch, on the argument that a key half is not a
-    // secret. It is not safe, and the reason is the same sentence as above: **an entry we are
-    // refusing is one whose halves we cannot vouch for.** A transposed `<secret>=` has the secret
-    // sitting in the key position, and that is precisely a case this branch catches.
-    //
-    // The ordinal is enough to act on: the operator has the variable in front of them and can count
-    // commas. The two messages stay distinct so they still say *what* is wrong.
-    if (eq <= 0) {
-      console.error(`[manager] ${name}: entry ${ordinal} is malformed — expected <key>=<value>`);
-      process.exit(2);
-    }
-    if (eq === entry.length - 1) {
-      console.error(`[manager] ${name}: entry ${ordinal} has an empty value — expected <key>=<value>`);
-      process.exit(2);
-    }
-    const k = entry.slice(0, eq).trim();
-    const v = entry.slice(eq + 1).trim();
-    if (out.has(k)) {
-      console.error(`[manager] ${name}: ${JSON.stringify(k)} is declared twice`);
-      process.exit(2);
-    }
-    out.set(k, v);
+const relaysFrom = (spec: string): RelaySource[] => {
+  try {
+    return parseRelays(spec);
+  } catch (error) {
+    return refuse(error);
   }
-  return out;
-}
+};
 
-const relays = parseRelays(env("HELIOPAUSE_RELAYS")).map((r) => ({
+const pairs = (spec: string, name: string): Map<string, string> => {
+  try {
+    return parsePairs(spec, name);
+  } catch (error) {
+    return refuse(error);
+  }
+};
+
+const relays = relaysFrom(env("HELIOPAUSE_RELAYS")).map((r) => ({
   ...r,
   // One name for every VPC. The manager has one identity conceptually — `hp-manager` — even though
   // the certificate proving it is different per VPC, because the CAs are separate.
@@ -286,7 +235,7 @@ const { server } = await startManager({
     ? {
         enrollment: {
           storeFile: env("HELIOPAUSE_ENROLLMENT_STORE"),
-          trustedCaFiles: parsePairs(process.env.HELIOPAUSE_ENROLLMENT_TRUSTED_CAS ?? "", "HELIOPAUSE_ENROLLMENT_TRUSTED_CAS"),
+          trustedCaFiles: pairs(process.env.HELIOPAUSE_ENROLLMENT_TRUSTED_CAS ?? "", "HELIOPAUSE_ENROLLMENT_TRUSTED_CAS"),
         },
       }
     : {}),
@@ -338,7 +287,7 @@ const { server } = await startManager({
         otp: {
           issuerUrl: env("HELIOPAUSE_OTP_ISSUER_URL"),
           serviceToken: readFileSync(env("HELIOPAUSE_OTP_SERVICE_TOKEN_FILE"), "utf8").trim(),
-          users: parsePairs(process.env.HELIOPAUSE_OTP_USERS ?? "", "HELIOPAUSE_OTP_USERS"),
+          users: pairs(process.env.HELIOPAUSE_OTP_USERS ?? "", "HELIOPAUSE_OTP_USERS"),
         },
       }
     : {}),
@@ -366,7 +315,7 @@ const { server } = await startManager({
           operatorGroups: list("HELIOPAUSE_OIDC_OPERATOR_ROLES"),
           writerGroups: list("HELIOPAUSE_OIDC_WRITER_ROLES"),
           soloApprovalRoles: list("HELIOPAUSE_OIDC_SOLO_ROLES"),
-          aliases: parsePairs(process.env.HELIOPAUSE_OIDC_ALIASES ?? "", "HELIOPAUSE_OIDC_ALIASES"),
+          aliases: pairs(process.env.HELIOPAUSE_OIDC_ALIASES ?? "", "HELIOPAUSE_OIDC_ALIASES"),
           ...(process.env.HELIOPAUSE_OIDC_SESSION_TTL_SEC
             ? { sessionTtlSec: Number(process.env.HELIOPAUSE_OIDC_SESSION_TTL_SEC) }
             : {}),
