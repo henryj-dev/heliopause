@@ -88,3 +88,18 @@ updates:
 # property (`agent/` installs nothing, which is why a host needs no package index reachable), not an
 # omission waiting to be fixed. If a requirements file ever appears, that property is gone and this
 # file is the second thing to change.
+
+# ── What this file does NOT control: security updates ──────────────────────────
+#
+# Everything above is *version* updates — the scheduled sweep for newer releases. Dependabot's other
+# half, the one that opens a pull request the day an advisory lands, is a repository setting
+# ("Dependabot security updates"), and no line here turns it on or off. It was **off** while this
+# file existed and looked complete, which is the failure mode worth naming: the schedules above make
+# the repository look covered, and a monthly sweep is the wrong response time for a published
+# advisory. Turned on 2026-08-23; `gh api repos/<owner>/<repo>/automated-security-fixes` says which
+# it is now.
+#
+# A security update ignores the groups above and arrives alone, immediately. It does respect
+# `ignore` — so the `@types/node` major rule is a standing decision that an advisory cannot
+# override, which is correct for a package that is really a platform declaration, and is the kind
+# of thing to re-read if a Node types advisory ever appears.
