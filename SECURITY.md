@@ -101,7 +101,8 @@ material, general credentials, and an out-of-tree private-hostname pattern. Conf
 Actions secret `HELIOPAUSE_SITE_HOSTNAME_PATTERN` with an escaped alternation covering every private
 site domain; the values must not be committed to this repository.
 
-Require the **`trusted site-data leak gate`** check in repository rules. Its
+Require the **`trusted site-data leak gate`** check in repository rules — it is required here, and
+the paragraph stays in the imperative because a fork inherits the workflow and not the setting. Its
 `pull_request_target` workflow is loaded from the protected default branch, fetches the candidate
 only as inert Git objects, and executes only the scanner from that protected default branch. It grants only
 `contents: read`, persists no checkout credential, and never runs a candidate Action, script, hook,
@@ -117,11 +118,41 @@ manually-scanned bootstrap change (preferably by themselves), then configure
 `HELIOPAUSE_SITE_HOSTNAME_PATTERN` and make `trusted site-data leak gate` required **before** accepting
 later feature changes. For the bootstrap itself, run the trusted local scanner against every
 introduced commit and inspect the workflow diff; do not treat the candidate-controlled ordinary CI
-job as approval. The scheduled trusted job scans `--all`, so it is expected to stay red until the
-old reachable history described below has been sanitized.
+job as approval.
 
-That prevention does not sanitize the already distributed history. Before making the repository
-public or adding a new mirror, coordinate one of these destructive, repository-wide operations:
+### The sanitization: done, and what it does not undo
+
+**This section is a record, not a task.** It used to read as pending work — it said the scheduled
+`--all` job "is expected to stay red until the old reachable history has been sanitized", and told
+the reader to coordinate a destructive rewrite "before making the repository public". Both are now
+false, and leaving them standing is worse than saying nothing: a public repository should not tell
+its readers that a disclosure remediation is still outstanding when it is not.
+
+Measured 2026-08-23:
+
+- Reachable history is 33 commits beginning at this repository's initial import. That is the shape
+  route 1 below produces — a fresh repository from a scanned tree — rather than a rewrite of an
+  older one. Recorded here as the observed state; this file did not perform it.
+- `scripts/scan-public-history.mjs --all --require-hostname-pattern` **passes** over all of it. Run
+  through the `trusted site-data leak gate` workflow, because that is the only place the hostname
+  pattern exists. The address, key-material and credential classes also pass when the scanner is
+  run locally without the pattern.
+- `gitleaks` examines every commit on every push (`ci.yml`, the `leaks` job, full-depth checkout)
+  and passes.
+- `HELIOPAUSE_SITE_HOSTNAME_PATTERN` is configured, and `trusted site-data leak gate` is a required
+  check.
+
+**What none of that undoes.** Site-specific deployment documents and policy inventory were pushed to
+a reachable remote before those directories became untracked. Treat that inventory as disclosed to
+everyone who could read or mirror the former remote: a fresh repository does not recall clones,
+forks, caches, or backups, and neither would a rewrite. The addresses in it are addresses of real
+hosts, and that is a fact about the past which no future scan changes. It is the reason `docs/` and
+`policy/` are untracked rather than sanitized — see the split in CONTRIBUTING.
+
+### If a mirror is ever created, or this is ever re-bootstrapped
+
+The same two routes apply, in the same order, and both require repository-owner coordination —
+they are intentionally not something an ordinary remediation branch performs:
 
 1. Create a fresh repository from a scanned clean tree, preserving no old objects; or
 2. use `git filter-repo` to remove the affected paths and blobs from every branch and tag, delete
@@ -130,9 +161,6 @@ public or adding a new mirror, coordinate one of these destructive, repository-w
 
 After either route, run `node scripts/scan-public-history.mjs --all --require-hostname-pattern` with
 the hostname pattern supplied only through the environment, and run a full-history credential scan.
-Treat the old inventory as disclosed to everyone who could read or mirror the former remote; history
-rewriting cannot recall clones, forks, caches, or backups. These steps require repository-owner
-coordination and intentionally are not performed by an ordinary remediation branch.
 
 ## Supported versions
 
