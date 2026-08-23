@@ -354,6 +354,24 @@ def target_cwd(tool, tool_input, cwd):
             if WORKTREE_DIR in raw.replace(os.sep, "/"):
                 return None                          # 우리 메인이 아니다
         return base
+    # 🔴 **경로가 여럿이면 「우리 메인인 것」이 이긴다 — 첫 번째가 아니라.**
+    #
+    #    예전에는 첫 번째로 존재하는 경로 하나로 대상 저장소를 정하고 끝냈다. 이 저장소에서
+    #    `docs/`·`policy/` 는 **다른 저장소로 걸린 심링크**라, 그것을 앞에 세운 다중 경로
+    #    편집은 「우리 메인이 아니다」 분기로 빠져 **뒤에 붙은 추적 파일이 그대로 실려
+    #    갔다.** 실측 재현:
+    #
+    #        {"tool_name":"Write","tool_input":{"files":["<repo>/docs/x.md",
+    #                                                    "<repo>/README.md"],"content":"x"}}
+    #        → 통과. 순서를 뒤집으면 거부.
+    #
+    #    `ignored_only` 는 이미 「하나라도 추적 대상이면 통째로 막는다」로 옳게 짜여 있었다.
+    #    문제는 그 함수가 **불리지도 않았다**는 것이다 — `main()` 이 그 전에 돌아섰다.
+    #    그러니 고칠 자리는 판정이 아니라 **대상을 고르는 여기**다.
+    #
+    #    우리 메인이 하나도 없으면 옛 동작 그대로 첫 번째 존재 경로를 준다. 넓어지는 것은
+    #    「우리 메인이 섞여 있는」 경우뿐이고, 그건 원래 막았어야 하는 경우다.
+    fallback = None
     for path in edit_paths(tool_input):          # 상대 경로는 그 호출의 cwd 기준이다
         p = path if os.path.isabs(path) else os.path.join(cwd, path)
         # 새 중첩 디렉터리에 Add File 하는 경우, 바로 위 부모는 아직 없다. 이때
@@ -365,9 +383,14 @@ def target_cwd(tool, tool_input, cwd):
             if parent == d:
                 break
             d = parent
-        if os.path.isdir(d):
+        if not os.path.isdir(d):
+            continue
+        if fallback is None:
+            fallback = d
+        mine, _ = is_main_tree(d)
+        if mine is True:
             return d
-    return cwd
+    return fallback if fallback is not None else cwd
 
 
 def relevant(tool, tool_input):
