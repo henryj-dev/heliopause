@@ -334,7 +334,15 @@ def target_cwd(tool, tool_input, cwd):
         return base
     for path in edit_paths(tool_input):          # 상대 경로는 그 호출의 cwd 기준이다
         p = path if os.path.isabs(path) else os.path.join(cwd, path)
+        # 새 중첩 디렉터리에 Add File 하는 경우, 바로 위 부모는 아직 없다. 이때
+        # 세션 cwd(대개 메인)로 떨어지면 워크트리 편집을 메인 편집으로 오인한다.
+        # 실제로 존재하는 가장 가까운 부모까지 올라가서 git 최상위를 판정한다.
         d = os.path.dirname(os.path.abspath(p))
+        while not os.path.isdir(d):
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
         if os.path.isdir(d):
             return d
     return cwd

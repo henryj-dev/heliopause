@@ -46,6 +46,14 @@ AGENT_ENV = (
     "CLAUDE_PROJECT_DIR",
     "CLAUDE_CODE",
     "CLAUDE_SESSION_ID",
+    # 2026-08-23 실측: 위 두 이름은 이 층이 노리는 하네스가 **실제로는 안 심는다.**
+    # Claude Code 의 Bash 툴 서브프로세스에서 `printenv` 로 재면 여덟 개가 전부
+    # 비어 있고, 대신 `CLAUDECODE=1` 과 `CLAUDE_CODE_SESSION_ID` 가 있다. 한 끗
+    # 차이라 목록이 맞는 것처럼 보였고, 그래서 git 층이 Claude 세션을 **사람으로
+    # 분류**하고 있었다 — PreToolUse 가 fail-open 하면 받쳐 줄 것이 없는 상태.
+    # 위 두 개는 남긴다: 다른 빌드가 심을 수 있고, 목록에 더 있어서 손해는 없다.
+    "CLAUDECODE",
+    "CLAUDE_CODE_SESSION_ID",
     "GROK_AGENT",
     "GROK_SESSION_ID",
     "CODEX_THREAD_ID",
