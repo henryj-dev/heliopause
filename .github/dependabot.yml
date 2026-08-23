@@ -50,11 +50,35 @@ updates:
       # CI, loudly and immediately; a console dependency ships to the page an operator opens when
       # the network is broken. Reviewing those in one diff means reviewing them at the lower
       # standard.
+      #
+      # **Majors are excluded from both groups** — they arrive as their own pull request. Measured
+      # on the first batch this config ever produced: `dev-tooling` came back holding
+      # `@types/node` 22→26, `typescript` 5→7 *and* a routine `lucide-static` 1.31→1.33 in one
+      # diff. Two of those are the kind of change that needs its own argument; the third is a
+      # rubber stamp. Grouped, the only ways to act were "take all three" or "take none", and the
+      # safe one throws away a fix for no reason. `update-types` is what keeps a major from
+      # hiding behind a patch.
       dev-tooling:
         dependency-type: development
         patterns: ["typescript", "@types/*", "lucide-static"]
+        update-types: [minor, patch]
       console:
         patterns: ["svelte*", "@sveltejs/*", "vite"]
+        update-types: [minor, patch]
+    ignore:
+      # `@types/node` is not a dependency in the ordinary sense — it is the declaration of which
+      # Node this code is written against, and that answer is fixed elsewhere: `node-version: "22"`
+      # in CI, and the type-stripping contract that makes the runtime version part of the API
+      # rather than an implementation detail (CONTRIBUTING).
+      #
+      # Taking the 26 types while shipping to 22 hosts is the repository's own stated failure mode
+      # turned on the toolchain: `tsc` would start accepting calls the target runtime does not have,
+      # and it would accept them *silently* — a green typecheck that certifies the wrong platform.
+      # So the majors are ignored here rather than reviewed each time. **When the Node floor moves,
+      # this line is what has to move with it**, together with `node-version` in `ci.yml` and the
+      # `^22` range in package.json.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
     open-pull-requests-limit: 5
     commit-message:
       prefix: chore(deps)
