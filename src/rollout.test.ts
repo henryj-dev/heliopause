@@ -292,7 +292,12 @@ describe("a host declared out of service", () => {
     // on the strength of the peers that did report.
     const m = withMaintenance("h-app-02", "vultr migrated it onto an unsupported CPU");
     const gate = computeGate(m, "gw-dev", { "h-canary": confirmed, "h-app-01": confirmed });
-    assert.equal(gate.open, true, gate.reason);
+    // `?? …` because `reason` is optional: the message is only ever printed when this assertion
+    // fails, which is when the gate is shut and therefore does carry one — but "the failure message
+    // may be undefined" is not a property worth leaving in a test whose whole value is saying why
+    // the gate did not open. Newer `@types/node` refuses it outright; that is the type catching a
+    // real, if small, hole rather than being pedantic.
+    assert.equal(gate.open, true, gate.reason ?? "the gate is shut and reported no reason");
   });
 
   it("does not excuse the other hosts in that stage, whichever order they are visited in", () => {
