@@ -5,11 +5,22 @@
 # `rollback` needs a real kernel because the thing under test is whether nftables actually reverts.
 # Collapsing them into one job would mean a machine without `nft` silently skipping the check that
 # matters most.
+#
+# Two jobs here are about the repository rather than the product, and they are not decoration.
+# `leaks` is the backstop half of the site-data scan (the authoritative half is `trusted-leaks.yml`),
+# and `guards` runs the hook suites that keep agent sessions off the shared working tree. Both guard
+# against failures whose symptom is silence, which is the only reason a check is worth CI minutes.
 name: ci
 
 on:
+  # `main` only, not `["**"]`. A branch here is either on its way to a pull request — where
+  # `pull_request` runs these same jobs against the merge result, which is the verdict that actually
+  # decides the merge — or an agent worktree branch that gets rebased and pushed straight to `main`,
+  # which this still covers. The wildcard bought a second full run of `e2e` and `rollback` for the
+  # first case and nothing for the second, and on a public repository those minutes are shared with
+  # every contributor's pull requests.
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
   # A firewall tool's dependencies are few but its assumptions about the host are many — a kernel or
   # nft change can break the rollback path without anything in this repository moving.
@@ -31,16 +42,23 @@ permissions:
 #
 # `github.event_name` is part of the key on purpose. Without it the `push` and `pull_request` runs
 # of the same branch land in one group and cancel each other — and a cancelled run is not a passing
-# check, so whichever event arrived first leaves a required check dead on the pull request. Keeping
-# them apart means the duplicate run stays (see the `on:` block); it does not mean a superseded one
-# does.
+# check, so whichever event arrived first leaves a required check dead on the pull request. Now that
+# `push` is narrowed to `main` the two cannot collide on a ref either, but the key stays: the reason
+# it was added is a property of the group, not of which branches happen to be listed above.
+#
+# **Superseding only makes sense for a pull request**, which is why `cancel-in-progress` is now
+# conditional rather than `true`. On a push to `main` there is no later run that republishes the
+# verdict for the cancelled commit — that commit *is* the branch, and killing its run leaves `main`
+# with no answer for a state that is already published. A pull request has the opposite property:
+# the next push re-runs every check against the new head, so the old run's answer is about code
+# nobody will merge.
 #
 # Cancelling `rollback` mid-flight is safe by construction: its ruleset lives in the container's own
 # network namespace, never the runner's, and `docker rm -f` in the EXIT trap runs on the SIGINT the
 # cancellation sends. A SIGKILL after the grace period leaves a stray container, not a locked host.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # ── Every job runs on a GitHub-hosted runner ─────────────────────────────────
 #
@@ -69,19 +87,42 @@ jobs:
   check:
     name: types, unit tests, agent tests
     runs-on: ubuntu-latest
+    # A hung job on a public repository does not fail — it bills. Without a ceiling the default is
+    # six hours, which is the difference between a bad commit costing minutes and costing a day of
+    # the account's shared budget.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # No job here pushes, so nothing needs the token left in `.git/config` afterwards. What it
+          # would buy an attacker is not theoretical: `npm ci` runs lifecycle scripts from the
+          # branch's own package.json, and on a fork's pull request that is candidate code running
+          # in a checkout that holds a credential.
+          persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           # Type stripping runs .ts directly, so the Node version is the toolchain. 22 is the floor
           # the code assumes; testing on it rather than on latest keeps that claim honest.
           node-version: "22"
+          # Keyed on package-lock.json, which is what `npm ci` reads. The workspaces have no lock of
+          # their own — the root one covers all seven — so one key is the whole dependency set.
+          cache: npm
       - run: npm ci
       - run: npm run typecheck
       # Svelte's template and component diagnostics are outside the root tsconfig.
       # Keep this as a named gate so a passing library typecheck cannot hide a
       # broken operator console.
       - run: npm run check:web
+      # `check:web` type-checks the console; it does not prove the console still *builds*. The
+      # manager and the workstation both serve this build's output, so a broken adapter or a bad
+      # import lands as a firewall console that will not come up — on the day the network is broken,
+      # which is the day it gets opened. Five seconds of CI, measured.
+      - run: npm run build:web
+      # The console renders icons from a generated source file, deliberately, so that a firewall
+      # console loads nothing from a CDN. Lucide renames icons between versions and a name that no
+      # longer exists renders as an **empty box**, not an error — the same silence this repository
+      # keeps getting caught by. `--check` is the only thing that turns it into a failure.
+      - run: npm run icons:check
       - run: npm test
       # Standard library only, so no install step. Pinned to the same interpreter the hosts run.
       - name: agent tests
@@ -90,11 +131,15 @@ jobs:
   e2e:
     name: mTLS round trip
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
+          cache: npm
       - run: npm ci
       # Identity binding depends on a real handshake presenting a real client certificate. The whole
       # security argument for staged rollout rests on it: if the relay cannot tell which agent is
@@ -106,10 +151,17 @@ jobs:
     # The strongest capability any job here holds: a container with `--pid=host` and NET_ADMIN. On
     # an ephemeral hosted VM that is a capability over a machine discarded when the job ends.
     runs-on: ubuntu-latest
+    # The rollback timer this exercises is measured in seconds, not minutes. If the job is still
+    # alive after fifteen, the thing under test did not happen and no longer will.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
+          # No `npm ci` and no cache: the relay and the agent import only `src/`, so this job needs
+          # the interpreter and nothing from the registry.
           node-version: "22"
       # The property under test is that a locking ruleset is actually reverted by the agent's timer.
       # A mock cannot fail the way a kernel does, and this is the check that stands between a bad
@@ -119,6 +171,7 @@ jobs:
   leaks:
     name: defense-in-depth leak scan
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -141,7 +194,15 @@ jobs:
 
       # This job intentionally receives no repository secret and is not the merge gate: a candidate
       # can alter a `pull_request` workflow. The default-branch `pull_request_target` workflow is the
-      # authoritative, out-of-tree scanner; this remains useful on pushes and schedules.
+      # authoritative, out-of-tree scanner; this is a detection backstop on pull requests and pushes.
+      #
+      # **Not on the schedule, whatever the `on:` block suggests.** A scheduled run has neither a
+      # pull request base nor `github.event.before`, so the scanner falls back to
+      # `merge-base(HEAD, origin/main)` — on `main` that is HEAD, the range is empty, and the step
+      # passes having read nothing. The whole-history sweep is `--all` in the scheduled
+      # `trusted-leaks.yml` job, which owns it because it is the one holding the hostname pattern.
+      # Copying `--all` here would only add a second permanently-red check: SECURITY.md records that
+      # the sweep stays red until the already-distributed history is rewritten.
 
       # General credential detection complements the site-inventory scanner above. A full checkout
       # makes this history-aware.
@@ -165,3 +226,47 @@ jobs:
           echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tgz" | sha256sum -c -
           tar xzf /tmp/gitleaks.tgz -C /tmp gitleaks
           /tmp/gitleaks git --no-banner --redact --exit-code 1 .
+
+  guards:
+    name: agent worktree guards
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # `test-session-end-cleanup.py` asks which worktree branches a session may delete, and
+          # "already merged" is a history question. A shallow checkout answers it wrongly rather
+          # than refusing to answer.
+          fetch-depth: 0
+          persist-credentials: false
+
+      # `git clone` writes `refs/remotes/origin/HEAD`; `actions/checkout` does not — it builds the
+      # repository with `init` + `fetch`, and nothing in that path sets a remote HEAD. The suites
+      # create their worktrees off `origin/HEAD`, so without this the whole file dies at the first
+      # fixture with `fatal: invalid reference: origin/HEAD` — measured against a checkout built the
+      # way the runner builds one. It fails loudly if the ref is missing, which is the point: a
+      # skipped guard suite and a passing one must not look alike.
+      - name: point origin/HEAD at the default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: git symbolic-ref refs/remotes/origin/HEAD "refs/remotes/origin/$DEFAULT_BRANCH"
+
+      # These hooks are what keeps several agent sessions from sharing one index and committing each
+      # other's half-finished work (AGENTS.md). They are tracked code with tests, and until now
+      # nothing ran those tests except a person remembering to — which is the worst shape for this
+      # particular thing: **a guard that has stopped denying looks exactly like a guard that works.**
+      # Every suite here pins the ALLOW side too, and mutates a copy of the hook to prove the check
+      # is not vacuous, so a green run means more than "nothing threw".
+      #
+      # Standard library only, no install step, ~20s for all seven. They build their own fixtures in
+      # temporary directories and restore the owner records they touch.
+      - name: hook suites
+        run: |
+          set -euo pipefail
+          python3 scripts/claude-hooks/test-main-tree-guard.py
+          python3 scripts/claude-hooks/test-enter-worktree.py
+          python3 scripts/claude-hooks/test-ignored-paths.py
+          python3 scripts/claude-hooks/test-session-start-pull.py
+          python3 scripts/claude-hooks/test-session-end-cleanup.py
+          python3 scripts/claude-hooks/test-codex-hooks.py
+          python3 scripts/git-hooks/test-pre-commit.py
