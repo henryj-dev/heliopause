@@ -1,7 +1,7 @@
 {
   "name": "heliopause",
   "version": "0.0.0",
-  "description": "A host firewall you can't lock yourself out of \u2014 declarative nftables with commit/confirm/auto-rollback",
+  "description": "A host firewall you can't lock yourself out of — declarative nftables with commit/confirm/auto-rollback",
   "type": "module",
   "license": "Apache-2.0",
   "author": "mack-erel",
@@ -58,7 +58,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "lucide-static": "^1.31.0",
+    "lucide-static": "^1.33.0",
     "typescript": "^5.6.0"
   }
 }
