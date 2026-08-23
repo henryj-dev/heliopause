@@ -85,10 +85,25 @@ const list = (name: string): string[] =>
 
 function parsePairs(spec: string, name: string): Map<string, string> {
   const out = new Map<string, string>();
+  let ordinal = 0;
   for (const entry of spec.split(",").map((s) => s.trim()).filter(Boolean)) {
+    ordinal += 1;
     const eq = entry.indexOf("=");
-    if (eq <= 0 || eq === entry.length - 1) {
-      console.error(`[manager] ${name}: malformed entry ${JSON.stringify(entry)} — expected <key>=<value>`);
+    // 🔴 **The entry itself never reaches the log.** One caller is `HELIOPAUSE_OTP_USERS`, whose
+    // values are shared OTP secrets, and this branch fires on exactly the inputs where we cannot
+    // tell which half we are holding — a secret containing a comma splits into a fragment with no
+    // `=`, and printing the "malformed entry" then writes that fragment to stderr and into
+    // journald. A misconfiguration must not be the thing that publishes the secret.
+    //
+    // The ordinal is enough to fix it: the operator has the variable in front of them and can count
+    // commas. Where the key is known to be a key — there is an `=`, the value is just empty — say
+    // it, because "which one" is the whole question and the key half is not the secret.
+    if (eq <= 0) {
+      console.error(`[manager] ${name}: entry ${ordinal} is malformed — expected <key>=<value>`);
+      process.exit(2);
+    }
+    if (eq === entry.length - 1) {
+      console.error(`[manager] ${name}: entry ${ordinal} (${JSON.stringify(entry.slice(0, eq).trim())}) has an empty value — expected <key>=<value>`);
       process.exit(2);
     }
     const k = entry.slice(0, eq).trim();
