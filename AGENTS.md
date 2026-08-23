@@ -70,6 +70,8 @@
 ```bash
 npm test                                                  # node --test (src + policy)
 npm run typecheck
+npm run check:web                                         # Svelte 진단 (루트 tsconfig 밖)
+npm run build:web                                         # 타입 통과와 빌드 성공은 다른 것이다
 npm run icons:check                                       # 아이콘 20종이 lucide-static 에 실재하는가
 python3 scripts/claude-hooks/test-main-tree-guard.py      # 실패 0
 python3 scripts/claude-hooks/test-enter-worktree.py       # 실패 0 (도구 중립 생성·소유권)
@@ -79,3 +81,11 @@ python3 scripts/claude-hooks/test-session-end-cleanup.py  # 실패 0
 python3 scripts/claude-hooks/test-codex-hooks.py          # 실패 0
 python3 scripts/git-hooks/test-pre-commit.py              # 실패 0 (사람 통과 · 에이전트 거부)
 ```
+
+이 목록은 이제 CI(`.github/workflows/ci.yml` 의 `check` · `agent worktree guards`)에서도 돈다.
+손으로 돌리는 것을 대신하지는 않는다 — 워크트리에서 훅을 고친 뒤 CI 가 알려주기를 기다리면
+그 사이 세션이 이미 깨진 가드를 쓴다. CI 는 **아무도 안 돌린 날**을 위한 것이다.
+
+⚠️ 훅 검사 7종은 `refs/remotes/origin/HEAD` 를 필요로 한다. `git clone` 은 그것을 쓰지만
+`actions/checkout` 은 안 쓴다 — 그래서 CI 쪽 job 이 먼저 `git symbolic-ref` 로 세운다.
+없으면 `fatal: invalid reference: origin/HEAD` 로 첫 픽스처에서 통째로 죽는다.

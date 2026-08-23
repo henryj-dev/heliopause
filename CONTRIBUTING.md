@@ -6,6 +6,9 @@
 npm ci
 npm run typecheck          # tsc --noEmit
 npm test                   # renderers, protocol, gating, relay, publisher, PKI
+npm run check:web          # Svelte template and component diagnostics — outside the root tsconfig
+npm run build:web          # the console the manager serves. Type-checking it does not build it
+npm run icons:check        # every icon name still exists in lucide-static
 python3 agent/test_validate.py    # the agent's validator and rollback state machine
 python3 agent/test_enroll.py      # host-generated key, durable CSR enrollment
 ```
@@ -92,6 +95,30 @@ Where a defect was measured, include the measurement. Conventional-commit prefix
 - New tests verified to fail against the defect they cover
 - No site-specific data in tracked files
 - Comments say why
+
+## What CI runs, and what it cannot tell you
+
+`ci.yml` runs everything above plus `e2e-roundtrip.sh` and `rollback-test.sh` — the two suites that
+need more than a checkout — on every pull request, including one from a fork. Every job is on an
+ephemeral GitHub-hosted VM, so there is no machine of ours a candidate's code could reach and
+nothing to skip for an outside contribution.
+
+Two more things run there and are worth knowing about before a red check surprises you:
+
+- **`trusted site-data leak gate`** is the required one. It scans every commit a pull request
+  introduces — including blobs added and later deleted — for addresses, key material and
+  credentials. It is loaded from the default branch and never executes anything from the branch
+  under review, so changing it in your pull request changes nothing about how you are scanned.
+- **`workflow audit`** lints `.github/workflows` with actionlint and zizmor. A pull request that
+  touches CI is the only one this normally has anything to say about.
+
+CodeQL runs alongside and does **not** gate a merge; its findings land in the Security tab and as
+annotations on the diff.
+
+What none of this covers: the policy suite. `policy/` is untracked (see the split above), and
+`node --test` passes a glob that matches nothing rather than failing on it — so a public checkout
+runs a smaller suite and says so nowhere. If a change touches rendering, expect the site-side tests
+to run somewhere this repository cannot see.
 
 ## Reporting a vulnerability
 
