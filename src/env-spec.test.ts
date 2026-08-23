@@ -11,8 +11,19 @@ import { parsePairs, parseRelays, EnvSpecError } from "./env-spec.ts";
  * entry — and fails there. That is what makes them tests rather than decoration.
  */
 
-/** A value shaped like a real TOTP secret, so a leak is unmistakable in the assertion output. */
-const SECRET = "JBSWY3DPEHPK3PXPTOTPSECRET";
+/**
+ * The stand-in for a secret value. Shaped like one — long, opaque, no `=` — because that shape is
+ * what the code under test has to handle, but **it says what it is in the value itself.**
+ *
+ * The first version of this used the canonical base32 TOTP example string. `gitleaks`, which scans
+ * every commit on every push, flagged it as a `generic-api-key` and turned CI red — correctly, on
+ * the information it had: a long opaque literal assigned to something called `SECRET` is exactly
+ * what it is looking for, and it cannot know a value is fictional. The lesson is the same one this
+ * repository already applies to addresses (RFC 5737 ranges) and hostnames (RFC 2606): **a fixture
+ * standing in for sensitive data should be self-evidently fake**, so that neither a scanner nor a
+ * reader has to decide.
+ */
+const FAKE_OTP_VALUE = "example-otp-value-not-a-real-secret-000000";
 
 const refusal = (fn: () => unknown): string => {
   try {
@@ -28,22 +39,22 @@ describe("parsePairs refuses without quoting what it refused", () => {
   test("an entry with no '=' is refused by position, not by content", () => {
     // How a secret gets here: a secret containing a comma is split by the comma, and the half
     // without the `=` arrives as its own entry.
-    const message = refusal(() => parsePairs(SECRET, "HELIOPAUSE_OTP_USERS"));
-    assert.ok(!message.includes(SECRET), `the secret is in the message: ${message}`);
+    const message = refusal(() => parsePairs(FAKE_OTP_VALUE, "HELIOPAUSE_OTP_USERS"));
+    assert.ok(!message.includes(FAKE_OTP_VALUE), `the secret is in the message: ${message}`);
     assert.match(message, /entry 1 is malformed/);
   });
 
   test("the ordinal says which entry, so the operator can still act", () => {
-    const message = refusal(() => parsePairs(`a=1,b=2,${SECRET}`, "HELIOPAUSE_OTP_USERS"));
+    const message = refusal(() => parsePairs(`a=1,b=2,${FAKE_OTP_VALUE}`, "HELIOPAUSE_OTP_USERS"));
     assert.match(message, /entry 3 is malformed/);
-    assert.ok(!message.includes(SECRET));
+    assert.ok(!message.includes(FAKE_OTP_VALUE));
   });
 
   test("an empty value does not name the key either", () => {
     // A transposed entry puts the secret in the key position, and this branch is what catches it —
     // so naming "the key" here would name the secret.
-    const message = refusal(() => parsePairs(`${SECRET}=`, "HELIOPAUSE_OTP_USERS"));
-    assert.ok(!message.includes(SECRET), `the secret is in the message: ${message}`);
+    const message = refusal(() => parsePairs(`${FAKE_OTP_VALUE}=`, "HELIOPAUSE_OTP_USERS"));
+    assert.ok(!message.includes(FAKE_OTP_VALUE), `the secret is in the message: ${message}`);
     assert.match(message, /entry 1 has an empty value/);
   });
 
@@ -66,8 +77,8 @@ describe("parsePairs refuses without quoting what it refused", () => {
   });
 
   test("a duplicate never discloses either value", () => {
-    const message = refusal(() => parsePairs(`k=${SECRET},k=other`, "X"));
-    assert.ok(!message.includes(SECRET), `the secret is in the message: ${message}`);
+    const message = refusal(() => parsePairs(`k=${FAKE_OTP_VALUE},k=other`, "X"));
+    assert.ok(!message.includes(FAKE_OTP_VALUE), `the secret is in the message: ${message}`);
   });
 });
 
@@ -89,7 +100,7 @@ describe("parsePairs parses what it should", () => {
   });
 
   test("a value may look like a secret and is returned intact", () => {
-    assert.equal(parsePairs(`alice=${SECRET}`, "X").get("alice"), SECRET);
+    assert.equal(parsePairs(`alice=${FAKE_OTP_VALUE}`, "X").get("alice"), FAKE_OTP_VALUE);
   });
 });
 

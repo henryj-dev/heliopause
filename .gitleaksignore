@@ -1,0 +1,18 @@
+# Findings gitleaks should stop reporting, one line per fingerprint, each with the reason.
+#
+# ⚠️ **This file is the wrong tool for a real secret.** If something genuinely sensitive is ever
+# committed, the answer is rotation plus the destructive, owner-coordinated history work SECURITY.md
+# describes — never a line here. An entry is only ever appropriate for a value that was never
+# sensitive to begin with, and the comment above it has to establish that.
+#
+# Why an entry is needed at all, rather than just deleting the value: gitleaks reads **every commit**
+# (`ci.yml`, the `leaks` job, full-depth checkout), so removing a literal from the tree leaves the
+# blob in history and the finding stands. That is the same property this repository documents about
+# site data — deleting a file does not remove an older Git blob.
+
+# A test fixture standing in for an OTP value. It was the canonical base32 TOTP example string, which
+# `generic-api-key` matched — correctly, given what it could see: a long opaque literal assigned to a
+# constant named SECRET. Nothing sensitive; the value is public example data and was never in use
+# anywhere. The current tree uses a self-evidently fake value instead
+# ("example-otp-value-not-a-real-secret-…"), so this covers only the blob already in history.
+c28383ee4f0e824628ab3d16295903bbe791e606:src/env-spec.test.ts:generic-api-key:15
