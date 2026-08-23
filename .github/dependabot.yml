@@ -1,0 +1,66 @@
+# Why a repository that pins everything by SHA needs this most, not least.
+#
+# Every action in `.github/workflows` is pinned to a commit SHA, and the gitleaks and actionlint
+# binaries are pinned to a version *and* a checksum. That is the right call — a floating tag is a
+# supply chain that changes under you — but it has a cost that is easy to forget: a SHA never
+# updates itself, and nothing about a stale one is visible. A pinned action with a fixed
+# vulnerability looks exactly like a pinned action that is current.
+#
+# So the pinning and this file are two halves of one policy. The pin decides that an update is a
+# reviewed change; this decides that the update is actually proposed.
+version: 2
+updates:
+  # ── GitHub Actions ─────────────────────────────────────────────────────────
+  #
+  # Dependabot rewrites the SHA and the trailing `# vX.Y.Z` comment together, so the pin stays a pin
+  # and the version stays readable. It does not touch the two pinned binaries downloaded with
+  # `curl` — those are checksum-verified by hand, and the checksum is the thing a reviewer has to
+  # regenerate deliberately.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    # One pull request for all of them. Actions here move in step (checkout and setup-node ship
+    # together), and four near-identical pull requests a month is how a small project starts
+    # rubber-stamping them.
+    groups:
+      actions:
+        patterns: ["*"]
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: chore(ci)
+    labels: [dependencies]
+
+  # ── npm ────────────────────────────────────────────────────────────────────
+  #
+  # `directory: /` covers all seven workspaces: they have no lockfile of their own, the root
+  # `package-lock.json` is the whole dependency set, and dependabot reads workspaces from the root
+  # manifest.
+  #
+  # The runtime dependency count of the library is zero by design — the relay and the agent import
+  # only `src/`, which is why the `rollback` job needs no `npm ci`. Everything below is therefore
+  # build- and console-side: typescript, svelte, vite, lucide-static.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      # Split by blast radius rather than by name. A dev-tooling bump that breaks something breaks
+      # CI, loudly and immediately; a console dependency ships to the page an operator opens when
+      # the network is broken. Reviewing those in one diff means reviewing them at the lower
+      # standard.
+      dev-tooling:
+        dependency-type: development
+        patterns: ["typescript", "@types/*", "lucide-static"]
+      console:
+        patterns: ["svelte*", "@sveltejs/*", "vite"]
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore(deps)
+    labels: [dependencies]
+
+# Not configured here, deliberately: `pip`. The agent is standard library only — that is a stated
+# property (`agent/` installs nothing, which is why a host needs no package index reachable), not an
+# omission waiting to be fixed. If a requirements file ever appears, that property is gone and this
+# file is the second thing to change.
