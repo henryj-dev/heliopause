@@ -31,6 +31,18 @@ def build(script_src):
     root = tempfile.mkdtemp(prefix="repo-", dir=TMP)
     origin, work, up = (os.path.join(root, n) for n in ("origin.git", "work", "up"))
     subprocess.run(["git", "init", "-q", "--bare", origin], check=True)
+    # 🔴 bare 쪽 HEAD 도 **픽스처가 정한다**. 이 줄이 없으면 기본 브랜치 이름은 git **빌드**가
+    #    정하고, 그 값은 머신마다 다르다 — 실측: Apple Git 2.50 은 `init.defaultBranch` 가
+    #    없어도 `main`, GitHub 러너의 git 은 `master`. 후자에서는 이 bare 의 HEAD 가 존재하지
+    #    않는 `refs/heads/master` 로 남는다.
+    #    그때 `git clone` 은 **경고 한 줄만 내고 성공한다**
+    #    (`remote HEAD refers to nonexistent ref, unable to checkout`) — 아무것도 체크아웃하지
+    #    않은 채로. `check=True` 로도 안 잡힌다. 실패는 한참 뒤 `work/A.md` 가 없다는
+    #    FileNotFoundError 로 나타나 **「당기지 못했다」로 읽힌다** — 훅은 멀쩡한데 픽스처가
+    #    깨진 모양이고, 이 검사에서 가장 헷갈리는 거짓 신호다.
+    #    2026-08-23 CI 첫 실행에서 실제로 이렇게 죽었다. `test-pre-commit.py` ⑨ 에 같은 교훈이
+    #    이미 적혀 있었다 — 그 파일만 지키고 있었던 것이다.
+    git(origin, "symbolic-ref", "HEAD", "refs/heads/main")
     subprocess.run(["git", "init", "-q", up], check=True)
     for k, v in (("user.email", "t@t"), ("user.name", "t")):
         git(up, "config", k, v)
