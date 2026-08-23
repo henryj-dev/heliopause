@@ -1,6 +1,7 @@
 # heliopause
 
 [![ci](https://github.com/henryj-dev/heliopause/actions/workflows/ci.yml/badge.svg)](https://github.com/henryj-dev/heliopause/actions/workflows/ci.yml)
+[![codeql](https://github.com/henryj-dev/heliopause/actions/workflows/codeql.yml/badge.svg)](https://github.com/henryj-dev/heliopause/actions/workflows/codeql.yml)
 
 **A host firewall you can't lock yourself out of.**
 

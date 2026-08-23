@@ -112,8 +112,19 @@ Two more things run there and are worth knowing about before a red check surpris
 - **`workflow audit`** lints `.github/workflows` with actionlint and zizmor. A pull request that
   touches CI is the only one this normally has anything to say about.
 
-CodeQL runs alongside and does **not** gate a merge; its findings land in the Security tab and as
-annotations on the diff.
+CodeQL and OpenSSF Scorecard run alongside and do **not** gate a merge; their findings land in the
+Security tab, and CodeQL's also as annotations on the diff. Scorecard is there for the checks
+nothing else performs — the ones about repository *settings*, which change without leaving a diff —
+so read its per-check output rather than its score. This project will legitimately rate poorly on
+signed releases and fuzzing.
+
+### `npm audit` reports three low advisories, and they stay
+
+All three are one root: `@sveltejs/kit` depends on `cookie < 0.7.0` (GHSA-pxg6-pf52-xh8x). The
+console is built with `adapter-static`, so the SvelteKit *server* runtime — the only thing that
+parses cookies — never runs, and there is no path to the vulnerable code. There is nothing to do
+until upstream bumps it; `npm audit fix --force` "resolves" it by breaking Kit. Recorded here so
+the next person does not spend the afternoon re-deriving it.
 
 What none of this covers: the policy suite. `policy/` is untracked (see the split above), and
 `node --test` passes a glob that matches nothing rather than failing on it — so a public checkout
