@@ -1,0 +1,92 @@
+# Static analysis of the two languages that decide what a host accepts on the network.
+#
+# This is not here because a public repository is expected to have a CodeQL badge. It is here for a
+# specific shape of defect that the test suites are structurally bad at catching: the ones that live
+# on a path no test constructs. `npm test` covers the renderer's decisions exhaustively because
+# those are the decisions someone thought to write down. A path traversal in the artifact writer, an
+# injection through a value that reaches `execFile`, a `catch` that swallows the error that was the
+# whole answer — nobody writes a test for the case they did not think of, and that is exactly the
+# population a taint analysis enumerates instead of sampling.
+#
+# ## Why this file exists rather than "default setup"
+#
+# GitHub can run CodeQL from repository settings with no workflow at all. A workflow is chosen here
+# for the same reason the actions are SHA-pinned: what runs in CI should be reviewable in the diff
+# that changes it. Default setup is configured in a settings page that a pull request cannot show
+# you, and it silently picks its own languages and query set.
+#
+# ⚠️ **The two are mutually exclusive.** If default setup is enabled on the repository, this
+# workflow's uploads are rejected with "CodeQL analyses from advanced configurations cannot be
+# processed when the default setup is enabled". Turn default setup off (Settings → Code security →
+# Code scanning) before merging this, or the job fails on every run while looking like a CodeQL
+# problem rather than a settings one.
+name: codeql
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # A dependency did not change and neither did the code, but the query pack did. Most of what
+  # CodeQL will ever find in a frozen tree arrives this way — as a new query, not a new commit —
+  # which makes the schedule the load-bearing trigger here rather than a backstop.
+  schedule:
+    - cron: "31 4 * * 3"
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: analyze ${{ matrix.language }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      # The only write anywhere in this repository's CI. It is scoped to a single job and buys the
+      # one thing that makes the analysis useful: results attached to the pull request that
+      # introduced them, rather than a log nobody reads.
+      security-events: write
+      # Needed for the analysis to read workflow run metadata on a private fork of this repository.
+      # Harmless here; the alternative is a check that works upstream and not on a clone.
+      actions: read
+    strategy:
+      # One language's failure must not withdraw the other's verdict. A CodeQL extractor breaking on
+      # the Python agent should leave the TypeScript control plane analysed, not silently unscanned.
+      fail-fast: false
+      matrix:
+        include:
+          # The control plane: renderer, relay, manager, publisher, and the console.
+          - language: javascript-typescript
+          # The agent — the half that runs as root on every managed host and talks to nftables.
+          - language: python
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: initialise CodeQL
+        uses: github/codeql-action/init@c16c0f3f2812ec4bb3750a5ed64873fe2ce0fbef # codeql-bundle-v2.26.3
+        with:
+          languages: ${{ matrix.language }}
+          # There is no build step in this repository — Node 22 strips types and runs `.ts`
+          # directly, and the agent is a Python script. `none` says that outright instead of letting
+          # autobuild guess, fail, and report a build error as an analysis result.
+          build-mode: none
+          # One step above the default suite, one below `security-and-quality`.
+          #
+          # The default suite is tuned for a low false-positive rate on any repository; `extended`
+          # adds the lower-precision security queries, and for a tool that decides host reachability
+          # a maybe is worth reading. `security-and-quality` adds the style and maintainability
+          # queries on top, and those arrive by the hundred on a first run — a backlog nobody
+          # triages is indistinguishable from no scanning at all, which is the failure this file
+          # exists to avoid rather than reproduce.
+          #
+          # Neither of these fails the job. Findings land in the Security tab and, for a pull
+          # request, as annotations on the diff; the merge gate stays `ci` and the leak gate.
+          queries: security-extended
+
+      - name: analyze
+        uses: github/codeql-action/analyze@c16c0f3f2812ec4bb3750a5ed64873fe2ce0fbef # codeql-bundle-v2.26.3
+        with:
+          category: /language:${{ matrix.language }}
