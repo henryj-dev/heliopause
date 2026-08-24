@@ -72,12 +72,14 @@ const siteMode = flags.has("site");
 if (!relayUrl || flags.has("help")) {
   console.error(
     "usage: heliopause-status <url> [--site] [--pki=DIR] [--operator=NAME] [--json] [--watch[=SEC]]\n" +
+      "                             [--timeout-ms=N]\n" +
       "\n" +
       "  --site           read a manager's /site (every VPC) instead of a relay's /status (one)\n" +
       "  --pki=DIR        directory holding ca.pem and operator-<name>.pem/.key (default ./pki)\n" +
       "  --operator=NAME  which operator certificate to present (default: the only one present)\n" +
       "  --json           emit the raw response instead of a table\n" +
-      "  --watch[=SEC]    redraw every SEC seconds (default 5)\n",
+      "  --watch[=SEC]    redraw every SEC seconds (default 5)\n" +
+      "  --timeout-ms=N   give up on one request after N ms (default 20000)\n",
   );
   process.exit(2);
 }
@@ -140,6 +142,37 @@ function operatorFiles(): { cert: Buffer; key: Buffer; ca: Buffer; name: string 
 const CONTROL_CHARS = /[\u0000-\u001F\u007F-\u009F]/g;
 const scrub = (text: string): string => text.replace(CONTROL_CHARS, "\uFFFD");
 
+/**
+ * How long this waits for the whole answer, and how much of it it will hold.
+ *
+ * ## Neither existed
+ *
+ * `request()` was called with no `timeout` and the body was accumulated with an unbounded
+ * `chunks.push`. A relay that completes the handshake and then says nothing left this command
+ * **hanging with no output** — which is what an operator runs first during an incident, and the one
+ * moment a hang is indistinguishable from a slow fleet. A relay that answers forever filled the
+ * workstation's memory instead.
+ *
+ * Both are the same failure this repository has now fixed in `feed-fetch.ts`, `otp.ts`, `oidc.ts`
+ * and `cert-api.ts`. This one is a CLI rather than the manager, so the cost is a crashed command
+ * instead of an outage — which is why it survived, and not a reason to leave it.
+ *
+ * `--timeout-ms` because the honest value depends on the link: the same command is run from a
+ * workstation on the VPC and over a tunnel from elsewhere. Twenty seconds is generous for a status
+ * page and short enough to be a failure rather than a wait.
+ *
+ * The byte ceiling is `MAX_RELAY_RESPONSE_BYTES` from `manager-server.ts`, not a fresh number: that
+ * is the manager's bound on **this same answer** read from the same relay, and two limits on one
+ * body would only ever be an opportunity for them to disagree.
+ */
+const DEFAULT_TIMEOUT_MS = 20_000;
+const MAX_VIEW_BYTES = 8 * 1024 * 1024;
+const timeoutMs = flags.has("timeout-ms") ? Number(flags.get("timeout-ms")) : DEFAULT_TIMEOUT_MS;
+if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+  console.error(`[status] --timeout-ms must be a positive number of milliseconds`);
+  process.exit(2);
+}
+
 async function fetchView<T>(path: string): Promise<T> {
   const { cert, key, ca } = operatorFiles();
   const url = new URL(path, relayUrl);
@@ -152,14 +185,32 @@ async function fetchView<T>(path: string): Promise<T> {
         method: "GET",
         cert,
         key,
+        // Socket inactivity. The deadline below is the one that ends a peer trickling bytes; this
+        // one ends a peer that has stopped sending them, without waiting out the whole deadline.
+        timeout: timeoutMs,
         // Setting `ca` replaces Node's Web PKI roots. Status supports both private relay
         // certificates and a publicly certified manager, so retain both trust stores.
         ca: [...rootCertificates, ca],
       },
       (res) => {
         const chunks: Buffer[] = [];
-        res.on("data", (c: Buffer) => chunks.push(c));
+        let total = 0;
+        res.on("data", (c: Buffer) => {
+          total += c.length;
+          if (total > MAX_VIEW_BYTES) {
+            // Rejected before the destroy, so the reason is the size and not the `aborted` the
+            // destroy raises — a promise keeps its first settlement, and those two send a reader to
+            // opposite places.
+            fail(new Error(`${siteMode ? "manager" : "relay"} answer exceeded ${MAX_VIEW_BYTES} bytes`));
+            res.destroy();
+            return;
+          }
+          chunks.push(c);
+        });
         res.on("end", () => {
+          // One decode of the whole body. Decoding each chunk would corrupt any multi-byte character
+          // that straddled a chunk boundary, which is `bounded-body.ts`'s reason for existing and is
+          // exactly what a Korean `detail` field in a fleet view would hit.
           const body = Buffer.concat(chunks).toString("utf8");
           if (res.statusCode !== 200) {
             // 403 is the common one and deserves the actionable message rather than a bare code:
@@ -186,7 +237,18 @@ async function fetchView<T>(path: string): Promise<T> {
         });
       },
     );
+    req.on("timeout", () => {
+      req.destroy(new Error(`no answer within ${timeoutMs}ms`));
+    });
+    // The wall clock, distinct from the socket timeout above: a peer sending one byte at a time
+    // resets an inactivity timer forever. Armed before the request so the TLS handshake counts.
+    const deadline = setTimeout(() => {
+      req.destroy(new Error(`did not finish within ${timeoutMs}ms`));
+    }, timeoutMs);
+    const settled = () => clearTimeout(deadline);
+    req.on("close", settled);
     req.on("error", (e) => {
+      settled();
       const hint = wrongCaHint((e as NodeJS.ErrnoException).code, siteMode, pkiDir);
       fail(new Error(`cannot reach ${relayUrl}: ${e.message}${hint}`));
     });
