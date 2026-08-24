@@ -7,6 +7,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createHash, generateKeyPairSync, createSign, randomBytes, constants } from "node:crypto";
 import {
+  endSessionUrl,
   exchange,
   MAX_OIDC_DOCUMENT_BYTES,
   OidcError,
@@ -76,6 +77,100 @@ function provider() {
 //
 // A `Provider` needs its discovery document; these drive both endpoints off one fake so the exchange
 // runs the way it does in the manager, against the same `Provider` the rest of this file uses.
+// ## Signing out, which did not sign anything out
+//
+// `/auth/logout` destroys the manager's session and clears its cookie. It does not touch the IdP's
+// session, and without `prompt` the next authorization request is answered from that session with no
+// credential asked for — so sign-out followed by sign-in put the same operator back in, silently.
+// Measured 2026-08-24. On a shared workstation the button ended nothing an attacker at that keyboard
+// would care about.
+//
+// Two halves, and both are here because either alone leaves the gap open. `prompt=login` needs
+// nothing registered at the IdP and makes the way back in ask for something. The end-session
+// redirect ends the IdP session properly, and depends on a `post_logout_redirect_uri` the IdP has to
+// know about.
+describe("ending a session at the identity provider", () => {
+  const DOC = {
+    issuer: ISSUER,
+    authorization_endpoint: `${ISSUER}/oidc/authorize`,
+    token_endpoint: `${ISSUER}/oidc/token`,
+    jwks_uri: `${ISSUER}/oidc/jwks`,
+  };
+  const AUTHZ = {
+    clientId: CLIENT,
+    redirectUri: "https://console.example.invalid/auth/callback",
+    state: "st",
+    nonce: NONCE,
+    challenge: "ch",
+    scopes: ["openid", "profile"],
+  };
+
+  it("asks for a credential rather than reusing the IdP's session", () => {
+    const u = new URL(authorizeUrl(DOC, AUTHZ));
+    assert.equal(u.searchParams.get("prompt"), "login");
+  });
+
+  it("still sends everything the code exchange needs", () => {
+    // The known negative for the line above: adding a parameter must not disturb the ones that make
+    // this an authorization request. PKCE in particular fails at the *token* endpoint, one step
+    // later, where the message is about the verifier rather than about a missing challenge.
+    const u = new URL(authorizeUrl(DOC, AUTHZ));
+    assert.equal(u.searchParams.get("response_type"), "code");
+    assert.equal(u.searchParams.get("code_challenge"), "ch");
+    assert.equal(u.searchParams.get("code_challenge_method"), "S256");
+    assert.equal(u.searchParams.get("nonce"), NONCE);
+    assert.equal(u.searchParams.get("state"), "st");
+  });
+
+  it("points at the end-session endpoint when the provider offers one", () => {
+    const to = endSessionUrl(
+      { ...DOC, end_session_endpoint: `${ISSUER}/oidc/logout` },
+      { clientId: CLIENT, postLogoutRedirectUri: "https://console.example.invalid/" },
+    );
+    assert.ok(to);
+    const u = new URL(to!);
+    assert.equal(u.origin + u.pathname, `${ISSUER}/oidc/logout`);
+    assert.equal(u.searchParams.get("client_id"), CLIENT);
+    assert.equal(u.searchParams.get("post_logout_redirect_uri"), "https://console.example.invalid/");
+    // No `id_token_hint`. Sending it means keeping the raw ID token in the session for its lifetime,
+    // in the process that holds the artifact signing key — not a trade to make without saying so.
+    // The spec requires `client_id` instead when the hint is absent, which is why it is above.
+    assert.equal(u.searchParams.get("id_token_hint"), null);
+  });
+
+  it("says nowhere when the provider offers nowhere", () => {
+    // A normal answer, not an error: RP-initiated logout is optional. The caller sends the browser
+    // to the login page, behind a session that is already destroyed.
+    assert.equal(
+      endSessionUrl(DOC, { clientId: CLIENT, postLogoutRedirectUri: "https://console.example.invalid/" }),
+      null,
+    );
+  });
+
+  it("says nowhere rather than throwing on an endpoint that is not a URL", () => {
+    // This is called while ending a session — the session is already gone, so a throw here would
+    // turn a completed logout into a 500. A provider document that parses and carries nonsense is
+    // the case: `parsePolicySource`-style validation does not reach inside the discovery document.
+    assert.equal(
+      endSessionUrl(
+        { ...DOC, end_session_endpoint: "not a url" },
+        { clientId: CLIENT, postLogoutRedirectUri: "https://console.example.invalid/" },
+      ),
+      null,
+    );
+  });
+
+  it("keeps a query string the endpoint already carried", () => {
+    // Some providers publish an endpoint with parameters of their own. Rebuilding the URL from
+    // scratch would drop them; `URL` plus `searchParams.set` keeps them.
+    const to = endSessionUrl(
+      { ...DOC, end_session_endpoint: `${ISSUER}/oidc/logout?realm=ops` },
+      { clientId: CLIENT, postLogoutRedirectUri: "https://console.example.invalid/" },
+    );
+    assert.equal(new URL(to!).searchParams.get("realm"), "ops");
+  });
+});
+
 describe("the token exchange", () => {
   /** An IdP that serves discovery and JWKS normally, and the token endpoint however the test says. */
   function idp(tokenAnswer: () => Response) {

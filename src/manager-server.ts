@@ -56,7 +56,7 @@ import { peerCN, type FleetView } from "./relay.ts";
 import { readBoundedNodeBody, readBoundedText } from "./bounded-body.ts";
 import { buildId } from "./build-id.ts";
 
-import { authorizeUrl, exchange, nonce as randomNonce, pkce, Provider } from "./oidc.ts";
+import { authorizeUrl, endSessionUrl, exchange, nonce as randomNonce, pkce, Provider } from "./oidc.ts";
 import { authorize } from "./oidc-authz.ts";
 import { statusFor, verifyOtp } from "./otp.ts";
 import { RoleChangeLedger, verifyBackchannelLogout, verifyRoleChange } from "./set.ts";
@@ -916,6 +916,18 @@ function relayCall<T>(
     if (body !== null) req.write(body);
     req.end();
   });
+}
+
+/**
+ * Where the IdP sends the browser after an RP-initiated logout.
+ *
+ * Derived from the redirect URI rather than configured separately, the same reasoning the
+ * back-channel logout URI is derived: they are the same origin by construction, and a second
+ * variable is a second thing to get wrong. `/` because that is where a signed-out operator belongs —
+ * the login page.
+ */
+export function postLogoutRedirectUri(redirectUri: string): string {
+  return new URL("/", redirectUri).toString();
 }
 
 /** Exact bounded representation shared by manager, relay socket, and the persisted denylist. */
@@ -3025,8 +3037,43 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       const s = o.sessions.get(id);
       if (s) log(`session for ${s.principal.name} ended`, `${s.principal.name}의 세션 종료`);
       o.sessions.destroy(id);
-      res.writeHead(204, { "set-cookie": clearCookieHeader(), "cache-control": "no-store" });
-      return void res.end();
+
+      // ## The local session is gone; the IdP's is not
+      //
+      // Destroying this cookie ends nothing at the identity provider, and the authorization request
+      // is answered from **its** session. Before `prompt=login` and this redirect, sign-out followed
+      // by sign-in put the same operator back in with no credential asked for — on a shared
+      // workstation, a sign-out button that signs nobody out.
+      //
+      // The URL is handed back rather than sent as a 302 because this is a `fetch` from the console,
+      // and a redirect answered to `fetch` is followed by `fetch`, not by the browser. The console
+      // navigates. `null` — no `end_session_endpoint`, or no provider at all — means it goes to `/`
+      // as before, which is still a destroyed session behind a login page.
+      //
+      // Computed after the destroy, deliberately: whether the IdP offers this must not decide
+      // whether the local session ends.
+      let endSession: string | null = null;
+      if (o.provider) {
+        try {
+          endSession = endSessionUrl(await o.provider.load(), {
+            clientId: o.conf.clientId,
+            postLogoutRedirectUri: postLogoutRedirectUri(o.conf.redirectUri),
+          });
+        } catch (e) {
+          // The discovery document could not be read. The session is already destroyed, so this is
+          // a lost convenience and not a failed logout; saying so beats a 500 on a sign-out.
+          log(
+            `logout: could not read the provider document for RP-initiated logout: ${(e as Error).message}`,
+            `로그아웃: RP-initiated 로그아웃을 위한 provider 문서를 읽지 못함: ${(e as Error).message}`,
+          );
+        }
+      }
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "set-cookie": clearCookieHeader(),
+        "cache-control": "no-store",
+      });
+      return void res.end(JSON.stringify({ endSession }));
     }
 
     return send(res, 404, { error: `no such route ${url.pathname}` });
@@ -3136,14 +3183,17 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     // Derived from the redirect URI rather than configured separately: they are the same origin by
     // construction, and a second variable would be a second thing to get wrong.
     let logoutUri = "(cannot derive — check HELIOPAUSE_OIDC_REDIRECT_URI)";
+    let postLogoutUri = logoutUri;
     try {
       logoutUri = new URL("/auth/backchannel-logout", oidc.conf.redirectUri).toString();
+      postLogoutUri = postLogoutRedirectUri(oidc.conf.redirectUri);
     } catch { /* the redirect URI is not a URL; the login path will say so first */ }
     log(
       `oidc: issuer ${oidc.conf.issuer}, client ${oidc.conf.clientId}. The IdP must have these ` +
         `registered for this deployment — nothing here can verify them:\n` +
         `[manager]   redirect URI            ${oidc.conf.redirectUri}\n` +
         `[manager]   back-channel logout URI ${logoutUri}  (session_required: off)\n` +
+        `[manager]   post-logout redirect    ${postLogoutUri}\n` +
         `[manager]   role-change event key   ${oidc.conf.roleChangeEvent}\n` +
         `[manager]   A blank logout URI means a force-logout at the IdP ends nothing here and still ` +
         `reports success. A role-change key that differs from the issuer's means every authority ` +
@@ -3152,6 +3202,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         `있어야 하며 이쪽에서는 확인할 수 없음:\n` +
         `[manager]   리다이렉트 URI      ${oidc.conf.redirectUri}\n` +
         `[manager]   백채널 로그아웃 URI ${logoutUri}  (session_required: off)\n` +
+        `[manager]   로그아웃 후 리다이렉트 ${postLogoutUri}\n` +
         `[manager]   역할 변경 이벤트 키 ${oidc.conf.roleChangeEvent}\n` +
         `[manager]   로그아웃 URI 가 비어 있으면 IdP 의 강제 로그아웃이 여기서 아무것도 끝내지 ` +
         `못하면서 성공을 보고함. 역할 변경 키가 발급자의 것과 다르면 모든 권한 변경이 조용히 버려짐.`,

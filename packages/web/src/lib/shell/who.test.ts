@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { loginHref, LOGOUT_PATH, mayLabel, readWho, shouldAskOtp, viaLabel } from "./who.ts";
+import { loginHref, LOGOUT_PATH, logoutDestination, mayLabel, readWho, shouldAskOtp, viaLabel } from "./who.ts";
 
 describe("readWho", () => {
   it("reads the caller the chrome draws", () => {
@@ -73,6 +73,28 @@ describe("the labels the bar draws", () => {
 describe("login and logout paths", () => {
   it("posts logout, never navigates to it", () => {
     assert.equal(LOGOUT_PATH, "/auth/logout");
+  });
+
+  // ## Where a sign-out lands
+  //
+  // Destroying this server's cookie ends nothing at the identity provider, and the next
+  // authorization request is answered from **its** session — so sign-out then sign-in put the same
+  // person back in with no credential asked for. The manager answers with where that session can be
+  // ended; this is the parse of that answer.
+  it("goes where the manager says the IdP session ends", () => {
+    assert.equal(
+      logoutDestination({ endSession: "https://idp.example.invalid/oidc/logout?client_id=x" }),
+      "https://idp.example.invalid/oidc/logout?client_id=x",
+    );
+  });
+
+  it("falls back to the login page for every answer that names nowhere", () => {
+    // Each of these is a real shape. `null` is a provider offering no end-session endpoint;
+    // `undefined` is a manager that predates this and answered 204 with no body; the rest are a
+    // proxy or a bug. All of them mean the same thing to a browser whose session is already gone.
+    for (const body of [{ endSession: null }, {}, undefined, null, "", [], { endSession: "" }, { endSession: 7 }]) {
+      assert.equal(logoutDestination(body), "/", `${JSON.stringify(body)} must land on the login page`);
+    }
   });
 
   it("carries the screen back after login and refuses to leave it raw in the query", () => {

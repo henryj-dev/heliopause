@@ -1,4 +1,4 @@
-import { LOGOUT_PATH, readWho, type WhoView } from "./who";
+import { LOGOUT_PATH, logoutDestination, readWho, type WhoView } from "./who";
 
 export const WHO_POLL_MS = 10_000;
 
@@ -38,15 +38,24 @@ function createWhoQuery(): WhoQuery {
   }
 
   async function signOut(): Promise<void> {
+    // Where the IdP's own session gets ended, when it offers somewhere. Destroying this
+    // server's cookie does not touch it, and the next authorization request is answered
+    // from it — so without this, sign-out then sign-in put the same person back in with
+    // no credential asked for. `logoutDestination` is where that decision lives and is
+    // tested; this function is the part that cannot be.
+    let to = "/";
     try {
       // POST, so a cross-site page cannot end the session with an image tag.
       // No CSRF token: ending your own session is not worth one.
-      await fetch(LOGOUT_PATH, { method: "POST", credentials: "same-origin" });
+      const res = await fetch(LOGOUT_PATH, { method: "POST", credentials: "same-origin" });
+      // The server hands back a URL rather than a 302, because a redirect answered to
+      // `fetch` is followed by `fetch` and never reaches the address bar.
+      if (res.ok) to = logoutDestination(await res.json());
     } catch {
       // The cookie is gone either way once the server answers. If it did not,
       // sending the browser to `/` still lands on login.
     }
-    location.href = "/";
+    location.href = to;
   }
 
   return {

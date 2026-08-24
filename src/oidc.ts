@@ -243,7 +243,23 @@ export class Provider {
 
 // ── The authorization request ─────────────────────────────────────────────────
 
-/** Build the URL to send the browser to. `state` and `nonce` must be stored server-side. */
+/**
+ * Build the URL to send the browser to. `state` and `nonce` must be stored server-side.
+ *
+ * ## `prompt=login`, and why it is not a preference
+ *
+ * `/auth/logout` destroys this server's session and clears its cookie. It does not touch the IdP's
+ * session, and without `prompt` the next authorization request is answered from that session with no
+ * credential asked for. So "sign out" followed by "sign in" put the same operator back in, silently
+ * — measured 2026-08-24, and on a shared workstation it means the sign-out button ends nothing an
+ * attacker at that keyboard cares about.
+ *
+ * The RP-initiated logout in `endSessionUrl` is the other half and the better one: it ends the IdP
+ * session too. This is here as well because that half depends on a `post_logout_redirect_uri` being
+ * registered at the IdP, and an unregistered one fails by doing nothing. A console that re-prompts
+ * is a cost paid on every login; a console that silently re-authenticates after a logout is a
+ * different kind of thing entirely.
+ */
 export function authorizeUrl(
   d: Discovery,
   o: { clientId: string; redirectUri: string; state: string; nonce: string; challenge: string; scopes: string[] },
@@ -257,6 +273,45 @@ export function authorizeUrl(
   u.searchParams.set("nonce", o.nonce);
   u.searchParams.set("code_challenge", o.challenge);
   u.searchParams.set("code_challenge_method", "S256");
+  u.searchParams.set("prompt", "login");
+  return u.toString();
+}
+
+/**
+ * Where to send the browser so the **IdP's** session ends too, or `null`.
+ *
+ * `null` when the provider advertises no `end_session_endpoint`. That is a normal answer, not an
+ * error: RP-initiated logout is optional in OpenID Connect, and a deployment whose IdP does not
+ * offer it still gets a destroyed local session and `prompt=login` on the way back in.
+ *
+ * ## No `id_token_hint`
+ *
+ * The spec calls it RECOMMENDED, and sending it would mean keeping the raw ID token in the session
+ * for the lifetime of that session. This process already holds the artifact signing key; adding a
+ * bearer artifact to its memory to save the user one confirmation click is not a trade worth making
+ * quietly. `client_id` is what the spec requires instead when a `post_logout_redirect_uri` is sent
+ * without the hint, and the IdP may ask the user to confirm — which for a sign-out button is fine.
+ *
+ * ⚠️ **`post_logout_redirect_uri` has to be registered at the IdP.** An unregistered one is refused
+ * by the IdP, and what the operator sees is a logout that lands on an error page rather than back on
+ * the console — loud, unlike the back-channel URI whose absence was silent. The manager prints the
+ * exact value at startup for that reason.
+ */
+export function endSessionUrl(
+  d: Discovery,
+  o: { clientId: string; postLogoutRedirectUri: string },
+): string | null {
+  if (!d.end_session_endpoint) return null;
+  let u: URL;
+  try {
+    u = new URL(d.end_session_endpoint);
+  } catch {
+    // A provider document that parses but carries a nonsense endpoint. Treated as "not offered"
+    // rather than thrown: this is called while ending a session, and the session is already gone.
+    return null;
+  }
+  u.searchParams.set("client_id", o.clientId);
+  u.searchParams.set("post_logout_redirect_uri", o.postLogoutRedirectUri);
   return u.toString();
 }
 

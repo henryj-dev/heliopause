@@ -856,7 +856,12 @@ describe("OIDC login routes", () => {
   it("accepts a logout with no session and says nothing about it", async () => {
     // Ending a session you do not have is not an error worth reporting, and a different answer here
     // would tell an unauthenticated caller whether a cookie was live.
-    assert.equal((await call("/auth/logout", "POST")).status, 204);
+    //
+    // 200 rather than 204 since RP-initiated logout: the answer now carries where to send the browser
+    // so the IdP's session ends too. The body must be the same either way, for the reason above.
+    const out = await call("/auth/logout", "POST");
+    assert.equal(out.status, 200);
+    assert.deepEqual(JSON.parse(out.body), { endSession: null }, "no provider here, so nowhere to go");
   });
 
   it("does not invent routes under /auth", async () => {
@@ -918,6 +923,9 @@ describe("a real OIDC session, end to end", () => {
           authorization_endpoint: "https://idp.example.invalid/oidc/authorize",
           token_endpoint: "https://idp.example.invalid/oidc/token",
           jwks_uri: "https://idp.example.invalid/oidc/jwks",
+          // Advertised, so the RP-initiated logout below is about this manager's behaviour rather
+          // than about a provider that does not offer the endpoint.
+          end_session_endpoint: "https://idp.example.invalid/oidc/logout",
           code_challenge_methods_supported: ["S256"],
         }), { status: 200 });
       }
@@ -1527,8 +1535,38 @@ describe("a real OIDC session, end to end", () => {
     const cookie = await signIn(["heliopause-operators"]);
     assert.equal((await call("/site", "GET", { cookie })).status, 200);
     const out = await call("/auth/logout", "POST", { cookie, origin: `https://127.0.0.1:${port5}` });
-    assert.equal(out.status, 204);
+    assert.equal(out.status, 200);
     assert.equal((await call("/site", "GET", { cookie })).status, 401, "the cookie must stop working");
+
+    // ## The IdP's session, which the cookie above says nothing about
+    //
+    // Destroying this cookie ends nothing at the identity provider, and the authorization request is
+    // answered from **its** session. Before this, sign-out then sign-in put the same operator back in
+    // with no credential asked for.
+    //
+    // Two halves, and this asserts both because either alone leaves the gap open: the answer names
+    // where to end the IdP session, and the authorization request asks for a fresh credential in case
+    // the operator never goes there.
+    const { endSession } = JSON.parse(out.body) as { endSession: string | null };
+    assert.ok(endSession, "the fake IdP advertises end_session_endpoint, so logout must point at it");
+    const ended = new URL(endSession!);
+    assert.equal(ended.searchParams.get("client_id"), "heliopause-manager");
+    assert.ok(
+      ended.searchParams.get("post_logout_redirect_uri"),
+      "without this the IdP has nowhere to send the browser back to",
+    );
+    // No `id_token_hint`: sending one means keeping the raw ID token in the session for its lifetime,
+    // in the process that holds the artifact signing key. Pinned so it is not added without thought.
+    assert.equal(ended.searchParams.get("id_token_hint"), null);
+  });
+
+  it("asks the IdP for a credential rather than reusing its session", async () => {
+    // The other half, and the one that works with no registration at the IdP. `prompt=login` is what
+    // makes the sign-in after a sign-out ask for something.
+    const r = await call("/auth/login", "GET");
+    assert.equal(r.status, 302);
+    const to = new URL(r.headers.location as string);
+    assert.equal(to.searchParams.get("prompt"), "login");
   });
 });
 

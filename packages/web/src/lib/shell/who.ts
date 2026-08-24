@@ -58,6 +58,29 @@ export const LOGOUT_PATH = "/auth/logout";
 export const LOGIN_PATH = "/auth/login";
 
 /** Where a signed-out browser is sent. Same-origin path; `/auth/login` encodes it. */
+/**
+ * Where the browser goes after a sign-out.
+ *
+ * `/auth/logout` destroys this server's session and answers with where — if anywhere — the identity
+ * provider's session can be ended too. Destroying the cookie does not touch that one, and the next
+ * authorization request is answered from it, so without going there sign-out followed by sign-in put
+ * the same person back in with no credential asked for.
+ *
+ * A plain function beside `readWho` rather than logic inside the rune module, for the same reason
+ * `readWho` is: this parses a response from the other side of a socket, and that is a thing worth
+ * being able to run in a test.
+ *
+ * Anything but a non-empty string means `/` — the login page, behind an already-destroyed session.
+ * An older manager answers `204` with no body at all, and this is what makes that keep working.
+ */
+export function logoutDestination(body: unknown): string {
+  if (body && typeof body === "object" && !Array.isArray(body)) {
+    const to = (body as { endSession?: unknown }).endSession;
+    if (typeof to === "string" && to) return to;
+  }
+  return "/";
+}
+
 export function loginHref(next: string): string {
   return `${LOGIN_PATH}?next=${encodeURIComponent(next)}`;
 }
