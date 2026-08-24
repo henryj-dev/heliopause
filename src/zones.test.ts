@@ -184,3 +184,76 @@ describe("the table", () => {
     assert.equal(rows.length, ZONES.length);
   });
 });
+
+// ── IPv6, which this table used to leave out entirely ─────────────────────────
+//
+// `Zone.cidrs6` was declared and documented — "IPv6 CIDRs, when the zone has any" — and **read by
+// nothing**: a repository-wide grep found the declaration and no other mention. `range` was
+// IPv4-only, so every IPv6 endpoint resolved to no zone and vanished from `crossings()`, the table
+// whose whole job is showing which policies let a less trusted zone reach a more trusted one.
+//
+// `zoneConflicts` did not catch it either. It validated `cidrs`, so a v6 prefix put *there* was
+// reported as "not a CIDR" — but put in `cidrs6`, where the documentation says it goes, it was
+// dropped without a word. This fleet assigns public IPv6 on every host.
+describe("zones — IPv6", () => {
+  const zones = [
+    { id: "vpc", name: "VPC", cidrs: ["10.17.0.0/16"], cidrs6: ["2001:db8:17::/48"], trust: 2 as const },
+    { id: "pods", name: "Pods", cidrs: ["10.17.128.0/18"], trust: 2 as const },
+    { id: "net", name: "Internet", cidrs: ["0.0.0.0/0"], cidrs6: ["::/0"], trust: 0 as const },
+  ];
+
+  it("places an IPv6 address in the zone that declares it", () => {
+    assert.equal(zoneOf(zones, "2001:db8:17::1/128")?.id, "vpc");
+  });
+
+  it("falls through to the widest v6 zone rather than to no zone", () => {
+    // Before this, an address outside every declared v6 range answered `null` — and a policy with no
+    // zone is a policy the crossings table never shows.
+    assert.equal(zoneOf(zones, "2606:4700::1/128")?.id, "net");
+  });
+
+  it("keeps most-specific-wins across a 128-bit range", () => {
+    // The v4 half does this with `number`; 128 bits needs `bigint`, and getting the width wrong
+    // makes every v6 zone the same size.
+    const nested = [
+      { id: "wide", name: "wide", cidrs: [], cidrs6: ["2001:db8::/32"], trust: 1 as const },
+      { id: "narrow", name: "narrow", cidrs: [], cidrs6: ["2001:db8:17::/48"], trust: 2 as const },
+    ];
+    assert.equal(zoneOf(nested, "2001:db8:17::5/128")?.id, "narrow");
+    assert.equal(zoneOf(nested, "2001:db8:99::5/128")?.id, "wide");
+  });
+
+  it("never places a v4 address in a v6 zone, or the reverse", () => {
+    // The two are different number spaces. `::/0` spans every v6 address and is numerically wider
+    // than `0.0.0.0/0`; without a family check it would win every comparison and swallow the v4
+    // zones. The known positive is the v4 row, which must be unchanged.
+    const v6only = [{ id: "six", name: "six", cidrs: [], cidrs6: ["::/0"], trust: 0 as const }];
+    assert.equal(zoneOf(v6only, "10.17.0.5/32"), null);
+    const v4only = [{ id: "four", name: "four", cidrs: ["0.0.0.0/0"], trust: 0 as const }];
+    assert.equal(zoneOf(v4only, "2001:db8::1/128"), null);
+  });
+
+  it("refuses embedded IPv4, which would put one machine in two trust levels", () => {
+    // Same call `nft.ts` and `geofeed.ts` make. `::ffff:10.0.0.1` is a v4 address wearing v6.
+    const zones6 = [{ id: "six", name: "six", cidrs: [], cidrs6: ["::/0"], trust: 0 as const }];
+    assert.equal(zoneOf(zones6, "::ffff:10.0.0.1/128"), null);
+  });
+
+  it("reports a prefix in the wrong list, which parses and then matches nothing", () => {
+    const bad = zoneConflicts([
+      { id: "x", name: "X", cidrs: ["2001:db8::/32"], cidrs6: ["10.0.0.0/8"], trust: 1 as const },
+    ]).map((c) => c.cidr);
+    assert.ok(bad.some((c) => /IPv6 but is listed in cidrs\b/.test(c)), bad.join(" | "));
+    assert.ok(bad.some((c) => /IPv4 but is listed in cidrs6/.test(c)), bad.join(" | "));
+  });
+
+  it("does not call the two all-space prefixes a conflict", () => {
+    // `::/0` and `0.0.0.0/0` both span their whole space and compare equal as numbers. They cannot
+    // overlap, and reporting them would make the conflict list cry on the most ordinary zone set.
+    const both = [
+      { id: "a", name: "A", cidrs: ["0.0.0.0/0"], trust: 0 as const },
+      { id: "b", name: "B", cidrs: [], cidrs6: ["::/0"], trust: 0 as const },
+    ];
+    assert.deepEqual(zoneConflicts(both), []);
+  });
+});
