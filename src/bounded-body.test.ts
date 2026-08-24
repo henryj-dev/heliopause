@@ -216,4 +216,99 @@ describe("pollRelays decodes a relay answer that arrives in pieces", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  // ## The other half of "the relay will not stop talking"
+  //
+  // The bound above stops a relay sending too much. Nothing stopped one sending too *slowly*:
+  // `relayCall` passed `timeout` to `request()`, which is `socket.setTimeout` — inactivity, reset by
+  // every byte. A relay writing one byte at a time stayed inside it forever.
+  //
+  // This runs in the manager, a single pod, and `relayCall` is the fan-out behind `/site` as well as
+  // the push behind `/publish`. A hung call is an HTTP request that never answers, holding the plan
+  // lock with it.
+  //
+  // Shares this file rather than building a second mTLS fixture: it is the same relay, the same call,
+  // and a duplicate openssl fixture is a minute of CI for nothing.
+  it("gives up on a relay that answers too slowly to ever finish", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "heliopause-relay-deadline-"));
+    let server: Server | undefined;
+    let trickle: ReturnType<typeof setInterval> | undefined;
+    let stop: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const run = (...args: string[]) => execFileSync("openssl", args, { cwd: dir, stdio: "pipe" });
+      run("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", "ca.key", "-out", "ca.pem",
+          "-days", "1", "-subj", "/CN=test-ca");
+      for (const [file, cn, eku, san] of [
+        ["operator-hp-manager", "hp-manager", "clientAuth", ""],
+        ["relay", "relay", "serverAuth", "subjectAltName=IP:127.0.0.1\n"],
+      ] as const) {
+        run("req", "-newkey", "rsa:2048", "-nodes", "-keyout", `${file}.key`, "-out", `${file}.csr`,
+            "-subj", `/CN=${cn}`);
+        writeFileSync(join(dir, `${file}.ext`), `extendedKeyUsage=critical,${eku}\n${san}`);
+        run("x509", "-req", "-in", `${file}.csr`, "-CA", "ca.pem", "-CAkey", "ca.key",
+            "-CAcreateserial", "-out", `${file}.pem`, "-days", "1", "-extfile", `${file}.ext`);
+      }
+      const read = (f: string) => readFileSync(join(dir, f));
+
+      // One fixture, two behaviours. Building a second mTLS server to measure the successful path
+      // would cost another openssl run for a difference of one `if`.
+      let mode: "trickle" | "fast" = "trickle";
+      server = createHttpsServer(
+        { cert: read("relay.pem"), key: read("relay.key"), ca: read("ca.pem"), requestCert: true, rejectUnauthorized: true },
+        (_req, res) => {
+          if (mode === "fast") {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ generation: null, issuedAt: "2026-08-24T00:00:00.000Z", hosts: [], problems: [], relayAgeSec: 1 }));
+            return;
+          }
+          res.writeHead(200, { "content-type": "application/json" });
+          res.write('{"hosts":[');
+          // Well inside the deadline, so an idle timeout is reset on every write and never fires.
+          trickle = setInterval(() => { if (!res.writableEnded) res.write(" "); }, 40);
+          // The server gives up on its own. Without this a regression does not fail the test, it
+          // hangs the run: the call never settles and `server.close()` waits on a live connection.
+          stop = setTimeout(() => { clearInterval(trickle); if (!res.writableEnded) res.end("]}"); }, 4_000);
+          res.on("close", () => { clearInterval(trickle); clearTimeout(stop); });
+        },
+      );
+      const port: number = await new Promise((resolve) => {
+        server!.listen(0, "127.0.0.1", () => resolve((server!.address() as { port: number }).port));
+      });
+
+      const started = Date.now();
+      const results = await pollRelays([{ name: "dev", url: `https://127.0.0.1:${port}`, pkiDir: dir }], 700);
+      const took = Date.now() - started;
+      const first = results[0]!;
+      assert.equal(first.ok, false, "a relay that never finishes must not come back as a fleet view");
+      assert.match("error" in first ? first.error : "", /did not finish answering within 700ms/);
+      // Bounded above too: the server ends the body at four seconds, so a generous assertion would
+      // pass against a version with no deadline at all.
+      assert.ok(took < 3_000, `took ${took}ms — this ended because the relay stopped, not the deadline`);
+
+      // ## …and it does not fire on a call that finished
+      //
+      // The known positive for the deadline. Without it, a timer armed at the wrong moment — or for
+      // the wrong duration — would leave every one of these assertions green while breaking every
+      // real poll.
+      //
+      // ⚠️ **Whether the timer is *cleared* is not asserted here, and the attempt is worth recording.**
+      // `process.getActiveResourcesInfo()` counts a `Timeout` either side of the call, which is how
+      // `api-client.test.ts` pins the same property — and there it discriminates, verified by
+      // injection. Here it does not: `request({ timeout })` arms Node's own socket timer, the agent
+      // pools the socket, and that timer is still counted after the call returns. The measurement
+      // cannot tell it from an uncleared deadline.
+      //
+      // Left unasserted rather than asserted loosely. The clearing has no externally visible effect
+      // on this path anyway — a timer firing after the promise settled destroys a pooled socket and
+      // the next call opens a new one — so a test here would be pinning a fact it cannot see.
+      mode = "fast";
+      const ok = await pollRelays([{ name: "dev", url: `https://127.0.0.1:${port}`, pkiDir: dir }], 20_000);
+      assert.equal(ok[0]!.ok, true, `the fast poll failed: ${"error" in ok[0]! ? ok[0]!.error : ""}`);
+    } finally {
+      clearInterval(trickle);
+      clearTimeout(stop);
+      if (server) await new Promise<void>((resolve) => server!.close(() => resolve()));
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

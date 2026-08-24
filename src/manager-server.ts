@@ -832,7 +832,27 @@ function relayCall<T>(
   timeoutMs: number,
 ): Promise<T> {
   const url = new URL(path, relayUrl);
-  return new Promise((resolve, reject) => {
+  return new Promise((settleOk, settleErr) => {
+    // ## `timeout` is inactivity; this is the wall clock
+    //
+    // `request({ timeout })` is `socket.setTimeout` — every byte resets it, so a relay answering one
+    // byte at a time never trips it. This runs **in the manager**, a single pod, and it is the fan-out
+    // behind `/site` as well as the push behind `/publish`. A hung call there is an HTTP request that
+    // never answers, holding the plan lock with it.
+    //
+    // The `/publish` call site already reasoned about the timeout *value* — "a timeout here would
+    // abandon a push that may well have landed" — and that is exactly as true of the idle timeout it
+    // was reasoning about. What changes here is that the wait is now bounded at all; an indefinite
+    // hang leaves the plan unpublishable and the operator with no answer, which is strictly worse
+    // than an error the existing `catch` already knows how to release.
+    //
+    // Cleared on every exit rather than `unref`'d: an unref'd timer still fires, and firing after a
+    // successful call would destroy a socket the agent may have handed to the next one.
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    const clear = () => { if (deadline !== undefined) clearTimeout(deadline); deadline = undefined; };
+    const resolve = (v: T) => { clear(); settleOk(v); };
+    const reject = (e: unknown) => { clear(); settleErr(e); };
+
     const req = request(
       {
         hostname: url.hostname,
@@ -886,7 +906,12 @@ function relayCall<T>(
         );
       },
     );
+    // Inactivity, kept beside the deadline: a relay that has gone silent should not have to wait out
+    // the whole deadline, and a relay that is answering too slowly to finish is a different thing.
     req.on("timeout", () => req.destroy(new Error(`no answer within ${timeoutMs}ms`)));
+    deadline = setTimeout(() => {
+      req.destroy(new Error(`relay ${url.host} did not finish answering within ${timeoutMs}ms`));
+    }, timeoutMs);
     req.on("error", reject);
     if (body !== null) req.write(body);
     req.end();
