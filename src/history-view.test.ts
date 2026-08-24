@@ -83,4 +83,48 @@ describe("reading the live set from a site view", () => {
   it("ignores a VPC with no generation at all", () => {
     assert.equal(liveGenerations([{ generation: null, vpcs: ["dev"] }]).size, 0);
   });
+
+  // ## The discriminator `--policies` adds, which used to blank the whole screen
+  //
+  // `heliopause-publish --policies` mints `<commit>-policy-<hash>`, and `historyRows` matches with
+  // `liveIds.has(commit.id)` — exact equality against what `git log` printed. Nothing matched, so
+  // `newestLive` stayed past the end of the log and **every row read "not published"**, including
+  // the commit that was live. That label is this file's strongest claim: "no VPC has reached it".
+  it("reads the commit out of a generation that carries a policy discriminator", () => {
+    const live = liveGenerations([{ generation: "abc1234-policy-deadbeef", vpcs: ["dev"] }]);
+    assert.deepEqual([...live.entries()], [["abc1234", ["dev"]]]);
+  });
+
+  it("keeps that commit marked live all the way through to the rows", () => {
+    // The behaviour, not just the key. A version that extracted the commit and lost it somewhere
+    // between here and the row would pass the test above.
+    const log: Commit[] = [
+      { id: "c3", subject: "newest", author: "a", at: "2026-08-24T03:00:00Z" },
+      { id: "c2", subject: "middle", author: "a", at: "2026-08-24T02:00:00Z" },
+      { id: "c1", subject: "oldest", author: "a", at: "2026-08-24T01:00:00Z" },
+    ];
+    const rows = historyRows(log, liveGenerations([{ generation: "c2-policy-deadbeef", vpcs: ["dev"] }]));
+    assert.deepEqual(rows.map((r) => `${r.commit.id}=${r.status}`), [
+      "c3=not-published",
+      "c2=live",
+      "c1=superseded",
+    ]);
+    assert.deepEqual(rows[1]?.liveOn, ["dev"]);
+  });
+
+  it("merges two policy documents published from one commit, without repeating a VPC", () => {
+    // The row is a commit, and both VPCs are on that commit's rules. Which document each is on is
+    // not shown here — the full generation id is what the fleet view carries per host.
+    const live = liveGenerations([
+      { generation: "abc1234-policy-aaaaaaaa", vpcs: ["dev", "util"] },
+      { generation: "abc1234-policy-bbbbbbbb", vpcs: ["prod", "dev"] },
+    ]);
+    assert.deepEqual([...live.entries()], [["abc1234", ["dev", "util", "prod"]]]);
+  });
+
+  it("ignores an id that names no commit at all", () => {
+    // `--allow-dirty` with no repository mints `no-git-<ts>`. It is not a commit prefix and must not
+    // be treated as one — `no` is not hex, which is why this needs no special case.
+    assert.equal(liveGenerations([{ generation: "no-git-1756000000", vpcs: ["dev"] }]).size, 0);
+  });
 });

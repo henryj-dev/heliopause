@@ -101,11 +101,48 @@ export function historyRows(
 }
 
 /**
+ * The commit a generation id names, or `null` when it names none.
+ *
+ * A generation id is not always a bare commit. `heliopause-publish` mints three shapes:
+ *
+ *     abc1234                      the ordinary case
+ *     abc1234-policy-deadbeef      when `--policies` ships a policy document alongside the module
+ *     no-git-1756000000            `--allow-dirty` with no repository at all
+ *
+ * Only the first is equal to what `git log` prints. The second is a commit plus a discriminator, and
+ * the third names no commit — `no` is not hex, so the pattern declines it rather than needing a case.
+ */
+function commitOf(generation: string): string | null {
+  const m = /^([0-9a-fA-F]+)(?:-|$)/.exec(generation);
+  return m ? m[1]! : null;
+}
+
+/**
  * Which generations are live, from a manager's site view.
  *
  * Takes the `generations` array the manager already computes rather than re-deriving it from hosts:
  * that array is what the console shows, and two paths answering "what is live" is how they come to
  * disagree.
+ *
+ * ## Keyed by the commit, not by the whole id
+ *
+ * `historyRows` looks these up with `liveIds.has(commit.id)` — an exact string match against what
+ * `git log` printed. So a generation carrying the `-policy-…` discriminator matched nothing, and
+ * because nothing matched, `newestLive` stayed past the end of the log and **every row on the screen
+ * read "not published"** — including the commit that was live. Measured 2026-08-24:
+ *
+ *     generation "c2"                    → c3 not-published · c2 live · c1 superseded
+ *     generation "c2-policy-deadbeef"    → c3 not-published · c2 not-published · c1 not-published
+ *
+ * That is the worst of the three labels to be wrong in this direction: this file's own header says
+ * `not-published` means "no VPC has reached it", stated as the strong claim it is.
+ *
+ * ⚠️ **Two policy documents published from one commit merge into one row.** Their VPC lists are
+ * combined, because the row is a commit and both VPCs are on that commit's rules. What is lost is
+ * *which* document each is on — a real distinction, and the reason the discriminator exists. It is
+ * not lost anywhere it matters: the full generation id is what the fleet view shows per host. Making
+ * this screen carry it would mean a row that is no longer a commit, which is the one thing the log
+ * order here depends on.
  */
 export function liveGenerations(
   generations: readonly { generation: string | null; vpcs: readonly string[] }[],
@@ -115,9 +152,13 @@ export function liveGenerations(
     if (!g.generation) continue;
     // A `-dirty-…` id names a commit that does not describe what was published. It still matches a
     // commit prefix, and marking that commit "live" would say the repository holds those rules when
-    // by construction it does not.
+    // by construction it does not. Checked before `commitOf`, which would happily extract that prefix.
     if (g.generation.includes("-dirty")) continue;
-    out.set(g.generation, [...g.vpcs]);
+    const commit = commitOf(g.generation);
+    if (!commit) continue;
+    const at = out.get(commit) ?? [];
+    for (const vpc of g.vpcs) if (!at.includes(vpc)) at.push(vpc);
+    out.set(commit, at);
   }
   return out;
 }
