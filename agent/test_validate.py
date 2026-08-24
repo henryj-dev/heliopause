@@ -3104,9 +3104,6 @@ class TestSignedRoutesReachTheApplier(unittest.TestCase):
         self.assertIn("signature is invalid", str(caught.exception))
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
 
 class RoutesFromJson(unittest.TestCase):
     """The parser behind `Heartbeat.routes`.
@@ -3460,3 +3457,6 @@ class RouteApplyAndRestore(unittest.TestCase):
         hp._restore_routes(restore)
         touched = [c[1] for c in self.calls]
         self.assertNotIn("10.7.0.0/16", touched)
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
