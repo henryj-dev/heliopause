@@ -95,6 +95,64 @@ describe("the manager's policy boundary — it does not evaluate", () => {
     );
   });
 
+  // ## The other function in this contract that touches the disk
+  //
+  // The test above pins `collectPolicySource`, which the manager does not import. `buildScreen` is
+  // the one it **does** import and call — and inside it:
+  //
+  //     input.repo ? input.repo.probes : readCoverageProbes(sitePath)
+  //
+  // `readCoverageProbes` does `readdirSync` and `readFileSync`. The manager passes
+  // `sitePath: source.label`, which its own comment calls "a label, and never a path" precisely
+  // because there is no policy on this filesystem — and `label` arrives in the renderer's JSON.
+  //
+  // So a falsy `repo` would turn a string the untrusted side chose into a directory this process
+  // enumerates, synchronously, on every `/policy/screen` request. It cannot happen today, and the
+  // reason is one line in a different file: `parsePolicySource` refuses a payload whose `repo` is
+  // not an object. That is a property two files hold up between them with nothing asserting it, and
+  // `repo?:` on `BuildScreenInput` says the fallback is a supported shape.
+  //
+  // Both halves are pinned here rather than one, because either alone can be true while the pair is
+  // not: the manager could stop passing `repo`, or the parser could start accepting its absence.
+  it("cannot reach the disk fallback inside buildScreen", () => {
+    const source = code(read("./manager-server.ts"));
+    // Every `buildScreen(` call in the manager hands it a `repo`. The renderer's payload is the only
+    // source of one, which is the point.
+    for (const call of source.matchAll(/buildScreen\(\{([^}]*)\}/gs)) {
+      assert.match(
+        call[1]!,
+        /\brepo\s*:/,
+        "a buildScreen call in the manager omits `repo`, which makes it read the disk at `sitePath`",
+      );
+    }
+    // …and the manager never names the disk-reading function itself.
+    assert.ok(
+      !/readCoverageProbes/.test(source),
+      "manager-server.ts names readCoverageProbes — that side runs where the checkout is",
+    );
+  });
+
+  it("refuses a rendered payload that carries no repo facts", async () => {
+    // The other half, as behaviour rather than as text. If this stops throwing, the manager starts
+    // taking the fallback above with a renderer-chosen path.
+    const { parsePolicySource } = await import("./policy-source.ts");
+    // Valid in every other respect, so the refusal can only be about `repo`. `label` is the field
+    // that would become a directory path, which is why it is the one pointed somewhere alarming.
+    const withoutRepo = {
+      schemaVersion: 1,
+      label: "../../etc",
+      build: "b",
+      files: {},
+      head: { sha: null, dirty: false },
+      site: { cfg: {}, hosts: [], objects: [] },
+    };
+    assert.throws(() => parsePolicySource(withoutRepo), /repo/);
+    // And the same payload *with* repo is accepted — otherwise this passes against a parser that
+    // refuses everything, and proves nothing about `repo` in particular.
+    assert.doesNotThrow(() =>
+      parsePolicySource({ ...withoutRepo, repo: { probes: [], commits: [], generation: null } }));
+  });
+
   it("never asks the renderer for anything but the rendered policy", () => {
     // The connection to `heliopause-policy-render` is the one place untrusted output enters this
     // process. It is one GET, and the response is parsed by `parsePolicySource` rather than used
