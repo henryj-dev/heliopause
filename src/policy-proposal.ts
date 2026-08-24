@@ -132,12 +132,35 @@ async function gh(
   return text ? JSON.parse(text) : {};
 }
 
-/** Exchange the App JWT for an installation token. Short-lived by construction — GitHub gives an hour. */
+/**
+ * Exchange the App JWT for an installation token. Short-lived by construction — GitHub gives an hour.
+ *
+ * ## Cached, because four functions here each minted their own
+ *
+ * `repoHead`, `compareGenerations`, `commitToBranch` and `openPullRequest` all began with this call,
+ * so one `POST /policy/propose` spent at least three and every `/policy/screen` poll spent one more
+ * on top of the `repoHead` cache that already exists. `manager-server.ts` names the cost where it
+ * caches the head sha: *"every poll would otherwise spend an installation rate limit shared with the
+ * thing that actually needs it — proposing."* The same argument applies one layer down.
+ *
+ * Keyed by installation, so a deployment with more than one credential does not hand the wrong token
+ * to the wrong repository. Retired **ten minutes early**: the token is good for an hour, and a
+ * request that starts just before expiry must not arrive just after it.
+ *
+ * In memory and per process, like everything else here. Losing it costs one extra exchange.
+ */
+const installationTokens = new Map<string, { token: string; goodUntilSec: number }>();
+const INSTALLATION_TOKEN_TTL_SEC = 50 * 60;
+
 export async function installationToken(
   creds: AppCredentials,
   fetcher: Fetcher,
   nowSec: number,
 ): Promise<string> {
+  const key = `${creds.appId}/${creds.installationId}`;
+  const cached = installationTokens.get(key);
+  if (cached && cached.goodUntilSec > nowSec) return cached.token;
+
   const jwt = appJwt(creds, nowSec);
   const out = (await gh(
     fetcher,
@@ -146,7 +169,13 @@ export async function installationToken(
     "POST",
   )) as { token?: string };
   if (!out.token) throw new ProposalError("the installation did not return a token");
+  installationTokens.set(key, { token: out.token, goodUntilSec: nowSec + INSTALLATION_TOKEN_TTL_SEC });
   return out.token;
+}
+
+/** Drop every cached installation token. For a test, and for a credential rotation. */
+export function forgetInstallationTokens(): void {
+  installationTokens.clear();
 }
 
 /**
@@ -308,6 +337,36 @@ export function branchName(who: string, at: string): string {
       .replace(/^[.-]+|[.-]+$/g, "") || "operator";
   const stamp = at.replace(/[-:]/g, "").replace(/\.\d+/, "").replace("T", "-").replace("Z", "");
   return `policy/${slug}/${stamp}`;
+}
+
+/**
+ * Is this a branch name this console is willing to create?
+ *
+ * ## Why `branchName` alone was not the gate it reads as
+ *
+ * That function slugs the operator's name and says why — a `/` in it "would silently create a nested
+ * ref namespace that later refs collide with". But `POST /policy/edit` accepts a `branch` in the
+ * request body and only falls back to `branchName` when it is absent, so a caller supplying one
+ * skipped the whole argument. Every writer is authenticated and GitHub refuses a malformed ref, so
+ * nothing escaped — what was wrong is that the invariant had a documented reason and an open door.
+ *
+ * The shape is what this console itself emits plus room for a person naming a branch by hand:
+ * segments of letters, digits, dot, dash, underscore, separated by `/`. Everything git objects to is
+ * outside that — `..`, a leading or trailing dot, a trailing `.lock`, a control character, a space —
+ * and so is anything that would climb out of the `policy/` namespace.
+ */
+export function isUsableBranchName(branch: string): boolean {
+  if (!branch || branch.length > 255) return false;
+  if (branch.includes("..") || branch.includes("//")) return false;
+  if (branch.startsWith("/") || branch.endsWith("/")) return false;
+  return branch
+    .split("/")
+    .every((segment) =>
+      segment.length > 0 &&
+      /^[A-Za-z0-9._-]+$/.test(segment) &&
+      !segment.startsWith(".") &&
+      !segment.endsWith(".") &&
+      !segment.endsWith(".lock"));
 }
 
 export interface EditInput {

@@ -248,9 +248,22 @@ export function cidrsOverlap(a: string, b: string): boolean {
   return (pa.net & mask) === (pb.net & mask);
 }
 
-/** Do two port specs overlap? An empty policy spec means "all ports" and overlaps everything. */
+/**
+ * Do two port specs overlap? An empty policy spec means "all ports" and overlaps everything.
+ *
+ * **Undecidable input counts as overlapping**, the same rule `cidrsOverlap` follows and for the same
+ * reason: this decides whether a policy could take away a protected management path, so anything it
+ * cannot reason about must not come back as "no conflict".
+ *
+ * It did. `Number("@web")` is `NaN`, every comparison against `NaN` is false, and the function
+ * returned `false` — "these do not overlap" — for exactly the inputs whose meaning is unknown. On
+ * the render path `assertPorts` throws before that matters, so the fleet was never at risk; but
+ * `baselineConflict` is also read by the policy screen and the coverage table, and there an
+ * unresolved reference produced a confident "does not conflict with the baseline".
+ */
 export function portsOverlap(policyPorts: string, baselinePorts: string): boolean {
   if (!policyPorts) return true;
+  let undecidable = false;
   const ranges = (spec: string): Array<[number, number]> =>
     spec
       .split(",")
@@ -259,10 +272,13 @@ export function portsOverlap(policyPorts: string, baselinePorts: string): boolea
       .map((x) => {
         const [lo, hi] = x.split(":");
         const l = Number(lo);
-        return [l, hi === undefined ? l : Number(hi)] as [number, number];
+        const h = hi === undefined ? l : Number(hi);
+        if (!Number.isFinite(l) || !Number.isFinite(h)) undecidable = true;
+        return [l, h] as [number, number];
       });
   const A = ranges(policyPorts);
   const B = ranges(baselinePorts);
+  if (undecidable) return true;
   return A.some(([a1, a2]) => B.some(([b1, b2]) => a1 <= b2 && b1 <= a2));
 }
 

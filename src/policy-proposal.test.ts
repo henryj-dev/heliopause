@@ -3,13 +3,16 @@
 // Everything here is about a request that *succeeded* while meaning something other than what the
 // caller assumed — a branch that already existed, a file that moved under the editor, a 422 that is
 // not a duplicate. None of those throw on their own.
-import { describe, it } from "node:test";
+import { beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { generateKeyPairSync } from "node:crypto";
 import {
   appJwt,
   branchName,
   commitToBranch,
+  forgetInstallationTokens,
+  installationToken,
+  isUsableBranchName,
   openPullRequest,
   proposalBody,
   sameCommit,
@@ -17,6 +20,10 @@ import {
   type AppCredentials,
   type Fetcher,
 } from "./policy-proposal.ts";
+
+// The installation token is cached per process, so one test warming it would change what the next
+// one observes on its route table — a test that stopped exercising the exchange and did not say so.
+beforeEach(() => forgetInstallationTokens());
 
 const { privateKey } = generateKeyPairSync("rsa", {
   modulusLength: 2048,
@@ -278,5 +285,54 @@ describe("sameCommit — the comparison a staleness banner rests on", () => {
     assert.equal(sameCommit(null, "6e17455bd0d2c0a4c2f9e8f0a1b2c3d4e5f60718"), false);
     assert.equal(sameCommit("6e17455", null), false);
     assert.equal(sameCommit(null, null), false);
+  });
+});
+
+describe("the installation token is not re-minted per call", () => {
+  // Four functions in this file each began with `installationToken`, so a single `/policy/propose`
+  // spent three exchanges and every policy-screen poll spent another — against a rate limit shared
+  // with the thing that actually needs it. The manager's own `repoHeadCache` comment names that cost
+  // one layer up.
+  it("mints once and reuses it inside the window", async () => {
+    const { fetch, seen } = fetcherFor([tokenRoute]);
+    assert.equal(await installationToken(creds, fetch, 1_000), "t");
+    assert.equal(await installationToken(creds, fetch, 1_000 + 60), "t");
+    assert.equal(seen.filter((s) => s.url.endsWith("access_tokens")).length, 1);
+  });
+
+  it("mints again before the hour GitHub gives is actually up", async () => {
+    // Retired ten minutes early, so a request that starts just before expiry cannot arrive after it.
+    const { fetch, seen } = fetcherFor([tokenRoute]);
+    await installationToken(creds, fetch, 1_000);
+    await installationToken(creds, fetch, 1_000 + 50 * 60);
+    assert.equal(seen.filter((s) => s.url.endsWith("access_tokens")).length, 2);
+  });
+
+  it("does not hand one installation's token to another", async () => {
+    const { fetch, seen } = fetcherFor([tokenRoute]);
+    await installationToken(creds, fetch, 1_000);
+    await installationToken({ ...creds, installationId: "99" }, fetch, 1_000);
+    assert.equal(seen.filter((s) => s.url.endsWith("access_tokens")).length, 2);
+  });
+});
+
+describe("isUsableBranchName", () => {
+  // `branchName` slugs the operator's name and says why a `/` in it would be a problem — and
+  // `POST /policy/edit` accepts a `branch` from the body, which skipped that argument entirely.
+  it("accepts what this console emits and what a person would type", () => {
+    assert.equal(isUsableBranchName(branchName("ops@example.com", "2026-08-24T09:00:00.000Z")), true);
+    assert.equal(isUsableBranchName("policy/narrow-idp"), true);
+    assert.equal(isUsableBranchName("fix_1.2-rc"), true);
+  });
+
+  it("refuses what git refuses, and what would climb out of the namespace", () => {
+    for (const bad of [
+      "", "   ", "policy/../main", "/policy/x", "policy/x/", "policy//x",
+      ".hidden", "policy/.hidden", "policy/x.", "policy/x.lock",
+      "policy/a b", "policy/a~b", "policy/a^b", "policy/a:b", "policy/a?b", "policy/a*b",
+      "policy/a\\b", "policy/a\nb", `policy/${"x".repeat(300)}`,
+    ]) {
+      assert.equal(isUsableBranchName(bad), false, `${JSON.stringify(bad)} should be refused`);
+    }
   });
 });

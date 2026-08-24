@@ -87,6 +87,7 @@ import {
   type AppCredentials,
   compareGenerations,
   isGeneratedPolicyFile,
+  isUsableBranchName,
   repoHead,
   sameCommit,
   type Fetcher,
@@ -1923,7 +1924,15 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
           }
           const content = String(body.content ?? "");
           if (!content) return send(res, 400, { error: "refusing to commit an empty file" });
+          // Checked, not just defaulted. `branchName` slugs the operator's name and explains why a
+          // `/` in it would be a problem — and a caller who supplies `branch` skipped that argument
+          // entirely. See `isUsableBranchName`.
           const branch = String(body.branch ?? "") || branchName(who, now().toISOString());
+          if (!isUsableBranchName(branch)) {
+            return send(res, 400, {
+              error: "branch must be slash-separated segments of letters, digits, dot, dash or underscore",
+            });
+          }
           const out = await commitToBranch(creds, call, nowSec, {
             target,
             path,
@@ -1937,6 +1946,11 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
 
         const branch = String(body.branch ?? "");
         if (!branch) return send(res, 400, { error: "propose needs the branch to open a pull request from" });
+        if (!isUsableBranchName(branch)) {
+          return send(res, 400, {
+            error: "branch must be slash-separated segments of letters, digits, dot, dash or underscore",
+          });
+        }
         // The body names the rendered plan rather than describing the diff. GitHub shows the diff;
         // what a reviewer cannot see there is whether the change renders into anything.
         //
@@ -2712,6 +2726,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         return send(res, 403, { error: `signed in, but not authorised: ${decision.reason}` });
       }
 
+      const evictedBefore = o.sessions.evictionReport.count;
       const s = o.sessions.create({ ...decision.principal, canWrite: decision.canWrite });
       log(
         `session for ${s.principal.name} via oidc (sub ${identity.sub}), ` +
@@ -2719,6 +2734,19 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         `${s.principal.name}의 OIDC 세션 (sub ${identity.sub}), ` +
           `${decision.canWrite ? "쓰기 가능" : "읽기 전용"} — ${decision.reason}`,
       );
+      // The session table is capped, and reaching the cap throws out the oldest **live** session
+      // rather than refusing the new login — otherwise anyone could lock the operator out by filling
+      // it. The cost is that a real operator can be signed out by somebody else's login loop, and
+      // all they see is that they were signed out. Said here so the other half exists in the journal.
+      const evicted = o.sessions.evictionReport;
+      if (evicted.count > evictedBefore) {
+        log(
+          `session table is full — evicted the oldest live session (${evicted.last}) to admit this ` +
+            `login; ${evicted.count} evicted since start`,
+          `세션 테이블이 가득 참 — 이 로그인을 받기 위해 가장 오래된 활성 세션(${evicted.last})을 축출함; ` +
+            `시작 이후 ${evicted.count}건`,
+        );
+      }
       // Back to the page that sent them here, if it named one this server will follow.
       //
       // **This is the only gate**, and it is on the way out on purpose. The stored value came from a
@@ -3098,6 +3126,11 @@ function send(res: ServerResponse, status: number, body: unknown) {
   res.writeHead(status, {
     "content-type": "application/json",
     "content-length": Buffer.byteLength(payload),
+    // The static console has carried this since it grew security headers; the API answers did not,
+    // and several of them reflect caller input — a host name, a plan hash, a Service reference —
+    // back inside an error string. Nothing here is served as a document, so declaring that the
+    // declared type is the only one costs nothing and removes a class of surprise.
+    "x-content-type-options": "nosniff",
   });
   res.end(payload);
 }

@@ -103,8 +103,20 @@ export function summarise(s: Snapshot): SnapshotSummary {
   return rest;
 }
 
-/** Fetches a URL's body. Injected — this module does no I/O of its own. */
-export type FetchFeed = (url: string) => Promise<string>;
+/**
+ * Fetches a URL's body. Injected — this module does no I/O of its own.
+ *
+ * `maxBytes` is the ceiling **for this feed**, and passing it is what makes it a transfer bound
+ * rather than a post-hoc measurement. `feeds.ts` sets Cloudflare's ingress list to 256 KB and calls
+ * that "a guard in its own right: if this list ever returns something the size of a geofeed, the URL
+ * is not returning what it used to" — but nothing carried the number to the fetch, so the transfer
+ * ran to the global 32 MB and the 256 KB was checked by `parseFeed` afterwards. Detection worked;
+ * the bound did not exist.
+ *
+ * Optional so an existing implementation stays valid — including the ones in the tests, which return
+ * a fixture string and have nothing to bound.
+ */
+export type FetchFeed = (url: string, maxBytes?: number) => Promise<string>;
 
 export interface RefreshLimits {
   /**
@@ -201,7 +213,9 @@ export async function refreshFeed(input: {
   const parts: string[] = [];
   for (const url of source.urls) {
     try {
-      parts.push(await fetch(url));
+      // The feed's own ceiling reaches the fetch, so an oversized body is refused mid-transfer
+      // rather than measured once it is all in memory. See `FetchFeed`.
+      parts.push(await fetch(url, feedLim.maxBytes));
     } catch (e) {
       // **One failure abandons the whole refresh.** Concatenating the parts that succeeded would
       // produce a feed missing an address family — Cloudflare's list is `/ips-v4` plus `/ips-v6`, so a

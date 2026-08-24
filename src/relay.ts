@@ -1096,6 +1096,9 @@ function send(res: ServerResponse, status: number, body: unknown) {
   res.writeHead(status, {
     "content-type": "application/json",
     "content-length": Buffer.byteLength(payload),
+    // Same as the manager's. Nothing here is a document, and several answers carry a host name or an
+    // agent's own error text back to the caller.
+    "x-content-type-options": "nosniff",
   });
   res.end(payload);
 }

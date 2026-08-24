@@ -55,6 +55,14 @@ import { OidcError, verifyJws, type Provider } from "./oidc.ts";
 /** Bound on remembered `jti` values. Far above any plausible burst; a cap, not a policy. */
 const MAX_SEEN = 4096;
 
+/**
+ * Bound on remembered per-subject watermarks. Same reasoning as `MAX_SEEN`, and it was missing.
+ *
+ * Far above the number of people who can sign in to this console — the session table itself holds
+ * 64 — so reaching it means something other than ordinary use.
+ */
+const MAX_SUBJECTS = 4096;
+
 /** Upper bound on a token's own lifetime, whatever `exp` says. */
 const MAX_LIFETIME_SEC = 3600;
 
@@ -88,9 +96,30 @@ export class RoleChangeLedger {
     return last === undefined || txn > last;
   }
 
-  /** Record that this subject's state has been advanced to `txn`. */
+  /**
+   * Record that this subject's state has been advanced to `txn`.
+   *
+   * Bounded like `seen`, and it was not — `MAX_SEEN` capped the `jti` set while this map grew one
+   * entry per subject for the lifetime of the process. Every entry requires a signed token from the
+   * issuer, so it is not reachable by an anonymous caller; it is still a table that only ever grows
+   * in a process meant to stay up for months.
+   *
+   * Eviction is least-recently-advanced, and losing an entry is safe in the direction that matters:
+   * a subject with no watermark accepts the next token whatever its `txn`. The exposure that
+   * reintroduces is a *stale* snapshot arriving after its eviction — and `MAX_LIFETIME_SEC` already
+   * bounds a token to an hour, so anything old enough to have been evicted from a table this size
+   * has expired on its own.
+   */
   advance(sub: string, txn: bigint): void {
+    // Re-inserted rather than updated, so `Map` order tracks recency and the eviction below drops
+    // the subject nobody has heard about in longest.
+    this.lastTxn.delete(sub);
     this.lastTxn.set(sub, txn);
+    while (this.lastTxn.size > MAX_SUBJECTS) {
+      const oldest = this.lastTxn.keys().next().value;
+      if (oldest === undefined) break;
+      this.lastTxn.delete(oldest);
+    }
   }
 
   /** True the first time a `jti` is offered, false afterwards. */

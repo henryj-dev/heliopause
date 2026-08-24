@@ -108,6 +108,9 @@ export class SessionStore {
   private readonly sessions = new Map<string, Session>();
   private readonly limits: SessionLimits;
   private readonly now: () => Date;
+  /** How many live sessions have been pushed out by the cap. See `create`. */
+  private evictions = 0;
+  private lastEvicted: string | null = null;
 
   constructor(limits: SessionLimits = DEFAULT_LIMITS, now: () => Date = () => new Date()) {
     this.limits = limits;
@@ -126,8 +129,18 @@ export class SessionStore {
     if (this.sessions.size >= this.limits.max) {
       // Oldest first. Refusing the new login instead would let anyone lock out the operator by
       // filling the table, and the failure would look like a broken IdP.
+      //
+      // Neither direction is free, and this one has its own cost: a login loop pushes real operators
+      // out, and the operator whose session vanished sees only that they were signed out. So the
+      // eviction is reported — `evicted` counts them, and the manager logs it. A bound that is being
+      // hit is a fact about the deployment, and the version of this that said nothing made a
+      // deliberate flood indistinguishable from an ordinary expiry.
       const oldest = [...this.sessions.values()].sort((a, b) => +a.createdAt - +b.createdAt)[0];
-      if (oldest) this.sessions.delete(oldest.id);
+      if (oldest) {
+        this.sessions.delete(oldest.id);
+        this.evictions += 1;
+        this.lastEvicted = oldest.principal.name;
+      }
     }
     const at = this.now();
     const s: Session = {
@@ -195,6 +208,17 @@ export class SessionStore {
 
   get size(): number {
     return this.sessions.size;
+  }
+
+  /**
+   * Whose live session the cap has thrown away, and how many times, since this process started.
+   *
+   * Read by the caller after `create` so the eviction reaches a journal. Cumulative rather than a
+   * per-call return value: the interesting reading is "this keeps happening", which a boolean at one
+   * call site cannot say.
+   */
+  get evictionReport(): { count: number; last: string | null } {
+    return { count: this.evictions, last: this.lastEvicted };
   }
 
   private sweep(): void {

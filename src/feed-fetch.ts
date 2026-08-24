@@ -46,8 +46,18 @@ export const FETCH_LIMITS: FetchLimits = {
  * "keep the previous snapshot", which is the same response in each case.
  */
 export function makeFetchFeed(limits: FetchLimits = FETCH_LIMITS): FetchFeed {
-  return (url: string) =>
+  // `perFeedMaxBytes` is the registered feed's own ceiling, passed down by `refreshFeed`. The
+  // smaller of the two wins: `limits.maxBytes` is the absolute bound this process will ever buffer,
+  // and a feed that declares a tighter one means it. Absent — a caller that does not know which feed
+  // this is — leaves the global bound, which is what happened for every fetch until now.
+  return (url: string, perFeedMaxBytes?: number) =>
     new Promise<string>((resolve, reject) => {
+      const maxBytes = Math.min(
+        limits.maxBytes,
+        perFeedMaxBytes !== undefined && Number.isFinite(perFeedMaxBytes) && perFeedMaxBytes > 0
+          ? perFeedMaxBytes
+          : limits.maxBytes,
+      );
       let parsed: URL;
       try {
         parsed = new URL(url);
@@ -91,10 +101,10 @@ export function makeFetchFeed(limits: FetchLimits = FETCH_LIMITS): FetchFeed {
           let total = 0;
           res.on("data", (c: Buffer) => {
             total += c.length;
-            if (total > limits.maxBytes) {
+            if (total > maxBytes) {
               // Destroyed rather than left to finish. `Content-Length` is a claim; this is the limit.
               res.destroy();
-              return reject(new FeedError(`feed body exceeded ${limits.maxBytes} bytes`));
+              return reject(new FeedError(`feed body exceeded ${maxBytes} bytes`));
             }
             chunks.push(c);
           });
@@ -104,7 +114,7 @@ export function makeFetchFeed(limits: FetchLimits = FETCH_LIMITS): FetchFeed {
             // A truncated body is not a short feed. Without this an aborted transfer would parse to a
             // prefix of the real list and look like a feed that shrank — which the drift guard would
             // catch, but only by luck of the size, and never by knowing the transfer broke.
-            if (res.destroyed && total > limits.maxBytes) return;
+            if (res.destroyed && total > maxBytes) return;
             resolve(Buffer.concat(chunks).toString("utf8"));
           });
         },
