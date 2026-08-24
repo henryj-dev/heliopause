@@ -73,7 +73,7 @@ npm test                                                  # node --test (src + e
                                                           #   + @heliopause/manager + @heliopause/web
 python3 agent/test_validate.py                            # 에이전트 검증기·롤백 상태기계
 python3 agent/test_enroll.py                              # 호스트 생성 키 · 지속 CSR 등록
-npm run typecheck
+npm run typecheck                                         # 루트(src + bin + examples) + @heliopause/manager
 npm run check:web                                         # Svelte 진단 (루트 tsconfig 밖)
 npm run build:web                                         # 타입 통과와 빌드 성공은 다른 것이다
 npm run icons:check                                       # 아이콘 20종이 lucide-static 에 실재하는가
@@ -89,6 +89,12 @@ python3 scripts/git-hooks/test-pre-commit.py              # 실패 0 (사람 통
 이 목록은 이제 CI(`.github/workflows/ci.yml` 의 `check` · `agent worktree guards`)에서도 돈다.
 손으로 돌리는 것을 대신하지는 않는다 — 워크트리에서 훅을 고친 뒤 CI 가 알려주기를 기다리면
 그 사이 세션이 이미 깨진 가드를 쓴다. CI 는 **아무도 안 돌린 날**을 위한 것이다.
+
+⚠️ **수를 보라.** 「OK」는 무엇이 돌았는지 말하지 않는다. `agent/test_validate.py` 의
+`if __name__ == "__main__"` 이 파일 중간에 있어서 그 아래 다섯 클래스(라우트 안전 검사
+39개)가 정의조차 되지 않은 채 몇 달을 지났고, 초록불은 그동안 한 번도 흔들리지 않았다
+— 수가 줄어든 게 아니라 센 적이 없어 비교할 기준선이 없었다. 지금 기대값:
+`npm test` 1,600+ · `test_validate.py` 238 · `test_enroll.py` 13.
 
 ⚠️ 훅 검사 7종은 `refs/remotes/origin/HEAD` 를 필요로 한다. `git clone` 은 그것을 쓰지만
 `actions/checkout` 은 안 쓴다 — 그래서 CI 쪽 job 이 먼저 `git symbolic-ref` 로 세운다.

@@ -90,14 +90,38 @@ describe("privilege-separated revocation writer", () => {
         new RegExp(`exceeds ${MAX_REVOCATION_SNAPSHOT_BYTES} bytes`),
       );
 
+      // ## A write error here is the writer working, not the test failing
+      //
+      // The oversized case sends 256 KiB + 1 in one `write`. The writer refuses the moment the
+      // count crosses the ceiling and answers with `socket.end(…, () => socket.destroy())` — so
+      // whether the client's own write finishes first is a race with the kernel's send buffer, and
+      // it depends on the machine and on how loaded it is.
+      //
+      // Rejecting on `error` therefore made this test fail **when the guard reacted quickly**:
+      // measured once in a full-suite run as `write EPIPE`, and not reproducible in eight isolated
+      // runs or ten under CPU load. That is the worst shape a test can have — it distinguishes "the
+      // bound fired" from "this machine was fast" and reports the first as a defect.
+      //
+      // So a broken pipe is recorded rather than thrown. What the assertions below check is
+      // unchanged and is the actual property: the writer answered `ok: false`, and it closed the
+      // connection. An error with no answer still fails, because `JSON.parse("")` throws.
       const rawRequest = (payload?: Buffer) => new Promise<{ response: string; destroyed: boolean }>((resolve, reject) => {
         const socket = createConnection(socketPath);
         let response = "";
         socket.setEncoding("utf8");
-        socket.once("connect", () => { if (payload) socket.write(payload); });
+        socket.once("connect", () => {
+          // The callback swallows the same race on the write itself; without it Node reports an
+          // unhandled 'error' event before `once("error")` below can see it on some platforms.
+          if (payload) socket.write(payload, () => undefined);
+        });
         socket.on("data", (chunk) => { response += chunk; });
         socket.once("close", () => resolve({ response, destroyed: socket.destroyed }));
-        socket.once("error", reject);
+        socket.once("error", (e: NodeJS.ErrnoException) => {
+          // Only the two the far side's `destroy()` can cause. Anything else — a missing socket, a
+          // permission failure — is still a real failure and must not be absorbed here.
+          if (e.code === "EPIPE" || e.code === "ECONNRESET") return;
+          reject(e);
+        });
       });
 
       // Do not half-close either request: the writer itself must terminate abusive/idle peers.

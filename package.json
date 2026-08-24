@@ -44,7 +44,7 @@
     "pki": "node bin/heliopause-pki.ts",
     "publish": "node bin/heliopause-publish.ts",
     "status": "node bin/heliopause-status.ts",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && npm run typecheck -w @heliopause/manager --if-present",
     "check:web": "npm run check -w @heliopause/web",
     "e2e": "./scripts/e2e-roundtrip.sh",
     "relay": "node bin/heliopause-relay.ts",

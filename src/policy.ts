@@ -124,7 +124,15 @@ export interface Endpoint {
   kind: EndpointKind;
   /**
    * Meaning depends on `kind`: host name, CIDR, or object name.
-   * Ignored (and cleared) for `internet` and `any`.
+   *
+   * **Required, and `""` for `internet` and `any`** — those kinds carry no address, so
+   * `normalizeEndpoint` discards whatever was sent and writes the empty string.
+   *
+   * Not optional, and the comment used to read as though it were ("Ignored (and cleared) for
+   * `internet` and `any`"), which is how `examples/site.ts` came to declare
+   * `src: { kind: "internet" }` and fail to compile. Fifty-one call sites read this field expecting
+   * a `string`; widening it so an example could omit one word would put a `?? ""` at every one of
+   * them to save a `value: ""` here.
    */
   value: string;
 }

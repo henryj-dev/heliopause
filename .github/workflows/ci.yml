@@ -108,6 +108,11 @@ jobs:
           # their own — the root one covers all seven — so one key is the whole dependency set.
           cache: npm
       - run: npm ci
+      # Covers `src/` + `bin/` + `examples/`, and then `@heliopause/manager`, which has its own
+      # tsconfig and was checked by nothing — the root script only ran the root project, so the
+      # workspace's `typecheck` script existed and no gate called it. `examples/` was outside the
+      # root `include` for the same reason and had shipped a real error: `node --test` runs those
+      # files by stripping types, never by checking them.
       - run: npm run typecheck
       # Svelte's template and component diagnostics are outside the root tsconfig.
       # Keep this as a named gate so a passing library typecheck cannot hide a
@@ -125,8 +130,20 @@ jobs:
       - run: npm run icons:check
       - run: npm test
       # Standard library only, so no install step. Pinned to the same interpreter the hosts run.
+      #
+      # 🔴 **`OK` does not say what ran.** `test_validate.py` had its `if __name__ == "__main__"`
+      # block in the middle of the file, so `unittest.main()` executed there and `sys.exit()`ed
+      # before five classes below it were even defined — 39 route-safety tests, green the whole
+      # time. This step could not have noticed: the count did not drop, it had never been counted.
+      # The floor below is the cheapest thing that turns "a suite vanished" into a failure.
       - name: agent tests
-        run: python3 agent/test_validate.py && python3 agent/test_enroll.py
+        run: |
+          set -euo pipefail
+          python3 agent/test_validate.py 2>&1 | tee /tmp/agent-tests.log
+          python3 agent/test_enroll.py
+          ran="$(sed -n 's/^Ran \([0-9]*\) tests.*/\1/p' /tmp/agent-tests.log)"
+          test "${ran:-0}" -ge 238 \
+            || { echo "agent validator ran ${ran:-0} tests, expected at least 238 — did a suite stop being discovered?"; exit 1; }
 
   e2e:
     name: mTLS round trip

@@ -268,6 +268,33 @@ describe("hostVerdict — silence outranks the last thing a host said", () => {
   it("passes any other fresh state through rather than inventing a word for it", () => {
     assert.deepEqual(hostVerdict({ ageSec: 3, state: "pending" }), { kind: "other", state: "pending" });
   });
+
+  // ## The ordering around `maintenance`, pinned in both directions
+  //
+  // `hostVerdict` carried the same `if (h.maintenance)` twice — once above `never-seen` and once
+  // below it. The second was unreachable, and **deleting either copy broke no test**, which is why
+  // it survived long enough to accumulate a comment arguing for the order it no longer had.
+  //
+  // Both directions are asserted because only the pair is a statement about ordering. The first
+  // case alone passes with the check anywhere above `silent`; the second alone passes with it
+  // anywhere below `drift`.
+  it("puts a declared exemption above every form of silence", () => {
+    // Measured 2026-08-11: relay state is memory-only, so **every** host reads as never-seen for a
+    // minute after a relay restart — and a host that is genuinely gone stays there for good.
+    // `mailer-03` was declared out of service and the console still drew `never seen`.
+    assert.deepEqual(
+      hostVerdict({ ageSec: null, state: null, maintenance: "vultr migrated it onto a CPU its libc cannot use" }),
+      { kind: "maintenance", reason: "vultr migrated it onto a CPU its libc cannot use" },
+    );
+    assert.equal(hostVerdict({ ageSec: 99_999, state: "confirmed", maintenance: "out for repair" }).kind, "maintenance");
+  });
+
+  it("keeps drift and rollback above a declared exemption", () => {
+    // Those are statements the host itself made about the generation. An exemption from being
+    // waited on must not erase evidence the host already produced.
+    assert.equal(hostVerdict({ drifted: true, ageSec: null, state: "confirmed", maintenance: "out for repair" }).kind, "drift");
+    assert.equal(hostVerdict({ ageSec: 5, state: "rolled-back", maintenance: "out for repair" }).kind, "rolled-back");
+  });
 });
 
 describe("a host declared out of service", () => {

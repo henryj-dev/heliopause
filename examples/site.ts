@@ -99,7 +99,10 @@ export const exampleConfig: Config = defineConfig({
 const publicWeb: Policy = {
   id: "example-web",
   name: "public web",
-  src: { kind: "internet" },
+  // `value: ""` and not an omitted field. `internet` and `any` carry no address, and
+  // `normalizeEndpoint` clears whatever is sent — but the field is required, because fifty-one
+  // call sites read it as a `string`. Writing the empty string is what normalisation produces.
+  src: { kind: "internet", value: "" },
   dst: { kind: "cidr", value: INTERNAL },
   proto: "tcp",
   ports: "80,443",

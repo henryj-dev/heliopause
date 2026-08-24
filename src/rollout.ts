@@ -343,14 +343,19 @@ export function hostVerdict(h: {
   // The ordering question is really "which is the stronger statement". `never-seen` is the absence
   // of an observation; `maintenance` is a sentence a person wrote about this host on purpose. A
   // declaration should not be overridden by the absence of a measurement it already explains.
+  // Above every form of silence — both `never-seen` and `silent`. This host is quiet *and somebody
+  // wrote down why*, which is a stronger statement than either measurement.
+  //
+  // Still below drift and rollback. Those are statements the host itself made about the generation,
+  // and an exemption from being waited on must not erase evidence the host already produced.
+  //
+  // ⚠️ There was a second, identical `if (h.maintenance)` below the `never-seen` line, left behind
+  // when this one moved up. It was unreachable, and the comment that travelled with it argued for
+  // the *old* order ("Below `never-seen` for the opposite reason") — so the function that says
+  // ordering is the whole point carried a paragraph describing an order it no longer had. Deleting
+  // either copy broke no test, which is the other reason it survived.
   if (h.maintenance) return { kind: "maintenance", reason: h.maintenance };
   if (h.ageSec === null) return { kind: "never-seen" };
-  // Above silence, because that is the whole point: this host is silent *and someone said why*.
-  // Below `never-seen` for the opposite reason — a host never once heard from is unaccounted for
-  // rather than out of service, and the flag must not make one that was never real look handled.
-  // Below drift and rollback — those are statements the host itself made about the generation, and
-  // an exemption from waiting must not erase evidence the host already produced.
-  if (h.maintenance) return { kind: "maintenance", reason: h.maintenance };
   if (h.ageSec > STALE_SEC) return { kind: "silent", ageSec: h.ageSec };
   // Being behind outranks `state`, for the same reason silence does: `confirmed` describes the
   // generation this host is running, not the one being rolled out. A host mid-rollout is reporting

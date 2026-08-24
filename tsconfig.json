@@ -13,5 +13,11 @@
     "skipLibCheck": true,
     "verbatimModuleSyntax": true
   },
-  "include": ["src/**/*.ts", "bin/**/*.ts"]
+  "//include": [
+    "`examples/` is here because it was not, and nobody could tell. `node --test` runs it by",
+    "stripping types rather than checking them, so `examples/site.ts` shipped with a real TS2741",
+    "and every gate stayed green. The file's whole purpose is to be copied by a public clone —",
+    "into a project that does have strict typechecking on."
+  ],
+  "include": ["src/**/*.ts", "bin/**/*.ts", "examples/**/*.ts"]
 }
