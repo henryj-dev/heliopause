@@ -63,6 +63,59 @@ function hb(over: HeartbeatOverride = {}): Heartbeat {
 
 const reply = (o: { body: HeartbeatReply | { error: string } }) => o.body as HeartbeatReply;
 
+// ## The one heartbeat field the relay does not carry
+//
+// `Heartbeat.artifactTrust` is built and transmitted by the agent every interval and read by nothing.
+// `handleHeartbeat` copies the heartbeat into `HostStatus` field by field — with a comment on each
+// explaining why it is kept — and this one is absent, so it stops at the relay and never reaches the
+// manager.
+//
+// Pinned because the alternative is a comment. The note on `Heartbeat.artifactTrust` states this as
+// measured fact, and a fact about behaviour that nothing checks is a fact that goes stale. This test
+// is also the notice: **when it fails because something started reading the field, that note is what
+// to delete** — the failure is the feature arriving, not a regression.
+//
+// It is deliberately about the stored status rather than about the reply. The reply is `computeGate`'s
+// business and never carried trust material; the loss is in what the relay remembers.
+describe("the heartbeat field that stops at the relay", () => {
+  const trust = {
+    managerKeyIds: ["mk-1"],
+    breakGlassKeyIds: ["bg-1"],
+    trustDigest: "sha256:deadbeef",
+    currentKeyId: "mk-1",
+    currentPayloadHash: "sha256:aaaa",
+    currentAuthorizationMode: "break-glass" as const,
+    currentAuthorizedAt: "2026-08-24T00:00:00Z",
+    currentPlanHash: "sha256:bbbb",
+  };
+
+  it("accepts the heartbeat and keeps none of its trust material", () => {
+    const s = state();
+    const out = handleHeartbeat(s, "h-canary", hb({ artifactTrust: trust }), AT);
+    // Accepted — an unread field is not a rejected one, and the agent is not told it wasted the bytes.
+    assert.equal(out.status, 200);
+    const stored = s.statuses["h-canary"];
+    assert.ok(stored, "the host was recorded");
+    // Nothing in the stored status mentions any of it, under any key. Asserted against the serialised
+    // status rather than a field list, so a future `HostStatus` that nests it somewhere still counts.
+    const text = JSON.stringify(stored);
+    for (const value of ["mk-1", "bg-1", "sha256:deadbeef", "sha256:aaaa", "sha256:bbbb", "break-glass"]) {
+      assert.equal(text.includes(value), false, `the relay began carrying ${value} — see Heartbeat.artifactTrust`);
+    }
+  });
+
+  it("records the same status whether or not the agent sent any", () => {
+    // The stronger form: not merely "the values are absent" but "the field changes nothing". A
+    // partial implementation that stored it under a key this test does not name would still pass the
+    // check above and fail this one.
+    const withTrust = state();
+    handleHeartbeat(withTrust, "h-canary", hb({ artifactTrust: trust }), AT);
+    const without = state();
+    handleHeartbeat(without, "h-canary", hb(), AT);
+    assert.deepEqual(withTrust.statuses["h-canary"], without.statuses["h-canary"]);
+  });
+});
+
 describe("identity binding", () => {
   it("refuses a connection with no subject CN", () => {
     assert.equal(handleHeartbeat(state(), null, hb(), AT).status, 401);

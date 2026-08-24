@@ -449,7 +449,34 @@ export interface Heartbeat {
   agentVersion: string;
   schemaVersion: number;
 
-  /** Public-key trust configuration and the signed authorization currently enforced by this host. */
+  /**
+   * Public-key trust configuration and the signed authorization currently enforced by this host.
+   *
+   * ⚠️ **The agent sends this every interval and nothing reads it.** Measured 2026-08-24:
+   * `artifact_trust_report` in `heliopause-pull.py` builds all eight fields and puts them on the
+   * wire; `handleHeartbeat` copies the heartbeat into `HostStatus` field by field and this is not
+   * one of them, so it does not survive the relay and never reaches the manager. A
+   * repository-wide grep finds the producer and this declaration, and no consumer.
+   *
+   * It is left in place rather than deleted because the questions it answers have no other source,
+   * and each is one this system exists to answer:
+   *
+   *   · `managerKeyIds` / `breakGlassKeyIds` / `trustDigest` — **did a key rotation actually land on
+   *     every host?** Only the host knows which keys it will accept a ruleset from. Without this,
+   *     "the new signing key is deployed" is an assumption about a file, not an observation.
+   *   · `currentKeyId` / `currentPayloadHash` / `currentPlanHash` — **is any host enforcing an
+   *     authorization we did not issue?**
+   *   · `currentAuthorizationMode` / `currentAuthorizedAt` — **is a `break-glass` authorization still
+   *     in force somewhere?** Nothing else notices one that was never wound back.
+   *
+   * Building the consumer is a design decision, not an omission to patch quietly: `Manifest` carries
+   * no authorization fields, so a per-host check in `reportContradictions` has nothing to compare
+   * against, and a fleet-wide agreement check needs this carried into `HostStatus` first. Both are
+   * real options; neither is implied by this comment.
+   *
+   * `relay.test.ts` pins the current behaviour so this note cannot quietly become false. If that
+   * test starts failing because something began reading the field, this paragraph is what to delete.
+   */
   artifactTrust?: {
     managerKeyIds: string[];
     breakGlassKeyIds: string[];
