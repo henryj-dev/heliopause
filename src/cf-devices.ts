@@ -70,6 +70,12 @@ interface Page {
   rows: Registration[];
   addressless: Addressless[];
   cursor: string;
+  /**
+   * How many rows the API said it sent on this page.
+   *
+   * `result_info.count` is per page, not per read — the fixture builds it as `result.length`, and the
+   * follow-up request after the last real page comes back `count: 0, cursor: ""`.
+   */
   count: number;
   /** Total the cursor claims, when it can be decoded. `null` when it cannot. */
   total: number | null;
@@ -142,11 +148,31 @@ export function parsePage(body: unknown): Page {
 
   const info = (b.result_info ?? {}) as Record<string, unknown>;
   const cursor = str(info.cursor);
+  const parsed = rows.length + addressless.length;
+
+  // ## The API's own per-page count, checked rather than merely recorded
+  //
+  // This field was computed and read by nothing — including by the tests. The aggregate check in
+  // `fetchRegistrations` covers the same ground, but only when the cursor decodes, and that cursor
+  // format is undocumented: `totalFromCursor` returning `null` is a normal outcome, not an error. So
+  // on a read where it does not decode there was **no completeness check at all**, with the number
+  // that would have supplied one sitting unread in the same object.
+  //
+  // That is this module's own stated contract — "never degrade this to an empty list" — left to a
+  // check that is allowed to be absent. Compared only when the API actually sent a number, because
+  // the fallback below is `parsed` itself and comparing a value against its own default proves
+  // nothing.
+  if (typeof info.count === "number" && info.count !== parsed) {
+    throw new TruncatedRead(
+      `the page claimed ${info.count} registrations and ${parsed} could be read — refusing to treat this as complete`,
+    );
+  }
+
   return {
     rows,
     addressless,
     cursor,
-    count: typeof info.count === "number" ? info.count : rows.length + addressless.length,
+    count: typeof info.count === "number" ? info.count : parsed,
     total: cursor ? totalFromCursor(cursor) : null,
   };
 }

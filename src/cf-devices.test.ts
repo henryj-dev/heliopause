@@ -169,6 +169,43 @@ describe("fetchRegistrations", () => {
     );
   });
 
+  // ## The per-page count, which used to be recorded and never read
+  //
+  // `parsePage` computed `result_info.count` into the `Page` it returned and nothing — not even a
+  // test — looked at it. The aggregate check above covers the same ground, but only when the cursor
+  // decodes, and that format is undocumented: `totalFromCursor` returning `null` is a normal
+  // outcome. So a read whose cursor did not decode had **no completeness check at all**, with the
+  // number that would have supplied one sitting unread in the same object.
+  it("refuses a page that sent fewer rows than it claimed", () => {
+    // No cursor, so the aggregate check cannot fire and this is the only thing standing between a
+    // short page and a list that reads as the whole account.
+    assert.throws(
+      () => parsePage({ success: true, errors: [], result: [reg()], result_info: { count: 4, cursor: "" } }),
+      (e: Error) => e instanceof TruncatedRead && /claimed 4/.test(e.message),
+    );
+  });
+
+  it("accepts the page whose count matches, and does not invent one when the API sends none", () => {
+    // Two known positives for the check above. The first is the ordinary case; without the second, a
+    // check comparing against its own fallback would look like it worked while proving nothing —
+    // which is what the unread field amounted to.
+    assert.equal(parsePage({ success: true, errors: [], result: [reg()], result_info: { count: 1, cursor: "" } }).rows.length, 1);
+    const noCount = parsePage({ success: true, errors: [], result: [reg()], result_info: { cursor: "" } });
+    assert.deepEqual([noCount.rows.length, noCount.count], [1, 1]);
+  });
+
+  it("counts an addressless registration toward the page's own count too", () => {
+    // The same distinction the aggregate check makes. A registration with no address is a row the
+    // API sent; excluding it here would make every account holding one fail this check.
+    const page = parsePage({
+      success: true,
+      errors: [],
+      result: [reg(), reg({ id: "r2", virtual_ipv4: null })],
+      result_info: { count: 2, cursor: "" },
+    });
+    assert.deepEqual([page.rows.length, page.addressless.length], [1, 1]);
+  });
+
   it("counts addressless registrations toward the claimed total", async () => {
     const { get } = pager([{ rows: [reg(), reg({ id: "r2", virtual_ipv4: null })], cursor: "" }]);
     const read = await fetchRegistrations({ accountId: "acc", token: "t", get });
