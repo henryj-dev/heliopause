@@ -7,7 +7,7 @@
 // no build step is involved.
 
 import { startRelay, loadManifest } from "../src/relay.ts";
-import { boundedInteger, EnvSpecError, type NumberBounds } from "../src/env-spec.ts";
+import { boundedInteger, ENV_BOUNDS, EnvSpecError, type BoundedEnvName } from "../src/env-spec.ts";
 import { formatOperatorLog, installCliLanguage, logLangFromEnv } from "../src/operator-i18n.ts";
 
 const cliLangRequested = process.argv.slice(2).some((arg) => arg === "--lang" || arg.startsWith("--lang="));
@@ -25,9 +25,9 @@ const env = (name: string, fallback?: string): string => {
 };
 
 /** Refuse a numeric setting the way `env()` refuses a missing one: a sentence, and exit 2. */
-const number = (name: string, bounds: NumberBounds): number => {
+const number = (name: BoundedEnvName): number => {
   try {
-    return boundedInteger(name, process.env[name], bounds);
+    return boundedInteger(name, process.env[name], ENV_BOUNDS[name]);
   } catch (error) {
     if (!(error instanceof EnvSpecError)) throw error;
     console.error(`[relay] ${error.message}`);
@@ -46,13 +46,14 @@ const hostname = process.env.HELIOPAUSE_RELAY_HOST ?? "::";
  * to 16 MB — roughly 875 times a second, on a machine with under a gigabyte of RAM. Measured.
  *
  * The `Math.max(5, …)` that used to guard the interval is what makes this worth a comment: it reads
- * exactly like the check that would have caught it.
+ * exactly like the check that would have caught it — and it was not one. It **clamped**, so
+ * `HELIOPAUSE_RELOAD_SEC=2` was accepted and quietly became 5. Replacing the clamp with a refusal
+ * that kept the same 5 turned an accepted value into a startup failure, and `rollback-test.sh` sets
+ * exactly that 2: unit tests green, the job with a real kernel red. The ranges live in `ENV_BOUNDS`
+ * now, where a test can read them against the values the scripts actually use.
  */
-// `0` is allowed and means what it means to `listen` — let the kernel choose. It is what the
-// service tests bind, and `heliopause-ui.ts` has accepted it since it grew a check. What this
-// refuses is the value that is not a port at all, which is the one that used to get through.
-const port = number("HELIOPAUSE_RELAY_PORT", { min: 0, max: 65_535, fallback: 8443 });
-const reloadSec = number("HELIOPAUSE_RELOAD_SEC", { min: 5, max: 3600, fallback: 30 });
+const port = number("HELIOPAUSE_RELAY_PORT");
+const reloadSec = number("HELIOPAUSE_RELOAD_SEC");
 
 // Comma-separated certificate CNs allowed to read /status. Unset means the endpoint is off, which
 // is the right default: a fleet-wide view names every host, its generation and its drift state, so

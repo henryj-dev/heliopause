@@ -32,7 +32,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { timingSafeEqual } from "node:crypto";
-import { boundedInteger } from "../src/env-spec.ts";
+import { boundedInteger, ENV_BOUNDS } from "../src/env-spec.ts";
 import { armedReasons } from "../src/policy-render-guard.ts";
 import { collectPolicySource, type PolicySource } from "../src/policy-source.ts";
 import { policyHead, type ScreenSite } from "../src/policy-screen.ts";
@@ -117,10 +117,11 @@ const allowPaths = (process.env.HELIOPAUSE_POLICY_ALLOW_PATHS ?? "policies.json"
 // every other numeric setting; see `boundedInteger`.
 let port: number;
 try {
-  port = boundedInteger("HELIOPAUSE_POLICY_RENDER_PORT", process.env.HELIOPAUSE_POLICY_RENDER_PORT, {
-    // `0` lets the kernel choose, which is what `policy-render-service.test.ts` binds.
-    min: 0, max: 65_535, fallback: 9099,
-  });
+  port = boundedInteger(
+    "HELIOPAUSE_POLICY_RENDER_PORT",
+    process.env.HELIOPAUSE_POLICY_RENDER_PORT,
+    ENV_BOUNDS.HELIOPAUSE_POLICY_RENDER_PORT,
+  );
 } catch (error) {
   console.error(`[policy-render] ${(error as Error).message}`);
   process.exit(2);

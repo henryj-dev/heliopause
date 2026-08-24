@@ -1,6 +1,11 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { boundedInteger, boundedNumber, parsePairs, parseRelays, EnvSpecError } from "./env-spec.ts";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import {
+  boundedInteger, boundedNumber, ENV_BOUNDS, parsePairs, parseRelays, EnvSpecError,
+  type BoundedEnvName,
+} from "./env-spec.ts";
 
 /**
  * The point of this file is one property that had no test when it was fixed: **a refused entry must
@@ -201,6 +206,89 @@ describe("boundedInteger", () => {
       assert.ok(message.length < 130, `message is ${message.length} chars`);
       return true;
     });
+  });
+});
+
+// ── The bound and the values it will actually judge ───────────────────────────
+//
+// ## What this exists to stop happening again
+//
+// `bin/heliopause-relay.ts` had `Math.max(5, reloadSec)` before any of this existed. That is a
+// **clamp**: `HELIOPAUSE_RELOAD_SEC=2` was accepted and quietly became 5. Replacing it with a
+// refusal that kept the same 5 turned an accepted value into a startup failure — and
+// `scripts/rollback-test.sh` sets exactly that 2.
+//
+// Every unit test passed. So did `typecheck`, `check:web`, the agent suites and the hook suites. The
+// job that caught it needs a real kernel and cannot run on a workstation, so the first sign was CI
+// going red on `main` eight commits later.
+//
+// A number written in one file and depended on in another is what made that possible. The bound now
+// lives in `ENV_BOUNDS`, and this reads the values the scripts and the env examples actually set and
+// puts them through it. It is deliberately a *scan* rather than a list: a list would be a third copy.
+describe("the bounds accept what this repository actually configures", () => {
+  const root = join(import.meta.dirname, "..");
+  const sources = [
+    "scripts/rollback-test.sh",
+    "scripts/e2e-roundtrip.sh",
+    "packaging/manager.env.example",
+    "packaging/systemd/relay.env.example",
+    "packaging/systemd/agent.env.example",
+  ];
+
+  /** `NAME=value` assignments for names the entry points bound, commented-out ones included. */
+  function configured(): Array<{ file: string; name: BoundedEnvName; raw: string }> {
+    const found: Array<{ file: string; name: BoundedEnvName; raw: string }> = [];
+    for (const file of sources) {
+      const path = join(root, file);
+      if (!existsSync(path)) continue;
+      // Matched anywhere on the line, not anchored to its start: a shell script sets several in one
+      // command (`HELIOPAUSE_CA_FILE=… HELIOPAUSE_RELOAD_SEC=2 \`), and an anchored pattern finds the
+      // first and silently misses the rest — including the one that went red.
+      for (const m of readFileSync(path, "utf8").matchAll(/(HELIOPAUSE_[A-Z0-9_]+)=("?)([^\s"\\]*)\2/g)) {
+        const name = m[1] as BoundedEnvName;
+        // Only the numeric settings, and only a literal: `PORT="$SOME_VAR"` says nothing about a value.
+        if (!(name in ENV_BOUNDS) || !/^[0-9]+(\.[0-9]+)?$/.test(m[3]!)) continue;
+        found.push({ file, name, raw: m[3]! });
+      }
+    }
+    return found;
+  }
+
+  test("the scan finds something, so a passing run means more than an empty loop", () => {
+    const rows = configured();
+    assert.ok(rows.length >= 5, `only found ${rows.length} configured numeric settings — did the scan break?`);
+  });
+
+  test("every value a script or an env example sets is accepted", () => {
+    for (const { file, name, raw } of configured()) {
+      const bounds = ENV_BOUNDS[name];
+      // Fractions are legal for exactly one setting, so the integer form is what the rest get —
+      // matching how the entry points read them.
+      const read = name === "HELIOPAUSE_PUBLIC_RETRY_SEC" ? boundedNumber : boundedInteger;
+      assert.doesNotThrow(
+        () => read(name, raw, bounds),
+        `${file} sets ${name}=${raw}, which ${name}'s bound (${bounds.min}..${bounds.max}) refuses`,
+      );
+    }
+  });
+
+  test("rollback-test.sh's two-second reload is one of them", () => {
+    // Named, not just covered by the sweep. This is the value that went red, and a scan that stopped
+    // finding it would go quiet rather than fail.
+    const rows = configured();
+    const reload = rows.find((r) => r.file.endsWith("rollback-test.sh") && r.name === "HELIOPAUSE_RELOAD_SEC");
+    assert.ok(reload, "rollback-test.sh no longer sets HELIOPAUSE_RELOAD_SEC — update this test with it");
+    assert.doesNotThrow(() => boundedInteger(reload.name, reload.raw, ENV_BOUNDS[reload.name]));
+  });
+
+  test("every default is inside its own range", () => {
+    // A fallback that the bound would refuse is a setting that cannot be left unset.
+    for (const [name, bounds] of Object.entries(ENV_BOUNDS)) {
+      assert.ok(
+        bounds.fallback >= bounds.min && bounds.fallback <= bounds.max,
+        `${name} defaults to ${bounds.fallback}, outside ${bounds.min}..${bounds.max}`,
+      );
+    }
   });
 });
 

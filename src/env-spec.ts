@@ -119,6 +119,57 @@ function quote(raw: string | undefined): string {
 }
 
 /**
+ * Every numeric setting an entry point reads, and the range it accepts.
+ *
+ * ## Why these are here and not at each `number(...)` call
+ *
+ * They were at the call sites, and CI caught what that costs. `bin/heliopause-relay.ts` had
+ * `Math.max(5, reloadSec)` before this parser existed — a **clamp**, so `HELIOPAUSE_RELOAD_SEC=2`
+ * was accepted and quietly became 5. Turning the clamp into a refusal with the same 5 in it turned
+ * an accepted value into a startup failure, and `scripts/rollback-test.sh` sets exactly that 2. The
+ * unit tests passed; the job that needs a real kernel did not.
+ *
+ * A number written in one file and depended on in another is the shape of that failure. With the
+ * table here, `env-spec.test.ts` can read the values the scripts and the env examples actually use
+ * and check them against the bound that will judge them — which is the test that was missing.
+ *
+ * `fallback` is inside the bound so a default that would itself be refused cannot be introduced by
+ * editing one of the two.
+ */
+export const ENV_BOUNDS = {
+  // `0` is `listen(0)` — let the kernel choose, which is what the service tests bind.
+  HELIOPAUSE_MANAGER_PORT: { min: 0, max: 65_535, fallback: 8444 },
+  HELIOPAUSE_RELAY_PORT: { min: 0, max: 65_535, fallback: 8443 },
+  HELIOPAUSE_POLICY_RENDER_PORT: { min: 0, max: 65_535, fallback: 9099 },
+
+  /**
+   * How often the relay re-reads its artifact directory.
+   *
+   * **Floor of 1, not 5.** Five was carried over from the `Math.max(5, …)` this replaced, and that
+   * was a clamp: a smaller value was honoured as 5 rather than refused. Refusing it broke
+   * `rollback-test.sh`, which asks for 2 — and asking for 2 is a reasonable thing for a gateway
+   * whose bundle is small. What this exists to refuse is `NaN`, `0` and negatives, all of which
+   * `setInterval` turns into a one-millisecond loop.
+   *
+   * A value below the old clamp is now **honoured rather than silently raised**, so a deployment
+   * that set one is getting what it asked for from this release.
+   */
+  HELIOPAUSE_RELOAD_SEC: { min: 1, max: 3600, fallback: 30 },
+
+  HELIOPAUSE_ARTIFACT_AUTHORIZATION_TTL_SEC: { min: 15 * 60, max: 7 * 24 * 60 * 60, fallback: 86_400 },
+  HELIOPAUSE_PUBLIC_REFRESH_SEC: { min: 60, max: 86_400, fallback: 3600 },
+  /** Fractional on purpose — a test drives the retry ladder without waiting. */
+  HELIOPAUSE_PUBLIC_RETRY_SEC: { min: 0.001, max: 3600, fallback: 5 },
+  HELIOPAUSE_OIDC_SESSION_TTL_SEC: { min: 60, max: 30 * 86_400, fallback: 8 * 3600 },
+  HELIOPAUSE_RELAY_TIMEOUT_MS: { min: 100, max: 120_000, fallback: 5_000 },
+  HELIOPAUSE_PUBLISH_TIMEOUT_MS: { min: 1_000, max: 600_000, fallback: 30_000 },
+  HELIOPAUSE_PLAN_TTL_SEC: { min: 60, max: 86_400, fallback: 600 },
+  HELIOPAUSE_MAX_PENDING_PLANS: { min: 1, max: 1024, fallback: 32 },
+} as const satisfies Record<string, NumberBounds>;
+
+export type BoundedEnvName = keyof typeof ENV_BOUNDS;
+
+/**
  * `dev=https://192.0.2.1:8443=./pki,prod=https://192.0.2.2:8443=./pki-prod`
  *
  * Three fields because each VPC has its own CA (V39): the manager presents a different operator
