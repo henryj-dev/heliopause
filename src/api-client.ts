@@ -20,7 +20,7 @@ import { readBoundedNodeBody } from "./bounded-body.ts";
  * 8 MB for a fleet's worth of rulesets; twice that here, because refusing a legitimate answer would
  * break the approval path and this is a short-lived process on a workstation.
  */
-const MAX_MANAGER_RESPONSE_BYTES = 16 * 1024 * 1024;
+export const MAX_MANAGER_RESPONSE_BYTES = 16 * 1024 * 1024;
 
 export interface Creds {
   cert: Buffer;
@@ -107,7 +107,23 @@ export async function api<T>(
 ): Promise<T> {
   const url = new URL(path, managerUrl);
   const payload = body === undefined ? null : JSON.stringify(body);
-  return new Promise((ok, fail) => {
+  return new Promise((settleOk, settleFail) => {
+    // ## `timeout` is inactivity, so there is a deadline as well
+    //
+    // `request({ timeout })` is `socket.setTimeout`: every byte resets it. A manager that answers
+    // one byte at a time stays inside it forever, and this is the client behind `heliopause-approve`
+    // and `heliopause-publish` — the write path. The hang is on *reading the answer*, so a deadline
+    // does not tell an operator whether the plan landed; it turns a terminal that never returns into
+    // an error they can act on, which is the difference that matters at 3 a.m.
+    //
+    // Armed before the request so DNS and the TLS handshake are inside it, and cleared on every exit
+    // rather than `unref`'d: an unref'd timer still fires, and firing after a successful call would
+    // destroy a socket the agent may have handed to the next one.
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    const clear = () => { if (deadline !== undefined) clearTimeout(deadline); deadline = undefined; };
+    const ok = (v: T) => { clear(); settleOk(v); };
+    const fail = (e: unknown) => { clear(); settleFail(e); };
+
     const req = request(
       {
         hostname: url.hostname,
@@ -153,7 +169,12 @@ export async function api<T>(
         );
       },
     );
+    // Inactivity. Kept beside the deadline because the two catch different things — a manager that
+    // has gone quiet, and one that is answering too slowly to ever finish.
     req.on("timeout", () => req.destroy(new Error(`no answer from ${managerUrl} within ${timeoutMs}ms`)));
+    deadline = setTimeout(() => {
+      req.destroy(new Error(`${managerUrl} did not finish answering within ${timeoutMs}ms`));
+    }, timeoutMs);
     req.on("error", (e) => fail(new ApiError(`cannot reach ${managerUrl}: ${e.message}`, 0)));
     if (payload !== null) req.write(payload);
     req.end();
