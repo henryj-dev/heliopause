@@ -25,7 +25,7 @@
 // mistake that made the `fromCIDR` question take two round trips: the rule was right there in the
 // list and the reader concluded it did not apply.
 import { isWorkload, type Endpoint, type Policy, type Proto } from "./policy.ts";
-import { cidrsOverlap } from "./nft.ts";
+import { cidrRange, cidrsOverlap } from "./nft.ts";
 import { t, type Lang } from "./i18n.ts";
 
 /**
@@ -149,25 +149,49 @@ export interface LookupResult {
   considered: number;
 }
 
-const V4 = /^(\d{1,3}\.){3}\d{1,3}$/;
+// ⚠️ **There is no `no` list, and the reason attached to every `no` verdict is discarded.**
+//
+// `lookupPolicies` does `if (parts.some((v) => v.kind === "no")) continue;`, so the sentence a
+// `Verdict` carries for a rejection never reaches a reader. That is deliberate as *display* policy —
+// the "no" list is every rule in the policy minus a handful, which is not a list anyone reads — but
+// it means `lookup.outside`, `lookup.requires`, `lookup.cidrNoPod`, `lookup.notInMembers`,
+// `lookup.insideInternet`, `lookup.ruleIs` and `lookup.portNotIn` are written, translated into two
+// languages, and rendered nowhere.
+//
+// Recorded here rather than quietly: the deferral reasons *are* shown, and this module's own
+// documentation calls that sentence its most useful output, so the natural assumption on reading
+// `{ kind: "no", why }` is that `why` goes somewhere. Anyone adding a message to a `no` branch is
+// adding dead text. `lookup.cidrNoPod` is the one worth surfacing if this is ever revisited — it
+// carries the 2026-08-16 finding that a `fromCIDR` rule admits no pod, which is exactly what a
+// reader who expected a match and got none needs to be told.
 
 /**
  * Is `addr` inside `cidr`?
  *
  * Built on `cidrsOverlap` by asking whether a single address overlaps the range, which is the same
- * question for a /32. That function is deliberately conservative — it answers `true` for anything it
- * could not parse — so IPv6 is screened out here first and reported as undecidable rather than
- * inherited as a silent yes. Over-reporting is the safe direction for a security lookup, but only
- * when the reader is told it happened.
+ * question for a full-length prefix. That function is deliberately conservative — it answers `true`
+ * for anything it could not parse — so anything unreadable is screened out here first and reported
+ * as undecidable rather than inherited as a silent yes. Over-reporting is the safe direction for a
+ * security lookup, but only when the reader is told it happened.
+ *
+ * ## IPv6 was screened out with it, and that was a different thing
+ *
+ * The screen used to be an IPv4 regex, and its comment said IPv6 was deferred because
+ * `cidrsOverlap` could not parse it. That was true and is no longer: `cidrRange` reads both
+ * families. Deferring now would print a reason that is false, in the one place this module says its
+ * output is most useful — the sentence explaining why it could not decide.
+ *
+ * A cross-family pair is decided, not deferred. An IPv6 address is not inside an IPv4 range, and
+ * saying so is the answer; "undecidable" would send the reader looking for a rule that cannot exist.
+ * `cidrsOverlap` answers that on its own, so there is no branch for it here — and no message either,
+ * because `lookupPolicies` drops the `why` of every `no` verdict. See the note on `LookupResult`.
  */
 function addrInCidr(addr: string, cidr: string, lang: Lang): Verdict {
-  if (!V4.test(addr)) {
-    return { kind: "undecidable", why: t(lang, "lookup.notV4", { addr }) };
-  }
-  if (!V4.test(cidr.split("/")[0] ?? "")) {
-    return { kind: "undecidable", why: t(lang, "lookup.ruleNotNarrow", { cidr }) };
-  }
-  return cidrsOverlap(`${addr}/32`, cidr)
+  const a = cidrRange(addr);
+  if (!a) return { kind: "undecidable", why: t(lang, "lookup.notAnAddress", { addr }) };
+  const c = cidrRange(cidr);
+  if (!c) return { kind: "undecidable", why: t(lang, "lookup.ruleNotNarrow", { cidr }) };
+  return cidrsOverlap(`${addr}/${a.family === "ip6" ? 128 : 32}`, cidr)
     ? { kind: "matches" }
     : { kind: "no", why: t(lang, "lookup.outside", { addr, cidr }) };
 }

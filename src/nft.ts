@@ -209,43 +209,111 @@ export interface RulesetPlan {
 
 // ── CIDR / port overlap (needed for baseline protection) ──────────────────────
 
-function ipToInt(ip: string): number | null {
+function ipToInt(ip: string): bigint | null {
   const parts = ip.split(".");
-  if (parts.length !== 4) return null; // IPv6 out of scope for overlap checks
-  let n = 0;
+  if (parts.length !== 4) return null;
+  let n = 0n;
   for (const p of parts) {
     const v = Number(p);
     if (!Number.isInteger(v) || v < 0 || v > 255) return null;
-    n = n * 256 + v;
+    n = n * 256n + BigInt(v);
   }
   return n;
 }
 
-function parseCidr(c: string): { net: number; bits: number } | null {
-  const [addr, bitsRaw] = c.split("/");
-  const net = ipToInt((addr ?? "").trim());
-  if (net === null) return null;
-  const bits = bitsRaw === undefined ? 32 : Number(bitsRaw);
-  if (!Number.isInteger(bits) || bits < 0 || bits > 32) return null;
-  const shift = 32 - bits;
-  const mask = shift >= 32 ? 0 : (~0 << shift) >>> 0;
-  return { net: (net & mask) >>> 0, bits };
+/**
+ * An IPv6 address as a 128-bit integer.
+ *
+ * `bigint` because 128 bits does not fit a double, which is the reason this did not exist and every
+ * caller of `cidrsOverlap` treated IPv6 as unparseable. Embedded IPv4 (`::ffff:10.0.0.1`) is refused
+ * rather than expanded — `familyOf` refuses it on the render path and `geofeed.ts` refuses it in a
+ * feed, both because an address that belongs to the other family must not be reasoned about as
+ * though it were in this one.
+ */
+function ip6ToInt(value: string): bigint | null {
+  if (value.includes(".")) return null;
+  const halves = value.split("::");
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0]!.split(":") : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1]!.split(":") : [];
+  if (halves.length === 1 && head.length !== 8) return null;
+  if (halves.length === 2 && head.length + tail.length > 7) return null;
+  const groups = halves.length === 1
+    ? head
+    : [...head, ...Array(8 - head.length - tail.length).fill("0"), ...tail];
+  if (groups.length !== 8) return null;
+  let n = 0n;
+  for (const g of groups) {
+    if (!/^[0-9a-fA-F]{1,4}$/.test(g)) return null;
+    n = (n << 16n) | BigInt(parseInt(g, 16));
+  }
+  return n;
+}
+
+/** The address span a CIDR covers, as integers, with the family it belongs to. */
+export interface CidrRange {
+  first: bigint;
+  last: bigint;
+  family: Family;
+  bits: number;
+}
+
+/**
+ * Parse a CIDR into the span of addresses it covers, or `null` if it is not one.
+ *
+ * The canonical answer to "what does this CIDR cover" for the whole repository — `zones.ts` and
+ * `where-used.ts` read it too. It existed three times in three shapes before, which is how
+ * `Zone.cidrs6` came to be declared and never read.
+ *
+ * **The base is masked to the prefix.** `10.17.0.5/16` covers `10.17.0.0`–`10.17.255.255`, not the
+ * 65,536 addresses starting at `.0.5`. Nothing in this repository writes a CIDR that way on purpose,
+ * which is exactly why an unmasked reading would be wrong somewhere nobody was looking.
+ */
+export function cidrRange(cidr: string): CidrRange | null {
+  const slash = cidr.indexOf("/");
+  const base = (slash === -1 ? cidr : cidr.slice(0, slash)).trim();
+  if (!base) return null;
+  const family: Family = base.includes(":") ? "ip6" : "ip";
+  const width = family === "ip6" ? 128 : 32;
+  const bits = slash === -1 ? width : Number(cidr.slice(slash + 1));
+  if (!Number.isInteger(bits) || bits < 0 || bits > width) return null;
+  const addr = family === "ip6" ? ip6ToInt(base) : ipToInt(base);
+  if (addr === null) return null;
+  const size = 1n << BigInt(width - bits);
+  const first = (addr / size) * size;
+  return { first, last: first + size - 1n, family, bits };
 }
 
 /**
  * Do two CIDRs share any address?
  *
  * **Undecidable input counts as overlapping.** If this returned "no overlap" for anything it
- * failed to parse (IPv6, malformed input), baseline protection would be bypassed by exactly the
- * inputs it could not reason about.
+ * failed to parse, baseline protection would be bypassed by exactly the inputs it could not reason
+ * about.
+ *
+ * ## IPv6 used to land in that bucket, and it was the wrong bucket
+ *
+ * `ipToInt` returned `null` for anything with a colon — "IPv6 out of scope for overlap checks" —
+ * so every IPv6 CIDR was undecidable and every comparison involving one answered `true`. Measured
+ * 2026-08-24: `cidrsOverlap("2001:db8::/32", "10.17.0.0/17")` was `true`, and so was the comparison
+ * of two *disjoint* IPv6 prefixes.
+ *
+ * On the render path that is not conservative, it is inverted. `baselineConflict` **rejects** the
+ * policy it finds a conflict for, so an over-broad `true` does not protect a management path — it
+ * throws away the operator's rule and gives a reason that is false. Every IPv6 deny whose
+ * protocol and ports touched any baseline entry was dropped from the ruleset with
+ * "could block a protected path", on a fleet where every host has a public IPv6 address.
+ *
+ * **Different families cannot overlap.** An `ip6 saddr` rule matches no IPv4 packet and an
+ * `ip saddr` rule matches no IPv6 packet — that is why `groupByFamily` exists twenty lines down.
+ * Answering `false` here is not a relaxation; it is the same statement the renderer already makes.
  */
 export function cidrsOverlap(a: string, b: string): boolean {
-  const pa = parseCidr(a);
-  const pb = parseCidr(b);
+  const pa = cidrRange(a);
+  const pb = cidrRange(b);
   if (!pa || !pb) return true;
-  const shift = 32 - Math.min(pa.bits, pb.bits);
-  const mask = shift >= 32 ? 0 : (~0 << shift) >>> 0;
-  return (pa.net & mask) === (pb.net & mask);
+  if (pa.family !== pb.family) return false;
+  return pa.first <= pb.last && pb.first <= pa.last;
 }
 
 /**

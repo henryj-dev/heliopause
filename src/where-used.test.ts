@@ -76,6 +76,58 @@ describe("where a value is written", () => {
   });
 });
 
+// ── IPv6 ──────────────────────────────────────────────────────────────────────
+//
+// The containment half was gated on an IPv4 regex, so an IPv6 query fell through to `null` — which
+// this function's caller reads as **"not written there"**. Not "cannot say": not written. In the one
+// tool whose purpose is answering "where is this address written down" before somebody renumbers it,
+// on a fleet where every host has a public IPv6 address.
+//
+// The exact half always worked, which is what made it quiet: search for the prefix as it is spelled
+// in the rule and you get a hit, so the tool looks like it handles IPv6 right up until the address
+// you type is *inside* a rule's range rather than equal to it. That is the case renumbering is.
+describe("where an IPv6 value is written", () => {
+  const v6 = (over: Partial<Policy> = {}): Policy => policy({
+    src: { kind: "cidr", value: "2001:db8:17::/48" }, dst: { kind: "any", value: "" }, ...over,
+  });
+
+  it("finds the rule whose range contains it", () => {
+    const u = whereUsed([v6()], "2001:db8:17::5");
+    assert.equal(u.length, 1);
+    assert.equal(u[0]?.match, "contains");
+    assert.equal(u[0]?.text, "cidr 2001:db8:17::/48");
+  });
+
+  it("keeps the exact write apart from the containing one, as it does for v4", () => {
+    const u = whereUsed([v6({ id: "A" }), v6({ id: "B", src: { kind: "cidr", value: "2001:db8::/32" } })],
+      "2001:db8:17::/48");
+    assert.deepEqual(u.map((x) => [x.policyId, x.match]), [["A", "exact"], ["B", "contains"]]);
+  });
+
+  it("reads a bare address as one machine, not as a /32 of it", () => {
+    // A query without a prefix is widened to the family's full length. Widening a v6 address to
+    // `/32` instead — the v4 constant, which is what a half-converted version of this does — makes
+    // it stand for its first two hextets, so every rule anywhere under `2001:db8::/32` comes back as
+    // containing it. Two addresses that share nothing below the /32 is the case that shows it.
+    assert.deepEqual(whereUsed([v6()], "2001:db8:99::5"), []);
+    assert.equal(whereUsed([v6()], "2001:db8:17::5").length, 1);
+  });
+
+  it("does not report a v4 rule for a v6 address, or the reverse", () => {
+    // `cidrsOverlap` answers `true` for what it cannot read, so a family check that was not there
+    // would make every IPv4 rule in the policy "contain" any IPv6 address typed into the box.
+    assert.deepEqual(whereUsed([policy()], "2001:db8:17::5"), []);
+    assert.deepEqual(whereUsed([v6()], "10.17.192.45"), []);
+  });
+
+  it("still says nothing about a query it cannot read", () => {
+    // The other direction of the same conservatism: a mistyped query must not come back as every
+    // CIDR rule in the policy.
+    assert.deepEqual(whereUsed([policy(), v6()], "2001:db8:17::/nonsense"), []);
+    assert.deepEqual(whereUsed([policy(), v6()], "10.17.192"), []);
+  });
+});
+
 describe("which literals are asking for a name", () => {
   it("counts a range written in more than one rule", () => {
     const u = repeatedLiterals([

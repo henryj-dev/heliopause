@@ -60,8 +60,57 @@ describe("cidrsOverlap", () => {
   });
   it("**undecidable input counts as overlapping** — bias toward protection", () => {
     // Treating unparseable input as "no overlap" would silently bypass baseline protection.
-    assert.equal(cidrsOverlap("fd00::/8", "10.254.0.0/16"), true);
     assert.equal(cidrsOverlap("garbage", "10.254.0.0/16"), true);
+    assert.equal(cidrsOverlap("10.254.0.0/16", "10.254.0.0/notanumber"), true);
+    // Embedded IPv4 is refused rather than expanded, the same call `familyOf` makes, so it lands in
+    // the conservative bucket rather than being reasoned about as though it were IPv4.
+    assert.equal(cidrsOverlap("::ffff:10.254.0.5/128", "10.254.0.0/16"), true);
+  });
+
+  // ## IPv6 was in the undecidable bucket, and that was the wrong bucket
+  //
+  // `ipToInt` returned null for anything with a colon, so every comparison involving an IPv6 CIDR
+  // answered `true`. `baselineConflict` **rejects** the policy it finds a conflict for, so that was
+  // not caution — it threw away every IPv6 deny whose protocol and ports touched a baseline entry
+  // and gave "could block a protected path" as the reason, which is false: an `ip6 saddr` rule
+  // matches no IPv4 packet. On a fleet where every host has a public IPv6 address.
+  it("compares IPv6 rather than calling it undecidable", () => {
+    assert.equal(cidrsOverlap("2001:db8:1::/48", "2001:db8:1::5/128"), true);
+    assert.equal(cidrsOverlap("2001:db8:1::/48", "2001:db8:2::/48"), false);
+  });
+
+  it("never calls two different families an overlap", () => {
+    // `groupByFamily` exists because a rule renders into one family's chain and matches nothing in
+    // the other. This says the same thing where the decision is made.
+    assert.equal(cidrsOverlap("2001:db8::/32", "10.254.0.0/16"), false);
+    assert.equal(cidrsOverlap("fd00::/8", "10.254.0.0/16"), false);
+    // `::/0` spans a larger number than `0.0.0.0/0`; compared as bare integers it contains it.
+    assert.equal(cidrsOverlap("::/0", "0.0.0.0/0"), false);
+  });
+
+  it("masks the base to the prefix", () => {
+    // `10.1.0.5/16` is `10.1.0.0/16`. Read unmasked it would run 65,536 addresses past `.0.5` and
+    // into `10.2.x`, which is a different zone and, here, a different baseline decision.
+    assert.equal(cidrsOverlap("10.1.0.5/16", "10.2.0.1/32"), false);
+    assert.equal(cidrsOverlap("10.1.0.5/16", "10.1.255.254/32"), true);
+  });
+});
+
+describe("baselineConflict — IPv6", () => {
+  it("does not reject an IPv6 deny over an IPv4 management path", () => {
+    // The live consequence of the bucket above. `cfg`'s baseline protects an IPv4 management range
+    // on tcp/22; an IPv6 source cannot reach it, and the policy must survive.
+    assert.equal(baselineConflict(cfg, policy({ proto: "tcp", ports: "22" }), ["2001:db8::/32"]), null);
+  });
+
+  it("still rejects one that could block an IPv6 management path", () => {
+    // The known positive. Without it the test above passes against a function that has stopped
+    // checking IPv6 altogether, which is the same defect with the sign flipped.
+    const v6cfg = { ...cfg, baseline: [{ ...cfg.baseline[0]!, srcCidrs: ["2001:db8:ff::/48"] }] };
+    contains(
+      baselineConflict(v6cfg, policy({ proto: "tcp", ports: "22" }), ["2001:db8:ff::5/128"])?.desc,
+      "management SSH",
+    );
   });
 });
 

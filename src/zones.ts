@@ -22,6 +22,7 @@
 // operators reach it through WARP with device posture behind them; the same range somewhere else
 // would deserve nothing. That is why it is stated in the site module and not derived.
 import type { Endpoint, Policy } from "./policy.ts";
+import { cidrRange } from "./nft.ts";
 
 /**
  * How far this deployment trusts what sits in a zone. Higher is more trusted.
@@ -62,87 +63,14 @@ export interface Crossing {
   action: Policy["action"];
 }
 
-// ── address arithmetic, shared with the CIDR checks ───────────────────────────
-
-function ip(value: string): bigint | null {
-  const parts = value.split(".");
-  if (parts.length !== 4) return null;
-  let n = 0n;
-  for (const p of parts) {
-    const v = Number(p);
-    if (!Number.isInteger(v) || v < 0 || v > 255) return null;
-    n = n * 256n + BigInt(v);
-  }
-  return n;
-}
-
-/**
- * An IPv6 address as a 128-bit integer, or null.
- *
- * `bigint` because 128 bits does not fit a double — which is the reason this function did not exist
- * and `Zone.cidrs6` was read by nothing. Embedded IPv4 (`::ffff:10.0.0.1`) is refused rather than
- * expanded, the same call `nft.ts` and `geofeed.ts` make: it is an address that belongs to the other
- * family, and placing it in a v6 zone would put one machine in two trust levels.
- */
-function ip6(value: string): bigint | null {
-  if (value.includes(".")) return null;
-  const halves = value.split("::");
-  if (halves.length > 2) return null;
-  const head = halves[0] ? halves[0]!.split(":") : [];
-  const tail = halves.length === 2 && halves[1] ? halves[1]!.split(":") : [];
-  if (halves.length === 1 && head.length !== 8) return null;
-  if (halves.length === 2 && head.length + tail.length > 7) return null;
-  const groups = halves.length === 1
-    ? head
-    : [...head, ...Array(8 - head.length - tail.length).fill("0"), ...tail];
-  if (groups.length !== 8) return null;
-  let n = 0n;
-  for (const g of groups) {
-    if (!/^[0-9a-fA-F]{1,4}$/.test(g)) return null;
-    n = (n << 16n) | BigInt(parseInt(g, 16));
-  }
-  return n;
-}
-
-/**
- * A CIDR or a bare address.
- *
- * The bare form is not a convenience: the site module's resolved lists carry host addresses without
- * a prefix — `10.17.0.10`, not `10.17.0.10/32`. Requiring the slash meant every destination failed
- * to parse and the crossings table came out empty on a policy set with sixteen of them, which reads
- * as "nothing crosses" rather than "nothing was measured".
- */
-/**
- * A CIDR as a numeric interval, with the family it belongs to.
- *
- * ## Why this carries a family now
- *
- * It was IPv4-only, and `Zone.cidrs6` — declared, documented as "IPv6 CIDRs, when the zone has any" —
- * was **read by nothing**: a repository-wide grep found the declaration and no other mention. So a
- * site that declared a v6 zone had it silently ignored, and every policy naming an IPv6 endpoint
- * resolved to no zone and vanished from `crossings()`, the table whose whole job is to show which
- * policies let a less trusted zone reach a more trusted one.
- *
- * `zoneConflicts` did not catch it either. It validates `cidrs`, so a v6 prefix put *there* is
- * reported as "not a CIDR" — but put in `cidrs6`, which is where the documentation says it goes, it
- * was dropped without a word.
- *
- * `bigint` rather than `number` because 128 bits does not fit a double. That is the reason the v6
- * half was never written, and it is four lines.
- */
-function range(cidr: string): { first: bigint; last: bigint; family: "ip" | "ip6" } | null {
-  const slash = cidr.indexOf("/");
-  const base = slash === -1 ? cidr : cidr.slice(0, slash);
-  if (!base) return null;
-  const family: "ip" | "ip6" = base.includes(":") ? "ip6" : "ip";
-  const width = family === "ip6" ? 128 : 32;
-  const bits = slash === -1 ? width : Number(cidr.slice(slash + 1));
-  if (!Number.isInteger(bits) || bits < 0 || bits > width) return null;
-  const first = family === "ip6" ? ip6(base) : ip(base);
-  if (first === null) return null;
-  const size = 1n << BigInt(width - bits);
-  return { first, last: first + size - 1n, family };
-}
+// ── address arithmetic ────────────────────────────────────────────────────────
+//
+// `cidrRange` lives in `nft.ts` and is imported rather than reimplemented. It was written three
+// times in three shapes before — one of them IPv4-only, which is how `Zone.cidrs6` came to be
+// declared and read by nothing. One parser, so "what does this CIDR cover" cannot have two answers.
+//
+// It carries the family, and this file compares only within one. `::/0` spans a larger number than
+// `0.0.0.0/0`, so without that check a single v6 zone swallows every v4 zone.
 
 /**
  * The zone a CIDR belongs to, or null.
@@ -152,7 +80,7 @@ function range(cidr: string): { first: bigint; last: bigint; family: "ip" | "ip6
  * zones claiming the same prefix is a configuration error `zoneConflicts` reports.
  */
 export function zoneOf(zones: readonly Zone[], cidr: string): Zone | null {
-  const r = range(cidr);
+  const r = cidrRange(cidr);
   if (!r) return null;
   let best: Zone | null = null;
   let bestSize: bigint | null = null;
@@ -160,7 +88,7 @@ export function zoneOf(zones: readonly Zone[], cidr: string): Zone | null {
     // Both lists. `cidrs6` was declared and read by nothing — see `range` — so an IPv6 endpoint
     // placed in no zone disappeared from the crossings table rather than being reported.
     for (const c of [...z.cidrs, ...(z.cidrs6 ?? [])]) {
-      const zr = range(c);
+      const zr = cidrRange(c);
       if (!zr) continue;
       // Compared only within a family. The two are different number spaces, and `::/0` contains
       // every v6 address rather than every address — without this an all-v6 zone would swallow the
@@ -198,28 +126,28 @@ export function zoneConflicts(zones: readonly Zone[]): Array<{ a: Zone; b: Zone;
   const all = (z: Zone): string[] => [...z.cidrs, ...(z.cidrs6 ?? [])];
   for (let i = 0; i < zones.length; i++) {
     for (const c of zones[i]!.cidrs) {
-      if (!range(c)) out.push({ a: zones[i]!, b: zones[i]!, cidr: `${c} is not a CIDR` });
+      if (!cidrRange(c)) out.push({ a: zones[i]!, b: zones[i]!, cidr: `${c} is not a CIDR` });
       // ## The wrong list is its own mistake, and it used to be invisible
       //
       // `cidrs` is the v4 list and `cidrs6` the v6 one. An entry in the wrong one parses fine and
       // then never matches anything, because `zoneOf` compares within a family — so the zone exists,
       // the CIDR is valid, and nothing is ever placed in it. That is indistinguishable from a zone
       // nobody uses, which is why it needs saying rather than inferring.
-      else if (range(c)!.family === "ip6") {
+      else if (cidrRange(c)!.family === "ip6") {
         out.push({ a: zones[i]!, b: zones[i]!, cidr: `${c} is IPv6 but is listed in cidrs — move it to cidrs6` });
       }
     }
     for (const c of zones[i]!.cidrs6 ?? []) {
-      if (!range(c)) out.push({ a: zones[i]!, b: zones[i]!, cidr: `${c} is not a CIDR` });
-      else if (range(c)!.family === "ip") {
+      if (!cidrRange(c)) out.push({ a: zones[i]!, b: zones[i]!, cidr: `${c} is not a CIDR` });
+      else if (cidrRange(c)!.family === "ip") {
         out.push({ a: zones[i]!, b: zones[i]!, cidr: `${c} is IPv4 but is listed in cidrs6 — move it to cidrs` });
       }
     }
     for (let j = i + 1; j < zones.length; j++) {
       for (const ca of all(zones[i]!)) {
         for (const cb of all(zones[j]!)) {
-          const ra = range(ca);
-          const rb = range(cb);
+          const ra = cidrRange(ca);
+          const rb = cidrRange(cb);
           if (!ra || !rb) continue;
           // Family included: `::/0` and `0.0.0.0/0` both span their whole space and would otherwise
           // compare equal as numbers, reporting a conflict between two zones that cannot overlap.

@@ -18,7 +18,7 @@
 // `repeatedLiterals` is the other half of that: it says which literals are worth a name, from the
 // policy itself rather than from taste.
 import { isWorkload, type Endpoint, type Policy } from "./policy.ts";
-import { cidrsOverlap } from "./nft.ts";
+import { cidrRange, cidrsOverlap } from "./nft.ts";
 
 export interface Usage {
   policyId: string;
@@ -40,7 +40,6 @@ export interface Usage {
   match: "exact" | "contains";
 }
 
-const V4_CIDR = /^(\d{1,3}\.){3}\d{1,3}(\/\d{1,2})?$/;
 
 function endpointText(e: Endpoint): string {
   return e.value ? `${e.kind} ${e.value}` : e.kind;
@@ -56,8 +55,22 @@ function endpointUse(e: Endpoint, q: string): "exact" | "contains" | null {
   // the texts a person greps for, and a selector is a comma-separated list they may quote part of.
   if (e.kind === "object" || isWorkload(e)) return e.value.includes(q) ? "exact" : null;
   if (e.kind !== "cidr") return null;
-  if (!V4_CIDR.test(q) || !V4_CIDR.test(e.value)) return null;
-  const asHost = q.includes("/") ? q : `${q}/32`;
+  // ## Both sides must parse before `cidrsOverlap` is asked
+  //
+  // That function answers `true` for anything it cannot read — the right default where it decides
+  // whether a rule could take away a management path, and the wrong one behind a search box, where
+  // it would report every CIDR rule in the policy as containing whatever the operator mistyped.
+  //
+  // The gate used to be an IPv4 regex, and that is a different mistake in the other direction:
+  // an IPv6 query returned `null` here, which this function's caller reads as **"not written
+  // there"**. Silently. `policy-lookup.ts` meets the same situation and says "undecidable, and
+  // here is why"; this said nothing, in a tool whose entire purpose is answering "where is this
+  // address written down" before somebody renumbers it. `cidrRange` reads both families now, so
+  // the honest answer is available rather than merely reportable.
+  const qr = cidrRange(q);
+  const er = cidrRange(e.value);
+  if (!qr || !er) return null;
+  const asHost = q.includes("/") ? q : `${q}/${qr.family === "ip6" ? 128 : 32}`;
   return cidrsOverlap(asHost, e.value) ? "contains" : null;
 }
 

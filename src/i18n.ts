@@ -211,7 +211,7 @@ export const MESSAGES = {
   "m.lookupCaveat": SHARED_MESSAGES["classic.m.lookupCaveat"]!,
   "m.lookupUndecided": SHARED_MESSAGES["m.lookupUndecided"]!,
   "m.lookupNeedsWorkload": SHARED_MESSAGES["m.lookupNeedsWorkload"]!,
-  "lookup.notV4": SHARED_MESSAGES["lookup.notV4"]!,
+  "lookup.notAnAddress": SHARED_MESSAGES["lookup.notAnAddress"]!,
   "lookup.ruleNotNarrow": SHARED_MESSAGES["lookup.ruleNotNarrow"]!,
   "lookup.outside": SHARED_MESSAGES["lookup.outside"]!,
   "lookup.cidrNoPod": SHARED_MESSAGES["lookup.cidrNoPod"]!,

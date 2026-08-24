@@ -102,14 +102,33 @@ describe("what an address cannot decide, and must say so", () => {
     assert.match(v?.kind === "undecidable" ? v.why : "", /신원으로 분류/);
   });
 
-  it("defers on IPv6 rather than inheriting a conservative yes", () => {
-    // `cidrsOverlap` answers `true` for anything it cannot parse, which is the right default for a
-    // renderer and the wrong one to copy into an answer a person reads. Screened out here instead.
-    const r = lookupPolicies([policy({ ports: "5432" })], ask({ dst: "2001:db8::1" }), site);
-    assert.equal(r.matches.length, 0);
-    assert.equal(r.undecidable.length, 1);
-    const v6 = r.undecidable[0]?.dst;
-    assert.match(v6?.kind === "undecidable" ? v6.why : "", /IPv4/);
+  it("decides IPv6 instead of deferring, and never inherits the conservative yes", () => {
+    // This used to assert a deferral, because `cidrsOverlap` answered `true` for anything with a
+    // colon and copying that into an answer a person reads would have been a match invented from a
+    // parse failure. The screen was right; the reason expired. `cidrRange` reads both families now,
+    // so the honest output is the answer, and the reader is not sent looking for a rule that cannot
+    // exist.
+    const v4rule = lookupPolicies([policy({ ports: "5432" })], ask({ dst: "2001:db8::1" }), site);
+    assert.deepEqual([v4rule.matches.length, v4rule.undecidable.length], [0, 0]);
+
+    // The known positive. Without it this passes against a lookup that answers "no" to every IPv6
+    // question, which is the same silence with a different label.
+    const v6rule = policy({ ports: "5432", dst: { kind: "cidr", value: "2001:db8::/32" } });
+    const hit = lookupPolicies([v6rule], ask({ dst: "2001:db8::1" }), site);
+    assert.deepEqual([hit.matches.length, hit.undecidable.length], [1, 0]);
+
+    // And a v6 address outside a v6 rule is a "no" with a reason, not a match.
+    const miss = lookupPolicies([v6rule], ask({ dst: "3fff:1::1" }), site);
+    assert.deepEqual([miss.matches.length, miss.undecidable.length], [0, 0]);
+
+    // Still conservative where it must be: something neither family can read stays undecidable
+    // rather than becoming a silent match.
+    const junk = lookupPolicies(
+      [policy({ ports: "5432", dst: { kind: "cidr", value: "not-an-address" } })],
+      ask(),
+      site,
+    );
+    assert.equal(junk.undecidable.length, 1);
   });
 
   it("defers when the ports come from a service object", () => {
@@ -219,11 +238,15 @@ describe("naming the workload turns a list into an answer", () => {
 
   it("counts the deferrals a better question would fix, apart from the ones it would not", () => {
     // So the screen can say it once. Forty identical explanations is a list nobody reads to the end.
-    const r = lookupPolicies([dispatcherRule, policy({ id: "V6", ports: "8080" })], {
-      ...q, dst: "2001:db8::1",
-    }, site);
+    // The second rule defers for a reason naming a workload would not fix — it points at an address
+    // object this site's catalogue does not carry. IPv6 used to play that part, before the lookup
+    // learned to answer it.
+    const r = lookupPolicies([
+      dispatcherRule,
+      policy({ id: "OBJ", ports: "8080", dst: { kind: "object", value: "not-in-catalogue" } }),
+    ], { ...q, dst: "10.17.0.9" }, site);
     assert.equal(r.needsWorkload, 1, "the workload rule is waiting on a workload");
-    assert.equal(r.undecidable.length, 2, "the IPv6 one is deferred too, but not for that reason");
+    assert.equal(r.undecidable.length, 2, "the object one is deferred too, but not for that reason");
   });
 
   it("still says a Service cannot be decided from labels", () => {
