@@ -2,6 +2,7 @@
 // Review, approve and push a proposed generation.
 //
 //   heliopause-approve <manager-url> [--pki=DIR] [--operator=NAME]              list pending plans
+//   heliopause-approve <manager-url> <plan-hash> --show [--rules]               read what it changes
 //   heliopause-approve <manager-url> <plan-hash> --approve                      approve one
 //   heliopause-approve <manager-url> <plan-hash> --push                         publish an approved one
 //
@@ -47,10 +48,16 @@ const [managerUrl, hash] = args.filter((a) => !a.startsWith("--"));
 if (!managerUrl || flags.has("help")) {
   console.error(
     "usage: heliopause-approve <manager-url> [--pki=DIR] [--operator=NAME]\n" +
+      "       heliopause-approve <manager-url> <plan-hash> --show [--rules]\n" +
       "       heliopause-approve <manager-url> <plan-hash> --approve\n" +
       "       heliopause-approve <manager-url> <plan-hash> --push\n" +
       "\n" +
       "  no flag     list pending plans\n" +
+      "  --show      read what this plan changes: the policy diff, and what each host's rules\n" +
+      "              become. Run this before --approve — without it, approving is a comparison\n" +
+      "              of hashes and no check at all on what the rules say.\n" +
+      "  --rules     with --show, also print each host's full rendered ruleset (the bytes the\n" +
+      "              agent applies, which is what rulesetHash covers).\n" +
       "  --approve   approve a plan. Must be a different operator than the one who proposed it.\n" +
       "  --push      publish an approved plan to its target VPC. This changes the fleet.\n" +
       "\n" +
@@ -62,6 +69,10 @@ if (!managerUrl || flags.has("help")) {
   );
   process.exit(2);
 }
+
+// Narrowed once, here, because the guard above does not follow into a function body — `show` would
+// otherwise see `string | undefined` for something the process has already exited without.
+const manager: string = managerUrl;
 
 const creds = operatorCreds(resolve(flags.get("pki") ?? "./pki"), flags.get("operator"));
 
@@ -108,6 +119,104 @@ function fail(e: unknown): never {
   throw e;
 }
 
+// ── What the second person is agreeing to ─────────────────────────────────────
+//
+// ## Why this had to exist
+//
+// `manager-server.ts` wrote the problem down and then solved it for one audience:
+//
+//   > The approver saw a host name, a stage, a rule *count* and a digest. Nothing else. So approval
+//   > was a comparison of hashes — which is a real check against tampering in transit and no check
+//   > at all on what the rules say.
+//
+// Three routes were added for that — `/changes`, `/ruleset`, `/ruleset-diff` — and all three were
+// reachable only from the browser. `/ruleset-diff` had **no caller anywhere**: implemented, tested,
+// and never fetched by any screen or command. So for a CLI approver the two-person rule was still
+// a hash comparison, which is the thing the routes were built to end.
+//
+// ## What it shows, in the order an approver needs it
+//
+//   1. the policy diff — the text a person wrote, which is where intent lives
+//   2. per host, what the *rules* become — because one edit to an address object moves every rule
+//      that names it, and a rule can move with no line of policy changing at all
+//
+// The full rendered ruleset is behind `--rules`. It is what lands and it is worth having, but six
+// hosts of nft JSON is not something anyone reads by default, and a screen nobody reads is the
+// failure this is fixing rather than a second instance of it.
+async function show(planHash: string, withRules: boolean): Promise<void> {
+  const encoded = encodeURIComponent(planHash);
+  const { plans } = await api<{ plans: PlanView[] }>(manager, "/api/plans", "GET", undefined, creds);
+  const plan = plans.find((p) => p.hash === planHash);
+  if (!plan) throw new ApiError(`no pending plan ${planHash} — it may have expired or been published`, 404);
+  printPlan(plan);
+
+  // Reported, never swallowed. An approver shown nothing concludes nothing changed, and every one of
+  // these routes answers 200 with an `unavailable` sentence rather than an error for exactly that
+  // reason — so the sentence has to reach the terminal.
+  console.log("\n── what changed in the policy ──");
+  const changes = await api<{
+    unavailable?: string; same?: boolean; base?: string; head?: string;
+    commits?: { sha: string; message: string; author: string }[];
+    files?: { filename: string; status: string; additions: number; deletions: number }[];
+    generated?: { filename: string; additions: number; deletions: number }[];
+  }>(manager, `/api/plans/${encoded}/changes`, "GET", undefined, creds);
+  if (changes.unavailable) {
+    console.log(`  ${changes.unavailable}`);
+  } else if (changes.same) {
+    console.log(`  nothing — the fleet is already on ${changes.head}`);
+  } else {
+    console.log(`  ${changes.base} → ${changes.head}`);
+    for (const c of changes.commits ?? []) console.log(`  ${c.sha}  ${c.message}  (${c.author})`);
+    for (const f of changes.files ?? []) {
+      console.log(`    ${f.status.padEnd(9)} ${f.filename}  +${f.additions} -${f.deletions}`);
+    }
+    // Listed, never hidden: the generation being approved does contain them, and an approver who
+    // later found unlisted changes in it would be right to distrust this output. Summarised, because
+    // the first real diff this console produced was 174 of 176 lines of coverage output with the one
+    // authored line underneath.
+    const generated = changes.generated ?? [];
+    if (generated.length) {
+      const added = generated.reduce((n, f) => n + f.additions, 0);
+      const removed = generated.reduce((n, f) => n + f.deletions, 0);
+      console.log(`    generated ${generated.length} file(s), +${added} -${removed} (machine-written)`);
+    }
+  }
+
+  for (const host of plan.summary.hosts) {
+    console.log(`\n── ${host.host}  ${host.stage}  ${host.ruleCount} rules ──`);
+    const diff = await api<{
+      unavailable?: string; added?: boolean; base?: string;
+      changes?: { comment: string; kind: "added" | "removed" | "changed" }[];
+      unchanged?: number; before?: number; after?: number;
+    }>(manager, `/api/plans/${encoded}/ruleset-diff?host=${encodeURIComponent(host.host)}`, "GET", undefined, creds);
+    if (diff.unavailable) {
+      console.log(`  ${diff.unavailable}`);
+    } else if (diff.added) {
+      console.log(`  new host — every rule is an addition`);
+    } else if (!diff.changes?.length) {
+      console.log(`  no rule changed (${diff.unchanged ?? 0} unchanged)`);
+    } else {
+      // Removals first, which is the order the server produced them in and the order that matters:
+      // a rule that disappeared is the one that opens a port, and it is the change an approver is
+      // least likely to notice on their own.
+      for (const c of diff.changes) {
+        console.log(`  ${c.kind === "removed" ? "-" : c.kind === "added" ? "+" : "~"} ${c.comment}`);
+      }
+      console.log(`  ${diff.before} rules → ${diff.after}, ${diff.unchanged ?? 0} unchanged`);
+    }
+    if (withRules) {
+      const full = await api<{ ruleset: string; rulesetHash: string }>(
+        manager, `/api/plans/${encoded}/ruleset?host=${encodeURIComponent(host.host)}`, "GET", undefined, creds,
+      );
+      // The stored bytes, which are what the agent applies and what `rulesetHash` covers — not a
+      // fresh render of the same policy. See the route's own comment.
+      console.log(`  ${full.rulesetHash}`);
+      for (const line of full.ruleset.split("\n")) console.log(`    ${line}`);
+    }
+  }
+  console.log(`\nTo approve: heliopause-approve ${manager} ${planHash} --approve`);
+}
+
 try {
   if (flags.has("approve")) {
     if (!hash) throw new Error("--approve needs a plan hash");
@@ -147,6 +256,9 @@ try {
       process.exit(1);
     }
     console.log(`\nWatch it roll out: heliopause-status ${managerUrl} --site --watch`);
+  } else if (flags.has("show")) {
+    if (!hash) throw new Error("--show needs a plan hash");
+    await show(hash, flags.has("rules"));
   } else {
     const { plans, limits } = await api<{
       plans: PlanView[];

@@ -120,7 +120,7 @@ import {
   submitValidatedNodeCsr, touchExistingNodeCsr, validateNodeCsrAsync, withEnrollmentTransaction,
 } from "./enrollment-store.ts";
 import { certificateIsRevoked } from "./certificate-revocation.ts";
-import { serializeRevocationSnapshot } from "./revocation-snapshot.ts";
+import { MAX_REVOCATION_ROWS, serializeRevocationSnapshot } from "./revocation-snapshot.ts";
 import { daysUntilExpiry } from "./cert-api.ts";
 import type { CertBundle } from "./cert-api.ts";
 import type { CertificateRevocation } from "./enrollment-store.ts";
@@ -1522,7 +1522,25 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       return send(res, 200, { events: requireEnrollmentDocument(opts.enrollment.storeFile).audit });
     }
     if (opts.enrollment && req.method === "GET" && url.pathname === "/enrollment/revocations") {
-      return send(res, 200, { revocations: requireEnrollmentDocument(opts.enrollment.storeFile).revocations });
+      // ## The remaining capacity travels with the list
+      //
+      // `MAX_REVOCATION_ROWS` is a hard ceiling, and `revocation-snapshot.ts` calls reaching it
+      // "the one failure a denylist cannot have" — past it, a new revocation is refused. Compaction
+      // exists (`planRevocationCompaction`, and `heliopause-revocations` drives it) but it is an
+      // operator action taken with the writer stopped.
+      //
+      // Nothing reported how close the list was. `/status`, `/site` and `/authz` all said nothing,
+      // so the first sign would have been a refused revocation during whatever incident prompted it.
+      // A number here is the cheapest version of the warning.
+      const revocations = requireEnrollmentDocument(opts.enrollment.storeFile).revocations;
+      return send(res, 200, {
+        revocations,
+        capacity: {
+          used: revocations.length,
+          max: MAX_REVOCATION_ROWS,
+          remaining: Math.max(0, MAX_REVOCATION_ROWS - revocations.length),
+        },
+      });
     }
 
     // ## Cross-site requests, refused before any write route runs

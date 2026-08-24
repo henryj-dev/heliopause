@@ -19,7 +19,7 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { request } from "node:https";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createHash, generateKeyPairSync } from "node:crypto";
 import { startManager } from "./manager-server.ts";
 import { startRelay } from "./relay.ts";
@@ -595,6 +595,58 @@ describe("publishing reaches the relay", () => {
     assert.equal(d.json.head, "gen-bbb");
     assert.deepEqual(d.json.changes, [{ comment: "BASE-SSH", kind: "changed" }]);
     assert.equal(d.json.unchanged, 0);
+  });
+
+  // ## The route had no caller, and that is what this asserts
+  //
+  // `/plans/<hash>/ruleset-diff` was implemented and tested and fetched by nothing — not the Svelte
+  // console, not any command. So the tests above proved the manager could answer a question nobody
+  // asked, and the CLI approver was still comparing hashes, which is the thing the route was added
+  // to end.
+  //
+  // Driven by spawning the real command against this manager, because "the command calls it" is not
+  // a property of the server and cannot be checked from here any other way.
+  it("is what `heliopause-approve --show` reads", async () => {
+    const first = await approved();
+    assert.equal((await call(managerPort, "/publish", "POST", { hash: first }, "henry")).status, 200);
+    const second = await call<{ hash: string }>(
+      managerPort, "/plan", "POST", { target: "dev", bundle: bundle(RULES2) }, "henry",
+    );
+    assert.equal(second.status, 200, second.text);
+
+    // ⚠️ `execFileSync` cannot be used here, and the reason is the same defect this batch keeps
+    // finding: the manager under test runs **in this process**, so a synchronous child blocks the
+    // event loop that would answer the request. Measured — the spawn sat for the full 120-second
+    // test timeout talking to a server that could not run.
+    const out = await new Promise<string>((resolveOut, rejectOut) => {
+      const child = spawn(
+        process.execPath,
+        [
+          join(import.meta.dirname, "..", "bin", "heliopause-approve.ts"),
+          `https://127.0.0.1:${managerPort}`,
+          second.json.hash,
+          "--show",
+          `--pki=${dir}`,
+          "--operator=henry",
+        ],
+        { stdio: ["ignore", "pipe", "pipe"] },
+      );
+      let stdout = "";
+      let stderr = "";
+      child.stdout.setEncoding("utf8").on("data", (c: string) => { stdout += c; });
+      child.stderr.setEncoding("utf8").on("data", (c: string) => { stderr += c; });
+      child.once("error", rejectOut);
+      child.once("close", (code) =>
+        code === 0 ? resolveOut(stdout) : rejectOut(new Error(`--show exited ${code}: ${stderr || stdout}`)));
+    });
+
+    // The rule that moved, by name — the whole point of showing a diff rather than a count.
+    contains(out, "BASE-SSH");
+    contains(out, "gw-01.dev");
+    // And the policy half, which answers `unavailable` here (no repository credential in this
+    // harness) — reported rather than swallowed, because an approver shown nothing concludes
+    // nothing changed.
+    contains(out, "what changed in the policy");
   });
 
   it("refuses a diff for a host or a plan it does not carry", async () => {
