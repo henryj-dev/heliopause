@@ -14,6 +14,7 @@ import base64
 import hashlib
 import json
 import os
+import pathlib
 import re
 import subprocess
 import sys
@@ -3519,6 +3520,58 @@ class RouteApplyAndRestore(unittest.TestCase):
         hp._restore_routes(restore)
         touched = [c[1] for c in self.calls]
         self.assertNotIn("10.7.0.0/16", touched)
+
+class TestRelayRequestDeadline(unittest.TestCase):
+    """`HTTP_TIMEOUT_SEC` bounds the whole exchange, not each socket operation.
+
+    `HTTPSConnection(timeout=…)` sets the socket timeout, which Python applies to **each** call: a
+    relay answering one byte at a time resets it forever. That number is load-bearing arithmetic —
+    `NFT_CONFIRM_MIN_SEC` is derived from `2 * HTTP_TIMEOUT_SEC` on the stated grounds of "one failed
+    HTTP attempt plus a short retry", and the heartbeat loop's own comment calls the rollback window
+    during a hung request "the full HTTP timeout rather than an instant".
+
+    The rollback is not at risk either way — it fires from a `threading.Timer` and the heartbeat
+    holds no lock. What an unbounded attempt costs is the retry, and with it a confirm window that
+    elapses while one attempt is still in flight: a host that would have confirmed on the second
+    rolls back a ruleset that was fine.
+
+    These drive `_remaining` rather than a socket, because a test that has to trickle real bytes for
+    ten seconds is one nobody runs. `_remaining` is where the deadline becomes an error, and the
+    call sites are pinned separately by reading the source — a socket whose timeout is never re-armed
+    from the clock is the defect, and that is visible as an absence.
+    """
+
+    def test_remaining_counts_down_and_then_refuses(self):
+        deadline = time.monotonic() + 5
+        left = hp._remaining(deadline, "reading the response body")
+        self.assertGreater(left, 0)
+        self.assertLessEqual(left, 5)
+
+    def test_an_elapsed_deadline_raises_rather_than_returning_zero(self):
+        # A socket reads a timeout of zero as **non-blocking**, not as expired. Returning 0 here
+        # would turn an exhausted deadline into a socket that never waits, which is a different
+        # failure with a much worse message.
+        with self.assertRaises(TimeoutError) as caught:
+            hp._remaining(time.monotonic() - 1, "reading the response body")
+        self.assertIn("reading the response body", str(caught.exception))
+        self.assertIn(str(hp.HTTP_TIMEOUT_SEC), str(caught.exception))
+
+    def test_the_relay_call_re_arms_the_socket_from_the_deadline(self):
+        # The call sites, as an absence. One `read(MAX_ARTIFACT_BYTES)` is a single call that keeps
+        # resetting the socket timeout internally — the body has to be read in pieces with the clock
+        # consulted between them, or the deadline above bounds nothing that matters.
+        source = pathlib.Path(hp.__file__).read_text()
+        body = source[source.index("def relay_request("):source.index("def post_heartbeat(")]
+        self.assertIn("deadline = time.monotonic() + HTTP_TIMEOUT_SEC", body)
+        self.assertEqual(
+            body.count("conn.sock.settimeout(_remaining(deadline"), 3,
+            "the request, the status and the body read each have to re-arm from the deadline",
+        )
+        self.assertNotIn(
+            "resp.read(MAX_ARTIFACT_BYTES)", body,
+            "one unbounded read is the defect — the body is read in pieces",
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

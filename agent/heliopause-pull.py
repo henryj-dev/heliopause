@@ -3938,12 +3938,47 @@ def _pin_ok(der):
     return any(p.removeprefix("sha256/") == digest for p in PINS)
 
 
+def _remaining(deadline, what):
+    """Seconds left before `deadline`, or a raise. Never returns zero or less.
+
+    Sockets treat a timeout of zero as non-blocking rather than as expired, so a deadline that has
+    already passed has to become an error here instead of being handed to `settimeout`.
+    """
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise TimeoutError(f"relay exchange exceeded {HTTP_TIMEOUT_SEC}s before {what}")
+    return left
+
+
 def relay_request(method, suffix, payload=None):
     """One authenticated request to the relay. Raises on any failure.
 
     Raising rather than returning None is deliberate: to this agent a failed exchange is a
     meaningful event, not a missing value. It is the signal an armed rollback is waiting on.
+
+    ## `HTTP_TIMEOUT_SEC` is a deadline here, not a socket timeout
+
+    `HTTPSConnection(timeout=…)` sets the socket timeout, which Python applies to **each** operation:
+    every `recv` that returns a byte resets it. A relay answering one byte at a time therefore stayed
+    inside a ten-second timeout indefinitely.
+
+    That matters because this number is load-bearing arithmetic elsewhere in this file.
+    `NFT_CONFIRM_MIN_SEC` is derived as `(2 * NFT_TIMEOUT_SEC) + (2 * HTTP_TIMEOUT_SEC) +
+    ROLLBACK_RETRY_SEC + 5`, from "allowing one failed HTTP attempt plus a short retry" — and the main
+    loop's own comment says the rollback window during a hung request is "the full HTTP timeout rather
+    than an instant". Both sentences assume a bound that was not enforced.
+
+    **The rollback itself is not at risk**, and that is worth stating rather than leaving to the
+    reader: it fires from a `threading.Timer` on another thread, and the heartbeat is sent holding no
+    lock. What an unbounded attempt costs is the *retry* — a confirm window can elapse with one
+    attempt still in flight, so a host that would have confirmed on the second rolls back a ruleset
+    that was fine. Safe direction, real cost.
+
+    The deadline covers connect, the pin check, the request and the body read, because all four are
+    inside the window the arithmetic above is about. It is the same shape `_deadline_timeout` gives
+    the kubectl calls, and the same `min(HTTP_TIMEOUT_SEC, remaining)` the private-proxy delete uses.
     """
+    deadline = time.monotonic() + HTTP_TIMEOUT_SEC
     parts = urllib.parse.urlsplit(RELAY_URL)
     conn = http.client.HTTPSConnection(
         parts.hostname,
@@ -3966,9 +4001,21 @@ def relay_request(method, suffix, payload=None):
         if payload is not None:
             body = json.dumps(payload).encode()
             headers = {"Content-Type": "application/json", "Content-Length": str(len(body))}
+        conn.sock.settimeout(_remaining(deadline, "sending the request"))
         conn.request(method, path, body, headers)
+        conn.sock.settimeout(_remaining(deadline, "reading the response status"))
         resp = conn.getresponse()
-        raw = resp.read(MAX_ARTIFACT_BYTES)
+        # Read in pieces, re-arming the socket from the deadline before each one. A single
+        # `read(MAX_ARTIFACT_BYTES)` is one call that keeps resetting the socket timeout internally,
+        # which is the whole defect; the chunk size only decides how often the clock is consulted.
+        raw = bytearray()
+        while len(raw) < MAX_ARTIFACT_BYTES:
+            conn.sock.settimeout(_remaining(deadline, "reading the response body"))
+            piece = resp.read(min(65536, MAX_ARTIFACT_BYTES - len(raw)))
+            if not piece:
+                break
+            raw += piece
+        raw = bytes(raw)
         if resp.status != 200:
             raise RuntimeError(f"relay returned {resp.status}: {raw[:200]!r}")
         return json.loads(raw)
