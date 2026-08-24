@@ -23,6 +23,16 @@ import type { SelectorMembership } from "./protocol.ts";
 /** File name inside the artifact directory. Sits beside `manifest.json`. */
 export const MEMBERSHIP_FILE = "membership.json";
 
+/**
+ * The largest pod count this will read back out of a record.
+ *
+ * Not a fact about clusters — a bound on what a corrupt diagnostic can make this process allocate.
+ * `asPodLists` materialises one array slot per pod, so the number in this file decides an allocation.
+ * Six orders of magnitude above any selector on this fleet, and small enough that a wrong value is
+ * a refusal rather than an out-of-memory kill during a publish.
+ */
+export const MAX_RECORDED_PODS = 1_000_000;
+
 export interface MembershipRecord {
   /** The generation this reading was rendered against. */
   generation: string;
@@ -90,9 +100,23 @@ export async function readMembershipRecord(dir: string): Promise<MembershipRecor
   try {
     const v = JSON.parse(text) as Partial<MembershipRecord>;
     if (typeof v.generation !== "string" || typeof v.at !== "string" || !v.counts) return undefined;
-    // Counts must be numbers. A string here would compare as NaN and silently report no jump —
-    // the quiet-pass failure this whole file is about.
-    for (const n of Object.values(v.counts)) if (typeof n !== "number" || !Number.isFinite(n)) return undefined;
+    // ## Counts must be numbers `asPodLists` can actually build an array from
+    //
+    // A string here would compare as NaN and silently report no jump — the quiet-pass failure this
+    // whole file is about. That was the original check, and `Number.isFinite` is not enough for it:
+    // `-1`, `2.5` and `1e12` are all finite, all passed, and all made `new Array(n)` throw
+    // `Invalid array length` **inside the publish**. Measured 2026-08-24, all three.
+    //
+    // Which is this file's own stated contract failing one step further along than the sentence
+    // describing it. `readMembershipRecord` promises never to throw, because "refusing to publish
+    // because a diagnostic file would not parse would make an observation aid into a release
+    // blocker" — and then the publish aborted on a value this function had just approved. The guard
+    // belongs at the boundary, in one place, rather than being repeated defensively in `asPodLists`.
+    for (const n of Object.values(v.counts)) {
+      if (typeof n !== "number" || !Number.isSafeInteger(n) || n < 0 || n > MAX_RECORDED_PODS) {
+        return undefined;
+      }
+    }
     return v as MembershipRecord;
   } catch {
     return undefined;

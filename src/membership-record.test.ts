@@ -13,6 +13,7 @@ import {
   asPodLists,
   readMembershipRecord,
   writeMembershipRecord,
+  MAX_RECORDED_PODS,
   MEMBERSHIP_FILE,
 } from "./membership-record.ts";
 import { membershipJumps } from "./cilium.ts";
@@ -77,6 +78,48 @@ describe("reading a record back", () => {
     writeFileSync(
       join(d, MEMBERSHIP_FILE),
       JSON.stringify({ generation: "g", at: reading.at, counts: { s: "12" } }),
+      "utf8",
+    );
+    assert.equal(await readMembershipRecord(d), undefined);
+  });
+
+  // ## Finite was not enough, and the gap was one step past the sentence promising there was none
+  //
+  // The check above was `Number.isFinite`. `-1`, `2.5` and `1e12` are all finite, all passed, and all
+  // made `new Array(n)` throw `Invalid array length` — **inside the publish**, because `asPodLists`
+  // is called on whatever this function returns. `readMembershipRecord` promises never to throw, on
+  // the stated grounds that a diagnostic file must not become a release blocker; it then approved
+  // three values that blocked the release.
+  //
+  // Each is written out rather than looped, because they fail for three different reasons and a
+  // future edit could plausibly fix one and not the others.
+  for (const [what, count] of [["negative", -1], ["fractional", 2.5], ["absurd", 1e12]] as const) {
+    it(`rejects a ${what} count, which would throw when built into an array`, async () => {
+      const d = dir();
+      writeFileSync(
+        join(d, MEMBERSHIP_FILE),
+        JSON.stringify({ generation: "g", at: reading.at, counts: { s: count } }),
+        "utf8",
+      );
+      assert.equal(await readMembershipRecord(d), undefined);
+    });
+  }
+
+  it("accepts a large but buildable count, so the bound is a bound and not a ban", async () => {
+    // The known positive. Without it every rejection above passes against a reader that refuses all
+    // counts, and the file would silently stop comparing anything.
+    const d = dir();
+    writeFileSync(
+      join(d, MEMBERSHIP_FILE),
+      JSON.stringify({ generation: "g", at: reading.at, counts: { s: MAX_RECORDED_PODS } }),
+      "utf8",
+    );
+    const rec = await readMembershipRecord(d);
+    assert.equal(rec?.counts.s, MAX_RECORDED_PODS);
+    // …and one past it is refused, so the boundary is where it says it is.
+    writeFileSync(
+      join(d, MEMBERSHIP_FILE),
+      JSON.stringify({ generation: "g", at: reading.at, counts: { s: MAX_RECORDED_PODS + 1 } }),
       "utf8",
     );
     assert.equal(await readMembershipRecord(d), undefined);
