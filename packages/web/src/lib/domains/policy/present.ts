@@ -100,10 +100,6 @@ export function policyFindings(rows: readonly PolicyRow[], lang: Lang = "en"): P
     .filter((finding) => finding.count > 0);
 }
 
-export function rowFor(rows: readonly PolicyRow[], id: string): PolicyRow | undefined {
-  return rows.find((row) => row.id === id);
-}
-
 export function coverageKind(verdict: string): "ok" | "bad" | "none" | "mute" {
   if (verdict === "pass") return "ok";
   if (verdict === "fail") return "bad";
@@ -111,9 +107,12 @@ export function coverageKind(verdict: string): "ok" | "bad" | "none" | "mute" {
   return "none";
 }
 
-export function deviceKind(state: string): "ok" | "warn" | "bad" | "none" {
-  if (state === "ok") return "ok";
-  if (state === "moved") return "warn";
-  if (state === "gone") return "bad";
-  return "none";
-}
+// `deviceKind` used to sit here, next to `coverageKind` and shaped like it, mapping a device row's
+// state to a chip kind. Nothing called it: `PolicyScreen.svelte` writes the same four-way mapping
+// inline, because each branch also picks a glyph and a label and so the `{#if}` chain exists anyway.
+//
+// Deleted rather than wired. The chain has to stay for the text, so calling this from it would
+// replace four literal `kind="ok"` attributes with four calls that read worse — and leaving it here
+// is the trap: an export that looks like the place device colouring is decided, where editing it
+// changes nothing on screen. `coverageKind` is the real version of this shape; the coverage cell has
+// no per-verdict text, so there the function is the whole decision.
