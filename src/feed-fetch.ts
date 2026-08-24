@@ -17,6 +17,15 @@
 //     and a server that ignores it can exhaust memory before any validation runs.
 //   · A wall-clock deadline — a feed that trickles forever holds the refresh open forever.
 //
+// ⚠️ The last one was **stated here and not implemented**, from the first version until 2026-08-24.
+// `request({ timeout })` is `socket.setTimeout`, which fires on *inactivity*: every byte resets it.
+// Measured — a server writing one byte every 200ms against a 1000ms timeout was still connected six
+// seconds later, and at the production settings (30s, 32 MB) one byte every 29 seconds would hold a
+// refresh open for roughly thirty years before the byte ceiling ended it. Neither of the other two
+// bounds covers this: the ceiling counts bytes and a trickle sends few, and `refreshFeed` is waiting
+// on this promise. There is now a real deadline below, and the socket timeout is kept beside it
+// because the two catch different things — a dead peer, and a slow one.
+//
 // None of these are guesses about what could go wrong; each is the direct consequence of the response
 // being trusted enough to shape a ruleset.
 
@@ -51,7 +60,22 @@ export function makeFetchFeed(limits: FetchLimits = FETCH_LIMITS): FetchFeed {
   // and a feed that declares a tighter one means it. Absent — a caller that does not know which feed
   // this is — leaves the global bound, which is what happened for every fetch until now.
   return (url: string, perFeedMaxBytes?: number) =>
-    new Promise<string>((resolve, reject) => {
+    new Promise<string>((settleOk, settleErr) => {
+      // ## One deadline over the whole request, and every exit clears it
+      //
+      // Armed before the request rather than inside the response handler: the wait this bounds
+      // includes DNS and the TLS handshake, and a peer that completes neither is the cheapest way to
+      // hold a refresh open.
+      //
+      // `resolve`/`reject` are wrapped rather than the timer being `unref`'d. An unref'd timer stops
+      // holding the loop but still fires, and firing after a successful fetch would destroy a socket
+      // the agent may have handed to the next request. Clearing is the honest version, and it also
+      // keeps a passing test from sitting on a live timer for the rest of the deadline.
+      let deadline: ReturnType<typeof setTimeout> | undefined;
+      const clear = () => { if (deadline !== undefined) clearTimeout(deadline); deadline = undefined; };
+      const resolve = (v: string) => { clear(); settleOk(v); };
+      const reject = (e: unknown) => { clear(); settleErr(e); };
+
       const maxBytes = Math.min(
         limits.maxBytes,
         perFeedMaxBytes !== undefined && Number.isFinite(perFeedMaxBytes) && perFeedMaxBytes > 0
@@ -102,9 +126,21 @@ export function makeFetchFeed(limits: FetchLimits = FETCH_LIMITS): FetchFeed {
           res.on("data", (c: Buffer) => {
             total += c.length;
             if (total > maxBytes) {
+              // ## Reject first, then destroy — the order decides which reason the operator reads
+              //
+              // `res.destroy()` makes the stream emit `aborted`, and that handler rejects too. A
+              // promise keeps the first settlement, so destroying first means the ceiling refusal is
+              // reported as **"feed connection aborted mid-body"** — measured 2026-08-24, on the very
+              // first run of this module's first test.
+              //
+              // `refreshFeed` keeps the previous snapshot either way, so nothing downstream behaves
+              // differently. The reason is the part a person acts on, and those two send them
+              // opposite ways: one reads as a network blip worth retrying, the other says this feed
+              // is larger than the ceiling it was registered with and no retry will help.
+              reject(new FeedError(`feed body exceeded ${maxBytes} bytes`));
               // Destroyed rather than left to finish. `Content-Length` is a claim; this is the limit.
               res.destroy();
-              return reject(new FeedError(`feed body exceeded ${maxBytes} bytes`));
+              return;
             }
             chunks.push(c);
           });
@@ -120,9 +156,20 @@ export function makeFetchFeed(limits: FetchLimits = FETCH_LIMITS): FetchFeed {
         },
       );
 
+      // Inactivity. Distinct from the deadline above and worth keeping: it ends a silent peer in
+      // `timeoutMs` rather than making every dead connection wait out the full deadline.
       req.on("timeout", () => {
-        req.destroy(new FeedError(`feed did not respond within ${limits.timeoutMs}ms`));
+        req.destroy(new FeedError(`feed went silent for ${limits.timeoutMs}ms`));
       });
+
+      deadline = setTimeout(() => {
+        req.destroy(
+          new FeedError(
+            `feed did not finish within ${limits.timeoutMs}ms — a body that arrives slowly enough ` +
+              `never trips the idle timeout, so this is the bound that ends it`,
+          ),
+        );
+      }, limits.timeoutMs);
       req.on("error", (e) =>
         reject(e instanceof FeedError ? e : new FeedError(`feed request failed: ${e.message}`)),
       );
