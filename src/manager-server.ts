@@ -113,7 +113,7 @@ import {
   type PlanSummary,
 } from "./approval.ts";
 import {
-  EnrollmentError, NODE_TOKEN_PREFIX, createNodeToken, fetchNodeCertificate, requireEnrollmentDocument,
+  EnrollmentError, createNodeToken, fetchNodeCertificate, looksLikeNodeToken, requireEnrollmentDocument,
   preflightNodeCsr, rejectNodeCsr, revokeCertificate, revokeNodeToken, storeNodeCertificate,
   submitValidatedNodeCsr, touchExistingNodeCsr, validateNodeCsrAsync, withEnrollmentTransaction,
 } from "./enrollment-store.ts";
@@ -647,6 +647,55 @@ const MAX_RELAY_RESPONSE_BYTES = 8 * 1024 * 1024;
 const MAX_TRAFFIC_DUMP_BYTES = 8 * 1024 * 1024;
 
 /**
+ * How often one source address may reach the two certificate-less enrollment routes.
+ *
+ * ## What is being limited, and why it is not "requests"
+ *
+ * Both routes read and parse the whole enrollment store **synchronously**, and one of them takes the
+ * `O_EXCL` lock, which is waited on with `Atomics.wait` — also synchronously. So each admitted
+ * request is a slice of this process's event loop during which nothing else is served, including
+ * the console and `/site`. That cost grows with the store, which only ever gets bigger.
+ *
+ * A real agent enrols once and then polls for its certificate every few seconds until it is signed.
+ * Thirty in a minute is far above that and far below anything that would matter.
+ *
+ * ## What this is not
+ *
+ * Not a defence against a distributed source, and not a substitute for the shape check in front of
+ * it. It is the bound on how much one caller can spend, which is the part that was missing.
+ */
+const ENROLLMENT_RATE_WINDOW_MS = 60_000;
+const ENROLLMENT_RATE_MAX = 30;
+/** Distinct source addresses tracked. Beyond this the oldest window is dropped, never the newest. */
+const ENROLLMENT_RATE_SOURCES = 1_024;
+
+/** Fixed-window counter per source. Exported for its test; the state is the caller's. */
+export function rateLimited(
+  seen: Map<string, { windowStartedAt: number; count: number }>,
+  key: string,
+  nowMs: number,
+  limit = ENROLLMENT_RATE_MAX,
+  windowMs = ENROLLMENT_RATE_WINDOW_MS,
+  maxKeys = ENROLLMENT_RATE_SOURCES,
+): boolean {
+  const found = seen.get(key);
+  if (!found || nowMs - found.windowStartedAt >= windowMs) {
+    // Re-inserted rather than mutated, so `Map` insertion order tracks recency and the eviction
+    // below drops the least recently *started* window instead of an arbitrary one.
+    seen.delete(key);
+    seen.set(key, { windowStartedAt: nowMs, count: 1 });
+    while (seen.size > maxKeys) {
+      const oldest = seen.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      seen.delete(oldest);
+    }
+    return false;
+  }
+  found.count += 1;
+  return found.count > limit;
+}
+
+/**
  * Fetch the policy as data and render it here.
  *
  * The replacement for the `await import(sitePath)` that was C1. Nothing in this function evaluates
@@ -942,6 +991,25 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
   const limits = opts.limits ?? DEFAULT_LIMITS;
   const now = opts.now ?? (() => new Date());
   const authorizationTimestamps = new AuthorizationTimestampIssuer();
+
+  /**
+   * Per-source counters for the two enrollment routes a caller reaches without a certificate.
+   *
+   * In memory and per process, like the sessions and the pending plans. A restart forgives everyone,
+   * which is the right trade for a bound whose job is to stop one caller monopolising the event loop
+   * rather than to be an access-control decision.
+   */
+  const enrollmentHits = new Map<string, { windowStartedAt: number; count: number }>();
+  const enrollmentFloodRefused = (req: IncomingMessage, res: ServerResponse): boolean => {
+    const source = req.socket.remoteAddress ?? "unknown";
+    if (!rateLimited(enrollmentHits, source, now().getTime())) return false;
+    log(
+      `enrollment request refused for ${source}: more than ${ENROLLMENT_RATE_MAX} in ${ENROLLMENT_RATE_WINDOW_MS / 1000}s`,
+      `${source}의 등록 요청 거부: ${ENROLLMENT_RATE_WINDOW_MS / 1000}초에 ${ENROLLMENT_RATE_MAX}건 초과`,
+    );
+    send(res, 429, { error: "too many enrollment requests from this address" });
+    return true;
+  };
 
   // ## Why pending plans live in memory and that is acceptable
   //
@@ -1247,12 +1315,20 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         // handshake reaches it. `requireEnrollmentDocument` then reads and parses the whole
         // enrollment store on the event loop, before the token has been checked at all.
         //
-        // A prefix test is not authentication and is not meant to be: `lookupNodeToken` still hashes
+        // A shape test is not authentication and is not meant to be: `lookupNodeToken` still hashes
         // and compares, inside the transaction, exactly as before. What this removes is the file read
-        // for a caller who has not even presented something shaped like a token, which is every
-        // unauthenticated request. The bounded remainder is a caller holding a well-formed but wrong
-        // token, and that one is worth a read.
-        if (!token.startsWith(NODE_TOKEN_PREFIX)) return send(res, 401, { error: "unauthorized node token" });
+        // for a caller who has not presented something shaped like a token.
+        //
+        // 🔴 **It used to test the prefix alone, and the prefix is public.** `NODE_TOKEN_PREFIX` is
+        // `"stnode_"`, seven characters in tracked source — so "a caller holding a well-formed but
+        // wrong token" was every caller, and the mitigation this comment described was worth nothing.
+        // `looksLikeNodeToken` checks the full emitted shape (prefix + 64 hex), which is what
+        // `createNodeToken` produces and costs the same.
+        //
+        // The rate limit below is the other half: a caller who *is* guessing in the right space still
+        // must not be able to spend this process's event loop on synchronous reads.
+        if (!looksLikeNodeToken(token)) return send(res, 401, { error: "unauthorized node token" });
+        if (enrollmentFloodRefused(req, res)) return;
         const body = JSON.parse(await readBody(req, 24 * 1024)) as { csrPem?: unknown };
         if (typeof body.csrPem !== "string") return send(res, 400, { error: "csrPem required" });
         const csrPem = body.csrPem;
@@ -1281,9 +1357,11 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     if (opts.enrollment && req.method === "GET" && certificateFetch) {
       try {
         const token = String(req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
-        // Same reasoning as `POST /infra/node-csrs` above: this route is also reachable without a
-        // certificate, and the transaction below takes the enrollment lock before checking anything.
-        if (!token.startsWith(NODE_TOKEN_PREFIX)) return send(res, 401, { error: "unauthorized node token" });
+        // Same reasoning as `POST /infra/node-csrs` above, and one degree worse: the transaction
+        // below takes the `O_EXCL` enrollment lock before checking anything, and that lock is waited
+        // on with `Atomics.wait` — synchronously, on this thread.
+        if (!looksLikeNodeToken(token)) return send(res, 401, { error: "unauthorized node token" });
+        if (enrollmentFloodRefused(req, res)) return;
         const certificate = withEnrollmentTransaction(opts.enrollment.storeFile, (document) =>
           fetchNodeCertificate(document, decodeURIComponent(certificateFetch[1]!), token, req.socket.remoteAddress ?? null));
         return send(res, 200, { ok: true, certificate });

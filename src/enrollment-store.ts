@@ -269,8 +269,34 @@ export function revokeNodeToken(document: EnrollmentDocument, id: string, actor 
   const row = document.tokens.find((token) => token.id === id); if (!row) throw new EnrollmentError(`node token ${id} not found`, 404);
   if (!row.revokedAt) row.revokedAt = nowIso(now); audit(document, { actor, action: "node-token.revoke", target: id, sourceIp: null, detail: { hostname: row.hostname } }, now); return row;
 }
+/**
+ * Is this shaped like a node token at all? **Not authentication** — `lookupNodeToken` still hashes
+ * and compares inside the transaction, exactly as before.
+ *
+ * ## Why the prefix alone was not worth the name it was given
+ *
+ * `POST /infra/node-csrs` and `GET /infra/node-csrs/<id>/certificate` run before operator
+ * authentication — a bootstrapping agent has no certificate yet — and the manager listens with
+ * `rejectUnauthorized: false`, so anyone who completes a handshake reaches them. The gate in front
+ * of the expensive work was `token.startsWith(NODE_TOKEN_PREFIX)`, described as leaving only "a
+ * caller holding a well-formed but wrong token, and that one is worth a read".
+ *
+ * `NODE_TOKEN_PREFIX` is `"stnode_"`, a public constant in this file. So "well-formed" meant seven
+ * fixed characters, and the remaining set was *everyone*: each such request costs a synchronous
+ * `readFileSync` + `JSON.parse` of the whole enrollment store on the event loop, and the
+ * certificate route additionally takes the `O_EXCL` lock.
+ *
+ * `createNodeToken` emits `prefix + randomHex(32)`, which is exactly 64 hex characters. Checking
+ * that costs nothing and removes every caller who is not at least guessing in the right space.
+ */
+export function looksLikeNodeToken(plaintext: string): boolean {
+  return NODE_TOKEN_RE.test(plaintext);
+}
+
+const NODE_TOKEN_RE = new RegExp(`^${NODE_TOKEN_PREFIX}[0-9a-f]{64}$`);
+
 export function lookupNodeToken(document: EnrollmentDocument, plaintext: string, now = new Date()): NodeTokenRecord | null {
-  if (!plaintext.startsWith(NODE_TOKEN_PREFIX)) return null; const digest = sha256(plaintext);
+  if (!looksLikeNodeToken(plaintext)) return null; const digest = sha256(plaintext);
   const row = document.tokens.find((token) => token.tokenHash === digest && !token.revokedAt && Date.parse(token.expiresAt) > now.getTime()) ?? null;
   if (row) row.lastUsedAt = nowIso(now); return row;
 }
@@ -485,7 +511,31 @@ export function storeNodeCertificate(document: EnrollmentDocument, input: { requ
 export function fetchNodeCertificate(document: EnrollmentDocument, requestId: string, plaintextToken: string, sourceIp?: string | null, now = new Date()) {
   const token = lookupNodeToken(document, plaintextToken, now); if (!token) throw new EnrollmentError("unauthorized node token", 401);
   const row = document.requests.find((request) => request.id === requestId && request.nodeTokenId === token.id && request.status === "signed");
-  if (!row?.certificatePem || !row.caPem || !row.certificateSha256) throw new EnrollmentError("certificate not ready", 404);
+  if (!row?.certificatePem || !row.caPem || !row.certificateSha256) {
+    // ## Why this can be "not ready" for a certificate that is sitting right there
+    //
+    // The match is on `nodeTokenId`, so a request submitted under an *earlier* token for the same
+    // host is invisible to a later one — and `createNodeToken` revokes the host's existing tokens by
+    // default. Reissue a token between "agent submits CSR" and "operator signs it" and the agent can
+    // never collect its own certificate: it polls, gets 404, and the message says the certificate is
+    // not ready when the truth is that it was asked for by somebody the store no longer recognises.
+    //
+    // The binding itself is kept. Loosening it to the hostname would let any live token for a host
+    // collect a certificate requested by a different key, which is a wider grant than this route
+    // should have. So the fix here is the sentence, not the query — an operator who reissued a token
+    // needs to be told that is what happened.
+    const forThisHost = document.requests.find(
+      (request) => request.id === requestId && request.hostname === token.hostname && request.status === "signed",
+    );
+    if (forThisHost) {
+      throw new EnrollmentError(
+        "this certificate was requested under a different node token for the same host — the token " +
+          "was reissued after the CSR was submitted. Submit a new CSR with the current token.",
+        409,
+      );
+    }
+    throw new EnrollmentError("certificate not ready", 404);
+  }
   if (!row.retrievedAt) {
     row.retrievedAt = nowIso(now);
     // Polling is expected during bootstrap. Record the first successful retrieval, not one

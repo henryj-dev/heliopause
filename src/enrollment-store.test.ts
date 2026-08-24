@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
   createNodeToken, emptyEnrollmentDocument, fetchNodeCertificate, initializeEnrollmentDocument,
-  loadEnrollmentDocument, lookupNodeToken,
+  loadEnrollmentDocument, looksLikeNodeToken, lookupNodeToken, NODE_TOKEN_PREFIX,
   rejectNodeCsr, saveEnrollmentDocument, storeNodeCertificate, submitNodeCsr, validateNodeCsrAsync,
   withEnrollmentTransaction,
 } from "./enrollment-store.ts";
@@ -233,5 +233,48 @@ exit 1
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+// ── The shape gate in front of the certificate-less routes ────────────────────
+//
+// `POST /infra/node-csrs` and `GET /infra/node-csrs/<id>/certificate` run before operator
+// authentication, and the manager listens with `rejectUnauthorized: false` — anyone who completes a
+// handshake reaches them, and each admitted request costs a synchronous read and parse of the whole
+// enrollment store on the event loop. One of them additionally takes the `O_EXCL` lock, which is
+// waited on with `Atomics.wait`, also synchronously.
+//
+// The gate was `token.startsWith(NODE_TOKEN_PREFIX)`, with a comment claiming it left only "a caller
+// holding a well-formed but wrong token, and that one is worth a read". `NODE_TOKEN_PREFIX` is seven
+// characters of public source, so the remaining set was *everyone* and the mitigation was worth
+// nothing. These pin the difference.
+describe("looksLikeNodeToken", () => {
+  it("accepts exactly what createNodeToken emits", () => {
+    const { token } = createNodeToken(emptyEnrollmentDocument(), { hostname: "gw-01.dev" });
+    assert.equal(looksLikeNodeToken(token), true);
+  });
+
+  it("refuses the bare prefix, which is what the old gate accepted", () => {
+    // The whole point: anyone can type this, and nobody should get a file read for it.
+    assert.equal(looksLikeNodeToken(NODE_TOKEN_PREFIX), false);
+    assert.equal(looksLikeNodeToken(`${NODE_TOKEN_PREFIX}x`), false);
+    assert.equal(looksLikeNodeToken(`${NODE_TOKEN_PREFIX}${"a".repeat(63)}`), false);
+    assert.equal(looksLikeNodeToken(`${NODE_TOKEN_PREFIX}${"a".repeat(65)}`), false);
+  });
+
+  it("refuses the right length in the wrong alphabet, and a missing prefix", () => {
+    // `randomHex` emits lowercase hex; anything else did not come from this store.
+    assert.equal(looksLikeNodeToken(`${NODE_TOKEN_PREFIX}${"A".repeat(64)}`), false);
+    assert.equal(looksLikeNodeToken(`${NODE_TOKEN_PREFIX}${"z".repeat(64)}`), false);
+    assert.equal(looksLikeNodeToken("a".repeat(64)), false);
+    assert.equal(looksLikeNodeToken(""), false);
+  });
+
+  it("is what lookupNodeToken screens on, so the two cannot disagree", () => {
+    // If the route's gate and the lookup's gate diverged, the route would admit shapes the lookup
+    // rejects — which is the file read this is here to prevent.
+    const document = emptyEnrollmentDocument();
+    createNodeToken(document, { hostname: "gw-01.dev" });
+    assert.equal(lookupNodeToken(document, NODE_TOKEN_PREFIX), null);
   });
 });

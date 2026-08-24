@@ -33,6 +33,7 @@ export {
   createNodeToken,
   revokeNodeToken,
   lookupNodeToken,
+  looksLikeNodeToken,
   validateNodeCsr,
   validateNodeCsrAsync,
   preflightNodeCsr,

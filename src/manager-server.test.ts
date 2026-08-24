@@ -24,6 +24,7 @@ import {
   MAX_PENDING_OIDC_LOGINS,
   API_ROUTES,
   API_ROUTE_PATTERNS,
+  rateLimited,
   startManager,
   trimPendingOidcLogins,
 } from "./manager-server.ts";
@@ -2105,5 +2106,48 @@ describe("the data routes answer under /api/ as well", () => {
     };
     const missing = [...served].filter((p) => !API_ROUTES.has(p) && !(p in NOT_DATA)).sort();
     assert.deepEqual(missing, [], `these routes are neither aliased nor explained: ${missing.join(", ")}`);
+  });
+});
+
+// ── The bound on the certificate-less enrollment routes ───────────────────────
+//
+// What is being limited is not "requests" in the abstract: both routes read and parse the whole
+// enrollment store synchronously, and one takes the `O_EXCL` lock via `Atomics.wait` — also
+// synchronously. Each admitted request is a slice of the event loop during which nothing else is
+// served. Pure and clock-injected, so the window can be crossed without waiting a minute.
+describe("the enrollment rate limiter", () => {
+  const fresh = () => new Map<string, { windowStartedAt: number; count: number }>();
+
+  it("admits up to the limit and refuses past it", () => {
+    const seen = fresh();
+    for (let i = 0; i < 5; i++) {
+      assert.equal(rateLimited(seen, "10.0.0.1", 1_000, 5, 60_000), false, `request ${i + 1} refused`);
+    }
+    assert.equal(rateLimited(seen, "10.0.0.1", 1_000, 5, 60_000), true);
+  });
+
+  it("counts each source separately", () => {
+    // A busy host must not lock out the rest of the fleet enrolling at the same time.
+    const seen = fresh();
+    for (let i = 0; i < 6; i++) rateLimited(seen, "10.0.0.1", 1_000, 5, 60_000);
+    assert.equal(rateLimited(seen, "10.0.0.2", 1_000, 5, 60_000), false);
+  });
+
+  it("forgives once the window has passed", () => {
+    // A real agent polls for its certificate for as long as signing takes. A limiter that never
+    // resets would turn a slow operator into a host that can never enrol.
+    const seen = fresh();
+    for (let i = 0; i < 6; i++) rateLimited(seen, "10.0.0.1", 1_000, 5, 60_000);
+    assert.equal(rateLimited(seen, "10.0.0.1", 1_000 + 60_000, 5, 60_000), false);
+  });
+
+  it("bounds how many sources it remembers, dropping the oldest window", () => {
+    // Otherwise the limiter is itself the memory leak: one entry per source address, and the
+    // addresses are chosen by whoever is calling.
+    const seen = fresh();
+    for (let i = 0; i < 10; i++) rateLimited(seen, `10.0.0.${i}`, 1_000 + i, 5, 60_000, 4);
+    assert.equal(seen.size, 4);
+    assert.equal(seen.has("10.0.0.9"), true, "the newest source must survive eviction");
+    assert.equal(seen.has("10.0.0.0"), false, "the oldest must not");
   });
 });
