@@ -52,7 +52,7 @@ export function objectRows(
     members: o.members.map(endpointLabel),
     notes: o.notes ?? null,
     usedBy: policies
-      .filter((p) => refersToObject(p.src, o.id) || refersToObject(p.dst, o.id))
+      .filter((p) => refersToObject(p.src, o) || refersToObject(p.dst, o))
       .map((p) => p.id),
   }));
 }
@@ -67,13 +67,40 @@ export function serviceRows(
     name: s.name,
     members: [...s.members],
     notes: s.notes ?? null,
-    // A service object is referenced from `ports`, not from an endpoint — `"@ssh-admin"`.
-    usedBy: policies.filter((p) => p.ports.split(",").some((x) => x.trim() === `@${s.id}`)).map((p) => p.id),
+    // A service object is referenced from `ports`, not from an endpoint — `"@ssh-admin"`. By id or
+    // by name, for the reason spelled out on `refersToObject`.
+    usedBy: policies
+      .filter((p) => p.ports.split(",").some((x) => {
+        const ref = x.trim();
+        return ref === `@${s.id}` || ref === `@${s.name}`;
+      }))
+      .map((p) => p.id),
   }));
 }
 
-function refersToObject(e: Endpoint, id: string): boolean {
-  return e.kind === "object" && e.value === id;
+/**
+ * Does this endpoint name that object — by id **or** by name?
+ *
+ * ## Both, because the resolver accepts both
+ *
+ * `objectCidrs` in `device-policy.ts` is what actually expands an object endpoint into addresses,
+ * and it matches `o.id === e.value || o.name === e.value`. `objects.ts` documents the reference as
+ * the *name* (`ports` as `"@<name>"`, `src`/`dst` as `{ kind: "object", value: "<name>" }`), and
+ * `normalizePorts` validates the thing after the `@` against the name character set.
+ *
+ * This asked only about the id. So every policy that referenced an object the documented way was
+ * missing from `usedBy` — on the one screen whose stated reason for existing is that
+ * "`usedBy` empty … is dead configuration that still reads as protection". An operator reading an
+ * empty column and deleting the object gets a render failure rather than a silent hole
+ * (`assertPorts` refuses an unresolved `@ref`), which is why this is a wrong answer and not an
+ * outage. It is still the wrong answer, given by the column that exists to give the right one.
+ *
+ * Matching both here rather than picking one keeps this screen agreeing with the resolver. That an
+ * id can collide with another object's name is a real ambiguity, and it is refused where it
+ * matters — `objectCidrs` throws when a reference resolves to two objects.
+ */
+function refersToObject(e: Endpoint, o: { id: string; name: string }): boolean {
+  return e.kind === "object" && (e.value === o.id || e.value === o.name);
 }
 
 // ── Feeds (7) ─────────────────────────────────────────────────────────────────

@@ -20,6 +20,24 @@ const policy = (over: Partial<Policy> = {}): Policy => ({
 describe("address objects", () => {
   const obj = { id: "ao-mgmt", kind: "address" as const, name: "management", members: [{ kind: "cidr" as const, value: "10.254.0.0/16" }] };
 
+  // ## Referenced by name, which is how `objects.ts` documents it
+  //
+  // `objectCidrs` — the function that actually expands an object endpoint into addresses — matches
+  // `o.id === e.value || o.name === e.value`. This screen matched the id alone, so a policy written
+  // the documented way was missing from the one column whose stated purpose is that an empty
+  // `usedBy` means dead configuration.
+  it("names a policy that references it by name, not only by id", () => {
+    const rows = objectRows([obj], [policy({ id: "BYNAME", src: { kind: "object", value: "management" } })]);
+    assert.deepEqual(rows[0]!.usedBy, ["BYNAME"]);
+  });
+
+  it("still says nothing uses an object nothing uses", () => {
+    // The known negative for the widening above. Matching both spellings must not turn into matching
+    // anything — that would make every object look referenced and empty the screen of its point.
+    const rows = objectRows([obj], [policy({ id: "ELSE", src: { kind: "object", value: "something-else" } })]);
+    assert.deepEqual(rows[0]!.usedBy, []);
+  });
+
   it("names the policies that reference it", () => {
     const rows = objectRows([obj], [
       policy({ id: "USES", src: { kind: "object", value: "ao-mgmt" } }),
@@ -54,6 +72,18 @@ describe("service objects", () => {
     // address objects are found — would report every service as unused.
     const rows = serviceRows([svc], [policy({ id: "USES", ports: "@ssh-admin" })]);
     assert.deepEqual(rows[0]!.usedBy, ["USES"]);
+  });
+
+  it("names a policy that references the service by name", () => {
+    // Same widening as the address half, and the same reason: `ports` is documented as `"@<name>"`
+    // and `normalizePorts` validates what follows the `@` against the name character set.
+    const rows = serviceRows([svc], [policy({ id: "BYNAME", ports: "@ssh" })]);
+    assert.deepEqual(rows[0]!.usedBy, ["BYNAME"]);
+  });
+
+  it("does not claim a policy whose ports name something else", () => {
+    const rows = serviceRows([svc], [policy({ id: "ELSE", ports: "@web" })]);
+    assert.deepEqual(rows[0]!.usedBy, []);
   });
 
   it("finds it inside a port list", () => {
