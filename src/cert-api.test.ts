@@ -9,7 +9,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CertApiError, daysUntilExpiry, fetchCert } from "./cert-api.ts";
+import { CertApiError, MAX_CERT_BUNDLE_BYTES, daysUntilExpiry, fetchCert } from "./cert-api.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "hp-certapi-"));
 const run = (...a: string[]) => execFileSync("openssl", a, { cwd: dir, stdio: "pipe" });
@@ -39,6 +39,40 @@ function server(body: unknown, status = 200) {
   }) as unknown as typeof fetch;
   return { impl, calls };
 }
+
+// ## The bundle is bounded
+//
+// This file's header states the failure direction it chose: if the dispatcher is unreachable the
+// manager must still start, because the operator CLI does not need this at all, so a fetch failure
+// may cost the browser path and nothing else. That only holds if the failure is a thrown
+// `CertApiError` — a pod that runs out of memory reading the answer costs everything.
+//
+// The read was `res.json()`, which buffers whatever arrives. `AbortSignal.timeout` bounds the
+// duration and not the size, and this process holds the artifact signing key in a single pod.
+describe("the size of the dispatcher's answer", () => {
+  it("refuses a bundle larger than the bound instead of buffering it", async () => {
+    const s = server({ cert: "x".repeat(MAX_CERT_BUNDLE_BYTES), key: "y" });
+    await assert.rejects(() => fetchCert(OPTS, s.impl), CertApiError);
+    await assert.rejects(() => fetchCert(OPTS, s.impl), /exceeds/);
+  });
+
+  it("keeps the bound small enough to be one", () => {
+    // The test above is written relative to the constant and follows it anywhere; the value is the
+    // whole protection. A cert plus a key is a few kilobytes, and a chain with several intermediates
+    // is still well under a hundred.
+    assert.ok(
+      MAX_CERT_BUNDLE_BYTES <= 4 * 1024 * 1024,
+      `a certificate bundle is kilobytes; ${MAX_CERT_BUNDLE_BYTES} bytes is not a bound on one`,
+    );
+  });
+
+  it("still fetches a bundle of ordinary size", async () => {
+    // The known positive for the bound. Without it a reader that refused every body would pass the
+    // refusal above and take the console's certificate away on every start.
+    const s = server({ cert: read("a.pem"), key: read("a.key") });
+    assert.match((await fetchCert(OPTS, s.impl)).cert, /BEGIN CERTIFICATE/);
+  });
+});
 
 describe("fetching the public certificate", () => {
   it("returns a matching cert and key — the known positive", async () => {

@@ -30,7 +30,7 @@
 //   signed by nobody gets accepted.
 
 import { constants, createHash, createPublicKey, createVerify, randomBytes, timingSafeEqual } from "node:crypto";
-import { declaredTooLarge, readBoundedStream } from "./bounded-body.ts";
+import { BodyTooLargeError, declaredTooLarge, readBoundedStream, readBoundedText } from "./bounded-body.ts";
 
 /** Signature algorithms this accepts. Asymmetric only — see the header. */
 const ALLOWED_ALGS = new Set(["RS256", "RS384", "RS512", "ES256", "ES384", "ES512", "PS256", "PS384", "PS512"]);
@@ -302,7 +302,28 @@ export async function exchange(
     redirect: "error",
     signal: AbortSignal.timeout(10_000),
   });
-  const json = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+  // ## The third read from this IdP, which was not bounded like the other two
+  //
+  // `boundedProviderJson` exists forty lines up and says why: `Response.json()` buffers whatever
+  // arrives, `Content-Length` is a claim, and transparent decompression can make the decoded body
+  // larger than the wire value. It guards the discovery document and the key set. The token
+  // exchange — same IdP, same process, same `fetch` — went through a bare `res.json()`.
+  //
+  // `AbortSignal.timeout` above bounds the duration and not the size, and this process holds the
+  // artifact signing key in a single pod. The reasoning was already written down; only this call
+  // was missing from it.
+  //
+  // Failures here stay 502 like every other token-endpoint failure: the caller cannot act on the
+  // difference between "the IdP sent too much" and "the IdP sent nonsense", and both are the IdP's.
+  let json: Record<string, unknown>;
+  try {
+    json = JSON.parse(await readBoundedText(res, MAX_OIDC_DOCUMENT_BYTES, d.token_endpoint)) as Record<string, unknown>;
+  } catch (e) {
+    // A body that is too large is a different sentence from one that is not JSON, and `res.ok`
+    // below needs a value either way — an unparseable error response should still report its status.
+    if (e instanceof BodyTooLargeError) throw new OidcError(e.message, 502);
+    json = {};
+  }
   if (!res.ok) {
     // The IdP's own error, surfaced. `invalid_grant` on a replayed code reads very differently from
     // a network failure, and collapsing them costs an operator the diagnosis.

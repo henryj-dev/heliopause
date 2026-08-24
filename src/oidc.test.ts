@@ -7,6 +7,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createHash, generateKeyPairSync, createSign, randomBytes, constants } from "node:crypto";
 import {
+  exchange,
   MAX_OIDC_DOCUMENT_BYTES,
   OidcError,
   Provider,
@@ -66,6 +67,93 @@ function provider() {
   }) as unknown as typeof fetch;
   return new Provider(ISSUER, fake, 0);
 }
+
+// ## The token exchange, which had no test
+//
+// `exchange` turns an authorization code into a verified identity. It is the one function that
+// decides who the operator is, and nothing exercised it — `verifyIdToken` below was covered, the
+// discovery and key-set reads were covered, and the call that joins them was not.
+//
+// A `Provider` needs its discovery document; these drive both endpoints off one fake so the exchange
+// runs the way it does in the manager, against the same `Provider` the rest of this file uses.
+describe("the token exchange", () => {
+  /** An IdP that serves discovery and JWKS normally, and the token endpoint however the test says. */
+  function idp(tokenAnswer: () => Response) {
+    const jwks = {
+      keys: [
+        { ...publicKey.export({ format: "jwk" }), kid: "ec-1", use: "sig", alg: "ES256" },
+        { ...rsaPub.export({ format: "jwk" }), kid: "rsa-1", use: "sig", alg: "PS256" },
+      ],
+    };
+    const doc = {
+      issuer: ISSUER,
+      authorization_endpoint: `${ISSUER}/oidc/authorize`,
+      token_endpoint: `${ISSUER}/oidc/token`,
+      jwks_uri: `${ISSUER}/oidc/jwks`,
+      code_challenge_methods_supported: ["S256"],
+    };
+    const fake = (async (url: string | URL) => {
+      const u = String(url);
+      if (u.endsWith("/oidc/token")) return tokenAnswer();
+      return new Response(JSON.stringify(u.endsWith("/oidc/jwks") ? jwks : doc), { status: 200 });
+    }) as unknown as typeof fetch;
+    return { provider: new Provider(ISSUER, fake, 0), fake };
+  }
+
+  const OPTS = {
+    code: "auth-code",
+    clientId: CLIENT,
+    redirectUri: "https://console.example.invalid/auth/callback",
+    verifier: "v".repeat(43),
+    expectedNonce: NONCE,
+  };
+
+  it("returns the identity in the id_token — the known positive", async () => {
+    const { provider, fake } = idp(() => new Response(JSON.stringify({ id_token: token() }), { status: 200 }));
+    const id = await exchange(provider, OPTS, fake);
+    assert.equal(id.sub, "user-1");
+    assert.equal(id.username, "ops-alice");
+  });
+
+  it("refuses a token minted for a different login", async () => {
+    // The nonce check, which is the reason this function verifies rather than decodes. Without it a
+    // token obtained legitimately for another session replays into this one.
+    const { provider, fake } = idp(() => new Response(JSON.stringify({ id_token: token() }), { status: 200 }));
+    await assert.rejects(() => exchange(provider, { ...OPTS, expectedNonce: "some-other-nonce" }, fake), /nonce/i);
+  });
+
+  it("surfaces the IdP's own error rather than a generic failure", async () => {
+    // `invalid_grant` on a replayed code reads very differently from a network failure, and
+    // collapsing them costs an operator the diagnosis.
+    const { provider, fake } = idp(() =>
+      new Response(JSON.stringify({ error: "invalid_grant" }), { status: 400 }));
+    await assert.rejects(() => exchange(provider, OPTS, fake), /400.*invalid_grant/);
+  });
+
+  it("refuses a 200 that carries no id_token", async () => {
+    const { provider, fake } = idp(() => new Response(JSON.stringify({ access_token: "a" }), { status: 200 }));
+    await assert.rejects(() => exchange(provider, OPTS, fake), /no id_token/);
+  });
+
+  // ## The third read from this IdP, which was not bounded like the other two
+  //
+  // `boundedProviderJson` guards the discovery document and the key set, and says why at length. The
+  // token exchange — same IdP, same process — went through a bare `res.json()`, which buffers
+  // whatever arrives. `AbortSignal.timeout` bounds the duration, not the size, and this process holds
+  // the artifact signing key in a single pod.
+  it("refuses a token response larger than the document bound", async () => {
+    const { provider, fake } = idp(() =>
+      new Response(JSON.stringify({ id_token: "x".repeat(MAX_OIDC_DOCUMENT_BYTES) }), { status: 200 }));
+    await assert.rejects(() => exchange(provider, OPTS, fake), /response exceeds/);
+  });
+
+  it("still reports the status of an error response it could not parse", async () => {
+    // Not-JSON and too-large are different sentences. An unparseable *error* body must not lose the
+    // status — that number is the whole diagnosis when the body is a proxy's HTML.
+    const { provider, fake } = idp(() => new Response("<html>gateway</html>", { status: 502 }));
+    await assert.rejects(() => exchange(provider, OPTS, fake), /answered 502/);
+  });
+});
 
 describe("id token verification", () => {
   it("accepts a token this test signed — the known positive", async () => {

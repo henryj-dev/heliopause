@@ -24,6 +24,17 @@
 // here returns or throws in a way that lets the caller carry on without a public certificate.
 
 import { createPrivateKey, X509Certificate } from "node:crypto";
+import { BodyTooLargeError, readBoundedText } from "./bounded-body.ts";
+
+/**
+ * The most this will read of a certificate bundle.
+ *
+ * A cert plus a key is a few kilobytes; a chain with several intermediates is still well under a
+ * hundred. This is the bound on what the manager will buffer for one, for the reason `oidc.ts`
+ * bounds its own reads: the process holds the artifact signing key and runs as a single pod, so an
+ * unbounded body from any external service is an outage of the control plane.
+ */
+export const MAX_CERT_BUNDLE_BYTES = 1024 * 1024;
 
 /** A certificate and its key, as PEM. */
 export interface CertBundle {
@@ -88,7 +99,16 @@ export async function fetchCert(o: CertApiOptions, fetchImpl: typeof fetch = fet
     const hint = res.status === 401 ? " — token revoked, expired, or not scoped to this certificate" : "";
     throw new CertApiError(`cert-api answered ${res.status} for ${o.name}${hint}`, res.status);
   }
-  const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+  // Bounded, not `res.json()`. The failure direction this file chose is that a fetch failure costs
+  // the browser path and nothing else — which only holds if the failure is a thrown `CertApiError`
+  // and not the pod running out of memory.
+  let body: Record<string, unknown>;
+  try {
+    body = JSON.parse(await readBoundedText(res, MAX_CERT_BUNDLE_BYTES, `cert-api ${o.name}`)) as Record<string, unknown>;
+  } catch (e) {
+    if (e instanceof BodyTooLargeError) throw new CertApiError(e.message, res.status);
+    body = {};
+  }
   if (typeof body.cert !== "string" || typeof body.key !== "string" || !body.cert || !body.key) {
     throw new CertApiError(`cert-api returned no cert/key for ${o.name}`, res.status);
   }
