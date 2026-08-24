@@ -53,6 +53,7 @@ import { readFile, readdir, realpath } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { createHash, createPublicKey, type KeyObject } from "node:crypto";
 import { peerCN, type FleetView } from "./relay.ts";
+import { readBoundedNodeBody, readBoundedText } from "./bounded-body.ts";
 import { buildId } from "./build-id.ts";
 
 import { authorizeUrl, exchange, nonce as randomNonce, pkce, Provider } from "./oidc.ts";
@@ -627,6 +628,25 @@ async function loadRelayCreds(r: RelaySource): Promise<{ cert: Buffer; key: Buff
 const MAX_POLICY_SOURCE_BYTES = 4 * 1024 * 1024;
 
 /**
+ * How much of a relay's answer this will hold.
+ *
+ * `GET /status` is the large one — a `FleetView` carries every host's state, its intrusion events
+ * and its route table. Measured on dev: 6 hosts, a few kilobytes. The manifest allows 4,096 hosts,
+ * so the ceiling is set well above any fleet this deployment will have and well below anything that
+ * would matter to a manager pod.
+ */
+const MAX_RELAY_RESPONSE_BYTES = 8 * 1024 * 1024;
+
+/**
+ * How much of the traffic reader's dump this will hold.
+ *
+ * A Cilium policy-map dump for one node. The reader is a pod holding `pods/exec` in `kube-system`
+ * and nothing else — which is to say it holds a permission this process deliberately does not, so
+ * its answer is bounded like every other body that crosses into here.
+ */
+const MAX_TRAFFIC_DUMP_BYTES = 8 * 1024 * 1024;
+
+/**
  * Fetch the policy as data and render it here.
  *
  * The replacement for the `await import(sitePath)` that was C1. Nothing in this function evaluates
@@ -644,10 +664,11 @@ async function fetchPolicySource(
     signal: AbortSignal.timeout(timeoutMs),
     headers: src.token ? { authorization: `Bearer ${src.token}` } : {},
   });
-  const text = await res.text();
-  if (text.length > MAX_POLICY_SOURCE_BYTES) {
-    throw new Error(`the renderer returned ${text.length} bytes, over the ${MAX_POLICY_SOURCE_BYTES} limit`);
-  }
+  // Counted while reading, not measured afterwards. This process is the one holding the signing
+  // key and the renderer is the untrusted side of the connection, so "buffer it all and then check"
+  // is a limit enforced by the OOM killer rather than by this line. `text.length` was also the
+  // wrong unit — UTF-16 code units, not bytes.
+  const text = await readBoundedText(res, MAX_POLICY_SOURCE_BYTES, "the renderer");
   let body: unknown;
   try {
     body = JSON.parse(text);
@@ -736,20 +757,37 @@ function relayCall<T>(
           : {}),
       },
       (res) => {
-        let payload = "";
-        res.on("data", (c) => (payload += c));
-        res.on("end", () => {
-          if (res.statusCode !== 200) {
-            // The relay's own message, not a generic one — it distinguishes "not an operator" from
-            // "no manifest loaded", and those need different fixes.
-            return reject(new Error(`relay answered ${res.statusCode}: ${payload.slice(0, 300)}`));
-          }
-          try {
-            resolve(JSON.parse(payload) as T);
-          } catch (e) {
-            reject(new Error(`relay sent unparseable JSON: ${(e as Error).message}`));
-          }
-        });
+        // ## Decoded once, on the whole body — not per chunk
+        //
+        // This was `let payload = ""; res.on("data", (c) => (payload += c))`, which calls
+        // `Buffer.prototype.toString()` on each chunk **independently**. A multi-byte character
+        // split across a TCP boundary therefore becomes two U+FFFD replacement characters, and the
+        // damaged JSON still parses — so the failure is a wrong value on the screen rather than an
+        // error anywhere. Measured: a Korean string split at four different offsets came back
+        // corrupted at every one, and `JSON.parse` accepted all four.
+        //
+        // `/status` is where it bites. A `FleetView` carries the agent's own `detail` (nft's error
+        // text), `intrusions[].raw` (a line from `nft monitor`), `workloadDetail`, and the
+        // `maintenance` reason a person wrote in the policy — the four fields most likely to be
+        // non-ASCII, on the endpoint whose whole job is saying what is wrong.
+        //
+        // `api-client.ts` already collected chunks and concatenated once. This is now the same.
+        readBoundedNodeBody(res, MAX_RELAY_RESPONSE_BYTES, `relay ${url.host}`).then(
+          (buffer) => {
+            const payload = buffer.toString("utf8");
+            if (res.statusCode !== 200) {
+              // The relay's own message, not a generic one — it distinguishes "not an operator" from
+              // "no manifest loaded", and those need different fixes.
+              return reject(new Error(`relay answered ${res.statusCode}: ${payload.slice(0, 300)}`));
+            }
+            try {
+              resolve(JSON.parse(payload) as T);
+            } catch (e) {
+              reject(new Error(`relay sent unparseable JSON: ${(e as Error).message}`));
+            }
+          },
+          reject,
+        );
       },
     );
     req.on("timeout", () => req.destroy(new Error(`no answer within ${timeoutMs}ms`)));
@@ -1675,7 +1713,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
           headers: { accept: "text/plain" },
         });
         if (!answer.ok) throw new Error(`the reader answered ${answer.status}`);
-        const text = await answer.text();
+        const text = await readBoundedText(answer, MAX_TRAFFIC_DUMP_BYTES, "the traffic reader");
         // An empty body is the reader saying it has not managed a dump, and it must not read as a
         // cluster with no policy entries. Zero entries and no reading are opposite findings.
         if (!text.trim()) {

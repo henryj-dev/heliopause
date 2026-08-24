@@ -30,6 +30,7 @@
 //   signed by nobody gets accepted.
 
 import { constants, createHash, createPublicKey, createVerify, randomBytes, timingSafeEqual } from "node:crypto";
+import { declaredTooLarge, readBoundedStream } from "./bounded-body.ts";
 
 /** Signature algorithms this accepts. Asymmetric only — see the header. */
 const ALLOWED_ALGS = new Set(["RS256", "RS384", "RS512", "ES256", "ES384", "ES512", "PS256", "PS384", "PS512"]);
@@ -84,33 +85,28 @@ export class OidcError extends Error {
  * therefore the enforcing check.
  */
 async function boundedProviderJson(res: Response, url: string): Promise<unknown> {
-  const declared = res.headers.get("content-length");
-  if (declared !== null && Number(declared) > MAX_OIDC_DOCUMENT_BYTES) {
+  if (declaredTooLarge(res.headers, MAX_OIDC_DOCUMENT_BYTES)) {
     throw new OidcError(`${url} response exceeds ${MAX_OIDC_DOCUMENT_BYTES} bytes`, 502);
   }
 
-  const reader = res.body?.getReader();
-  if (!reader) throw new OidcError(`${url} returned an empty JSON response`, 502);
-  const chunks: Buffer[] = [];
-  let total = 0;
+  // A `Response` with no body is not an empty document — it is a provider that answered nothing
+  // where a discovery document or a key set was required. Kept as its own sentence rather than
+  // folded into the reader below, because "the IdP sent nothing" and "the IdP sent too much" send
+  // an operator to different places.
+  if (!res.body) throw new OidcError(`${url} returned an empty JSON response`, 502);
+
+  // The byte counting itself lives in `bounded-body.ts`. This function keeps the two decisions that
+  // are OIDC's own — what an absent body means, and that every failure here is a 502 rather than
+  // the caller's fault.
+  let encoded: Buffer;
   try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      total += value.byteLength;
-      if (total > MAX_OIDC_DOCUMENT_BYTES) {
-        void reader.cancel().catch(() => undefined);
-        throw new OidcError(`${url} response exceeds ${MAX_OIDC_DOCUMENT_BYTES} bytes`, 502);
-      }
-      chunks.push(Buffer.from(value));
-    }
+    encoded = await readBoundedStream(res.body, MAX_OIDC_DOCUMENT_BYTES, url);
   } catch (e) {
-    if (e instanceof OidcError) throw e;
-    throw new OidcError(`${url} response could not be read: ${(e as Error).message}`, 502);
+    throw new OidcError((e as Error).message, 502);
   }
 
   try {
-    return JSON.parse(Buffer.concat(chunks, total).toString("utf8")) as unknown;
+    return JSON.parse(encoded.toString("utf8")) as unknown;
   } catch {
     throw new OidcError(`${url} returned invalid JSON`, 502);
   }

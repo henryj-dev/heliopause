@@ -29,6 +29,17 @@
 // used only inside a request an operator authenticated. A credential that sits mounted forever
 // should be the weaker of the two.
 import { createSign } from "node:crypto";
+import { readBoundedText } from "./bounded-body.ts";
+
+/**
+ * How much of GitHub's answer this will hold.
+ *
+ * A `compare` between two generations carries a unified diff per changed file, and the first real
+ * one this console produced was 176 changed lines across nine commits — kilobytes. The ceiling is
+ * generous because the failure it would cause is an approval screen that stops working on a large
+ * change, and bounded because this runs in the process that holds the signing key.
+ */
+const MAX_GITHUB_RESPONSE_BYTES = 16 * 1024 * 1024;
 
 export interface AppCredentials {
   appId: string;
@@ -44,12 +55,25 @@ export interface ProposalTarget {
   base: string;
 }
 
-/** Minimal fetch shape, so tests do not reach the network. */
+/**
+ * Minimal fetch shape, so tests do not reach the network.
+ *
+ * `body` and `headers` on the *response* are optional because the real `fetch` has them and a
+ * substituted reader need not. `readBoundedText` treats that as a contract rather than a
+ * coincidence: with a stream it bounds before allocating, without one it bounds after. See its
+ * comment for why the two are not the same guarantee.
+ */
 export type Fetcher = (url: string, init?: {
   method?: string;
   headers?: Record<string, string>;
   body?: string;
-}) => Promise<{ ok: boolean; status: number; text: () => Promise<string> }>;
+}) => Promise<{
+  ok: boolean;
+  status: number;
+  text: () => Promise<string>;
+  headers?: { get(name: string): string | null };
+  body?: ReadableStream<Uint8Array> | null;
+}>;
 
 export class ProposalError extends Error {
   // Declared, not a constructor parameter property. Node runs this repository's TypeScript in
@@ -99,7 +123,7 @@ async function gh(
     },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
-  const text = await res.text();
+  const text = await readBoundedText(res, MAX_GITHUB_RESPONSE_BYTES, `${method} ${path}`);
   if (!res.ok) {
     // The body carries GitHub's reason — "Reference already exists", "No commits between …". Losing
     // it leaves the operator with a status code and no idea which of their inputs was wrong.

@@ -10,6 +10,17 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { request } from "node:https";
 import { rootCertificates } from "node:tls";
+import { readBoundedNodeBody } from "./bounded-body.ts";
+
+/**
+ * How much of the manager's answer a CLI will hold.
+ *
+ * The largest legitimate one is `/plans/<hash>/ruleset` — a whole host's rendered ruleset — and
+ * `/plans/<hash>/changes`, which carries GitHub's unified diff. `MAX_PLAN_BYTES` on the manager is
+ * 8 MB for a fleet's worth of rulesets; twice that here, because refusing a legitimate answer would
+ * break the approval path and this is a short-lived process on a workstation.
+ */
+const MAX_MANAGER_RESPONSE_BYTES = 16 * 1024 * 1024;
 
 export interface Creds {
   cert: Buffer;
@@ -115,26 +126,31 @@ export async function api<T>(
           : {}),
       },
       (res) => {
-        const chunks: Buffer[] = [];
-        res.on("data", (c: Buffer) => chunks.push(c));
-        res.on("end", () => {
-          const text = Buffer.concat(chunks).toString("utf8");
-          if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
-            let message = text;
-            try {
-              message = (JSON.parse(text) as { error?: string }).error ?? text;
-            } catch {
-              // Not JSON. The raw body is still the best thing to show — it may be a proxy's error page,
-              // and saying so beats reporting a parse failure the operator cannot act on.
+        // Bounded while reading. The manager is trusted to *decide* things and is still on the other
+        // side of a socket: a `/plans/<hash>/ruleset` answer carries a whole rendered ruleset and a
+        // `/changes` answer carries GitHub's diff, so this is generous — but a CLI that allocates
+        // whatever it is sent is one an unhealthy manager can take down.
+        readBoundedNodeBody(res, MAX_MANAGER_RESPONSE_BYTES, `manager ${url.host}`).then(
+          (buffer) => {
+            const text = buffer.toString("utf8");
+            if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
+              let message = text;
+              try {
+                message = (JSON.parse(text) as { error?: string }).error ?? text;
+              } catch {
+                // Not JSON. The raw body is still the best thing to show — it may be a proxy's error page,
+                // and saying so beats reporting a parse failure the operator cannot act on.
+              }
+              return fail(new ApiError(message, res.statusCode ?? 0));
             }
-            return fail(new ApiError(message, res.statusCode ?? 0));
-          }
-          try {
-            ok(JSON.parse(text) as T);
-          } catch (e) {
-            fail(new ApiError(`manager returned unparseable JSON: ${(e as Error).message}`, 0));
-          }
-        });
+            try {
+              ok(JSON.parse(text) as T);
+            } catch (e) {
+              fail(new ApiError(`manager returned unparseable JSON: ${(e as Error).message}`, 0));
+            }
+          },
+          (e: Error) => fail(new ApiError(e.message, 0)),
+        );
       },
     );
     req.on("timeout", () => req.destroy(new Error(`no answer from ${managerUrl} within ${timeoutMs}ms`)));
