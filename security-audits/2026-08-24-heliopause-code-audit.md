@@ -1,9 +1,27 @@
 # heliopause 코드 전수 감사 보고서
 
 - 감사일: 2026-08-24
+- **개정: 2026-08-25** — 검증 재실행, 발견 2건 정정, 3건 추가 (→ [개정 이력](#개정-이력--2026-08-25))
 - 대상: 저장소의 실행 코드 및 테스트 코드
-- 제외: README, 설계 문서, 주석의 보안 주장 자체
+- 제외: README, 설계 문서
+  - ⚠️ 초판은 「주석의 보안 주장 자체」도 제외했다. **개정에서 철회한다** — 이 저장소에서는
+    그것이 가장 큰 사각이다. [방법론](#방법론--이-저장소에서-제외하면-안-되는-것) 참조.
 - 방식: 코드 호출 경로 추적, 입력 경계·권한 경계·외부 프로세스 확인, 테스트 및 타입 검사 실행
+
+## 개정 이력 — 2026-08-25
+
+초판의 판정 두 개가 근거 위에 서 있지 않았다. 검사를 전부 다시 돌리고 두 발견을 코드에 대고
+재확인했다.
+
+| | 초판 | 개정 |
+|---|---|---|
+| 검증 실행 | `npm test` 중단 · `test_enroll` 2건 실패 · Ed25519 12건 skip | **전 게이트 통과** — 실패는 전부 초판 환경의 소켓 제한이었다. 다만 그 사실은 초판이 확인한 것이 아니다 |
+| 안 돌린 게이트 | 명시 없음 | `build:web` · **누출 스캔** · 훅 7종이 목록에 없었다 |
+| M-01 | 유효 · Medium | **유효 · Medium 유지.** 영향 서술의 방향 하나가 빠져 있었고, 행위자 모델이 없었다 |
+| L-01 | Low · 수정 제안 4건 | **Info 로 낮춤.** 넷 중 셋은 이미 되어 있다. 남는 것은 부분 인증서 폴백 하나 |
+| I-01 | — | **추가.** M-01 과 같은 결함 유형의 두 번째 자리 |
+| O-01 | — | **추가.** 저장소 밖에 열려 있는 유일한 항목 (IdP 등록) |
+| 미검토 영역 | 없음 | **추가.** 「문제 없음」과 「안 봄」이 구별되지 않았다 |
 
 ## 요약
 
@@ -14,9 +32,18 @@
 | Critical | 0 |
 | High | 0 |
 | Medium | 1 |
-| Low | 1 |
+| Low | 0 |
+| Info | 2 |
 
-주요 발견은 정책의 `enabled` 필드가 불리언인지 검증하지 않고 JavaScript의 truthy 규칙으로 변환한다는 점이다. `"false"`와 `"0"`이 활성화된 정책으로 처리된다.
+그 밖에 **저장소 밖에 열려 있는 항목이 1건**(O-01) 있다. 코드는 완비돼 있고 IdP 설정이 비어
+있는 상태라 코드 감사가 형식적으로는 넘길 수 있지만, 넘기면 그 사실이 어느 문서에도 남지 않는다.
+
+주요 발견은 정책의 `enabled` 필드가 불리언인지 검증하지 않고 JavaScript의 truthy 규칙으로
+변환한다는 점이다. `"false"`와 `"0"`이 활성화된 정책으로 처리된다.
+
+⚠️ **「0 Critical / 0 High」의 근거는 개정에서 처음 생겼다.** 초판은 테스트가 돌지 않은 상태에서
+이 판정을 내렸다. 검사가 안 돌면 「High 없음」이 아니라 「판정 불가」다. 아래 재실행 결과가
+그것을 사후에 뒷받침하지만, 순서는 반대였다.
 
 ## 발견 사항
 
@@ -24,7 +51,7 @@
 
 - 심각도: Medium
 - 위치: `src/policy.ts:450`, `normalizePolicy`
-- 확신도: 확인됨
+- 확신도: 확인됨 (재현 완료)
 
 현재 구현:
 
@@ -32,32 +59,84 @@
 enabled: o.enabled === undefined ? true : Boolean(o.enabled)
 ```
 
-다음 입력이 모두 거부되지 않는다.
+#### 재현 (2026-08-25, `3de1d05`, `normalizePolicy` 직접 호출)
 
-```json
-{ "enabled": "false" }
-{ "enabled": "0" }
+```
+"false" -> true      "no"  -> true      []    -> true      "true" -> true
+"0"     -> true      "off" -> true      {}    -> true
+0       -> false     null  -> false     ""    -> false
 ```
 
-JavaScript에서 두 문자열은 truthy이므로 결과적으로 정책이 활성화된다.
+초판의 표(`"false"`·`"0"`·`0`·`null`)에 YAML 관용 표기 `"no"`·`"off"` 와 빈 배열·빈 객체를
+더했다. 정책 문서는 JSON 이므로(`policy-store.ts` 의 `JSON.parse`) YAML 파서가 접어 주는
+경로는 없다 — `"no"` 는 끝까지 문자열로 도착하고, 문자열은 truthy 다.
 
-재현 결과:
+#### 이 함수의 규칙에서 이 한 필드만 빠져 있다
 
-| 입력 | 결과 |
-|---|---|
-| `"false"` | `true` |
-| `"0"` | `true` |
-| `0` | `false` |
-| `null` | `false` |
+「강제 변환이 나쁘다」가 아니다. 같은 함수의 다른 필드도 전부 강제 변환을 쓰지만 **변환 뒤에
+검증이 온다.**
 
-영향:
+| 필드 | 변환 | 검증 |
+|---|---|---|
+| `name` | `String(o.name ?? "")` | 빈 문자열 거부 · 120자 상한 |
+| `proto` | `String(...).toLowerCase()` | `PROTOS.has(proto)` |
+| `action` | `String(...).toLowerCase()` | `allow`/`deny` 외 거부 |
+| `denyMode` | `String(o.denyMode ?? "drop")` | `drop`/`reject` 외 거부 |
+| `priority` | `Number(o.priority ?? 100)` | `Number.isInteger` · 1..100000 |
+| `ports` | `normalizePorts` | 문법 검사 |
+| `src`/`dst` | `normalizeEndpoint` | kind 화이트리스트 + kind별 값 검사 |
+| **`enabled`** | **`Boolean(o.enabled)`** | **없음** |
 
-- API나 정책 파일에 타입이 잘못된 값이 들어가도 입력 오류가 발생하지 않는다.
-- 비활성화하려던 allow/deny 정책이 활성화될 수 있다.
-- deny 정책이라면 의도하지 않은 트래픽 차단으로 이어질 수 있다.
-- 정책 화면은 문자열을 다시 불리언으로 만들어 보내지만, 직접 API 호출·파일 편집·구형 클라이언트는 이 검사를 우회한다.
+#### 저장소가 이미 이 규칙을 다른 쪽에서 지키고 있다
 
-수정 제안:
+콘솔 리더는 엄격하다 — `typeof … !== "boolean"` 가드 8곳, `=== true` 로 불리언을 받는 자리
+15곳(`packages/web/src`):
+
+```
+packages/web/src/lib/domains/policy/screen.ts:235   typeof value.enabled !== "boolean" → null
+packages/web/src/lib/domains/lookup/lookup.ts:244   같은 검사
+```
+
+**그리고 그 엄격 검사는 이 결함을 잡을 수 없다** — 서버가 이미 `Boolean()` 으로 접은 뒤에
+직렬화하기 때문이다. 리더가 보는 것은 언제나 진짜 불리언이다. 수정이 필요한 이유가 취향이
+아니라 이 저장소의 규칙이라는 점, 그리고 하류의 방어가 구조적으로 무력하다는 점이 함께 있다.
+
+#### 영향 — 두 방향이 있고, 한쪽만 조용하다
+
+초판은 활성화되는 방향만 다뤘다. 반대 방향(`null`·`""`·`0` → 비활성)도 있다. 그런데:
+
+| 방향 | 렌더 결과 | 보고 경로 |
+|---|---|---|
+| `null`·`""`·`0` → **비활성** | 규칙이 렌더에서 빠진다 | **있다** — `nft.ts:783,829` 가 `skipped.push({ reason: "policy is disabled" })` |
+| `"false"`·`"0"`·`"no"`·`[]` → **활성** | 규칙이 렌더된다 | **없다** |
+
+즉 **비활성화되는 방향에는 보고 경로가 있고, 활성화되는 방향에는 없다.** 문자열이 `true` 로
+접히면 그 규칙은 의도적으로 켠 규칙과 렌더 결과가 구별되지 않는다. 이것이 Medium 의 근거다.
+
+- 비활성화하려던 allow 정책이 활성화되면 의도하지 않은 허용이 렌더된다.
+- 비활성화하려던 deny 정책이 활성화되면 의도하지 않은 차단이 렌더된다.
+- 어느 쪽이든 **오류가 나지 않는다** — 잘못된 타입이 입력 오류로 보고되는 지점이 없다.
+
+#### 행위자와 완화 — 인가 우회가 아니라 무결성 결함이다
+
+`normalizePolicy` 호출자는 둘뿐이다.
+
+```
+src/policy-store.ts:43    parseDocument — git 저장소의 정책 JSON 로드
+src/policy-store.ts:100   putPolicy    — 쓰기 API
+```
+
+둘 다 이미 writer 인증서 또는 저장소 커밋 권한을 전제한다. 익명 입력이 닿는 경계가 아니다.
+
+완화도 있다: `enabled` 는 `policyFingerprint`(`policy.ts:497` — `p.enabled ? "1" : "0"`)에
+들어가므로 잘못 켜진 규칙은 **2인 승인 diff 에 나타난다.** 다만 승인자가 `/ruleset` 을 실제로
+읽어야 하고, CLI 승인자가 그것을 볼 수 있게 된 것이 `4f7d14d`(2026-08-24, `heliopause-approve
+--show`)다. 그 전에는 CLI 승인이 해시 대조였다.
+
+그래서 정확한 분류는 **인가 우회가 아니라 무결성 결함**이고, Medium 인 이유는 심각한 권한
+상승이어서가 아니라 **틀린 값이 보고 없이 집행으로 흘러가는 유일한 필드**이기 때문이다.
+
+#### 수정 제안
 
 ```ts
 const enabled = o.enabled === undefined
@@ -67,40 +146,114 @@ const enabled = o.enabled === undefined
     : (() => { throw bad("enabled must be a boolean"); })();
 ```
 
-또는 별도의 타입 검증 함수로 분리하고 다음 회귀 테스트를 추가한다.
+또는 별도의 타입 검증 함수로 분리한다. 이 함수의 나머지 필드와 같은 모양(변환 → 검증)이
+되도록 하는 편이 낫다.
 
-- `enabled: false`는 비활성화됨
-- `enabled: true`는 활성화됨
-- `enabled: "false"`, `enabled: "0"`, `enabled: 0`, `enabled: null`은 거부됨
+회귀 테스트:
 
-### L-01. 운영 매니저와 별개인 인증 없는 스캐폴드 표면
+- `enabled: true` / `enabled: false` / 필드 부재(기본 `true`) — 셋 다 현행 동작 유지
+- 거부: `"false"` · `"true"` · `"0"` · `"no"` · `"off"` · `0` · `null` · `""` · `[]` · `{}`
+- **`mergePolicy`(`policy.ts:462`) 경유 경로도 같이** — 부분 갱신이라 `enabled` 만 문자열로
+  오는 것이 실제로 가장 그럴듯한 형태다
+- 결함 주입 확인: 검사를 되돌리면 위 10건이 실패할 것
 
-- 심각도: Low
-- 위치: `packages/manager/src/listen.ts:36-50`
+### I-01. `revokeExisting` — 같은 결함 유형의 두 번째 자리
+
+- 심각도: Info
+- 위치: `src/manager-server.ts:1721`, `src/enrollment-store.ts:287`
 - 확신도: 확인됨
 
-이 실행 경로는 실제 `src/manager-server.ts`가 아니라 다음만 제공한다.
+```ts
+// manager-server.ts:1721
+revokeExisting: body.revokeExisting !== false,
+// enrollment-store.ts:287
+if (input.revokeExisting !== false) for (const token of document.tokens) …
+```
 
-- `127.0.0.1:8445` 바인딩
-- `/healthz`
-- 정적 `/app`
-- `requestCert: false`
-- 인증·OIDC·쓰기 API 없음
+`body.revokeExisting = "false"` 는 `!== false` 이므로 취소가 실행된다. M-01 과 같은 유형이다.
 
-인증서 환경 변수가 없으면 임시 자체서명 인증서를 생성한다. 현재 loopback 전용이므로 직접적인 원격 취약점은 확인되지 않았다. 다만 운영자가 이 명령을 실제 매니저로 오인하거나 향후 바인드 주소를 변경하면 인증 없는 콘솔 표면이 될 수 있다.
+**방향은 안전한 쪽이라 Info 다** — 「취소하지 말라」는 요청이 취소로 해석되고, 그 반대가 아니다.
+그럼에도 적는 이유는 하나다: M-01 을 「`policy.ts:450` 한 줄」로 보고하면 이 자리가 목록에
+들어오지 않는다. 고쳐야 할 것은 줄이 아니라 **불리언을 강제 변환으로 받는 패턴**이고,
+저장소에는 이미 반대 사례(콘솔 리더 15+8곳)가 있다.
 
-추가로 인증서 파일 중 하나만 설정된 경우에도 오류를 내지 않고 임시 인증서 경로로 넘어간다.
+### I-02. 스캐폴드의 부분 인증서 설정이 조용히 자체서명으로 넘어간다
 
-수정 제안:
+- 심각도: Info (초판 L-01 을 정정 · 격하)
+- 위치: `packages/manager/src/listen.ts:36-41`
+- 확신도: 확인됨
 
-- 개발용 스캐폴드와 운영용 실행 명령을 명확히 분리한다.
-- 인증서 파일이 하나만 설정된 경우 즉시 종료한다.
-- 실행 시 개발용·운영용임을 명확히 표시한다.
-- 운영 매니저의 인증·권한 경로를 스캐폴드에 기대지 않도록 패키지 경계를 유지한다.
+```ts
+const tls = process.env.HELIOPAUSE_CERT_FILE && process.env.HELIOPAUSE_KEY_FILE
+  ? { cert: readFileSync(…), key: readFileSync(…) }
+  : ephemeralTls();
+```
+
+둘 중 하나만 설정되면 오류 없이 `ephemeralTls()` — 하루짜리 자체서명 인증서로 뜬다. 설정을
+했다고 믿는 운영자와 실제 동작이 갈리는 유일한 지점이다.
+
+**수정**: 한쪽만 설정된 경우 즉시 종료. 종료 메시지에 어느 변수가 비었는지 적을 것.
+
+#### 초판 L-01 의 나머지 세 제안은 이미 되어 있다 (정정)
+
+초판은 「운영자가 이 명령을 실제 매니저로 오인」할 위험을 들어 Low 로 매기고 수정 4건을
+제안했다. 코드에 대고 확인하니 셋은 이미 구현돼 있다.
+
+| 초판 제안 | 실제 |
+|---|---|
+| 개발용 스캐폴드와 운영용 실행 명령 분리 | `package.json` 에 `"private": true`. `packaging/` · `.github/` · `scripts/` 통틀어 `8445`·`manager-scaffold` 참조 **0건** — 배포되지도 패키징되지도 않는다 |
+| 실행 시 개발용임을 명확히 표시 | 로그 접두사 `[manager-scaffold]`(`listen.ts:51-52`) · 포트 8445(운영 8444) · `package.json` description · 파일 헤더 주석 — 넷 다 있다 |
+| 패키지 경계 유지 | `app.ts` 는 `/healthz` 하나뿐. `console.ts` 는 `src/web-console.ts` 재수출 4줄 |
+| 부분 인증서 설정 시 종료 | **없다** → I-02 |
+
+이 경로에 도달하려면 소스 체크아웃에서 손으로 `npm start -w @heliopause/manager` 를 쳐야 한다.
+Low 도 후하다.
+
+또한 초판이 언급하지 않은 사실: `listen.ts:50` 부근에서 인증 없이 프로세스를 죽일 수 있던
+`decodeURIComponent` 결함은 `95487ea`(2026-08-24)에서 근본 위치인 `src/web-console.ts` 를
+고쳐 세 호출자가 함께 닫혔다. 이 스캐폴드는 그 수정을 재수출로 상속한다.
+
+## 저장소 밖에 열려 있는 항목
+
+### O-01. IdP 에 등록되지 않은 로그아웃 URI 둘
+
+- 상태: **코드 완비 · 배포 설정 미완**
+- 코드 위치: `src/manager-server.ts:2980`(백채널 라우트) · `:3188`(시작 로그) ·
+  `packaging/manager.env.example:81,113`
+- 근거: `security-audits/2026-08-24-todo.md` §4.5 — 30항목 중 유일하게 안 닫힌 것
+
+KeyStone 클라이언트 설정에 두 값이 비어 있다.
+
+```
+Back-channel Logout URI:  https://<console>/auth/backchannel-logout
+backchannel_logout_session_required: off
+post_logout_redirect_uri: (packaging/manager.env.example 참조)
+```
+
+**둘의 실패 방식이 다르다.**
+
+| | 미등록이면 |
+|---|---|
+| `post_logout_redirect_uri` | **시끄럽다** — 운영자가 IdP 오류 페이지에 떨어진다. `a6c367b` 가 넣은 `prompt=login` 이 그동안 구멍을 막는다 |
+| Back-channel Logout URI | **조용하다** — 강제 로그아웃이 아무에게도 안 닿고 **IdP 는 성공을 보고한다** |
+
+코드 감사가 「코드는 정상」으로 넘길 수 있는 항목이지만, 넘기면 조용한 쪽의 사실이 어느 문서에도
+남지 않는다. 그것이 여기 적는 이유다.
+
+확인 방법:
+
+```
+IdP 에서 강제 로그아웃 → 매니저 저널에
+[manager] backchannel-logout for sub <id>: N session(s) ended
+```
+
+줄이 아예 없으면 아직 미등록. 거부 줄이 나오면 등록은 됐고 토큰이 거부된 것이며, 그 줄이 이유를
+말한다.
 
 ## 검토 결과 문제가 확인되지 않은 영역
 
-다음 영역은 코드 호출 경로와 관련 테스트를 확인했으나 현재 구현상 취약점이나 기능 결함을 확인하지 못했다.
+다음 영역은 코드 호출 경로와 관련 테스트를 확인했으나 현재 구현상 취약점이나 기능 결함을
+확인하지 못했다.
 
 - nft JSON allowlist 및 타 테이블 조작 방지
 - `flush ruleset`, NAT, prerouting, postrouting 차단
@@ -115,28 +268,119 @@ const enabled = o.enabled === undefined
 - feed HTTPS·redirect 차단·응답 크기·wall-clock timeout
 - nft 문자열 주입 및 호스트명 검증
 - 정책 렌더러의 credential 보유 방지 검사
-- 주요 subprocess 및 응답 body 크기 제한
+- subprocess 및 응답 body 크기 제한
+  - 개정에서 추가 확인: 저장소의 모든 외부 프로세스 호출이 `execFileSync`(셸 없음)다 —
+    `policy-screen.ts:157`(git) · `enrollment-store.ts:93`(openssl) ·
+    `bin/heliopause-pki.ts:85,196` · `bin/heliopause-publish.ts:129,191,328` ·
+    `bin/heliopause-ui.ts:38` · `packages/manager/src/listen.ts:28`. `exec(` 또는 `execSync` 로
+    셸을 경유하는 자리는 없다.
 
-## 미구현·더미 코드 점검
+## 아직 아무 주장도 하지 않은 영역
 
-코드상 명확히 스캐폴드인 것은 `packages/manager`의 Hono 기반 서버다. 실제 운영 매니저 기능은 `src/manager-server.ts`와 `bin/heliopause-manager.ts`에 있다.
+⚠️ **초판에는 이 절이 없었다.** 위의 「문제 없음」 목록만 있으면 독자에게는 「확인함」과 「안 봄」이
+구별되지 않고, 다음 감사가 그 위에 쌓을 수 없다.
 
-그 밖의 mock·fixture는 테스트 코드에 한정되어 있었고, 운영 코드에서 인증·정책 적용을 우회하는 dummy branch나 빈 구현은 확인하지 못했다.
+이 감사가 읽지 않은 곳 (`2026-08-24-todo.md` 의 같은 목록과 일치):
+
+`src/protocol.ts`(757) · `src/publish.ts`(417) · `src/geofeed.ts`(402) ·
+`src/i18n.ts` 와 `packages/i18n`(1,561) · `src/coverage*.ts` · `src/zones.ts` ·
+`src/device-*.ts` · `src/cf-devices.ts` · `src/site-*.ts` · `src/history-view.ts` ·
+`src/where-used.ts` · `src/workload-traffic.ts` · `src/policy-lookup.ts` ·
+`src/policy-screen.ts` · `src/policy-store.ts` · `src/policy-view.ts` · `src/routes.ts` ·
+`src/ruleset-diff.ts` · `src/membership-record.ts` · `src/env-spec.ts` · `src/objects.ts` ·
+`src/icons*.ts` · `src/design-tokens.ts` ·
+`agent/heliopause-pull.py` 의 workload 롤백과 복구 경로(약 800줄) · `agent/heliopause-enroll.py` ·
+대부분의 `bin/*` · `scripts/claude-hooks/*.py` · Svelte 컴포넌트 본문
+
+3차 감사를 돌린다면 여기부터.
+
+## 방법론 — 이 저장소에서 제외하면 안 되는 것
+
+초판은 범위에서 「주석의 보안 주장 자체」를 명시적으로 뺐다. 다른 저장소에서는 합리적인 선택이다.
+**여기서는 아니다.**
+
+`2026-08-23-full-code-review.md` 가 찾은 결함의 상당수가 정확히 그 유형이었다.
+
+| | 주석이 약속한 것 | 코드가 한 것 |
+|---|---|---|
+| §3.2 `fetchPolicySource` | 응답 크기 경계 | `await res.text()` — 전부 버퍼한 뒤 검사 |
+| §3.3 `feeds.ts` | "A ceiling this tight is a guard in its own right" | 실제 상한 32MB, 피드별 256KB 는 다 받은 뒤 검사 |
+| §2.7 `rollout.ts:353` | "Below never-seen for the opposite reason" | **지금 코드와 반대 순서**를 설명하는 죽은 분기 |
+| §2.5 `NODE_TOKEN_PREFIX` | 「제대로 생긴 토큰」 관문 | 소스에 있는 공개 상수 7글자 — 완화 효과 사실상 0 |
+
+이 저장소는 주석에 설계 판단을 싣는 스타일이다. 그래서 **주석–코드 불일치가 곧 결함**이고,
+그것을 범위에서 빼면 이 저장소가 실제로 결함을 생산하는 방식을 통째로 안 보게 된다.
+`AGENTS.md` 가 자기 문서에 대해 같은 일을 해 놓았다 — 「`policy/` 없으면 npm test 가 깨진다」고
+오래 적혀 있었고 실측하면 아니었다.
 
 ## 검증 실행 결과
 
-- `npm run typecheck`: 통과
-- `npm run check:web`: 통과
-- `npm run icons:check`: 통과
-- `python3 agent/test_validate.py`: 241개 통과
+### 개정 재실행 — 2026-08-25
+
+환경: 워크트리 `audit-b1-relay-buffering`, HEAD `3de1d05`, `policy/` · `node_modules` 심링크 연결,
+macOS. `AGENTS.md` 「검사」 절의 명령 전부.
+
+| 게이트 | 결과 |
+|---|---|
+| `npm test` | **1,764 + 4 + 194 · fail 0** |
+| `python3 agent/test_validate.py` | `Ran 241 · OK (skipped=12)` → 실행 229 |
+| `python3 agent/test_enroll.py` | `Ran 16 · OK` |
+| `npm run typecheck` | 통과 (루트 + `@heliopause/manager`) |
+| `npm run check:web` | `339 FILES 0 ERRORS 0 WARNINGS` |
+| `npm run build:web` | 통과 |
+| `npm run icons:check` | 아이콘 20종 전부 실재 |
+| `node scripts/scan-public-history.mjs --worktree` | `site-data scan passed (worktree)` |
+| 훅 스위트 7종 | 실패 0 |
+
+`policy/` 심링크가 연결된 트리에서 돌렸다. 안 걸면 87개가 말없이 사라진다(`AGENTS.md`).
+
+### 초판 실행 결과와 그 정정
+
+초판이 보고한 것:
+
+- `npm run typecheck` · `check:web` · `icons:check`: 통과
+- `python3 agent/test_validate.py`: **241개 통과**
 - `python3 agent/test_enroll.py`: 2개 테스트가 샌드박스의 loopback 소켓 생성 제한으로 실패
-- 전체 `npm test`: 소켓 생성 제한으로 네트워크·Unix socket 테스트가 진행되지 않아 중단
+- 전체 `npm test`: 소켓 생성 제한으로 중단
 - Ed25519 관련 12개 테스트: macOS LibreSSL의 `openssl -rawin` 미지원으로 skip
 
-테스트 실행 실패 중 소켓 생성 오류는 코드 assertion 실패가 아니라 감사 환경의 네트워크·Unix socket 권한 제한으로 분류했다.
+정정 셋:
+
+1. **`test_validate.py` 는 241개가 통과한 것이 아니다.** `Ran 241 · OK (skipped=12)` — 실행은
+   229다. 그리고 그 12건이 바로 아래 「Ed25519 12개 skip」과 같은 것이라 한 번 더 세어졌다.
+2. **`test_enroll.py` 의 실패 2건은 코드 결함이 아니었다** — 같은 명령이 이 트리에서
+   `Ran 16 · OK`. 초판의 「환경 제한으로 분류」는 결과적으로 맞았지만, 그것은 확인이 아니라
+   추정이었다.
+3. **`npm test` 는 중단된 것이 아니라 돌지 않은 것이다.** 그 상태에서 나온 「Medium 1 · Low 1」은
+   실행된 검사의 결론이 아니다.
+
+### 초판이 목록에 넣지 않은 게이트 셋
+
+`AGENTS.md` 「검사」 절이 정본인데 초판 목록에서 빠져 있었다.
+
+- `npm run build:web` — 타입 통과와 빌드 성공은 다른 것이다
+- **`node scripts/scan-public-history.mjs`** — 이 저장소에서 「모든 게이트 통과」 보고 뒤에
+  CI 를 3커밋 동안 빨갛게 세운 바로 그 잡이다(`2026-08-24-todo.md` 2차 검수 4건)
+- 훅 스위트 7종
+
+게이트 목록이 CI 잡 목록과 다르면 초록은 **목록의 초록**이지 CI 의 초록이 아니다.
+
+## 미구현·더미 코드 점검
+
+코드상 명확히 스캐폴드인 것은 `packages/manager`의 Hono 기반 서버다(`"private": true`, 어디에도
+배포되지 않음). 실제 운영 매니저 기능은 `src/manager-server.ts`와 `bin/heliopause-manager.ts`에
+있다.
+
+그 밖의 mock·fixture는 테스트 코드에 한정되어 있었고, 운영 코드에서 인증·정책 적용을 우회하는
+dummy branch나 빈 구현은 확인하지 못했다.
 
 ## 권장 우선순위
 
-1. `normalizePolicy`에서 `enabled`의 타입을 엄격히 검증하고 회귀 테스트를 추가한다.
-2. Linux/OpenSSL 환경에서 전체 테스트를 다시 실행해 Ed25519 및 socket 테스트를 검증한다.
-3. `packages/manager` 스캐폴드의 실행 계약과 운영 매니저의 실행 계약을 분리하고, 부분 인증서 설정을 실패 처리한다.
+1. **M-01** — `normalizePolicy`에서 `enabled`의 타입을 엄격히 검증하고 회귀 테스트 10건을
+   추가한다. `mergePolicy` 경유 경로도 포함할 것.
+2. **I-01** — 같은 커밋에서 `revokeExisting` 두 자리도 함께. 결함이 아니라 패턴이다.
+3. **I-02** — 스캐폴드의 부분 인증서 설정을 실패 처리한다.
+4. **O-01** — KeyStone 클라이언트에 로그아웃 URI 둘을 등록한다. 저장소 밖 작업이고, 백채널 쪽은
+   미등록이 조용하다.
+5. 3차 감사를 돌린다면 「아직 아무 주장도 하지 않은 영역」 절부터, 그리고 **주석–코드 대조를
+   범위에 넣고**.
