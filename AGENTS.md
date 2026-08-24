@@ -77,6 +77,7 @@ npm run typecheck                                         # 루트(src + bin + e
 npm run check:web                                         # Svelte 진단 (루트 tsconfig 밖)
 npm run build:web                                         # 타입 통과와 빌드 성공은 다른 것이다
 npm run icons:check                                       # 아이콘 20종이 lucide-static 에 실재하는가
+node scripts/scan-public-history.mjs --worktree           # 공개 레포에 사이트 데이터가 섞였는가
 python3 scripts/claude-hooks/test-main-tree-guard.py      # 실패 0
 python3 scripts/claude-hooks/test-enter-worktree.py       # 실패 0 (도구 중립 생성·소유권)
 python3 scripts/claude-hooks/test-ignored-paths.py        # 실패 0 (이 레포 — 무시 경로 예외)
@@ -85,6 +86,12 @@ python3 scripts/claude-hooks/test-session-end-cleanup.py  # 실패 0
 python3 scripts/claude-hooks/test-codex-hooks.py          # 실패 0
 python3 scripts/git-hooks/test-pre-commit.py              # 실패 0 (사람 통과 · 에이전트 거부)
 ```
+
+⚠️ **누출 스캔이 이 목록에 없어서 CI 가 세 커밋 동안 빨갛게 서 있었다.** 위 검사를 전부 돌리고
+「모든 게이트 통과」라고 보고한 뒤, `defense-in-depth leak scan` 잡만 계속 실패하고 있었다. 로컬
+게이트 목록이 CI 잡 목록과 다르면 초록불은 **목록의 초록**이지 CI 의 초록이 아니다. 걸린 것은
+실제 사이트 데이터가 아니라 **결함을 설명하는 주석에 적은 예시 주소**였다 — 스캐너는 그 둘을
+구별할 수 없고, 구별하려 들면 안 된다.
 
 이 목록은 이제 CI(`.github/workflows/ci.yml` 의 `check` · `agent worktree guards`)에서도 돈다.
 손으로 돌리는 것을 대신하지는 않는다 — 워크트리에서 훅을 고친 뒤 CI 가 알려주기를 기다리면

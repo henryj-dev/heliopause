@@ -23,11 +23,52 @@ const allowedV4 = ([a, b, c]) =>
   (a === 192 && b === 0 && [0, 2].includes(c)) ||
   (a === 198 && b === 51 && c === 100) || (a === 203 && b === 0 && c === 113);
 
+// The two ranges IANA reserved so text can show an address: `2001:db8::/32` (RFC 3849) and
+// `3fff::/20` (RFC 9637). The second exists because the first is visibly not a real address, so
+// documentation that has to demonstrate a *global unicast* prefix has nowhere else to go — which is
+// exactly the shape a geofeed known-positive needs. Neither can be site data.
+const documentationV6 = (value) => {
+  if (/^2001:0?db8:/.test(value)) return true;
+  // `/20`, not `/16` — the second hextet's top nibble must be zero. A four-digit second hextet is
+  // outside the range and is refused; the literal lives in `history-leak-scan.test.ts`, because
+  // naming a forbidden address here makes this file refuse itself.
+  const m = /^3fff:([0-9a-f]{1,4})?(?::|$)/.exec(value);
+  return !!m && parseInt(m[1] ?? "0", 16) <= 0x0fff;
+};
+
+// ## IPv4 inside IPv6, written in hex
+//
+// The dotted spelling (`::ffff:10.0.0.1`) is skipped by the v6 loop below on purpose and checked by
+// the v4 scanner instead. The hex spelling of the same address (`::ffff:a00:1`) was refused
+// unconditionally — so one value passed in one notation and failed in the other, and the comment in
+// `geofeed.ts` explaining that very bypass could not be committed. Three commits went red on it.
+//
+// In `::ffff:0:0/96` (IPv4-mapped), `64:ff9b::/96` (NAT64) and `::/96` (the deprecated
+// IPv4-compatible range) the last 32 bits *are* an IPv4 address, by definition. Decoding them and
+// asking `allowedV4` gives both spellings the same answer.
+//
+// This is not a hole. The payload is handed to `allowedV4` unchanged, so a mapped address whose
+// last 32 bits are public still fails — `history-leak-scan.test.ts` pins that direction with the
+// literal assembled at runtime, because this file cannot both name a forbidden address and forbid
+// it. (It cannot: writing the counter-example here made the scanner refuse itself.) And none of
+// these three prefixes can carry a global address a site is actually reachable at.
+const embeddedV4 = (value) => {
+  const m = /^(?:::ffff:|64:ff9b::|::)(?:([0-9a-f]{1,4}):([0-9a-f]{1,4}))?$/.exec(value);
+  if (!m) return null;
+  const hi = parseInt(m[1] ?? "0", 16);
+  const lo = parseInt(m[2] ?? "0", 16);
+  return [hi >>> 8, hi & 255, lo >>> 8, lo & 255];
+};
+
 const allowedV6 = (address) => {
   const value = address.toLowerCase();
-  return value === "::" || value === "::1" || value === "::ffff" ||
-    /^2001:0?db8:/.test(value) ||
-    /^f[cd][0-9a-f]{2}:/.test(value) || /^fe[89ab][0-9a-f]:/.test(value) || /^ff[0-9a-f]{2}:/.test(value);
+  if (value === "::" || value === "::1" || value === "::ffff") return true;
+  if (documentationV6(value)) return true;
+  if (/^f[cd][0-9a-f]{2}:/.test(value) || /^fe[89ab][0-9a-f]:/.test(value) || /^ff[0-9a-f]{2}:/.test(value)) {
+    return true;
+  }
+  const v4 = embeddedV4(value);
+  return v4 !== null && allowedV4(v4);
 };
 const V6_GLOBAL_UNICAST_FLOOR = ["2000", "::"].join("");
 

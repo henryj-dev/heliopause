@@ -160,8 +160,8 @@ function reservedReason(prefix: string, family: "ip" | "ip6"): string | null {
   //
   // What is above it is a different thing: an address that is IPv4 wearing IPv6, which matches
   // nothing in *either* family and slips past the v4 reserved list.
-  // ⚠️ **Not detected: the deprecated IPv4-compatible range `::/96` in hex form.** `::102:304` is
-  // `1.2.3.4` and is indistinguishable from an ordinary low address without 128-bit arithmetic this
+  // ⚠️ **Not detected: the deprecated IPv4-compatible range `::/96` in hex form.** `::c000:204` is
+  // `192.0.2.4` and is indistinguishable from an ordinary low address without 128-bit arithmetic this
   // function does not do. The dotted spelling — the only way it appears in a real feed — is refused
   // by `parseV6`, and `minIpv6Prefix` bounds how wide any of it can be. Stated rather than left as a
   // gap somebody has to rediscover.

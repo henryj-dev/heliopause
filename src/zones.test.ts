@@ -209,7 +209,7 @@ describe("zones — IPv6", () => {
   it("falls through to the widest v6 zone rather than to no zone", () => {
     // Before this, an address outside every declared v6 range answered `null` — and a policy with no
     // zone is a policy the crossings table never shows.
-    assert.equal(zoneOf(zones, "2606:4700::1/128")?.id, "net");
+    assert.equal(zoneOf(zones, "3fff:1::1/128")?.id, "net");
   });
 
   it("keeps most-specific-wins across a 128-bit range", () => {

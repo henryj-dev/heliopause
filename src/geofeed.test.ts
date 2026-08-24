@@ -386,10 +386,15 @@ describe("parseFeed — IPv6 spellings of IPv4 addresses", () => {
     assert.equal(f.rejects.length, 0, JSON.stringify(f.rejects));
   });
 
-  it("still accepts a real public IPv6 prefix", () => {
+  it("still accepts a global-unicast prefix that is not the fixture's own", () => {
     // The known positive. Without it every test above passes against a parser that refuses all IPv6.
-    const f = parseFeed(`${GOOD}\n2606:4700::/32,KR,KR-11,Seoul`);
+    //
+    // `3fff::/20` is RFC 9637 documentation space, and it is here rather than a real allocation
+    // because the public-history leak scanner refuses real addresses — correctly. What this needs
+    // from the prefix is that it be global unicast and *not* `2001:db8::/32`, so acceptance cannot
+    // be an artefact of the fixture; RFC 9637 exists precisely to supply that shape.
+    const f = parseFeed(`${GOOD}\n3fff:1::/32,KR,KR-11,Seoul`);
     assert.equal(f.rejects.length, 0, JSON.stringify(f.rejects));
-    assert.ok(f.entries.some((e) => e.prefix === "2606:4700::/32" && e.family === "ip6"));
+    assert.ok(f.entries.some((e) => e.prefix === "3fff:1::/32" && e.family === "ip6"));
   });
 });

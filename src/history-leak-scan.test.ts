@@ -64,6 +64,59 @@ describe("introduced-history site-data scanner", () => {
     assert.equal(refused.stderr.includes(floor), false, "scanner output must redact the matched value");
   });
 
+  // ## Why these two cases exist
+  //
+  // Both allowances were added because the scanner refused text it should not have, and the way
+  // that showed up is the reason they are pinned rather than trusted:
+  //
+  //   · `geofeed.ts` explains a bypass in which an IPv4 address is written as IPv6 in pure hex. The
+  //     dotted spelling of the same address has always been skipped here and checked by the IPv4
+  //     scanner; the hex spelling was refused outright. So the same value passed in one notation and
+  //     failed in the other, and the comment describing the defect could not be committed. Three
+  //     commits sat red on it while every local gate reported green.
+  //   · `2001:db8::/32` is visibly not a real address, which makes it useless as the known positive
+  //     in a test that has to accept a *global unicast* prefix. RFC 9637 reserved `3fff::/20` for
+  //     exactly that, and it was refused here.
+  //
+  // Each case asserts the refusal too. An allowance with only the passing half is how a scanner
+  // stops scanning: `::ffff:` plus a public address, and a second hextet outside `3fff::/20`, must
+  // still fail. Both forbidden literals are assembled at runtime — written out, they would make
+  // *this* file fail the scan, which is precisely what happened to the comment in the scanner.
+  const scanFixture = (prefix: string, body: string) => {
+    const repo = mkdtempSync(join(tmpdir(), `heliopause-history-${prefix}-`));
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: repo, encoding: "utf8" }).trim();
+    git("init", "-q", "-b", "main");
+    git("config", "user.name", "security-test");
+    git("config", "user.email", "security-test@example.invalid");
+    writeFileSync(join(repo, "fixture.txt"), body);
+    git("add", "fixture.txt");
+    const scanner = resolve(import.meta.dirname, "../scripts/scan-public-history.mjs");
+    return spawnSync(process.execPath, [scanner, "--worktree"], { cwd: repo, encoding: "utf8" });
+  };
+
+  it("reads a hex-written embedded IPv4 as the address it is, in both directions", () => {
+    // `::ffff:a00:1` is `10.0.0.1`; the dotted spelling of it already passes.
+    const privatePayload = scanFixture("mapped-private", "mapped: ::ffff:a00:1/128\nnat64: 64:ff9b::/96\n");
+    assert.equal(privatePayload.status, 0, privatePayload.stderr);
+
+    // The same prefix carrying a public address — `4a7d:2b10` decodes into an ordinary routable
+    // /8 that `allowedV4` does not list. The decode hands the octets over unchanged, so the mapped
+    // spelling buys nothing. Spelled in dotted form here, this comment would fail the scan.
+    const publicPayload = scanFixture("mapped-public", `mapped: ::ffff:${["4a7d", "2b10"].join(":")}/128\n`);
+    assert.equal(publicPayload.status, 1, "a public address in mapped hex form must still fail");
+    assert.match(publicPayload.stderr, /contains a non-documentation IPv6 address/);
+  });
+
+  it("allows RFC 9637 documentation space at /20 and not one bit wider", () => {
+    const inside = scanFixture("doc-inside", "documentation: 3fff:1::/32 and 3fff::1\n");
+    assert.equal(inside.status, 0, inside.stderr);
+
+    // Second hextet above `0fff` is outside `3fff::/20` — unassigned global unicast, not documentation.
+    const outside = scanFixture("doc-outside", `outside: 3fff:${["1", "234"].join("")}::/32\n`);
+    assert.equal(outside.status, 1, "3fff::/16 must not be allowed — the reservation is /20");
+    assert.match(outside.stderr, /contains a non-documentation IPv6 address/);
+  });
+
   it("rejects binary credential containers instead of skipping their NUL bytes", () => {
     const repo = mkdtempSync(join(tmpdir(), "heliopause-history-binary-key-"));
     const git = (...args: string[]) => execFileSync("git", args, { cwd: repo, encoding: "utf8" }).trim();
