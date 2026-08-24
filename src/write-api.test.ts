@@ -663,6 +663,39 @@ describe("publishing reaches the relay", () => {
   });
 });
 
+// ── A stale enrollment lock must not stop the whole manager ───────────────────
+//
+// The transaction is fully synchronous and the spin between attempts is `Atomics.wait`, which blocks
+// the thread. So a request waiting for the lock does not wait *beside* the manager, it stops it —
+// the console, `/site`, every poll.
+//
+// Nothing in this process can hold the lock (Node is single-threaded and the path never yields), so
+// the case that matters is a `.lock` left behind by a crash, which by design is never reclaimed
+// automatically. At the CLI's ten-second default that froze the manager for ten seconds per attempt.
+describe("a stale enrollment lock", () => {
+  it("is refused quickly, and does not freeze everything else while it is", async () => {
+    writeFileSync(`${enrollmentFile}.lock`, JSON.stringify({ pid: 999999, nonce: "stale" }));
+    try {
+      const started = Date.now();
+      // A write route, so it takes the lock.
+      const blocked = call(managerPort, "/enrollment/tokens", "POST", { hostname: "gw-01.dev" }, "henry");
+      // A read route with no lock, issued while the write is waiting. If the wait blocked the thread
+      // for ten seconds this could not be answered inside it.
+      const alongside = call(managerPort, "/site", "GET", undefined, "henry");
+      const [w, r] = await Promise.all([blocked, alongside]);
+      const elapsed = Date.now() - started;
+
+      assert.equal(w.status, 503, `expected the busy store to be refused, got ${w.status}: ${w.text}`);
+      contains(w.text, "busy");
+      assert.equal(r.status, 200, "a read must still be served while a write waits for the lock");
+      // The CLI default is 10s. Generous headroom over the 100ms window, and far below it.
+      assert.ok(elapsed < 5_000, `the manager was blocked for ${elapsed}ms — the HTTP wait is not short`);
+    } finally {
+      unlinkSync(`${enrollmentFile}.lock`);
+    }
+  });
+});
+
 describe("the relay's own check", () => {
   it("refuses a push from an operator who is not a publisher", async () => {
     // Defence in depth, and not redundant: the manager's writer list and the relay's publisher list

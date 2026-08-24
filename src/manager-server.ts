@@ -118,6 +118,7 @@ import {
   EnrollmentError, createNodeToken, fetchNodeCertificate, looksLikeNodeToken, requireEnrollmentDocument,
   preflightNodeCsr, rejectNodeCsr, revokeCertificate, revokeNodeToken, storeNodeCertificate,
   submitValidatedNodeCsr, touchExistingNodeCsr, validateNodeCsrAsync, withEnrollmentTransaction,
+  type EnrollmentDocument,
 } from "./enrollment-store.ts";
 import { certificateIsRevoked } from "./certificate-revocation.ts";
 import { MAX_REVOCATION_ROWS, serializeRevocationSnapshot } from "./revocation-snapshot.ts";
@@ -686,6 +687,35 @@ const ENROLLMENT_RATE_MAX = 30;
 /** Distinct source addresses tracked. Beyond this the oldest window is dropped, never the newest. */
 const ENROLLMENT_RATE_SOURCES = 1_024;
 
+/**
+ * How long an HTTP request will wait for the enrollment lock.
+ *
+ * ## Why the manager's answer is not the CLI's
+ *
+ * `withEnrollmentTransaction` defaults to ten seconds, which is right for `heliopause-enrollment`:
+ * a person at a terminal can wait, and giving up early would fail an operator's write because a
+ * request happened to be mid-flight.
+ *
+ * It is wrong here, and the reason is what the wait costs rather than how long it is. The
+ * transaction is **fully synchronous** — `openSync`, a synchronous read, the mutation, a synchronous
+ * write and two `fsync`s — and the spin between attempts is `Atomics.wait`, which blocks the thread.
+ * So a waiting request does not wait *beside* the rest of the manager; it stops it. Ten seconds of
+ * that is ten seconds in which the console, `/site` and every heartbeat poll are frozen.
+ *
+ * ## What can actually make it wait
+ *
+ * Not another request. Node is single-threaded and this path never yields, so two transactions in
+ * this process cannot interleave — the lock is always free when a route takes it. The only
+ * contenders are *other processes*: an operator running `heliopause-enrollment` on the same host,
+ * and — the case that matters — a **stale `.lock` left by a crash**, which by design is never
+ * reclaimed automatically.
+ *
+ * With a stale lock, every enrollment write froze the manager for ten seconds and then answered 503.
+ * At 100ms it answers 503 just as correctly and the freeze is unnoticeable. The operator's own
+ * command still waits the full ten seconds, which is where waiting belongs.
+ */
+const ENROLLMENT_HTTP_LOCK_WAIT_MS = 100;
+
 /** Fixed-window counter per source. Exported for its test; the state is the caller's. */
 export function rateLimited(
   seen: Map<string, { windowStartedAt: number; count: number }>,
@@ -1016,6 +1046,16 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
    * which is the right trade for a bound whose job is to stop one caller monopolising the event loop
    * rather than to be an access-control decision.
    */
+  /**
+   * Every enrollment transaction this server takes, with the HTTP wait rather than the CLI one.
+   *
+   * A wrapper rather than an argument at each of the eight call sites, because eight is exactly the
+   * number at which one gets missed — and the one that gets missed is the one that freezes the
+   * process. See `ENROLLMENT_HTTP_LOCK_WAIT_MS`.
+   */
+  const enrollmentWrite = <T>(storeFile: string, mutate: (document: EnrollmentDocument) => T): T =>
+    withEnrollmentTransaction(storeFile, mutate, { waitMs: ENROLLMENT_HTTP_LOCK_WAIT_MS });
+
   const enrollmentHits = new Map<string, { windowStartedAt: number; count: number }>();
   const enrollmentFloodRefused = (req: IncomingMessage, res: ServerResponse): boolean => {
     const source = req.socket.remoteAddress ?? "unknown";
@@ -1355,11 +1395,11 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         const preflight = preflightNodeCsr(requireEnrollmentDocument(opts.enrollment.storeFile), { csrPem, token });
         let result;
         if (preflight.existing) {
-          result = withEnrollmentTransaction(opts.enrollment.storeFile, (document) =>
+          result = enrollmentWrite(opts.enrollment.storeFile, (document) =>
             touchExistingNodeCsr(document, { csrPem, token }));
         } else {
           const csr = await validateNodeCsrAsync(csrPem, preflight.hostname);
-          result = withEnrollmentTransaction(opts.enrollment.storeFile, (document) =>
+          result = enrollmentWrite(opts.enrollment.storeFile, (document) =>
             submitValidatedNodeCsr(document, {
               csr, token, sourceIp: req.socket.remoteAddress ?? null,
             }));
@@ -1379,7 +1419,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         // on with `Atomics.wait` — synchronously, on this thread.
         if (!looksLikeNodeToken(token)) return send(res, 401, { error: "unauthorized node token" });
         if (enrollmentFloodRefused(req, res)) return;
-        const certificate = withEnrollmentTransaction(opts.enrollment.storeFile, (document) =>
+        const certificate = enrollmentWrite(opts.enrollment.storeFile, (document) =>
           fetchNodeCertificate(document, decodeURIComponent(certificateFetch[1]!), token, req.socket.remoteAddress ?? null));
         return send(res, 200, { ok: true, certificate });
       } catch (e) { return sendEnrollmentError(res, e); }
@@ -1595,7 +1635,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
           hostname?: unknown; label?: unknown; revokeExisting?: unknown; ttlSec?: unknown; otp?: unknown;
         };
         if ((await requireOtp(principal, body, res, url.pathname)) === "answered") return;
-        const result = withEnrollmentTransaction(opts.enrollment.storeFile, (document) => createNodeToken(document, {
+        const result = enrollmentWrite(opts.enrollment.storeFile, (document) => createNodeToken(document, {
           hostname: String(body.hostname ?? ""),
           label: typeof body.label === "string" ? body.label : undefined,
           createdBy: who,
@@ -1612,7 +1652,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     if (opts.enrollment && req.method === "POST" && tokenRevoke) {
       if (!mayWrite) return refuseWrite(res, who, url.pathname, principal.via);
       try { const body = JSON.parse(await readBody(req)) as { otp?: unknown }; if ((await requireOtp(principal, body, res, url.pathname)) === "answered") return;
-        const row = withEnrollmentTransaction(opts.enrollment.storeFile, (document) =>
+        const row = enrollmentWrite(opts.enrollment.storeFile, (document) =>
           revokeNodeToken(document, decodeURIComponent(tokenRevoke[1]!), who));
         return send(res, 200, { ok: true, id: row.id }); }
       catch (e) { return sendEnrollmentError(res, e); }
@@ -1621,7 +1661,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     if (opts.enrollment && req.method === "POST" && csrReject) {
       if (!mayWrite) return refuseWrite(res, who, url.pathname, principal.via);
       try { const body = JSON.parse(await readBody(req)) as { reason?: unknown; otp?: unknown }; if ((await requireOtp(principal, body, res, url.pathname)) === "answered") return;
-        const row = withEnrollmentTransaction(opts.enrollment.storeFile, (document) =>
+        const row = enrollmentWrite(opts.enrollment.storeFile, (document) =>
           rejectNodeCsr(document, decodeURIComponent(csrReject[1]!), who, String(body.reason ?? "")));
         return send(res, 200, { ok: true, request: row }); }
       catch (e) { return sendEnrollmentError(res, e); }
@@ -1640,7 +1680,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         // File I/O is outside the enrollment lock. The transaction itself remains synchronous and
         // covers only load → validate/mutate → save, so a slow mount cannot block unrelated writes.
         const caPem = await readFile(caPath, "utf8");
-        const row = withEnrollmentTransaction(opts.enrollment.storeFile, (document) =>
+        const row = enrollmentWrite(opts.enrollment.storeFile, (document) =>
           storeNodeCertificate(document, {
             requestId: decodeURIComponent(certUpload[1]!), certificatePem,
             caPem, caName, actor: who,
@@ -1654,7 +1694,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         if ((await requireOtp(principal, body, res, url.pathname)) === "answered") return;
         if (typeof body.certificatePem !== "string") throw new EnrollmentError("certificatePem required");
         const certificatePem = body.certificatePem;
-        const row = withEnrollmentTransaction(opts.enrollment.storeFile, (document) =>
+        const row = enrollmentWrite(opts.enrollment.storeFile, (document) =>
           revokeCertificate(document, { certificatePem, reason: String(body.reason ?? ""), actor: who }));
         const replication = await replicateRevocations();
         return send(res, 201, { ok: true, revocation: row, replication }); }

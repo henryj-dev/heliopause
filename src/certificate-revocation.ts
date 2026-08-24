@@ -28,7 +28,26 @@ function parseEnrollmentRevocations(value: unknown): RevocationSnapshot {
   return parseRevocationSnapshot({ schemaVersion: 1, revocations: document.revocations });
 }
 
-/** Reloaded and strictly validated per request so an emergency revocation needs no restart. */
+/**
+ * Reloaded and strictly validated per request so an emergency revocation needs no restart.
+ *
+ * ## Deliberately not cached
+ *
+ * Caching it — keyed on mtime and inode, invalidated on change — was proposed and declined. The read
+ * is synchronous and per request, which sounds like exactly the thing to cache, and two facts say
+ * otherwise:
+ *
+ *   · **An unauthenticated caller never reaches it.** `peerFingerprint256` returns null unless
+ *     `socket.authorized`, and the function returns before touching the disk. So the read is paid by
+ *     peers holding a valid client certificate, not by anyone who can open a socket.
+ *   · **The property being traded away is the one the file exists for.** "Revocation takes effect on
+ *     the next request" would become "on the next request after the cache notices", and mtime has
+ *     one-second granularity on some filesystems while a revocation is something an operator does
+ *     because they are in a hurry.
+ *
+ * The cost is a small read of a bounded file. The benefit was microseconds. Written down here rather
+ * than left as an absence, because "why is this not cached" is a question a reader will have.
+ */
 export function certificateIsRevoked(
   path: string | undefined,
   req: IncomingMessage,

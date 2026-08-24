@@ -47,6 +47,33 @@ export interface EnrollmentAuditEvent {
   detail: Record<string, string | number | boolean | null>;
 }
 export interface CertificateRevocation { fingerprint256: string; subject: string | null; reason: string; actor: string; revokedAt: string; }
+/**
+ * The whole store, read and written as one document.
+ *
+ * ## `audit` and `requests` have no retention policy, and that is a decision rather than an omission
+ *
+ * Nothing here prunes either array. That was raised as a defect and measured before being accepted:
+ * a row is appended by seven actions, and in steady state the only ones that recur are a certificate
+ * rotation's — one token created, one revoked, one CSR submitted, one certificate uploaded, and one
+ * `node-cert.fetch` (recorded on the **first** retrieval only, because `retrievedAt` gates it; the
+ * agent polls). That is five rows per host per rotation. At seven hosts on a ninety-day certificate
+ * this is **on the order of a hundred rows a year**.
+ *
+ * The cost of a large store is that `requireEnrollmentDocument` reads and parses all of it,
+ * synchronously, on every enrollment request. What made that worth worrying about was that any
+ * caller could trigger it; that is now bounded by `looksLikeNodeToken` and the manager's per-source
+ * rate limit. At a hundred rows a year the parse is not measurable.
+ *
+ * So: no pruning, because discarding an audit trail needs a reason and "it might get big" is not one
+ * at this rate. **Revisit when either is true** — the store passes 1 MB, or the fleet passes ~50
+ * hosts. Both are checkable in one command:
+ *
+ *     ls -l <store.json> && jq '.audit | length, (.requests | length)' <store.json>
+ *
+ * At that point the shape is a compaction subcommand on `heliopause-enrollment`, matching the one
+ * `heliopause-revocations compact` already has — an operator action, not a runtime sweep, for the
+ * same reason revocation compaction is one.
+ */
 export interface EnrollmentDocument {
   schemaVersion: typeof ENROLLMENT_SCHEMA;
   tokens: NodeTokenRecord[]; requests: NodeCsrRecord[]; audit: EnrollmentAuditEvent[]; revocations: CertificateRevocation[];

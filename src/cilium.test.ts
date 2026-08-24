@@ -461,20 +461,41 @@ describe("renderer — direction decides which side becomes the selector", () =>
     ]);
     assert.equal(cnp.spec.ingress, undefined);
 
-    // ## And the receiver's half is **not** rendered — which is worth a sentence, not silence
+    // ## And the receiver's half, which this branch used to skip
     //
-    // The `k8s-label` form of the same policy renders both halves, because Cilium enforces egress at
-    // the sender and ingress at the receiver independently and the sender's half alone leaves the
-    // flow dropped at the destination (measured 2026-08-10, `endpoint 1586`). This branch is caught
-    // before that one, so the same intent written the recommended way gets one object instead of two.
+    // Cilium enforces the two directions independently, so the sender's egress object alone leaves
+    // the flow dropped at the destination — measured 2026-08-10 at `endpoint 1586`, which is why the
+    // `k8s-label` form renders both. `k8s-service` is caught before that branch and rendered one.
     //
-    // Whether it *should* render the second half depends on a live cluster — see the comment at the
-    // `toServices` branch. Until that is answered the renderer says so, and this pins that it does.
-    assert.equal(out.policies.length, 1, "no ingress half is rendered for a Service destination");
-    contains(
-      out.warnings.map((w) => w.warning).join("\n"),
-      "renders the sender's egress half only",
-    );
+    // The selector is the **Service's**, pinned to the Service's namespace: `endpointSelector` names
+    // pods, and `toServices` names a Service.
+    const ingressHalf = out.policies.find((o) => o.metadata.name.endsWith("-ingress"))!;
+    assert.ok(ingressHalf, "a Service destination must get the receiver's half too");
+    assert.equal(ingressHalf.metadata.namespace, "util", "it lands where the backend pods are");
+    assert.deepEqual(ingressHalf.spec.endpointSelector.matchLabels, { app: "zot", [NS]: "util" });
+    assert.deepEqual(ingressHalf.spec.ingress?.[0]?.fromEndpoints, [
+      { matchLabels: { [NS]: "arc-runners" } },
+    ]);
+    // Closing the destination is the point of an ingress allow — and it is also a consequence the
+    // author did not write, so it is warned about rather than left to be discovered.
+    assert.equal(ingressHalf.spec.enableDefaultDeny?.ingress, true);
+    contains(out.warnings.map((w) => w.warning).join("\n"), "ingress default-deny");
+  });
+
+  it("does not mirror a deny to a Service", () => {
+    // Same carve-out the `k8s-label` branch makes: a deny needs only the sender's side to be
+    // effective, and mirroring it would place an `ingressDeny` on pods the author never named —
+    // where Cilium's deny-beats-every-allow rule makes an accidental blast radius expensive.
+    const out = plan([{
+      policy: policy({
+        id: "P602D",
+        src: { kind: "k8s-namespace", value: "arc-runners" },
+        dst: { kind: "k8s-service", value: "util/zot" },
+        action: "deny",
+      }),
+    }]);
+    assert.equal(out.policies.length, 1);
+    assert.equal(out.policies[0]!.spec.egressDeny?.length, 1);
   });
 
   it("renders a workload source to an address destination as egress", () => {

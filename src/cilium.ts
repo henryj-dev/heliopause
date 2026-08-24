@@ -805,37 +805,49 @@ export function planCiliumPolicies(input: CiliumRenderInput, items: CiliumItem[]
         }
         // Built from the resolved Service, not from splitting `p.dst.value` — see `resolveServiceRef`.
         rule.toServices = [{ k8sService: { serviceName: svc.name, namespace: svc.namespace } }];
-        // ## This branch renders the sender's half only, and the `k8s-label` branch below does not
+        // ## The receiver's half, which this branch used to skip
         //
-        // `peerIngress` — the receiver's `ingress` object — is built in the `else if (dstWorkload)`
-        // branch. `k8s-service` is a workload kind, so it would reach that branch; it is caught here
-        // first, and this path never builds one.
+        // `peerIngress` is built in the `else if (dstWorkload)` branch below. `k8s-service` is a
+        // workload kind and would reach it — but it is caught here first, so a Service destination
+        // rendered the sender's egress object and nothing else.
         //
-        // The measurement that produced `peerIngress` applies here unchanged: on 2026-08-10 the
-        // dashboard could not reach dispatcher, the egress object rendered and applied cleanly, and
-        // the packets were dropped at the receiving endpoint. Cilium enforces egress at the sender
-        // and ingress at the receiver, independently, and neither knows about the other.
+        // The measurement behind `peerIngress` applies here unchanged: Cilium enforces egress at the
+        // sender and ingress at the receiver **independently**, and on 2026-08-10 the dashboard could
+        // not reach dispatcher because only the first existed — the egress object applied cleanly and
+        // the packets were dropped at `endpoint 1586`.
         //
-        // So the same policy written two ways behaves differently — and `toServices` is the form
-        // this file recommends, because Cilium re-resolves the name and the rule survives a Service
-        // selector change.
+        // So the same intent written two ways behaved differently, and `toServices` is the way this
+        // file recommends (Cilium re-resolves the name, so the rule survives a Service selector
+        // change). Measured against dev on 2026-08-24 before changing it: **no policy in the live
+        // cluster uses `toServices`**, so nothing was relying on the old shape — and the pods a
+        // Service destination would name are the same ones the `-ingress` objects already close.
         //
-        // **Not fixed here.** The ingress half is renderable (`svc.selector` is in hand), but
-        // whether it should be rendered is a question about a live cluster: it depends on whether
-        // anything else selects those backend pods for ingress, and getting it wrong in the other
-        // direction closes a Service to every caller this policy set does not name. Verify against
-        // the cluster, then decide. Until then the gap is stated rather than silent, which is the
-        // one thing it was not.
-        warnings.push({
-          policyId: p.id,
-          name: p.name,
-          warning:
-            `this renders the sender's egress half only. Cilium enforces ingress at the receiver ` +
-            `independently, so if anything else puts the pods behind Service ` +
-            `${JSON.stringify(p.dst.value)} into ingress default-deny, this flow is dropped there ` +
-            `with the egress rule applying cleanly. Naming the destination pods with k8s-label ` +
-            `instead renders both halves.`,
-        });
+        // The selector comes from the resolved Service rather than from `toServices`, because
+        // `endpointSelector` names pods and `toServices` names a Service. `resolveServiceRef` has
+        // already refused an unresolvable name and `assertServiceUsable` an empty selector — an empty
+        // one here would match the whole namespace.
+        if (p.action === "allow") {
+          assertServiceUsable(svc, p.dst.value, `${at} destination`);
+          const backends: MatchLabels = { ...svc.selector, [NS_LABEL]: svc.namespace };
+          assertNamespace(svc.namespace, `${at} destination`);
+          peerIngress = {
+            from: { matchLabels: backends },
+            allow: { fromEndpoints: [{ matchLabels: target.labels }], ...(toPorts.length ? { toPorts } : {}) },
+          };
+          // Same sentence the `k8s-label` branch carries, and for the same reason: the object below
+          // closes the pods behind this Service to everything a heliopause policy does not name, and
+          // the author asked for one flow rather than for that.
+          warnings.push({
+            policyId: p.id,
+            name: p.name,
+            warning:
+              `this allow also renders the receiver's half, which puts the pods behind Service ` +
+              `${JSON.stringify(p.dst.value)} into ingress default-deny — Cilium enforces the two ` +
+              `directions independently, so the sender's egress rule alone leaves the flow dropped ` +
+              `at the destination. Anything else that reaches those pods and is not named by a ` +
+              `heliopause policy stops working.`,
+          });
+        }
       } else if (dstWorkload) {
         const to = endpointSelectorFor(p.dst, "destination", input, `${at} destination`);
         // A *peer* selector needs the namespace label as much as the selected side does, for a
