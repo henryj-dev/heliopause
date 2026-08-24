@@ -63,56 +63,114 @@ function hb(over: HeartbeatOverride = {}): Heartbeat {
 
 const reply = (o: { body: HeartbeatReply | { error: string } }) => o.body as HeartbeatReply;
 
-// ## The one heartbeat field the relay does not carry
+// ## The heartbeat field the relay used to drop
 //
-// `Heartbeat.artifactTrust` is built and transmitted by the agent every interval and read by nothing.
-// `handleHeartbeat` copies the heartbeat into `HostStatus` field by field — with a comment on each
-// explaining why it is kept — and this one is absent, so it stops at the relay and never reaches the
-// manager.
+// `Heartbeat.artifactTrust` was built and transmitted by the agent every interval and read by
+// nothing: `handleHeartbeat` copied the heartbeat into `HostStatus` field by field — with a comment
+// on each explaining why it was kept — and this one was absent, so it stopped at the relay.
 //
-// Pinned because the alternative is a comment. The note on `Heartbeat.artifactTrust` states this as
-// measured fact, and a fact about behaviour that nothing checks is a fact that goes stale. This test
-// is also the notice: **when it fails because something started reading the field, that note is what
-// to delete** — the failure is the feature arriving, not a regression.
+// The block that used to be here pinned that. It said, in as many words, that the day it failed
+// because something started reading the field would be the day the feature arrived and the note on
+// `Heartbeat.artifactTrust` was what to delete. It failed on 2026-08-24. This is what replaced it.
 //
-// It is deliberately about the stored status rather than about the reply. The reply is `computeGate`'s
-// business and never carried trust material; the loss is in what the relay remembers.
-describe("the heartbeat field that stops at the relay", () => {
-  const trust = {
+// Two readings, and only two. `currentPlanHash` and `currentPayloadHash` would answer "is a host
+// enforcing something we did not issue", and they are carried unread on purpose — that comparison
+// needs the manifest to name the authorization it published, and the manifest is hashed into the
+// approval bundle.
+describe("what the fleet reports about which keys may sign", () => {
+  const trust = (over: Partial<NonNullable<Heartbeat["artifactTrust"]>> = {}) => ({
     managerKeyIds: ["mk-1"],
     breakGlassKeyIds: ["bg-1"],
-    trustDigest: "sha256:deadbeef",
+    trustDigest: "sha256:aaaaaaaaaaaa",
     currentKeyId: "mk-1",
-    currentPayloadHash: "sha256:aaaa",
-    currentAuthorizationMode: "break-glass" as const,
+    currentPayloadHash: "sha256:pppp",
+    currentAuthorizationMode: "two-person" as const,
     currentAuthorizedAt: "2026-08-24T00:00:00Z",
-    currentPlanHash: "sha256:bbbb",
-  };
-
-  it("accepts the heartbeat and keeps none of its trust material", () => {
-    const s = state();
-    const out = handleHeartbeat(s, "h-canary", hb({ artifactTrust: trust }), AT);
-    // Accepted — an unread field is not a rejected one, and the agent is not told it wasted the bytes.
-    assert.equal(out.status, 200);
-    const stored = s.statuses["h-canary"];
-    assert.ok(stored, "the host was recorded");
-    // Nothing in the stored status mentions any of it, under any key. Asserted against the serialised
-    // status rather than a field list, so a future `HostStatus` that nests it somewhere still counts.
-    const text = JSON.stringify(stored);
-    for (const value of ["mk-1", "bg-1", "sha256:deadbeef", "sha256:aaaa", "sha256:bbbb", "break-glass"]) {
-      assert.equal(text.includes(value), false, `the relay began carrying ${value} — see Heartbeat.artifactTrust`);
-    }
+    currentPlanHash: "sha256:hhhh",
+    ...over,
   });
 
-  it("records the same status whether or not the agent sent any", () => {
-    // The stronger form: not merely "the values are absent" but "the field changes nothing". A
-    // partial implementation that stored it under a key this test does not name would still pass the
-    // check above and fail this one.
-    const withTrust = state();
-    handleHeartbeat(withTrust, "h-canary", hb({ artifactTrust: trust }), AT);
-    const without = state();
-    handleHeartbeat(without, "h-canary", hb(), AT);
-    assert.deepEqual(withTrust.statuses["h-canary"], without.statuses["h-canary"]);
+  it("keeps it, so the manager can be told about it at all", () => {
+    const s = state();
+    handleHeartbeat(s, "h-canary", hb({ artifactTrust: trust() }), AT);
+    assert.equal(s.statuses["h-canary"]?.artifactTrust?.trustDigest, "sha256:aaaaaaaaaaaa");
+  });
+
+  it("distinguishes an agent that sent none from one that sent an empty ring", () => {
+    // The `?? null` contract its neighbours keep. `undefined` is an agent too old to send this;
+    // `null` is one that did and trusts nothing — and those are not the same host.
+    const s = state();
+    handleHeartbeat(s, "h-canary", hb(), AT);
+    assert.equal(s.statuses["h-canary"]?.artifactTrust, null);
+  });
+
+  it("says nothing when every host agrees", () => {
+    // The known negative, and the one that matters most: this line appears on a healthy fleet only
+    // if the check is wrong, and a `problems` list that cries wolf is one nobody reads.
+    const s = state();
+    for (const host of Object.keys(manifest.hosts)) {
+      handleHeartbeat(s, host, hb({ host, artifactTrust: trust() }), AT);
+    }
+    const view = fleetView(s, new Date(AT), 300);
+    assert.deepEqual(view.problems.filter((p) => p.includes("may sign")), []);
+  });
+
+  it("reports a fleet that does not agree, and names both sides", () => {
+    // A rotation that reached some hosts and not others. Nothing else in this system can say so:
+    // only the host knows which keys it will accept, and "the new signing key is deployed" is
+    // otherwise an assumption about a file.
+    const s = state();
+    const hosts = Object.keys(manifest.hosts);
+    handleHeartbeat(s, hosts[0]!, hb({ host: hosts[0]!, artifactTrust: trust() }), AT);
+    for (const host of hosts.slice(1)) {
+      handleHeartbeat(s, host, hb({ host, artifactTrust: trust({ trustDigest: "sha256:bbbbbbbbbbbb" }) }), AT);
+    }
+    const line = fleetView(s, new Date(AT), 300).problems.find((p) => p.includes("may sign"));
+    assert.ok(line, "a split ring must be reported");
+    assert.match(line!, /sha256:aaaaaaa/);
+    assert.match(line!, /sha256:bbbbbbb/);
+    assert.match(line!, new RegExp(hosts[0]!));
+    // Said as a state, not a fault: mid-rotation this is the expected reading and is supposed to be
+    // visible while it lasts.
+    assert.match(line!, /rotation/);
+  });
+
+  it("does not count a host that reported no ring as a third answer", () => {
+    // An agent too old to send this is not a host that disagrees. Counting it would make every
+    // partially upgraded fleet report a split that is not there.
+    const s = state();
+    const hosts = Object.keys(manifest.hosts);
+    handleHeartbeat(s, hosts[0]!, hb({ host: hosts[0]!, artifactTrust: trust() }), AT);
+    for (const host of hosts.slice(1)) handleHeartbeat(s, host, hb({ host }), AT);
+    assert.deepEqual(fleetView(s, new Date(AT), 300).problems.filter((p) => p.includes("may sign")), []);
+  });
+
+  it("reports a break-glass authorization that is still in force", () => {
+    // The mode that skips the two-person rule. The manager keeps no record of authorizations it
+    // issued — `approval.ts` deletes a plan the moment it is published, because an approval that
+    // outlives its publish is a standing permission — so the host enforcing it is the only place its
+    // duration is visible.
+    const s = state();
+    handleHeartbeat(
+      s, "h-canary",
+      hb({ artifactTrust: trust({ currentAuthorizationMode: "break-glass", currentAuthorizedAt: "2026-08-01T00:00:00Z" }) }),
+      AT,
+    );
+    const line = fleetView(s, new Date(AT), 300).problems.find((p) => p.includes("break-glass"));
+    assert.ok(line, "a live break-glass must be reported");
+    assert.match(line!, /2026-08-01/, "when it was authorized is the whole question");
+    assert.match(line!, /h-canary/);
+  });
+
+  it("says nothing about an ordinary two-person authorization", () => {
+    // The known negative. Without it, a check that reported every mode would pass the test above and
+    // put a line on the screen for every healthy host.
+    const s = state();
+    handleHeartbeat(s, "h-canary", hb({ artifactTrust: trust() }), AT);
+    assert.deepEqual(
+      fleetView(s, new Date(AT), 300).problems.filter((p) => p.includes("break-glass")),
+      [],
+    );
   });
 });
 

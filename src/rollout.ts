@@ -12,6 +12,7 @@
 import {
   ROLLOUT_ORDER,
   type ApplyState,
+  type Heartbeat,
   type Manifest,
   type RolloutGate,
   type RulesetEvent,
@@ -76,6 +77,34 @@ export interface HostStatus {
    */
   workloadObserved?: string[] | null;
   workloadPoliciesHash?: string | null;
+
+  /**
+   * Which keys this host will accept a signed ruleset from, and which authorization it is enforcing.
+   *
+   * ## Why this is kept
+   *
+   * The agent has built and transmitted it every interval since the signed-artifact path landed, and
+   * the relay copied the heartbeat into this record field by field without it. So it stopped here and
+   * never reached the manager — a repository-wide grep found the producer, the declaration, and no
+   * consumer.
+   *
+   * Only the host knows which keys it will accept. Nothing else in this system can answer:
+   *
+   *   · **did a key rotation reach every host?** Without this, "the new signing key is deployed" is
+   *     an assumption about a file rather than an observation of the fleet.
+   *   · **is a `break-glass` authorization still in force somewhere?** Nothing else notices one that
+   *     was never wound back.
+   *
+   * `fleetView` reads exactly those two. `currentPlanHash` and `currentPayloadHash` would answer
+   * "is a host enforcing something we did not issue", and they are carried here unread on purpose:
+   * the comparison needs the manifest to name the authorization it published, and the manifest is
+   * hashed into the approval bundle — changing it is a wire change with an approval-path consequence,
+   * and not one to make as a side effect of adding a diagnostic.
+   *
+   * `?? null` on arrival, the same contract as the fields above: an agent too old to send this and one
+   * that sent it empty are different things, and neither is "trusts nothing".
+   */
+  artifactTrust?: Heartbeat["artifactTrust"] | null;
 
   /**
    * Other nftables tables the host reported filtering on `input` or `forward`.

@@ -471,6 +471,24 @@ export function fleetView(
     const behind = agentVersionConcern(st, minAgentVersion);
     if (behind) problems.push(`${host}: ${behind}`);
 
+    // ## A break-glass authorization nobody wound back
+    //
+    // `break-glass` is the mode that skips the two-person rule. It is meant to be a moment, and the
+    // only place its duration is visible is the host enforcing it — the manager does not keep a
+    // record of authorizations it issued, by design (`approval.ts` deletes a plan the moment it is
+    // published, because an approval that outlives its publish is a standing permission).
+    //
+    // So this is the one sentence in the system that can say a break-glass is *still on*. Reported
+    // rather than gated: the host is enforcing a validly signed ruleset and cutting it off would be
+    // the relay acting on a policy judgement.
+    if (st?.artifactTrust?.currentAuthorizationMode === "break-glass") {
+      const at = st.artifactTrust.currentAuthorizedAt;
+      problems.push(
+        `${host}: enforcing a break-glass authorization${at ? ` from ${at}` : ""} — that mode skips ` +
+          `the two-person rule, and nothing else in this system reports that it is still in force`,
+      );
+    }
+
     // Silence is its own failure. A host that stopped heartbeating is not applying policy and is
     // not reporting drift either, so it looks healthy in every other field.
     //
@@ -484,6 +502,44 @@ export function fleetView(
     } else if (ageSec > staleAfterSec) {
       problems.push(`${host}: silent for ${ageSec}s`);
     }
+  }
+
+  // ## Do these hosts agree about which keys may sign a ruleset?
+  //
+  // A cross-host question, so it is here and not in the loop above. Each host reports a digest of the
+  // manager and break-glass keys it will accept; every host in one generation should hold the same
+  // ring, and only the hosts know whether they do.
+  //
+  // **What this catches is a rotation that did not land everywhere.** The published procedure is
+  // add-then-remove — the new public key reaches every agent's ring, then the manager switches, then
+  // the old one is dropped — and each step is a file on N machines. Nothing else in this system can
+  // say whether step one actually finished, so "the new signing key is deployed" was an assumption
+  // about a file rather than an observation of the fleet.
+  //
+  // Reported, never gated, and phrased as a state rather than a fault: **mid-rotation this is the
+  // expected reading**, and it is supposed to be visible while it lasts. A relay that refused to
+  // serve a disagreeing host would turn the safe half of the procedure into an outage.
+  //
+  // Hosts that have not reported one are left out rather than counted as a third answer — an agent
+  // too old to send it is not a host that disagrees.
+  const digests = new Map<string, string[]>();
+  for (const [host, entry] of Object.entries(m?.hosts ?? {})) {
+    void entry;
+    const digest = state.statuses[host]?.artifactTrust?.trustDigest;
+    if (!digest) continue;
+    const at = digests.get(digest) ?? [];
+    at.push(host);
+    digests.set(digest, at);
+  }
+  if (digests.size > 1) {
+    // Largest group first, so the sentence reads as "these are the odd ones out" rather than as an
+    // arbitrary listing. Ties are broken by digest so the same fleet always produces the same line.
+    const groups = [...digests.entries()].sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]));
+    problems.push(
+      `the fleet does not agree on which keys may sign a ruleset — ` +
+        groups.map(([digest, hs]) => `${digest.slice(0, 19)}: ${hs.sort().join(", ")}`).join(" · ") +
+        ` — expected during a key rotation and a finding after one`,
+    );
   }
 
   return {
@@ -588,6 +644,11 @@ export function handleHeartbeat(
     routes: hb.routes ?? null,
     publishedPorts: hb.publishedPorts ?? null,
     ciliumExposure: hb.ciliumExposure ?? null,
+    // Which keys this host will accept a ruleset from, and what it is enforcing. Same `?? null`
+    // contract as its neighbours — an agent too old to send it and one that sent it empty are
+    // different things. `fleetView` reads two of its fields; see `HostStatus.artifactTrust` for
+    // which, and for why the other two are carried and not compared.
+    artifactTrust: hb.artifactTrust ?? null,
     // Changes to **our** table that the agent does not claim as its own.
     //
     // ## Both halves of the filter are needed, and I checked rather than assumed

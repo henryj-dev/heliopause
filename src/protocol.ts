@@ -452,30 +452,28 @@ export interface Heartbeat {
   /**
    * Public-key trust configuration and the signed authorization currently enforced by this host.
    *
-   * ⚠️ **The agent sends this every interval and nothing reads it.** Measured 2026-08-24:
-   * `artifact_trust_report` in `heliopause-pull.py` builds all eight fields and puts them on the
-   * wire; `handleHeartbeat` copies the heartbeat into `HostStatus` field by field and this is not
-   * one of them, so it does not survive the relay and never reaches the manager. A
-   * repository-wide grep finds the producer and this declaration, and no consumer.
+   * Only the host knows which keys it will accept a ruleset from, which makes this the only source
+   * for two questions the rest of the system cannot answer:
    *
-   * It is left in place rather than deleted because the questions it answers have no other source,
-   * and each is one this system exists to answer:
+   *   · `managerKeyIds` / `breakGlassKeyIds` / `trustDigest` — **did a key rotation reach every
+   *     host?** The published procedure is add-then-remove across N machines, and without this
+   *     "the new signing key is deployed" is an assumption about a file. `fleetView` compares the
+   *     digests across the generation and reports a fleet that does not agree.
+   *   · `currentAuthorizationMode` / `currentAuthorizedAt` — **is a `break-glass` authorization
+   *     still in force?** The manager keeps no record of what it authorized (`approval.ts` deletes a
+   *     plan the moment it is published, because an approval that outlives its publish is a standing
+   *     permission), so the host enforcing it is the only place its duration is visible. `fleetView`
+   *     reports it.
    *
-   *   · `managerKeyIds` / `breakGlassKeyIds` / `trustDigest` — **did a key rotation actually land on
-   *     every host?** Only the host knows which keys it will accept a ruleset from. Without this,
-   *     "the new signing key is deployed" is an assumption about a file, not an observation.
-   *   · `currentKeyId` / `currentPayloadHash` / `currentPlanHash` — **is any host enforcing an
-   *     authorization we did not issue?**
-   *   · `currentAuthorizationMode` / `currentAuthorizedAt` — **is a `break-glass` authorization still
-   *     in force somewhere?** Nothing else notices one that was never wound back.
+   * ⚠️ **`currentKeyId`, `currentPayloadHash` and `currentPlanHash` are carried and not compared.**
+   * They would answer "is a host enforcing an authorization we did not issue", and the comparison
+   * needs the manifest to name the authorization it published. The manifest is hashed into the
+   * approval bundle, so extending it is a wire change with an approval-path consequence — a decision
+   * to take deliberately, not as a side effect of adding a diagnostic. Stated here rather than left
+   * for someone to rediscover that the data is present and unused.
    *
-   * Building the consumer is a design decision, not an omission to patch quietly: `Manifest` carries
-   * no authorization fields, so a per-host check in `reportContradictions` has nothing to compare
-   * against, and a fleet-wide agreement check needs this carried into `HostStatus` first. Both are
-   * real options; neither is implied by this comment.
-   *
-   * `relay.test.ts` pins the current behaviour so this note cannot quietly become false. If that
-   * test starts failing because something began reading the field, this paragraph is what to delete.
+   * This whole object reached nothing until 2026-08-24: the agent built and sent it every interval
+   * and `handleHeartbeat` copied the heartbeat into `HostStatus` field by field without it.
    */
   artifactTrust?: {
     managerKeyIds: string[];
