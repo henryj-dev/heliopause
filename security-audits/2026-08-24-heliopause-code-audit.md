@@ -3,7 +3,7 @@
 - 감사일: 2026-08-24
 - **개정: 2026-08-25** — 검증 재실행, 발견 2건 정정, 3건 추가 (→ [개정 이력](#개정-이력--2026-08-25))
 - 감사 기준 커밋: `3de1d05` (재실행 당시 워크트리)
-- 현재 저장소 HEAD: `c8f59f8` — 기준 커밋 이후 변경은 훅·설정과 감사 문서이며 제품 실행 코드 변경은 없음
+- 현재 후속 검토 커밋: `8b9c469` — M-01/L-02/I-02 수정과 감사 문서·기대값 갱신을 포함
 - 대상: 저장소의 실행 코드 및 테스트 코드 (아래 커버리지 표의 미검토 영역 제외)
 - 제외: README, 설계 문서
   - ⚠️ 초판은 「주석의 보안 주장 자체」도 제외했다. **개정에서 철회한다** — 이 저장소에서는
@@ -43,6 +43,16 @@
 주요 발견은 정책의 `enabled` 필드가 불리언인지 검증하지 않고 JavaScript의 truthy 규칙으로
 변환한다는 점이다. `"false"`와 `"0"`이 활성화된 정책으로 처리된다.
 
+### 후속 조치 상태 — 2026-08-25
+
+- **M-01 해결됨** — `normalizePolicy`가 비불리언 `enabled`를 거부하고, 정책·문서·부분 갱신
+  경로의 회귀 테스트를 추가했다.
+- **L-02 해결됨** — HTTP와 저장소 함수 양쪽에서 `revokeExisting`의 비불리언 입력을 거부한다.
+- **I-02 해결됨** — 스캐폴드 TLS 해석을 순수 함수로 분리하고, 인증서·키 부분 설정 시 즉시
+  실패하도록 했다. 양쪽 미설정 시 개발용 자체서명 경로는 유지된다.
+- **O-01 미검증** — KeyStone 외부 설정은 저장소 밖 작업이며, 두 로그아웃 URI의 실제 등록 여부는
+  운영 환경 확인이 필요하다.
+
 ⚠️ **「0 Critical / 0 High」는 검토한 범위에 한정된 판정이다.** 아래 「아직 아무 주장도 하지 않은
 영역」은 전수 검토하지 않았으므로, 저장소 전체에 High 이상이 없다고 주장하지 않는다. 초판은
 테스트가 돌지 않은 상태에서 이 판정을 내렸고, 검사가 안 돌면 「High 없음」이 아니라 「판정 불가」다.
@@ -54,6 +64,7 @@
 - 심각도: Medium
 - 위치: `src/policy.ts:450`, `normalizePolicy`
 - 확신도: 확인됨 (재현 완료)
+- 후속 상태: **해결됨** (`normalizePolicy`의 원시 입력 타입 검증 및 회귀 테스트 추가)
 
 현재 구현:
 
@@ -165,6 +176,7 @@ const enabled = o.enabled === undefined
 - 심각도: Low
 - 위치: `src/manager-server.ts:1721`, `src/enrollment-store.ts:287`
 - 확신도: 확인됨
+- 후속 상태: **해결됨** (HTTP 경계와 `createNodeToken` 양쪽에서 비불리언 입력 거부)
 
 ```ts
 // manager-server.ts:1721
@@ -189,6 +201,7 @@ if (input.revokeExisting !== false) for (const token of document.tokens) …
 - 심각도: Info (초판 L-01 을 정정 · 격하)
 - 위치: `packages/manager/src/listen.ts:36-41`
 - 확신도: 확인됨
+- 후속 상태: **해결됨** (`resolveTls` 분리 및 부분 설정 회귀 테스트 추가)
 
 ```ts
 const tls = process.env.HELIOPAUSE_CERT_FILE && process.env.HELIOPAUSE_KEY_FILE
@@ -335,7 +348,7 @@ macOS. `AGENTS.md` 「검사」 절의 명령 전부.
 
 | 게이트 | 결과 |
 |---|---|
-| `npm test` | **1,764 + 4 + 194 · fail 0** |
+| `npm test` | **1,770 + 8 + 194 · fail 0** |
 | `python3 agent/test_validate.py` | `Ran 241 · OK (skipped=12)` → 실행 229 |
 | `python3 agent/test_enroll.py` | `Ran 16 · OK` |
 | `npm run typecheck` | 통과 (루트 + `@heliopause/manager`) |
@@ -389,11 +402,9 @@ dummy branch나 빈 구현은 확인하지 못했다.
 
 ## 권장 우선순위
 
-1. **M-01** — `normalizePolicy`에서 `enabled`의 타입을 엄격히 검증하고 회귀 테스트 10건을
-   추가한다. `mergePolicy` 경유 경로도 포함할 것.
-2. **L-02** — 같은 커밋에서 `revokeExisting` 두 자리도 함께. 기존 토큰 폐기 영향까지 포함한
-   불리언 입력 검증 패턴이다.
-3. **I-02** — 스캐폴드의 부분 인증서 설정을 실패 처리한다.
+1. **M-01** — 완료. `enabled` 타입 검증과 회귀 테스트를 추가했다.
+2. **L-02** — 완료. `revokeExisting` 두 경계의 입력 검증을 추가했다.
+3. **I-02** — 완료. 스캐폴드 TLS 부분 설정을 실패 처리한다.
 4. **O-01** — KeyStone 클라이언트의 로그아웃 URI 두 개 등록 여부를 운영 환경에서 확인한다.
    저장소 밖 작업이고, 백채널 쪽은 미등록이 조용하다.
 5. 3차 감사를 돌린다면 「아직 아무 주장도 하지 않은 영역」 절부터, 그리고 **주석–코드 대조를
