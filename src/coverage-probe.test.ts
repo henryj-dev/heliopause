@@ -169,6 +169,49 @@ describe("control target", () => {
       probe: async () => ({ outcome: "connected" as const, ms: 1 }),
     });
     assert.equal(ps[0]!.outcome, "error");
+
+    // ## And it says which of the three it is
+    //
+    // This test asserted the outcome and stopped, which is where the defect lived: the cell was
+    // correctly `unknown` and the sentence under it read "control target for B8 was unreachable on
+    // v6" — **false**. Nothing was unreachable; the check declares no v6 control address at all.
+    //
+    // Those send an operator to opposite places: one is a network to investigate, the other is a
+    // line to add to the check. `coverage.ts` is built on a cell saying why, so the why is the part
+    // worth pinning.
+    const why = ps[0]!.detail ?? "";
+    assert.match(why, /declares a control target with no v6 address/);
+    assert.doesNotMatch(why, /unreachable/, "nothing was unreachable — it was never configured");
+  });
+
+  it("still says unreachable when the control really was unreachable", async () => {
+    // The other side of the same distinction, so widening the message above cannot quietly replace
+    // the case it was carved out of.
+    const ps = await probeAll([c()], {
+      ...opts,
+      usable: async () => ({ usable: true, reason: "control answered connected" }),
+      probe: async () => ({ outcome: "timeout" as const, ms: 1 }),
+    });
+    const why = ps[0]!.detail ?? "";
+    assert.match(why, /was unreachable on v4/);
+    assert.doesNotMatch(why, /declares a control target/);
+  });
+
+  it("separates a vantage with no path on this family from a control that did not answer", async () => {
+    // The third of the three. A runner with no IPv6 is not a control problem, and reporting it as
+    // one sends someone to look at a control target that is fine.
+    const ck = { ...c(), control: { addr4: "198.51.100.9", addr6: "2001:db8::1", port: 25 } };
+    ck.targets = [{ host: "mailer", addr6: "2001:db8::9", port: 25, proto: "tcp" }];
+    const ps = await probeAll([ck], {
+      ...opts,
+      families: ["v6"],
+      usable: async () => ({ usable: false, reason: "no route" }),
+      probe: async () => ({ outcome: "connected" as const, ms: 1 }),
+    });
+    assert.equal(ps[0]!.outcome, "error");
+    // The family check runs before the control does, so this reports the runner rather than the
+    // control — which is the honest order: an unusable family cannot probe a control either.
+    assert.match(ps[0]!.detail ?? "", /no usable v6 path/);
   });
 });
 

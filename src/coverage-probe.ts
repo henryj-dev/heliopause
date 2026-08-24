@@ -204,13 +204,44 @@ export async function probeAll(
     // Measure the measurer first. A vantage point that cannot reach a known-good third party on
     // this port cannot say anything about our hosts on it either, and the failure looks identical
     // to a firewall doing its job.
-    const controlOk = new Map<Family, boolean>();
+    //
+    // ## Why this holds a reason and not a boolean
+    //
+    // The three ways a control can fail to vouch for a family are different things, and the cell
+    // this produces is read by a person deciding what to fix:
+    //
+    //   · the control was probed and did not answer   → the network, or the far side
+    //   · the control declares no address for this family → the *check*, and nobody would guess it
+    //   · this vantage has no usable path on this family  → the runner
+    //
+    // A boolean collapsed all three into "control target for X was unreachable on v6", which is
+    // false for the middle one — it was never configured, and an operator reading that goes looking
+    // at a network that is fine. `coverage.ts` is built on the rule that a cell must say why; this
+    // is one of the sentences it says.
+    const controlWhy = new Map<Family, string | null>();
     for (const family of families) {
-      if (!check.control) { controlOk.set(family, true); continue; }
+      if (!check.control) { controlWhy.set(family, null); continue; }
       const addr = family === "v4" ? check.control.addr4 : check.control.addr6;
-      if (!addr || !ok.get(family)) { controlOk.set(family, false); continue; }
+      if (!addr) {
+        controlWhy.set(
+          family,
+          `check ${check.id} declares a control target with no ${family} address, so nothing on this` +
+            ` family can be vouched for — add one, or drop the ${family} targets`,
+        );
+        continue;
+      }
+      if (!ok.get(family)) {
+        controlWhy.set(family, `no usable ${family} path to reach the control target from ${opts.observedFrom}`);
+        continue;
+      }
       const r = await probe(addr, check.control.port, family, opts);
-      controlOk.set(family, r.outcome === "connected");
+      controlWhy.set(
+        family,
+        r.outcome === "connected"
+          ? null
+          : `control target for ${check.id} was unreachable on ${family} from ${opts.observedFrom}` +
+            ` — this vantage point cannot measure port ${check.control.port}`,
+      );
     }
     for (const t of check.targets) {
       for (const family of families) {
@@ -241,16 +272,9 @@ export async function probeAll(
           });
           continue;
         }
-        if (!controlOk.get(family)) {
-          out.push({
-            ...base,
-            outcome: "error",
-            at: now(),
-            ms: 0,
-            detail:
-              `control target for ${check.id} was unreachable on ${family} from ${opts.observedFrom}` +
-              ` — this vantage point cannot measure port ${t.port}, nothing was measured`,
-          });
+        const noControl = controlWhy.get(family);
+        if (noControl) {
+          out.push({ ...base, outcome: "error", at: now(), ms: 0, detail: `${noControl}, nothing was measured` });
           continue;
         }
         if (t.proto !== "tcp") {
