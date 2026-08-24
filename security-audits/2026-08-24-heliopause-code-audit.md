@@ -208,13 +208,14 @@ const tls = process.env.HELIOPAUSE_CERT_FILE && process.env.HELIOPAUSE_KEY_FILE
 
 | 초판 제안 | 실제 |
 |---|---|
-| 개발용 스캐폴드와 운영용 실행 명령 분리 | `package.json` 에 `"private": true`. `packaging/` · `.github/` · `scripts/` 통틀어 `8445`·`manager-scaffold` 참조 **0건** — 배포되지도 패키징되지도 않는다 |
+| 개발용 스캐폴드와 운영용 실행 명령 분리 | `packages/manager/package.json` 에 `"private": true`. `packaging/` · `.github/` · `scripts/`에는 `8445`·`manager-scaffold` 참조가 없지만, 루트 `package.json`의 `start:manager-scaffold` 스크립트로 개발자가 명시적으로 도달할 수 있다 — 배포·패키징 경로는 아니다 |
 | 실행 시 개발용임을 명확히 표시 | 로그 접두사 `[manager-scaffold]`(`listen.ts:51-52`) · 포트 8445(운영 8444) · `package.json` description · 파일 헤더 주석 — 넷 다 있다 |
 | 패키지 경계 유지 | `app.ts` 는 `/healthz` 하나뿐. `console.ts` 는 `src/web-console.ts` 재수출 4줄 |
 | 부분 인증서 설정 시 종료 | **없다** → I-02 |
 
-이 경로에 도달하려면 소스 체크아웃에서 손으로 `npm start -w @heliopause/manager` 를 쳐야 한다.
-Low 도 후하다.
+이 경로에 도달하려면 소스 체크아웃에서 `npm start -w @heliopause/manager` 또는 루트의
+`npm run start:manager-scaffold`를 명시적으로 실행해야 한다. 배포 경로는 아니므로 Info 판정은
+유지한다.
 
 또한 초판이 언급하지 않은 사실: `listen.ts:50` 부근에서 인증 없이 프로세스를 죽일 수 있던
 `decodeURIComponent` 결함은 `95487ea`(2026-08-24)에서 근본 위치인 `src/web-console.ts` 를
