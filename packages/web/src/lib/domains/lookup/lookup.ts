@@ -32,6 +32,17 @@ export interface LookupHit {
 export interface LookupView {
   matches: LookupHit[];
   undecidable: LookupHit[];
+  /**
+   * Rules excluded only by the enforcement point they render on, not by this flow.
+   *
+   * A `fromCIDR` on the workload layer matches no pod at all — Cilium classifies in-cluster pods by
+   * identity — so it would not have matched whatever the addresses were. Shown because a reader who
+   * expected a rule to cover their flow and got silence cannot otherwise tell "your flow is outside
+   * it" from "that rule could never cover it", and only one of those means a policy has to change.
+   *
+   * Optional on the wire: a manager that predates this sends nothing and the section is absent.
+   */
+  ruledOutByLayer: LookupHit[];
   needsWorkload: number;
   considered: number;
   generation: string | null;
@@ -197,11 +208,25 @@ export function readLookupView(data: unknown): LookupRead {
     if (!hit) return { ok: false, reason: "an undecidable hit is malformed" };
     undecidable.push(hit);
   }
+  // Absent rather than required: an older manager sends no such array, and refusing the whole answer
+  // over a section that did not exist yet would take the screen away to add a paragraph to it.
+  const ruledOutByLayer: LookupHit[] = [];
+  if (data.ruledOutByLayer !== undefined) {
+    if (!Array.isArray(data.ruledOutByLayer)) {
+      return { ok: false, reason: "lookup view has a malformed ruledOutByLayer" };
+    }
+    for (const row of data.ruledOutByLayer) {
+      const hit = readHit(row);
+      if (!hit) return { ok: false, reason: "a layer-ruled-out hit is malformed" };
+      ruledOutByLayer.push(hit);
+    }
+  }
   return {
     ok: true,
     view: {
       matches,
       undecidable,
+      ruledOutByLayer,
       needsWorkload: data.needsWorkload,
       considered: data.considered,
       generation: typeof data.generation === "string" ? data.generation : null,

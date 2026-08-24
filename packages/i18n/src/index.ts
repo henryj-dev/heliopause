@@ -853,6 +853,8 @@ export const MESSAGES = {
   "m.generation": {"en":"generation","ko":"세대"},
   "m.lookup": {"en":"which rule decides this flow","ko":"이 흐름을 어느 규칙이 정하나"},
   "m.lookupGo": {"en":"look up","ko":"조회"},
+  "m.ruledOutByLayer": {"en":"could never have matched, whatever the addresses","ko":"주소가 무엇이든 애초에 맞을 수 없었다"},
+  "m.ruledOutByLayerHint": {"en":"These rules were excluded by where they render, not by this flow. A rule written against a CIDR renders on the workload layer as a selector Cilium resolves by identity, and matches no pod at all — so it would not have covered this flow with any address in it. Changing the addresses will not bring them back; changing what the rule selects will.","ko":"이 규칙들은 이 흐름 때문이 아니라 어디서 렌더되는가 때문에 빠졌다. CIDR 로 쓴 규칙이 워크로드 계층에서는 Cilium 이 신원으로 푸는 셀렉터가 되어 파드를 하나도 안 맞힌다 — 어떤 주소를 넣어도 이 흐름을 덮지 않았을 것이다. 주소를 바꿔서는 안 돌아오고, 규칙이 무엇을 고르는지를 바꿔야 한다."},
   "m.lookupUndecided": {"en":"an address cannot rule these in or out","ko":"주소로는 이 규칙들을 넣을 수도 뺄 수도 없다"},
   "m.lookupNeedsWorkload": {"en":"rule(s) name workloads and could not be decided — name a workload above (ns or ns/k=v) to include them","ko":"개 규칙이 워크로드를 가리켜 판정하지 못했다 — 위에 워크로드를 적으면(ns 또는 ns/k=v) 판정한다"},
   "lookup.notAnAddress": {"en":"{addr} is not an IP address","ko":"{addr} 는 IP 주소가 아니다"},

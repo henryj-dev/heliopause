@@ -191,6 +191,41 @@
         </tbody>
       </table>
     {/if}
+    <!-- ## Rules the layer excluded, not the flow
+         Every other rejection is what the reader asked about and is not shown: a list of rules that
+         do not match is every rule in the policy. This one is not about the flow at all — the rule
+         renders somewhere that cannot see this kind of endpoint, so no address would have brought
+         it back. Silence here sent two teams through two document round trips on 2026-08-16. -->
+    {#if view.ruledOutByLayer.length > 0}
+      <h3>{t(prefs.lang, "m.ruledOutByLayer")}</h3>
+      <p class="dim">{t(prefs.lang, "m.ruledOutByLayerHint")}</p>
+      <table>
+        <thead>
+          <tr>
+            <th>{t(prefs.lang, "c.id")}</th>
+            <th>{t(prefs.lang, "c.action")}</th>
+            <th>{t(prefs.lang, "c.layer")}</th>
+            <th>{t(prefs.lang, "c.proto")}</th>
+            <th>{t(prefs.lang, "c.ports")}</th>
+            <th>{t(prefs.lang, "c.pri")}</th>
+            <th>{t(prefs.lang, "c.why")}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {#each view.ruledOutByLayer as hit (hit.id)}
+            <tr>
+              <td>{hit.id}</td>
+              <td>{actionWord(prefs.lang, hit.action)}</td>
+              <td>{layerWord(prefs.lang, hit.layer)}</td>
+              <td>{hit.proto}</td>
+              <td>{hit.ports || t(prefs.lang, "v.any")}</td>
+              <td>{hit.priority}</td>
+              <td>{hitWhy(hit)}</td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+    {/if}
   {/if}
 </section>
 

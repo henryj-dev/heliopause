@@ -101,7 +101,15 @@ function selectorParts(value: string): { namespace: string | null; labels: Map<s
 
 export type Verdict =
   | { kind: "matches" }
-  | { kind: "no"; why: string }
+  /**
+   * `layerRuledOut` marks the one rejection a reader is surprised by.
+   *
+   * Every other `no` is what the reader asked for: a port outside the range, an address outside the
+   * CIDR. This one is not about the flow at all — it says the rule renders on an enforcement point
+   * that cannot see this kind of endpoint, so it would not match whatever the addresses were.
+   * See `LookupResult.ruledOutByLayer`.
+   */
+  | { kind: "no"; why: string; layerRuledOut?: boolean }
   /**
    * `needsWorkload` marks the one deferral a better question can fix.
    *
@@ -145,6 +153,27 @@ export interface LookupResult {
    * nobody reads to the end of.
    */
   needsWorkload: number;
+  /**
+   * Rules excluded **only** because of the layer they render on, not because of this flow.
+   *
+   * ## The one rejection worth showing
+   *
+   * `lookupPolicies` drops every `no` and the reason with it, and that is right for almost all of
+   * them: "port 443 is not in 5432" is what the reader asked, and a list of every rule that does not
+   * match is every rule in the policy. This one is different. It says a rule renders on an
+   * enforcement point that cannot see this kind of endpoint — a `fromCIDR` on the workload layer
+   * matches no pod at all, because Cilium classifies in-cluster pods by identity — so it would not
+   * have matched whatever the addresses were.
+   *
+   * That is the 2026-08-16 finding, and it cost two teams two document round trips. A reader who
+   * expected a rule to cover their flow and got silence has no way to tell "your flow is outside it"
+   * from "that rule could never cover it"; those send them to opposite places, and only one of them
+   * means a policy has to change.
+   *
+   * **Only when the layer is the sole reason.** A rule ruled out by the layer *and* by its ports is
+   * not a surprise worth a line — the reader's flow does not match it on any reading.
+   */
+  ruledOutByLayer: LookupHit[];
   /** How many enabled policies were considered, so an empty answer is not confused with an empty input. */
   considered: number;
 }
@@ -154,9 +183,13 @@ export interface LookupResult {
 // `lookupPolicies` does `if (parts.some((v) => v.kind === "no")) continue;`, so the sentence a
 // `Verdict` carries for a rejection never reaches a reader. That is deliberate as *display* policy —
 // the "no" list is every rule in the policy minus a handful, which is not a list anyone reads — but
-// it means `lookup.outside`, `lookup.requires`, `lookup.cidrNoPod`, `lookup.notInMembers`,
-// `lookup.insideInternet`, `lookup.ruleIs` and `lookup.portNotIn` are written, translated into two
-// languages, and rendered nowhere.
+// it means `lookup.outside`, `lookup.requires`, `lookup.notInMembers`, `lookup.insideInternet`,
+// `lookup.ruleIs` and `lookup.portNotIn` are written, translated into two languages, and rendered
+// nowhere.
+//
+// `lookup.cidrNoPod` used to be in that list and is the one that came out of it: `ruledOutByLayer`
+// carries those hits, reason and all. It was singled out because it is the only `no` whose reason is
+// not about the flow the reader asked about.
 //
 // Recorded here rather than quietly: the deferral reasons *are* shown, and this module's own
 // documentation calls that sentence its most useful output, so the natural assumption on reading
@@ -231,6 +264,9 @@ function endpointMatches(
       ? {
           kind: "no",
           why: t(lang, "lookup.cidrNoPod", { named: e.kind === "cidr" ? e.value : e.kind }),
+          // Not a fact about this flow — a fact about where the rule renders. Marked so the caller
+          // can say it out loud; see `LookupResult.ruledOutByLayer`.
+          layerRuledOut: true,
         }
       : {
           kind: "undecidable",
@@ -358,6 +394,7 @@ export function lookupPolicies(
   const dstWorkload = parseWorkloadRef(query.dstWorkload ?? "");
   const matches: LookupHit[] = [];
   const undecidable: LookupHit[] = [];
+  const ruledOutByLayer: LookupHit[] = [];
   let considered = 0;
 
   for (const p of policies) {
@@ -371,7 +408,7 @@ export function lookupPolicies(
     const port = portMatches(p.ports, query.port, lang);
     const proto_ = protoMatches(p.proto, query.proto, lang);
     const parts = [src, dst, port, proto_];
-    if (parts.some((v) => v.kind === "no")) continue;
+    const noes = parts.filter((v) => v.kind === "no");
 
     const hit: LookupHit = {
       id: p.id, name: p.name, action: p.action, denyMode: p.denyMode,
@@ -380,6 +417,13 @@ export function lookupPolicies(
       src, dst, port, proto_,
       outcome: parts.some((v) => v.kind === "undecidable") ? "undecidable" : "matches",
     };
+
+    if (noes.length > 0) {
+      // The sole-reason rule. Ruled out by the layer *and* by something about the flow is not a
+      // surprise; the reader's flow does not match it on any reading.
+      if (noes.length === 1 && noes[0]!.kind === "no" && noes[0]!.layerRuledOut) ruledOutByLayer.push(hit);
+      continue;
+    }
     (hit.outcome === "matches" ? matches : undecidable).push(hit);
   }
 
@@ -390,8 +434,9 @@ export function lookupPolicies(
     (a.action === b.action ? 0 : a.action === "deny" ? -1 : 1) || a.priority - b.priority;
   matches.sort(order);
   undecidable.sort(order);
+  ruledOutByLayer.sort(order);
   const needsWorkload = undecidable.filter((h) =>
     [h.src, h.dst].some((v) => v.kind === "undecidable" && v.needsWorkload)
   ).length;
-  return { matches, undecidable, needsWorkload, considered };
+  return { matches, undecidable, ruledOutByLayer, needsWorkload, considered };
 }

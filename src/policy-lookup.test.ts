@@ -77,6 +77,70 @@ describe("what an address can decide", () => {
   });
 });
 
+// ## The one rejection a reader is surprised by
+//
+// `lookupPolicies` drops every `no` and the reason with it, which is right for almost all of them: a
+// list of rules that do not match is every rule in the policy. This one is not about the flow at
+// all. A `fromCIDR` on the workload layer matches **no pod** — Cilium classifies in-cluster pods by
+// identity — so it would not have covered the flow with any address in it.
+//
+// That is the 2026-08-16 finding, and it cost two teams two document round trips. A reader who
+// expected a rule to cover their flow and got silence cannot tell "your flow is outside it" from
+// "that rule could never cover it", and only one of those means a policy has to change.
+describe("rules the layer ruled out, not the flow", () => {
+  const podQuery = {
+    ...ask(),
+    src: "",
+    dst: "",
+    srcWorkload: "dispatcher/app=vultr-broker",
+    dstWorkload: "goatcounter/app=goatcounter",
+  };
+  const cidrRule = policy({
+    id: "MESH",
+    ports: "5432",
+    src: { kind: "cidr", value: "10.17.0.0/17" },
+    dst: { kind: "k8s-namespace", value: "goatcounter" },
+  });
+
+  it("names the rule instead of saying nothing", () => {
+    const r = lookupPolicies([cidrRule], podQuery, site);
+    assert.deepEqual([r.matches.length, r.undecidable.length], [0, 0], "it is not a match and not a deferral");
+    assert.deepEqual(r.ruledOutByLayer.map((h) => h.id), ["MESH"]);
+  });
+
+  it("says why, in the words that make it actionable", () => {
+    // The sentence is the product. "outside 10.17.0.0/17" would send the reader to widen the CIDR,
+    // which is exactly the move that does not work.
+    const hit = lookupPolicies([cidrRule], podQuery, site).ruledOutByLayer[0]!;
+    const why = hit.src.kind === "no" ? hit.src.why : "";
+    assert.match(why, /no pod/);
+  });
+
+  it("stays quiet when the layer is not the only reason", () => {
+    // Ruled out by the layer **and** by its ports is not a surprise — the reader's flow does not
+    // match it on any reading, and listing it would put the noise back that dropping `no` avoids.
+    const r = lookupPolicies([policy({ ...cidrRule, id: "PORTS", ports: "9999" })], podQuery, site);
+    assert.deepEqual(r.ruledOutByLayer, []);
+  });
+
+  it("stays quiet on the host layer, where the same rule can match", () => {
+    // nftables sees packets and a pod's packet has an address, so there the honest answer is that it
+    // cannot be decided — not that the rule could never match. A check that could not tell the two
+    // layers apart would put every host-layer CIDR rule in this list.
+    const hostRule = policy({ id: "HOST", ports: "5432", src: { kind: "cidr", value: "10.17.0.0/17" } });
+    const r = lookupPolicies([hostRule], { ...podQuery, dstWorkload: "" }, site);
+    assert.deepEqual(r.ruledOutByLayer, []);
+    assert.equal(r.undecidable.length, 1, "the host layer defers rather than ruling out");
+  });
+
+  it("is empty on an ordinary address query", () => {
+    // The known negative. Without it a version that collected every `no` would pass the tests above
+    // and turn this section into the list of every rule in the policy.
+    const r = lookupPolicies([policy({ ports: "443" })], ask(), site);
+    assert.deepEqual(r.ruledOutByLayer, []);
+  });
+});
+
 describe("what an address cannot decide, and must say so", () => {
   it("defers a rule that names a workload, and explains why", () => {
     // The 2026-08-16 case exactly: an address inside the pod range, a rule selecting pods by label.

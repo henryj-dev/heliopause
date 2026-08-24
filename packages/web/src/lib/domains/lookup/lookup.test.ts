@@ -39,6 +39,37 @@ const usage = (over: Partial<Usage> = {}): Usage => ({
   ...over,
 });
 
+describe("the rules the layer ruled out", () => {
+  const hit = {
+    id: "MESH", name: "mesh", action: "allow", denyMode: "drop", proto: "tcp", ports: "5432",
+    priority: 100, enabled: true, layer: "workload",
+    src: { kind: "no", why: "on the workload layer a CIDR names no pod" },
+    dst: { kind: "matches" }, port: { kind: "matches" }, proto_: { kind: "matches" },
+  };
+  const base = { matches: [], undecidable: [], needsWorkload: 0, considered: 1 };
+
+  it("carries the section through", () => {
+    const read = readLookupView({ ...base, ruledOutByLayer: [hit] });
+    assert.equal(read.ok, true);
+    if (read.ok) assert.deepEqual(read.view.ruledOutByLayer.map((h) => h.id), ["MESH"]);
+  });
+
+  it("accepts an answer from a manager that predates the section", () => {
+    // Absent, not empty. Refusing the whole answer over a section that did not exist yet would take
+    // the screen away in order to add a paragraph to it.
+    const read = readLookupView(base);
+    assert.equal(read.ok, true);
+    if (read.ok) assert.deepEqual(read.view.ruledOutByLayer, []);
+  });
+
+  it("refuses a section that is there and malformed", () => {
+    // Present and wrong is not the same as absent — that is a manager sending something this cannot
+    // read, and rendering half of it would be worse than saying so.
+    assert.equal(readLookupView({ ...base, ruledOutByLayer: "nope" }).ok, false);
+    assert.equal(readLookupView({ ...base, ruledOutByLayer: [{ id: "X" }] }).ok, false);
+  });
+});
+
 describe("readLookupView", () => {
   it("accepts the two lists the manager would send", () => {
     const read = readLookupView({
