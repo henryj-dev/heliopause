@@ -91,9 +91,31 @@ export function serveConsole(
     const path = new URL(req.url ?? "/", "https://manager.invalid").pathname;
     if (path !== CONSOLE_PREFIX && !path.startsWith(`${CONSOLE_PREFIX}/`)) return false;
 
-    const rel = path === CONSOLE_PREFIX || path === `${CONSOLE_PREFIX}/`
-      ? "index.html"
-      : decodeURIComponent(path.slice(CONSOLE_PREFIX.length + 1));
+    // ## The decode can throw, and one caller could not survive it
+    //
+    // `decodeURIComponent("%")` raises `URIError: URI malformed`. `new URL()` above does not
+    // normalise a stray `%` away, so `GET /app/%` reached this line and threw — while the very
+    // next check answered 400 for the null byte, which is the same class of input.
+    //
+    // Where it went depended on the caller, and that is the part worth naming:
+    //
+    //   `manager-server.ts` · `heliopause-ui.ts`   an async wrapper caught it → **500**
+    //   `packages/manager/src/listen.ts`           a plain synchronous call → **the process exits**
+    //
+    // The scaffold binds `127.0.0.1:8445` with `requestCert: false`, so that last one is an
+    // unauthenticated way to stop the listener. Fixing it here rather than at the three call sites
+    // is the point: the throw is this function's, and a caller should not have to know it exists.
+    let rel: string;
+    if (path === CONSOLE_PREFIX || path === `${CONSOLE_PREFIX}/`) {
+      rel = "index.html";
+    } else {
+      try {
+        rel = decodeURIComponent(path.slice(CONSOLE_PREFIX.length + 1));
+      } catch {
+        // Same answer as the null byte below. A malformed escape is a bad path, not a server fault.
+        rel = "";
+      }
+    }
     if (!rel || rel.includes("\0")) {
       res.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
       res.end("bad path");

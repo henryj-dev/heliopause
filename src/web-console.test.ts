@@ -70,6 +70,33 @@ describe("serveConsole", () => {
       await close();
     }
   });
+
+  // ## A malformed escape must answer, not throw
+  //
+  // `decodeURIComponent("%")` raises `URIError`. Where that landed depended entirely on the caller:
+  // the manager and the workstation wrap their handler in an async `.catch` and turned it into a
+  // 500, while `packages/manager/src/listen.ts` calls this synchronously — so the exception
+  // escaped the request handler and **ended the process**. That listener binds 127.0.0.1:8445 with
+  // `requestCert: false`, which makes `GET /app/%` an unauthenticated way to stop it.
+  //
+  // Driven through a real server rather than a stub response, because the property is "the caller
+  // never sees the throw" and a stub cannot tell a 400 from a crash the harness swallowed.
+  it("answers 400 for a malformed percent escape instead of throwing at its caller", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hp-web-"));
+    writeFileSync(join(dir, "index.html"), "shell");
+    const { url, close } = await listen(dir);
+    try {
+      for (const bad of ["/app/%", "/app/%zz", "/app/a%2", "/app/%e0%a4%a"]) {
+        const res = await fetch(`${url}${bad}`);
+        assert.equal(res.status, 400, `${bad} answered ${res.status}`);
+        assert.equal(await res.text(), "bad path");
+      }
+      // Still serving afterwards — the point is that nothing died on the way.
+      assert.equal((await fetch(`${url}${CONSOLE_PREFIX}`)).status, 200);
+    } finally {
+      await close();
+    }
+  });
 });
 
 // ── The headers that constrain the page ──────────────────────────────────────
