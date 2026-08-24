@@ -805,6 +805,37 @@ export function planCiliumPolicies(input: CiliumRenderInput, items: CiliumItem[]
         }
         // Built from the resolved Service, not from splitting `p.dst.value` — see `resolveServiceRef`.
         rule.toServices = [{ k8sService: { serviceName: svc.name, namespace: svc.namespace } }];
+        // ## This branch renders the sender's half only, and the `k8s-label` branch below does not
+        //
+        // `peerIngress` — the receiver's `ingress` object — is built in the `else if (dstWorkload)`
+        // branch. `k8s-service` is a workload kind, so it would reach that branch; it is caught here
+        // first, and this path never builds one.
+        //
+        // The measurement that produced `peerIngress` applies here unchanged: on 2026-08-10 the
+        // dashboard could not reach dispatcher, the egress object rendered and applied cleanly, and
+        // the packets were dropped at the receiving endpoint. Cilium enforces egress at the sender
+        // and ingress at the receiver, independently, and neither knows about the other.
+        //
+        // So the same policy written two ways behaves differently — and `toServices` is the form
+        // this file recommends, because Cilium re-resolves the name and the rule survives a Service
+        // selector change.
+        //
+        // **Not fixed here.** The ingress half is renderable (`svc.selector` is in hand), but
+        // whether it should be rendered is a question about a live cluster: it depends on whether
+        // anything else selects those backend pods for ingress, and getting it wrong in the other
+        // direction closes a Service to every caller this policy set does not name. Verify against
+        // the cluster, then decide. Until then the gap is stated rather than silent, which is the
+        // one thing it was not.
+        warnings.push({
+          policyId: p.id,
+          name: p.name,
+          warning:
+            `this renders the sender's egress half only. Cilium enforces ingress at the receiver ` +
+            `independently, so if anything else puts the pods behind Service ` +
+            `${JSON.stringify(p.dst.value)} into ingress default-deny, this flow is dropped there ` +
+            `with the egress rule applying cleanly. Naming the destination pods with k8s-label ` +
+            `instead renders both halves.`,
+        });
       } else if (dstWorkload) {
         const to = endpointSelectorFor(p.dst, "destination", input, `${at} destination`);
         // A *peer* selector needs the namespace label as much as the selected side does, for a
@@ -845,6 +876,31 @@ export function planCiliumPolicies(input: CiliumRenderInput, items: CiliumItem[]
             from: { matchLabels: to.labels },
             allow: { fromEndpoints: [{ matchLabels: target.labels }], ...(toPorts.length ? { toPorts } : {}) },
           };
+          // ## The half this renderer adds also **closes** the pods it was added for
+          //
+          // The object below carries `enableDefaultDeny: { ingress: true }`, which is right for an
+          // ingress allow the author wrote about that destination — it admits the named caller and
+          // refuses the rest. Here the author named those pods as a *peer* of a rule about somebody
+          // else, and the closing arrives as a side effect.
+          //
+          // That is the same argument this file already accepted in the other direction: an egress
+          // allow renders `{ egress: false }` precisely because "these pods may also reach that" is
+          // not "these pods may reach nothing else". The asymmetry is deliberate — an ingress allow
+          // that did not close its destination would admit everyone — but it is not obvious from the
+          // policy text, and Cilium's aggregation rule makes it irreversible from any other policy.
+          //
+          // Said rather than changed. Flipping it to `false` would make every ingress allow on this
+          // layer non-enforcing, which is a larger decision than this warning; and the deny path
+          // already warns about the same aggregation rule from the other side.
+          warnings.push({
+            policyId: p.id,
+            name: p.name,
+            warning:
+              `this allow also renders the receiver's half, which puts ${p.dst.value} into ingress ` +
+              `default-deny — Cilium enforces the two directions independently, so the sender's ` +
+              `egress rule alone leaves the flow dropped at the destination. Anything else that ` +
+              `reaches those pods and is not named by a heliopause policy stops working.`,
+          });
         }
       } else {
         // Destination is an address. The host layer sees this traffic too — pod source addresses are

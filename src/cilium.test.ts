@@ -460,6 +460,21 @@ describe("renderer — direction decides which side becomes the selector", () =>
       { k8sService: { serviceName: "zot", namespace: "util" } },
     ]);
     assert.equal(cnp.spec.ingress, undefined);
+
+    // ## And the receiver's half is **not** rendered — which is worth a sentence, not silence
+    //
+    // The `k8s-label` form of the same policy renders both halves, because Cilium enforces egress at
+    // the sender and ingress at the receiver independently and the sender's half alone leaves the
+    // flow dropped at the destination (measured 2026-08-10, `endpoint 1586`). This branch is caught
+    // before that one, so the same intent written the recommended way gets one object instead of two.
+    //
+    // Whether it *should* render the second half depends on a live cluster — see the comment at the
+    // `toServices` branch. Until that is answered the renderer says so, and this pins that it does.
+    assert.equal(out.policies.length, 1, "no ingress half is rendered for a Service destination");
+    contains(
+      out.warnings.map((w) => w.warning).join("\n"),
+      "renders the sender's egress half only",
+    );
   });
 
   it("renders a workload source to an address destination as egress", () => {
@@ -1283,6 +1298,28 @@ describe("an egress allow must not close the sender", () => {
     // directions together would turn the pair into decoration.
     const receiver = egressAllow().find((o) => o.metadata.namespace === "dispatcher")!;
     assert.equal(receiver.spec.enableDefaultDeny?.ingress, true);
+  });
+
+  it("says out loud that closing the destination is a side effect the author did not write", () => {
+    // The behaviour above is kept; what was missing is that it is *visible*. The author wrote "these
+    // pods may reach those pods" and got, as a consequence, "and nothing else may reach those pods"
+    // — the exact shape of claim this file refused to make silently in the egress direction, where
+    // an allow renders `{ egress: false }` for the same reason.
+    //
+    // Cilium's aggregation rule makes it unfixable from any other policy: default-deny is enabled
+    // for an endpoint if *any* policy asks for it, so a second policy cannot reopen those pods.
+    const warned = plan([
+      {
+        policy: policy({
+          id: "APP-TO-API",
+          src: { kind: "k8s-namespace", value: "stardust" },
+          dst: { kind: "k8s-label", value: `${NS}=dispatcher,app=dispatcher` },
+          ports: "8080",
+        }),
+      },
+    ]).warnings.map((w) => w.warning).join("\n");
+    contains(warned, "ingress default-deny");
+    contains(warned, "stops working");
   });
 
   it("keeps a deny subtractive rather than closing the pods it names", () => {
