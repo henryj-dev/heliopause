@@ -6,7 +6,7 @@
 // second failure look like user error for as long as nobody checks.
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { statusFor, verifyOtp, type OtpResult } from "./otp.ts";
+import { MAX_OTP_RESPONSE_BYTES, statusFor, verifyOtp, type OtpResult } from "./otp.ts";
 
 const OPTS = {
   baseUrl: "https://idp.example.invalid",
@@ -30,6 +30,48 @@ function idp(status: number, body: unknown) {
 }
 
 const fail = (r: OtpResult) => (r.ok ? assert.fail("expected a refusal") : r);
+
+// ## The verdict is bounded, like every other read from this IdP
+//
+// The verdict is `{"ok":true}` and this read it with a bare `res.text()`. `AbortSignal.timeout`
+// bounds the *duration* of the call, not the size of what comes back — eight seconds of a fast link
+// is gigabytes — and the manager holds the artifact signing key in a single pod, so a body it
+// buffers without a limit is an outage of the control plane. `oidc.ts` bounds every document it
+// reads from this same IdP; this call did not.
+describe("the size of the IdP's answer", () => {
+  it("refuses a verdict larger than the bound instead of buffering it", async () => {
+    // A 200 that *would* have been accepted, padded past the ceiling. So this is about the size and
+    // not about the verdict: the same body under the ceiling is the known positive above.
+    const huge = JSON.stringify({ ok: true, pad: "x".repeat(MAX_OTP_RESPONSE_BYTES) });
+    const r = fail(await verifyOtp(OPTS, idp(200, huge).impl));
+    assert.equal(r.reason, "unavailable");
+    // `unavailable`, not `wrong-code`. `statusFor` turns it into a 503 — this is the deployment's
+    // problem, and a 401 would have an operator retyping six digits that were never the issue.
+    assert.equal(statusFor(r.reason), 503);
+  });
+
+  it("keeps the bound small enough to be one", () => {
+    // The tests around this one are written *relative* to the constant, so they follow it wherever
+    // it goes — raising it a thousandfold leaves them all green while the manager buffers a thousand
+    // times more. Measured by defect injection, which is how this assertion came to exist.
+    //
+    // The value is the whole protection, so the value is what this pins. A megabyte is already
+    // absurd for `{"ok":true}`; the ceiling is here to be argued with in review, not moved quietly.
+    assert.ok(
+      MAX_OTP_RESPONSE_BYTES <= 1024 * 1024,
+      `the IdP's verdict is {"ok":true}; ${MAX_OTP_RESPONSE_BYTES} bytes is not a bound on it`,
+    );
+  });
+
+  it("still accepts a verdict just under the bound", async () => {
+    // The known positive for the bound. Without it, a reader that refused every body would pass the
+    // test above and turn every approval into a 503.
+    const pad = MAX_OTP_RESPONSE_BYTES - JSON.stringify({ ok: true, pad: "" }).length;
+    const body = JSON.stringify({ ok: true, pad: "x".repeat(pad) });
+    assert.ok(Buffer.byteLength(body, "utf8") <= MAX_OTP_RESPONSE_BYTES, "fixture must be under the bound");
+    assert.equal((await verifyOtp(OPTS, idp(200, body).impl)).ok, true);
+  });
+});
 
 describe("verifying a one-time code", () => {
   it("accepts a code the IdP confirms — the known positive", async () => {

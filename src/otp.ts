@@ -25,6 +25,8 @@
 // own doing and needs no diagnosis; the fourth is a deployment fault that no amount of retyping will
 // fix. Collapsing them into one exception loses exactly the distinction the person needs.
 
+import { BodyTooLargeError, readBoundedText } from "./bounded-body.ts";
+
 export type OtpFailure =
   /** The six digits were wrong, or already used. The only failure the caller can retry. */
   | "wrong-code"
@@ -50,6 +52,16 @@ export interface OtpOptions {
   code: string;
   timeoutMs?: number;
 }
+
+/**
+ * The most this will read of the IdP's verdict.
+ *
+ * The verdict is `{"ok":true}`. This is four orders of magnitude of headroom, and it exists for the
+ * same reason `MAX_OIDC_DOCUMENT_BYTES` does one file over: the manager holds the artifact signing
+ * key and runs as a single pod, so a body it buffers without a limit is an outage of the control
+ * plane. `oidc.ts` bounds every document it reads from this same IdP; this call did not.
+ */
+export const MAX_OTP_RESPONSE_BYTES = 64 * 1024;
 
 /**
  * Ask the IdP whether these digits are this user's current TOTP.
@@ -81,7 +93,27 @@ export async function verifyOtp(o: OtpOptions, fetchImpl: typeof fetch = fetch):
     return { ok: false, reason: "unavailable", detail: (e as Error).message };
   }
 
-  const text = await res.text().catch(() => "");
+  // ## Bounded, like every other read from this IdP
+  //
+  // This was `await res.text()`, which buffers whatever arrives. `AbortSignal.timeout` above bounds
+  // the *duration*, not the size — eight seconds of a fast link is still gigabytes — and a
+  // `Content-Length` is a claim, which is why `readBoundedText` counts while it reads.
+  //
+  // Failing to read is `unavailable` rather than a thrown error, because the contract above is that
+  // only a programming error escapes: a caller forced to try/catch to learn whether a code was wrong
+  // will eventually read a network failure as a wrong code, which fails open on the one path this
+  // function exists to close. A body too large is the deployment's problem, not the operator's
+  // credential, and `statusFor` turns it into a 503 rather than a 401 they would retype a code for.
+  let text: string;
+  try {
+    text = await readBoundedText(res, MAX_OTP_RESPONSE_BYTES, "the IdP's one-time-code verdict");
+  } catch (e) {
+    return {
+      ok: false,
+      reason: "unavailable",
+      detail: e instanceof BodyTooLargeError ? e.message : `could not read the IdP's answer: ${(e as Error).message}`,
+    };
+  }
   if (res.status === 200) {
     // The IdP answers 200 only on success, but read the body anyway: a proxy that returns 200 with
     // an error page would otherwise be a way to approve a firewall change with no code at all.
