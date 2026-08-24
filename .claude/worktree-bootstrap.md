@@ -48,3 +48,35 @@ openssl x509 -in <손에 든 ca.pem> -noout -fingerprint -sha256
 
 같은 이유로 `pki/` · `pki-prod/` · `pki-util/` · `pki-signing/` 의 키와 발행물도 워크트리
 사이에 공유된다. 두 워크트리에서 동시에 발행·승인 흐름을 돌리지 말 것.
+
+### ⚠️ `node_modules` 심링크는 `check:web` 이 **메인 트리의 소스**를 읽게 만든다
+
+`node_modules/@heliopause/i18n` 는 워크스페이스 링크라 `../../packages/i18n` 를 가리킨다. 그
+상대 경로의 기준은 **링크가 놓인 `node_modules` 의 실제 위치** — 즉 메인 트리다. 그래서
+`node_modules` 를 심링크로 걸어 둔 워크트리에서 `npm run check:web` 을 돌리면 svelte-check 은
+`packages/i18n` 를 **메인 트리에서** 읽는다. `packages/core` · `packages/manager` 등 워크스페이스
+패키지 전부가 같다.
+
+실측 2026-08-24: 워크트리에서 `packages/i18n` 에 메시지 키를 하나 추가하고 그것을 Svelte 에서
+쓰자, 그 파일이 워크트리에 실재하는데도 `check:web` 이 `is not assignable to parameter of type
+MessageKey` 로 떨어졌다. **CI 는 통과한다** — 깨끗한 체크아웃에서 `npm ci` 를 돌리므로 링크가
+자기 `packages/` 를 가리킨다. 즉 이 방향의 거짓 실패는 시끄럽고 안전하다.
+
+**반대 방향이 위험하다.** 같은 날 같은 방법으로 확인했다 — 워크트리의 `packages/i18n` 에서
+Svelte 가 실제로 쓰는 키(`m.withTraffic`)를 **지웠는데 그 삭제에 대한 오류가 한 줄도 안 나왔다.**
+그 실행이 실패한 것은 위의 추가 때문이고, 추가가 없었다면 그냥 통과했을 것이다. 지역 링크를 걸고
+같은 상태로 다시 돌리면 삭제가 즉시 잡힌다. 워크스페이스 패키지의 export 를 지우거나 이름을
+바꿀 때, 링크 없는 초록불은 **워크트리의 코드에 대한 것이 아니다.**
+
+워크트리 안에서 실제로 검사하려면 그 패키지만 지역 링크로 가려라(`node_modules` 는 어디서나
+gitignore 되어 있어 커밋에 안 들어간다):
+
+```bash
+mkdir -p packages/web/node_modules/@heliopause
+ln -sfn ../../../i18n packages/web/node_modules/@heliopause/i18n
+npm run check:web
+```
+
+Node 와 TS 는 import 하는 파일에서 위로 올라가며 찾으므로 `packages/web/node_modules` 가 루트
+것을 가린다. 워크스페이스 패키지를 건드렸다면 이걸 걸고 한 번 돌릴 것 — 안 걸었을 때의 초록은
+**메인 트리의 초록**이다.

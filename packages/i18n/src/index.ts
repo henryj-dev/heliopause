@@ -575,6 +575,7 @@ export const MESSAGES = {
   "m.policyRows": { en: "policy-produced rows · catch-all excluded", ko: "정책이 만든 행 · 포괄 규칙 제외" },
   "m.deadSample": { en: "dead sample", ko: "죽은 허용 표본" },
   "m.truncated": { en: "{shown} of {total} — the server truncated", ko: "{total} 중 {shown} — 서버가 잘랐다" },
+  "m.unreadableCounters": { en: "{n} row(s) had counters that could not be read and are in neither list", ko: "{n} 개 행은 카운터를 읽을 수 없어 어느 목록에도 없다" },
   "m.whatPassed": { en: "what passed · top 20", ko: "지나간 것 · 상위 20" },
   "m.trafficBelow": {
     en: "Reference only. This screen's question is what carried nothing, so this sits below.",

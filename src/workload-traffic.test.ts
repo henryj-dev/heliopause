@@ -67,6 +67,50 @@ Allow    Ingress     k8s:app=busy      80/TCP     NONE     disabled    9000   90
     assert.equal(parseTrafficDump("Endpoint ID: 7\nnonsense\n").entries, 0);
   });
 
+  // ## The three numbers on the screen used to stop adding up
+  //
+  // `Number("1.2k")` is `NaN`. `NaN > 0` is false and `NaN === 0` is false, so a row with a counter
+  // this could not read fell out of **both** `live` and `dead` while still being counted in
+  // `entries`. It appeared in no list, and the headline `dead / entries` percentage was quietly
+  // about a larger dump than the rows it could see.
+  //
+  // Zero and "never" are the same thing here and both are the finding. "Unreadable" is a third
+  // thing, and it is now counted as one.
+  it("counts a row whose counters it cannot read, instead of losing it between two filters", () => {
+    const s = parseTrafficDump(`Endpoint ID: 1
+
+Allow    Ingress     k8s:app=live      80/TCP     NONE     disabled    9000   1200   24
+Allow    Ingress     k8s:app=weird     80/TCP     NONE     disabled    1.2k   340k   24
+Allow    Ingress     k8s:app=dead      80/TCP     NONE     disabled    -      -      24
+`);
+    assert.equal(s.unreadable, 1);
+    assert.equal(s.entries, s.withTraffic + s.dead, "entries must be the two lists and nothing else");
+    assert.deepEqual([s.withTraffic, s.dead], [1, 1]);
+    // …and it is in neither sample, so nobody reads it as either.
+    const named = [...s.top, ...s.deadSample].map((r) => r.peer);
+    assert.deepEqual(named.includes("k8s:app=weird"), false);
+  });
+
+  it("still reads a dash as zero, which is the finding", () => {
+    // The known positive for the check above. Without it, a `counter` that refused everything would
+    // pass the test above by reporting every row unreadable and none dead.
+    const s = parseTrafficDump(`Endpoint ID: 1
+
+Allow    Ingress     k8s:app=dead      80/TCP     NONE     disabled    -      -      24
+`);
+    assert.deepEqual([s.unreadable, s.dead, s.deadSample[0]?.packets], [0, 1, 0]);
+  });
+
+  it("refuses a counter above the safe integer range rather than rounding it", () => {
+    // Past 2^53 a decimal string does not survive `Number()`, and a packet count that came back
+    // slightly wrong is worse than one that came back missing — it would be believed.
+    const s = parseTrafficDump(`Endpoint ID: 1
+
+Allow    Ingress     k8s:app=huge      80/TCP     NONE     disabled    1      99999999999999999999   24
+`);
+    assert.deepEqual([s.unreadable, s.entries], [1, 0]);
+  });
+
   it("reads an entry with no endpoint header as belonging to nothing, rather than guessing", () => {
     // Rows before the first `Endpoint ID:` line cannot be attributed. Attaching them to whatever came
     // next would put one endpoint's traffic under another's name.

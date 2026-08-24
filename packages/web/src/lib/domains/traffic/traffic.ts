@@ -19,6 +19,8 @@ export type TrafficView =
     kind: "summary";
     entries: number;
     withTraffic: number;
+    /** Rows whose counters the server could not read — in neither `top` nor `deadSample`. */
+    unreadable: number;
     dead: number;
     top: TrafficRow[];
     deadSample: TrafficRow[];
@@ -85,6 +87,10 @@ export function readTrafficView(data: unknown): TrafficRead {
       kind: "summary",
       entries: data.entries,
       withTraffic: data.withTraffic,
+      // Optional so an older manager still parses. Absent is not the same as zero, but it is the
+      // only reading available from a server that does not send it, and zero is what that server's
+      // own arithmetic assumed.
+      unreadable: typeof data.unreadable === "number" ? data.unreadable : 0,
       dead: data.dead,
       top,
       deadSample,

@@ -36,13 +36,40 @@ export interface TrafficEntry {
 }
 
 export interface TrafficSummary {
-  /** Every entry a policy produced, catch-alls excluded. */
+  /** Every entry a policy produced, catch-alls excluded. Always `withTraffic + dead`. */
   entries: number;
   withTraffic: number;
   /** How many have carried nothing — the finding no other instrument reports. */
   dead: number;
+  /**
+   * Rows whose counters this could not read, and which are therefore in neither list above.
+   *
+   * Zero and "never" are the same thing here and both are the finding — but "unreadable" is a third
+   * thing, and it used to be folded in by accident. `Number("1.2k")` is `NaN`, `NaN > 0` is false and
+   * `NaN === 0` is false, so such a row fell out of both `live` and `dead` while still being counted
+   * in `entries`. The three numbers on the screen stopped adding up, the row appeared in no list, and
+   * the headline `dead / entries` percentage was understated by exactly the rows nobody could see.
+   *
+   * Reported rather than dropped, for the same reason `top` and `deadSample` carry their totals: a
+   * count that has quietly stopped covering everything is worse than no count.
+   */
+  unreadable: number;
   top: TrafficEntry[];
   deadSample: TrafficEntry[];
+}
+
+/**
+ * A counter column, or `null` if it is not one.
+ *
+ * `-` means the counter was never touched, which is zero. Anything else that is not a plain
+ * non-negative integer is not evidence about traffic in either direction, and `Number()` turning it
+ * into `NaN` must not be mistaken for one.
+ */
+function counter(raw: string): number | null {
+  if (raw === "-") return 0;
+  if (!/^\d+$/.test(raw)) return null;
+  const n = Number(raw);
+  return Number.isSafeInteger(n) ? n : null;
 }
 
 const ROW = /^(Allow|Deny)\s+(Ingress|Egress)\s+(\S+)\s+(\S+)\s+\S+\s+\S+\s+(\S+)\s+(\S+)\s+\d+\s*$/;
@@ -53,6 +80,7 @@ export const DEAD_N = 40;
 
 export function parseTrafficDump(text: string): TrafficSummary {
   const rows: TrafficEntry[] = [];
+  let unreadable = 0;
   let endpoint: string | null = null;
   for (const line of text.split("\n")) {
     if (line.startsWith("Endpoint ID:")) {
@@ -66,16 +94,23 @@ export function parseTrafficDump(text: string): TrafficSummary {
     // are hundreds and none is one of ours. What survives is every entry naming a peer or a port,
     // which is exactly the set a policy produced.
     if (peer === "ANY" && port === "ANY") continue;
+    // A dash means the counter was never touched. Zero and "never" are the same thing here, and both
+    // are the finding — but a column this cannot read is a third thing, and it is counted as such
+    // rather than sorted into one of the two. See `TrafficSummary.unreadable`.
+    const b = counter(bytes!);
+    const pk = counter(packets!);
+    if (b === null || pk === null) {
+      unreadable += 1;
+      continue;
+    }
     rows.push({
       endpoint,
       policy: policy!.toLowerCase() as "allow" | "deny",
       direction: direction!.toLowerCase() as "ingress" | "egress",
       peer: peer!,
       port: port!,
-      // A dash means the counter was never touched. Zero and "never" are the same thing here, and
-      // both are the finding.
-      bytes: bytes === "-" ? 0 : Number(bytes),
-      packets: packets === "-" ? 0 : Number(packets),
+      bytes: b,
+      packets: pk,
     });
   }
   rows.sort((a, b) => b.packets - a.packets || a.endpoint.localeCompare(b.endpoint) || a.peer.localeCompare(b.peer));
@@ -88,6 +123,7 @@ export function parseTrafficDump(text: string): TrafficSummary {
     entries: rows.length,
     withTraffic: live.length,
     dead: dead.length,
+    unreadable,
     top: live.slice(0, TOP_N),
     deadSample: dead.slice(0, DEAD_N),
   };

@@ -30,6 +30,25 @@ describe("readTrafficView", () => {
     }
   });
 
+  it("carries the unreadable count through, and reads its absence as zero", () => {
+    // A row whose counters the manager could not read is in neither `top` nor `deadSample`, so the
+    // screen has to be told the number or it shows three totals that do not account for it.
+    const withCount = readTrafficView({
+      entries: 2, withTraffic: 1, dead: 1, unreadable: 3,
+      top: [row], deadSample: [{ ...row, packets: 0, bytes: 0 }],
+    });
+    assert.equal(withCount.ok && withCount.view.kind === "summary" ? withCount.view.unreadable : -1, 3);
+
+    // A manager that predates the field sends nothing, and zero is the only reading available — it is
+    // also what that manager's own arithmetic assumed. Defaulted rather than left `undefined`, so the
+    // screen does not have to decide what a missing number means.
+    const without = readTrafficView({
+      entries: 2, withTraffic: 1, dead: 1,
+      top: [row], deadSample: [{ ...row, packets: 0, bytes: 0 }],
+    });
+    assert.equal(without.ok && without.view.kind === "summary" ? without.view.unreadable : -1, 0);
+  });
+
   it("keeps 'the reader has not produced a dump' apart from an empty summary", () => {
     const read = readTrafficView({ unavailable: "the reader has not produced a dump yet" });
     assert.equal(read.ok, true);

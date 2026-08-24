@@ -109,6 +109,15 @@
       </div>
     </div>
 
+    <!-- Said out loud rather than left in the arithmetic. `entries` is now `withTraffic + dead`, so a
+         row the server could not read is not in any of the three numbers above — and the headline
+         percentage would otherwise be quietly about a smaller dump than the one that was taken. -->
+    {#if view.unreadable > 0}
+      <div class="empty-card">
+        <div class="lead warn">{t(prefs.lang, "m.unreadableCounters", { n: view.unreadable })}</div>
+      </div>
+    {/if}
+
     {#if view.dead === 0}
       <div class="empty-card">
         <div class="lead ok">{t(prefs.lang, "m.emptyDead")}</div>
