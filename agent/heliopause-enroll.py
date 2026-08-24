@@ -14,6 +14,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 
@@ -44,6 +45,8 @@ STATE_FILE = os.environ.get("HELIOPAUSE_ENROLL_STATE_FILE", "/var/lib/heliopause
 OPENSSL = os.environ.get("HELIOPAUSE_OPENSSL_BIN", "/usr/bin/openssl")
 NAME_OK = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?$")
 MAX_RESPONSE_BYTES = 64 * 1024
+# The whole exchange, not each socket operation — see `read_json_response`.
+HTTP_TIMEOUT_SEC = 15
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -88,7 +91,21 @@ def load_json(path):
         return None
 
 
-def read_json_response(res):
+def read_json_response(res, deadline=None):
+    """Parse the dispatcher's answer, bounded in size and — with a deadline — in time.
+
+    ## The size bound was here; the time bound was not
+
+    `timeout=` on the opener is a **socket** timeout: Python applies it per operation, so every byte
+    that arrives resets it. A dispatcher answering one byte at a time filled the 64 KiB ceiling in
+    about eleven days without ever tripping a fifteen-second timeout, and this command is what an
+    installer runs and watches.
+
+    The ceiling is the reason the damage was bounded at all, which is a different thing from the
+    wait being bounded. Reading in pieces and consulting the clock between them makes the second one
+    true as well. `deadline` is optional so the error paths below, which have already read their
+    body, keep working unchanged.
+    """
     declared = res.headers.get("Content-Length")
     if declared:
         try:
@@ -96,13 +113,42 @@ def read_json_response(res):
                 raise RuntimeError("enrollment response exceeds 64 KiB")
         except ValueError as e:
             raise RuntimeError("enrollment response has an invalid Content-Length") from e
-    raw = res.read(MAX_RESPONSE_BYTES + 1)
+    limit = MAX_RESPONSE_BYTES + 1
+    raw = bytearray()
+    while len(raw) < limit:
+        if deadline is not None:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise RuntimeError(f"enrollment response did not finish within {HTTP_TIMEOUT_SEC}s")
+            _set_socket_timeout(res, left)
+        piece = res.read(min(8192, limit - len(raw)))
+        if not piece:
+            break
+        raw += piece
+    raw = bytes(raw)
     if len(raw) > MAX_RESPONSE_BYTES:
         raise RuntimeError("enrollment response exceeds 64 KiB")
     value = json.loads(raw or b"{}")
     if not isinstance(value, dict):
         raise RuntimeError("enrollment response must be a JSON object")
     return value
+
+
+def _set_socket_timeout(res, seconds):
+    """Re-arm the response's socket, if this response has one to re-arm.
+
+    `urllib` hands back an `http.client.HTTPResponse` whose socket is reachable but not part of any
+    interface that promises to stay put. A best-effort re-arm is right here: failing to shorten the
+    socket does not make the deadline check above stop working — the loop still gives up on the next
+    pass — it only means the current `read` may block for the socket timeout first.
+    """
+    sock = getattr(getattr(res, "fp", None), "raw", None)
+    sock = getattr(sock, "_sock", None)
+    if sock is not None:
+        try:
+            sock.settimeout(seconds)
+        except OSError:
+            pass
 
 
 def request(method, path, token, body=None):
@@ -113,9 +159,10 @@ def request(method, path, token, body=None):
     opener = urllib.request.build_opener(
         NoRedirect(), urllib.request.HTTPSHandler(context=ssl.create_default_context())
     )
+    deadline = time.monotonic() + HTTP_TIMEOUT_SEC
     try:
-        with opener.open(req, timeout=15) as res:
-            return res.status, read_json_response(res)
+        with opener.open(req, timeout=HTTP_TIMEOUT_SEC) as res:
+            return res.status, read_json_response(res, deadline)
     except urllib.error.HTTPError as e:
         if 300 <= e.code < 400:
             raise RuntimeError(f"enrollment redirect refused ({e.code})") from e

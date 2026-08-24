@@ -293,5 +293,81 @@ class CaPinTests(unittest.TestCase):
         self.assertFalse((pki / "ca.pem").exists(), "the refused anchor was written anyway")
 
 
+class ResponseDeadlineTests(unittest.TestCase):
+    """The answer is bounded in time as well as in size.
+
+    `timeout=` on the opener is a **socket** timeout: Python applies it per operation, so every byte
+    that arrives resets it. The 64 KiB ceiling meant the damage was bounded — a dispatcher answering
+    one byte at a time filled it in about eleven days — which is a different thing from the wait
+    being bounded, and this is the command an installer runs and watches.
+    """
+
+    class _Res:
+        """A response that hands back one byte at a time and records every socket re-arm."""
+
+        def __init__(self, clock, per_read=1):
+            self.headers = {}
+            self.armed = []
+            self._clock = clock
+            self._per_read = per_read
+
+        def read(self, n):
+            # Each read costs a second of the deadline, which is what a trickling peer does.
+            self._clock.advance(1)
+            return b"x" * min(n, self._per_read)
+
+    class _Clock:
+        def __init__(self):
+            self.now = 0.0
+
+        def advance(self, by):
+            self.now += by
+
+    def test_a_trickling_response_is_given_up_on(self):
+        clock = self._Clock()
+        real = enroll.time.monotonic
+        enroll.time.monotonic = lambda: clock.now
+        try:
+            deadline = clock.now + enroll.HTTP_TIMEOUT_SEC
+            with self.assertRaises(RuntimeError) as caught:
+                enroll.read_json_response(self._Res(clock), deadline)
+        finally:
+            enroll.time.monotonic = real
+        self.assertIn(f"within {enroll.HTTP_TIMEOUT_SEC}s", str(caught.exception))
+        # Given up on the clock, not on the ceiling — those are different failures and the message
+        # is what tells an installer which.
+        self.assertNotIn("64 KiB", str(caught.exception))
+
+    def test_a_prompt_response_still_parses(self):
+        # The known positive. Without it, a reader that gave up immediately would pass the test above
+        # and make every enrolment fail.
+        class Prompt:
+            headers = {}
+
+            def __init__(self):
+                self._sent = False
+
+            def read(self, n):
+                if self._sent:
+                    return b""
+                self._sent = True
+                return b'{"ok": true}'
+
+        self.assertEqual(enroll.read_json_response(Prompt(), None), {"ok": True})
+
+    def test_the_size_ceiling_still_wins_when_there_is_time(self):
+        # The other bound, unchanged. A dispatcher that answers quickly and enormously is refused for
+        # its size, and says so.
+        class Flood:
+            headers = {}
+
+            def read(self, n):
+                return b"x" * n
+
+        with self.assertRaises(RuntimeError) as caught:
+            enroll.read_json_response(Flood(), None)
+        self.assertIn("64 KiB", str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
