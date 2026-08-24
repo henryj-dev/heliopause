@@ -61,8 +61,9 @@ import { authorize } from "./oidc-authz.ts";
 import { statusFor, verifyOtp } from "./otp.ts";
 import { RoleChangeLedger, verifyBackchannelLogout, verifyRoleChange } from "./set.ts";
 import {
-  checkCsrf, clearCookieHeader, cookieHeader, COOKIE, CSRF_HEADER,
-  DEFAULT_LIMITS as DEFAULT_SESSION_LIMITS, readCookie, SessionStore, type Principal,
+  checkCsrf, clearCookieHeader, clearLoginCookieHeader, cookieHeader, COOKIE, CSRF_HEADER,
+  DEFAULT_LIMITS as DEFAULT_SESSION_LIMITS, LOGIN_COOKIE, loginBinder, loginBinderMatches,
+  loginCookieHeader, readCookie, SessionStore, type Principal,
 } from "./session.ts";
 
 import { CONSOLE_ENTRY, consoleAppPath, policyAppPath } from "./app-shell.ts";
@@ -217,7 +218,22 @@ export const API_ROUTE_PATTERNS: readonly RegExp[] = [
   /^\/enrollment\/requests\/[^/]+\/certificate$/,
 ];
 
-export type PendingOidcLogin = { verifier: string; nonce: string; at: number; returnTo?: string };
+export type PendingOidcLogin = {
+  verifier: string;
+  nonce: string;
+  at: number;
+  returnTo?: string;
+  /**
+   * SHA-256 of the value handed to this browser as the `__Host-heliopause-login` cookie.
+   *
+   * What ties a callback to the browser that started the login. Without it `state` alone admits a
+   * callback anyone can replay into anyone else's browser — see the note in `session.ts`.
+   *
+   * Optional only so a record written by an older process is refused rather than crashing on a
+   * missing field; `loginBinderMatches` treats `undefined` as no match.
+   */
+  binder?: string;
+};
 
 /**
  * Where to send the browser after a login, or `null` if the request did not name a safe place.
@@ -2597,7 +2613,12 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       // dead code. One gate, at the point the value becomes a `Location` header.
       const next = url.searchParams.get("next");
       const returnTo = next && next.length <= 512 ? next : null;
-      o.pending.set(state, { verifier, nonce: n, at: startedAt, ...(returnTo ? { returnTo } : {}) });
+      // The value goes to this browser as a cookie; only its digest is kept here. `state` travels
+      // through the IdP in a URL and is therefore something an attacker can hold; this is not.
+      const binder = loginBinder();
+      o.pending.set(state, {
+        verifier, nonce: n, at: startedAt, binder: binder.digest, ...(returnTo ? { returnTo } : {}),
+      });
       const d = await o.provider.load();
       const to = authorizeUrl(d, {
         clientId: o.conf.clientId,
@@ -2609,7 +2630,11 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         // without it produces a principal with no groups and no access.
         scopes: ["openid", "profile", "email", "groups"],
       });
-      res.writeHead(302, { location: to, "cache-control": "no-store" });
+      res.writeHead(302, {
+        location: to,
+        "set-cookie": loginCookieHeader(binder.value),
+        "cache-control": "no-store",
+      });
       return void res.end();
     }
 
@@ -2636,6 +2661,30 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       if (!found) {
         log(`login callback with an unknown state from ${req.socket.remoteAddress ?? "?"}`, `${req.socket.remoteAddress ?? "?"}에서 알 수 없는 state로 로그인 콜백을 보냄`);
         return send(res, 400, { error: "this login did not start here, or it has expired" });
+      }
+
+      // ## `state` says the login started here. This says it started in *this browser*.
+      //
+      // They are different claims and only the second one stops a login CSRF. `state` travels
+      // through the identity provider in a URL, so an attacker who begins a login of their own holds
+      // a valid one — and a victim walked to `/auth/callback?state=…&code=…` would be handed the
+      // attacker's session, on a console that can approve and publish. See `session.ts`.
+      //
+      // The cookie is cleared on every outcome below, including this refusal: it is spent whether or
+      // not it matched, and leaving it would let a second attempt reuse it.
+      if (!loginBinderMatches(readCookie(req.headers["cookie"], LOGIN_COOKIE), found.binder)) {
+        log(
+          `login callback from ${req.socket.remoteAddress ?? "?"} did not carry the browser that started it`,
+          `${req.socket.remoteAddress ?? "?"}의 로그인 콜백이 로그인을 시작한 브라우저를 증명하지 못함`,
+        );
+        res.writeHead(400, {
+          "content-type": "application/json",
+          "set-cookie": clearLoginCookieHeader(),
+          "cache-control": "no-store",
+        });
+        return void res.end(JSON.stringify({
+          error: "this login did not start in this browser — open /auth/login here and try again",
+        }));
       }
 
       let identity;
@@ -2678,7 +2727,10 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       // this call fails `refuses to be turned into an open redirect`.
       res.writeHead(302, {
         location: safeReturnTo(found.returnTo ?? null) ?? "/",
-        "set-cookie": cookieHeader(s),
+        // Two, in one header: the session, and the removal of the login binder. The binder has done
+        // its job at this point and a value left in a browser is a value that can be replayed into
+        // the next attempt.
+        "set-cookie": [cookieHeader(s), clearLoginCookieHeader()],
         "cache-control": "no-store",
       });
       return void res.end();

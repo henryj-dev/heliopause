@@ -49,7 +49,7 @@
 // re-evaluated. It does not close the *session* half: logging somebody out without changing their
 // role produces no event.
 
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 
 /** Who a session belongs to, and what the IdP said about them. */
 export interface Principal {
@@ -243,6 +243,81 @@ export function cookieHeader(s: Session): string {
 /** The `Set-Cookie` that removes it. Same attributes, or the browser keeps the original. */
 export function clearCookieHeader(): string {
   return `${COOKIE}=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Strict`;
+}
+
+// ── The login itself, which was not tied to a browser ─────────────────────────
+//
+// ## What was wrong
+//
+// `state` was minted here and kept in a server-side map, and the comment on that map said the map
+// lookup *is* the check: "`state` was generated here, from the CSPRNG, and only this server has ever
+// held it." Both halves are true and they do not add up to the property that was wanted.
+//
+// The map is not keyed to a browser. So:
+//
+//   1. the attacker opens `/auth/login` in **their own** browser and authenticates at the IdP
+//   2. they stop before the redirect completes and keep the `code` and `state`
+//   3. they get the victim to open `/auth/callback?state=…&code=…`
+//   4. this server finds the state, exchanges the code, and sets **the attacker's session** as a
+//      cookie in the victim's browser
+//
+// The victim is now signed in as somebody else, on a console that can approve and publish a firewall
+// change — and `approval.ts` compares proposer and approver as strings, so whatever they do is
+// recorded under the attacker's name. Neither `safeReturnTo` (which stops the redirect being open)
+// nor single-use `state` (which stops the *same* callback being replayed twice) touches this.
+//
+// ## What closes it
+//
+// A second value minted at the same time: kept in the pending record as a digest, and handed to the
+// browser as a cookie. The callback must present a cookie whose digest matches the record the
+// `state` names. The attacker can produce the `state` — it travels through the IdP in the URL — and
+// cannot produce a cookie in the victim's browser.
+//
+// The digest rather than the value, for the same reason a session id is not derived from anything:
+// the pending map is the thing an attacker would have to read anyway, and there is no reason for it
+// to hold the secret in the clear.
+export const LOGIN_COOKIE = "__Host-heliopause-login";
+
+/**
+ * How long the browser keeps it. Matches the pending-login TTL; the record expires either way, and a
+ * cookie outliving the thing it unlocks is just a value sitting in a browser.
+ */
+const LOGIN_COOKIE_MAX_AGE_SEC = 10 * 60;
+
+/**
+ * `SameSite=Lax`, and this is the one cookie here that **must not** be `Strict`.
+ *
+ * The callback is a top-level navigation the *identity provider* sends the browser on, so it is
+ * cross-site by construction. `Strict` withholds the cookie on exactly that request, and the login
+ * would fail for everybody with a message about a missing binder — the check would be enforcing
+ * itself into an outage. `Lax` sends it on a top-level GET, which is what a redirect is, and
+ * withholds it from every subresource and every form post, which is what matters.
+ */
+export function loginCookieHeader(value: string): string {
+  return `${LOGIN_COOKIE}=${value}; Max-Age=${LOGIN_COOKIE_MAX_AGE_SEC}; Path=/; Secure; HttpOnly; SameSite=Lax`;
+}
+
+/** Removes it. Sent on every callback, including the refusals — it is spent either way. */
+export function clearLoginCookieHeader(): string {
+  return `${LOGIN_COOKIE}=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Lax`;
+}
+
+/**
+ * A login binder and the digest to store beside `state`.
+ *
+ * Two concurrent logins in one browser overwrite each other's cookie, so the newer one wins and the
+ * older refuses. That is correct rather than merely acceptable: the older attempt's `state` is still
+ * single-use and still expires, and a browser that started two logins is answering the second.
+ */
+export function loginBinder(): { value: string; digest: string } {
+  const value = randomBytes(32).toString("base64url");
+  return { value, digest: createHash("sha256").update(value).digest("base64url") };
+}
+
+/** Does this cookie unlock that pending record? Constant-time, and false for anything absent. */
+export function loginBinderMatches(cookie: string | null, digest: string | undefined): boolean {
+  if (!cookie || !digest) return false;
+  return constantEquals(createHash("sha256").update(cookie).digest("base64url"), digest);
 }
 
 // ── CSRF ──────────────────────────────────────────────────────────────────────

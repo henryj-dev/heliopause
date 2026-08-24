@@ -704,18 +704,24 @@ describe("OIDC login routes", () => {
   after(() => { close4(); rmSync(dir4, { recursive: true, force: true }); });
 
   function call(path: string, method = "GET", headers: Record<string, string> = {}) {
-    return new Promise<{ status: number; body: string; location?: string }>((resolve, reject) => {
-      const r = request({ host: "127.0.0.1", port: port4, path, method, ca: [readCa()], headers },
-        (res) => {
-          let b = ""; res.on("data", (d) => (b += d));
-          res.on("end", () => resolve({
-            status: res.statusCode ?? 0, body: b,
-            location: typeof res.headers.location === "string" ? res.headers.location : undefined,
-          }));
-        });
-      r.on("error", reject); r.end();
-    });
+    return new Promise<{ status: number; body: string; location?: string; setCookie: string[] }>(
+      (resolve, reject) => {
+        const r = request({ host: "127.0.0.1", port: port4, path, method, ca: [readCa()], headers },
+          (res) => {
+            let b = ""; res.on("data", (d) => (b += d));
+            res.on("end", () => resolve({
+              status: res.statusCode ?? 0, body: b,
+              location: typeof res.headers.location === "string" ? res.headers.location : undefined,
+              setCookie: ([] as string[]).concat((res.headers["set-cookie"] as string[]) ?? []),
+            }));
+          });
+        r.on("error", reject); r.end();
+      });
   }
+
+  /** What a browser would send back: `name=value` pairs, minus the ones being cleared. */
+  const cookieHeaderFrom = (r: { setCookie: string[] }): string =>
+    r.setCookie.map((c) => c.split(";")[0]!).filter((c) => !c.endsWith("=")).join("; ");
 
   it("tells an unauthenticated caller where to sign in", async () => {
     // Certificate-only deployments say "no subject CN", which is useless advice to a browser that
@@ -764,12 +770,74 @@ describe("OIDC login routes", () => {
     // Single use is what stops a replay of a callback that did start here.
     const login = await call("/auth/login");
     const state = new URL(login.location!).searchParams.get("state")!;
-    const first = await call(`/auth/callback?code=bad&state=${encodeURIComponent(state)}`);
+    const cookie = cookieHeaderFrom(login);
+    const first = await call(`/auth/callback?code=bad&state=${encodeURIComponent(state)}`, "GET", { cookie });
     // The exchange fails — there is no IdP — but the state was consumed by getting that far.
     assert.notEqual(first.status, 400, "the first use should reach the token exchange");
-    const second = await call(`/auth/callback?code=bad&state=${encodeURIComponent(state)}`);
+    const second = await call(`/auth/callback?code=bad&state=${encodeURIComponent(state)}`, "GET", { cookie });
     assert.equal(second.status, 400);
     assert.match(second.body, /did not start here/);
+  });
+
+  // ── Login CSRF ──────────────────────────────────────────────────────────────
+  //
+  // `state` proves the login started *here*. It does not prove it started in *this browser*, and
+  // those are different claims:
+  //
+  //   1. the attacker opens `/auth/login` in their own browser and authenticates at the IdP
+  //   2. they hold the resulting `code` and `state` instead of following the redirect
+  //   3. they walk the victim to `/auth/callback?state=…&code=…`
+  //   4. the victim's browser is handed **the attacker's session**
+  //
+  // On this console that session can approve and publish, and `approval.ts` compares proposer and
+  // approver as strings — so whatever the victim then does is recorded under the attacker's name.
+  // Neither `safeReturnTo` nor single-use `state` touches it: both are about the *redirect* and the
+  // *replay*, and this is neither.
+  it("hands the browser a login binder and requires it back at the callback", async () => {
+    const login = await call("/auth/login");
+    const binder = login.setCookie.find((c) => c.startsWith("__Host-heliopause-login="));
+    assert.ok(binder, "the login must give this browser something only it holds");
+    // `Lax`, and it has to be: the callback is a top-level navigation the *IdP* sends the browser
+    // on, so it is cross-site by construction and `Strict` would withhold the cookie from the one
+    // request that needs it — the check would enforce itself into an outage.
+    assert.match(binder, /SameSite=Lax/);
+    assert.match(binder, /HttpOnly/);
+    assert.match(binder, /Secure/);
+  });
+
+  it("refuses a callback whose state is valid but arrives without the browser that started it", async () => {
+    // Exactly the attack: a real `state`, and no cookie — a victim's browser has never seen this
+    // login. Before the binder existed this reached the token exchange.
+    const login = await call("/auth/login");
+    const state = new URL(login.location!).searchParams.get("state")!;
+    const r = await call(`/auth/callback?code=bad&state=${encodeURIComponent(state)}`);
+    assert.equal(r.status, 400);
+    assert.match(r.body, /did not start in this browser/);
+  });
+
+  it("refuses a callback carrying somebody else's login binder", async () => {
+    // Two logins in flight. Presenting A's `state` with B's cookie must fail — otherwise an attacker
+    // who can get *any* binder into the victim's browser is back where they started.
+    const a = await call("/auth/login");
+    const b = await call("/auth/login");
+    const stateA = new URL(a.location!).searchParams.get("state")!;
+    const r = await call(
+      `/auth/callback?code=bad&state=${encodeURIComponent(stateA)}`,
+      "GET",
+      { cookie: cookieHeaderFrom(b) },
+    );
+    assert.equal(r.status, 400);
+    assert.match(r.body, /did not start in this browser/);
+  });
+
+  it("clears the binder on a refusal, so it cannot be spent twice", async () => {
+    const login = await call("/auth/login");
+    const state = new URL(login.location!).searchParams.get("state")!;
+    const r = await call(`/auth/callback?code=bad&state=${encodeURIComponent(state)}`);
+    assert.ok(
+      r.setCookie.some((c) => c.startsWith("__Host-heliopause-login=;")),
+      "a spent binder must not be left in the browser",
+    );
   });
 
   it("passes an IdP refusal through rather than reporting a generic failure", async () => {
@@ -924,16 +992,41 @@ describe("a real OIDC session, end to end", () => {
       });
   }
 
-  /** Complete a login and return the session cookie. */
+  /** The `name=value` pairs a browser would send back, from a `Set-Cookie` list. */
+  function cookiesFrom(res: { headers: Record<string, string | string[] | undefined> }): string {
+    return ([] as string[])
+      .concat((res.headers["set-cookie"] as string[]) ?? [])
+      .map((c) => c.split(";")[0]!)
+      .filter((c) => !c.endsWith("="))
+      .join("; ");
+  }
+
+  /**
+   * Complete a login and return the session cookie.
+   *
+   * **Carries the login binder from `/auth/login` into `/auth/callback`, which a browser does and
+   * this helper did not.** That omission is the whole of the login-CSRF hole: the callback used to
+   * be accepted on `state` alone, so anyone holding a `state` could have it completed in *somebody
+   * else's* browser and hand them the attacker's session. Now the callback demands the cookie, and
+   * a helper that does not send one is not simulating a browser.
+   */
   async function signIn(groups: string[]): Promise<string> {
     mintGroups = groups;
     const login = await call("/auth/login");
     const q = new URL(String((login.headers.location ?? "") as string)).searchParams;
     mintNonce = q.get("nonce")!;
-    const cb = await call(`/auth/callback?code=any&state=${encodeURIComponent(q.get("state")!)}`);
+    const cb = await call(
+      `/auth/callback?code=any&state=${encodeURIComponent(q.get("state")!)}`,
+      "GET",
+      { cookie: cookiesFrom(login) },
+    );
     assert.equal(cb.status, 302, `callback should have set a session, got ${cb.status}: ${cb.body}`);
-    const setCookie = ([] as string[]).concat(cb.headers["set-cookie"] as string[] ?? []);
-    return setCookie[0]!.split(";")[0]!;
+    const session = ([] as string[])
+      .concat((cb.headers["set-cookie"] as string[]) ?? [])
+      .map((c) => c.split(";")[0]!)
+      .find((c) => c.startsWith("__Host-heliopause-session="));
+    assert.ok(session, "callback did not set a session cookie");
+    return session;
   }
 
   /** Same as `call`, but presenting the operator certificate the CLI uses. */
@@ -1011,7 +1104,7 @@ describe("a real OIDC session, end to end", () => {
     const login = await call("/auth/login?next=%2Fpolicy");
     const q = new URL(String(login.headers.location as string)).searchParams;
     mintNonce = q.get("nonce")!;
-    const cb = await call(`/auth/callback?code=any&state=${encodeURIComponent(q.get("state")!)}`);
+    const cb = await call(`/auth/callback?code=any&state=${encodeURIComponent(q.get("state")!)}`, "GET", { cookie: cookiesFrom(login) });
     assert.equal(cb.status, 302);
     assert.equal(cb.headers.location, "/policy", "login threw away where the operator was going");
   });
@@ -1025,7 +1118,7 @@ describe("a real OIDC session, end to end", () => {
       const login = await call(`/auth/login?next=${encodeURIComponent(evil)}`);
       const q = new URL(String(login.headers.location as string)).searchParams;
       mintNonce = q.get("nonce")!;
-      const cb = await call(`/auth/callback?code=any&state=${encodeURIComponent(q.get("state")!)}`);
+      const cb = await call(`/auth/callback?code=any&state=${encodeURIComponent(q.get("state")!)}`, "GET", { cookie: cookiesFrom(login) });
       assert.equal(cb.headers.location, "/", `login followed ${evil}`);
     }
   });
@@ -1041,7 +1134,7 @@ describe("a real OIDC session, end to end", () => {
     const login = await call("/auth/login");
     const q = new URL(String(login.headers.location as string)).searchParams;
     mintNonce = q.get("nonce")!;
-    const cb = await call(`/auth/callback?code=any&state=${encodeURIComponent(q.get("state")!)}`);
+    const cb = await call(`/auth/callback?code=any&state=${encodeURIComponent(q.get("state")!)}`, "GET", { cookie: cookiesFrom(login) });
     assert.equal(cb.status, 403);
     assert.match(cb.body, /not authorised/);
   });
@@ -1272,7 +1365,7 @@ describe("a real OIDC session, end to end", () => {
     const q = new URL(String(login.headers.location as string)).searchParams;
     mintNonce = q.get("nonce")!;
     // Same login, but the identity is one no alias covers.
-    const cb = await call(`/auth/callback?code=any&state=${encodeURIComponent(q.get("state")!)}`);
+    const cb = await call(`/auth/callback?code=any&state=${encodeURIComponent(q.get("state")!)}`, "GET", { cookie: cookiesFrom(login) });
     const cookie = ([] as string[]).concat(cb.headers["set-cookie"] as string[] ?? [])[0]!.split(";")[0]!;
     const plans = JSON.parse((await call("/plans", "GET", { cookie })).body);
     assert.equal(plans.canWrite, true, "this identity IS aliased, so it may write");
