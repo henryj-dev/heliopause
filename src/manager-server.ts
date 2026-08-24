@@ -1117,6 +1117,48 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
   }
   if (writers.size === 0) log("no writer CNs — the write endpoints will refuse everyone", "작성자 CN이 없음 — 쓰기 엔드포인트가 모두를 거부함");
 
+  /**
+   * Certificate name → every other writer name that is the same human.
+   *
+   * Built from `otp.users`, which is the only table in this process that says who a certificate
+   * *is*. Two writer names mapping to one identity-provider account are one person, and `approval.ts`
+   * compared names — so that person could propose under one and approve under the other, and the
+   * plan would record a two-person approval.
+   *
+   * Measured on dev, 2026-08-24, before this existed:
+   *
+   *     HELIOPAUSE_WRITER_CNS = ops-henry,ops-henry-review
+   *     HELIOPAUSE_OTP_USERS  = ops-henry=5b1ed54b-…, ops-henry-review=5b1ed54b-…
+   *
+   * Only writers are collapsed. A reader sharing an account with a writer changes nothing, and
+   * including them would make the map answer a question nobody asks.
+   */
+  const sameHumanAs = new Map<string, string[]>();
+  if (opts.otp) {
+    const byAccount = new Map<string, string[]>();
+    for (const [cn, userId] of opts.otp.users) {
+      if (!writers.has(cn)) continue;
+      byAccount.set(userId, [...(byAccount.get(userId) ?? []), cn]);
+    }
+    for (const [userId, names] of byAccount) {
+      if (names.length < 2) continue;
+      for (const cn of names) sameHumanAs.set(cn, names.filter((other) => other !== cn));
+      // Said at startup for the same reason the one-writer case is: the alternative is finding out
+      // from a 403 in the middle of a change. And unlike that one, this is a rule that **was not
+      // being enforced** until now — an operator who has been approving this way will meet the
+      // refusal, and needs to know why before they do.
+      log(
+        `writer CNs ${names.join(", ")} all map to identity-provider account ${userId} — they are ` +
+          `one person, so POST /approve now refuses an approval between them. It used to accept it ` +
+          `and record a two-person approval. Use a genuinely second operator, or an OIDC login with ` +
+          `a solo-approval role, which records the approval as solo.`,
+        `작성자 CN ${names.join(", ")} 이(가) 모두 IdP 계정 ${userId} 에 매핑됨 — 한 사람이므로 ` +
+          `POST /approve 가 이제 이들 사이의 승인을 거부함. 예전에는 받아들이고 2인 승인으로 기록했음. ` +
+          `실제 두 번째 운영자를 쓰거나, 단독 승인 역할의 OIDC 로그인을 쓸 것(그쪽은 단독으로 기록됨).`,
+      );
+    }
+  }
+
   const [cert, key, ca] = await Promise.all([
     readFile(opts.tls.certFile),
     readFile(opts.tls.keyFile),
@@ -2539,9 +2581,18 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       }
       if ((await requireOtp(principal, body, res, url.pathname)) === "answered") return;
       try {
+        // `alsoKnownAs` is what turns "the same name" into "the same person". An OIDC principal
+        // arrives already collapsed onto one certificate name by its alias, and that name's other
+        // certificates are the ones this adds — see `sameHumanAs`.
         const plan = approve(
           approvals,
-          { hash: String(body.hash ?? ""), by: who, now: now(), mayApproveOwn: maySoloApprove },
+          {
+            hash: String(body.hash ?? ""),
+            by: who,
+            now: now(),
+            mayApproveOwn: maySoloApprove,
+            alsoKnownAs: sameHumanAs.get(who) ?? [],
+          },
           limits,
         );
         log(
@@ -3036,6 +3087,50 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       return send(res, e.status, { error: e.message });
     }
     throw e;
+  }
+
+  // ## What the identity provider has to be configured with, said out loud
+  //
+  // Three values on this side have a counterpart on the IdP's side, and **all three fail silently
+  // when the two disagree** — which is the only reason this line exists.
+  //
+  //   · the redirect URI          registered wrong → login breaks loudly. This one is fine.
+  //   · the back-channel logout   **not registered → an administrator's force-logout reaches
+  //                               nobody, and the IdP reports success.** `session.ts` records that
+  //                               the route was built first precisely so this could be filled in;
+  //                               it is still blank, and nothing anywhere said so.
+  //   · the role-change event key RFC 8417 leaves it to the issuer, so a mismatch is not an error:
+  //                               the token verifies, the key does not match, and the authority
+  //                               change is discarded as "carries no role-change event". `set.ts`
+  //                               refused to default it for exactly this reason.
+  //
+  // The manager cannot read the IdP's client registration, so it cannot check any of them. What it
+  // can do is state what it expects, once, where an operator comparing the two has something to
+  // compare against. Before this, the startup journal said nothing about OIDC at all.
+  if (oidc) {
+    // Derived from the redirect URI rather than configured separately: they are the same origin by
+    // construction, and a second variable would be a second thing to get wrong.
+    let logoutUri = "(cannot derive — check HELIOPAUSE_OIDC_REDIRECT_URI)";
+    try {
+      logoutUri = new URL("/auth/backchannel-logout", oidc.conf.redirectUri).toString();
+    } catch { /* the redirect URI is not a URL; the login path will say so first */ }
+    log(
+      `oidc: issuer ${oidc.conf.issuer}, client ${oidc.conf.clientId}. The IdP must have these ` +
+        `registered for this deployment — nothing here can verify them:\n` +
+        `[manager]   redirect URI            ${oidc.conf.redirectUri}\n` +
+        `[manager]   back-channel logout URI ${logoutUri}  (session_required: off)\n` +
+        `[manager]   role-change event key   ${oidc.conf.roleChangeEvent}\n` +
+        `[manager]   A blank logout URI means a force-logout at the IdP ends nothing here and still ` +
+        `reports success. A role-change key that differs from the issuer's means every authority ` +
+        `change is discarded silently.`,
+      `oidc: 발급자 ${oidc.conf.issuer}, 클라이언트 ${oidc.conf.clientId}. IdP 에 아래가 등록돼 ` +
+        `있어야 하며 이쪽에서는 확인할 수 없음:\n` +
+        `[manager]   리다이렉트 URI      ${oidc.conf.redirectUri}\n` +
+        `[manager]   백채널 로그아웃 URI ${logoutUri}  (session_required: off)\n` +
+        `[manager]   역할 변경 이벤트 키 ${oidc.conf.roleChangeEvent}\n` +
+        `[manager]   로그아웃 URI 가 비어 있으면 IdP 의 강제 로그아웃이 여기서 아무것도 끝내지 ` +
+        `못하면서 성공을 보고함. 역할 변경 키가 발급자의 것과 다르면 모든 권한 변경이 조용히 버려짐.`,
+    );
   }
 
   await new Promise<void>((resolve) => server.listen(opts.port, opts.hostname ?? "::", resolve));

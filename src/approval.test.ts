@@ -237,3 +237,86 @@ describe("solo approval — the two-person rule, switched off on purpose", () =>
     assert.equal(plan.approval?.solo, undefined);
   });
 });
+
+// ── The same person under two certificate names ───────────────────────────────
+//
+// The rule above compares `plan.proposedBy` with `by`, and both are certificate names. One human can
+// hold two certificates, and the deployment says so in its own configuration — measured on dev,
+// 2026-08-24:
+//
+//     HELIOPAUSE_WRITER_CNS = ops-henry,ops-henry-review
+//     HELIOPAUSE_OTP_USERS  = ops-henry=5b1ed54b-…, ops-henry-review=5b1ed54b-…
+//
+// Two writer names, one identity-provider account. The one-time code does not catch it either: both
+// resolve to the same account, so the same TOTP credential answers for both.
+//
+// **The harm is the record, not the capability.** This site already permits one person to publish
+// alone, deliberately, through `soloApprovalRoles` — and that path writes `solo: true`. Going through
+// two names produced the same outcome with the plan saying two people signed off.
+describe("approve — two names, one human", () => {
+  const twoNames = () => {
+    const st = emptyApprovals();
+    propose(st, { hash: H, generation: "abc1234", summary: SUMMARY, by: "ops-henry", now: T0 });
+    return st;
+  };
+
+  it("refuses an approval from the proposer's other certificate", () => {
+    const st = twoNames();
+    assert.throws(
+      () => approve(st, { hash: H, by: "ops-henry-review", now: at(5), alsoKnownAs: ["ops-henry"] }),
+      (e: unknown) => {
+        const m = (e as Error).message;
+        // The reason has to name *why* two different strings are one person, or the operator reads
+        // it as the rule malfunctioning.
+        assert.match(m, /same person as ops-henry/);
+        assert.match(m, /recorded as two/);
+        return true;
+      },
+    );
+    assert.equal(st.plans.get(H)?.approval, null, "a refused approval must not be recorded");
+  });
+
+  it("still accepts a genuinely different operator", () => {
+    // The known positive. Without it this suite passes against a version that refuses everyone.
+    //
+    // `alsoKnownAs` is **the approver's** other names, which is why `ops-jae` gets an empty list
+    // rather than `ops-henry`'s. Getting that backwards refuses every approval, and it is the shape
+    // of mistake a caller can make — so the manager derives it with `sameHumanAs.get(who)`, keyed on
+    // the approver, and never on the plan.
+    const st = twoNames();
+    const plan = approve(st, { hash: H, by: "ops-jae", now: at(5), alsoKnownAs: [] });
+    assert.equal(plan.approval?.by, "ops-jae");
+    assert.equal(plan.approval?.solo, undefined, "two people is not a solo approval");
+  });
+
+  it("accepts an approver who has other names, none of them the proposer's", () => {
+    // A second writer who also holds two certificates. Sharing *an* account is not sharing *this*
+    // one, and a check that refused on the mere presence of aliases would stop real approvals.
+    const st = twoNames();
+    const plan = approve(st, {
+      hash: H, by: "ops-jae", now: at(5), alsoKnownAs: ["ops-jae-review"],
+    });
+    assert.equal(plan.approval?.by, "ops-jae");
+    assert.equal(plan.approval?.solo, undefined);
+  });
+
+  it("records solo when the second name is allowed to approve anyway", () => {
+    // `mayApproveOwn` is the deliberate escape hatch, and it must not launder the record: one person
+    // approved, so the plan says so. Writing `solo` only for the exact-name case would leave the
+    // audit trail claiming two.
+    const st = twoNames();
+    const plan = approve(st, {
+      hash: H, by: "ops-henry-review", now: at(5), mayApproveOwn: true, alsoKnownAs: ["ops-henry"],
+    });
+    assert.equal(plan.approval?.by, "ops-henry-review");
+    assert.equal(plan.approval?.solo, true);
+  });
+
+  it("changes nothing when the deployment declares no shared identity", () => {
+    // Every caller without an OTP user map passes nothing, and must behave exactly as before.
+    const st = twoNames();
+    const plan = approve(st, { hash: H, by: "ops-henry-review", now: at(5) });
+    assert.equal(plan.approval?.by, "ops-henry-review");
+    assert.equal(plan.approval?.solo, undefined);
+  });
+});

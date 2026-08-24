@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { request } from "node:https";
 import { createHash } from "node:crypto";
+import { SCHEMA_VERSION } from "./protocol.ts";
 import { collectPolicySource } from "./policy-source.ts";
 import { DEFAULT_CONFIG } from "./config.ts";
 import { connect as tlsConnect } from "node:tls";
@@ -1701,6 +1702,108 @@ describe("a writer with no IdP mapping", () => {
     assert.equal(r.status, 403);
     assert.match(r.body, /OTP user map/);
     rmSync(d7, { recursive: true, force: true });
+  });
+});
+
+// ── Two certificates, one human ───────────────────────────────────────────────
+//
+// The exact shape of the live dev deployment, read from its Deployment on 2026-08-24:
+//
+//     HELIOPAUSE_WRITER_CNS = ops-henry,ops-henry-review
+//     HELIOPAUSE_OTP_USERS  = ops-henry=5b1ed54b-…, ops-henry-review=5b1ed54b-…
+//
+// Two writer certificate names, **one identity-provider account**. `approval.ts` compared names, so
+// the two-person rule passed — and the one-time code did not catch it either, because both names
+// resolve to the same account and the same TOTP credential answers for both.
+//
+// The harm is the record. This site already permits one person to publish alone through
+// `soloApprovalRoles`, and that path writes `solo: true`. Two names produced the same outcome with
+// the plan claiming two people signed off.
+//
+// Driven end to end rather than in `approval.test.ts` alone, because the unit tests take
+// `alsoKnownAs` as an argument and what could be wrong here is the wiring that derives it.
+describe("two writer certificates that map to one identity-provider account", () => {
+  /** The smallest bundle `validateBundle` accepts. What it renders does not matter here. */
+  function sameHumanBundle() {
+    const rules = JSON.stringify({
+      nftables: [{ add: { rule: { family: "inet", table: "heliopause", chain: "input", comment: "BASE-SSH" } } }],
+    });
+    return {
+      manifest: {
+        generation: "gen-same",
+        issuedAt: "2026-08-24T00:00:00.000Z",
+        schemaVersion: SCHEMA_VERSION,
+        hosts: {
+          "gw-01.dev": {
+            stage: "canary",
+            rulesetHash: "sha256:" + createHash("sha256").update(rules).digest("hex"),
+            confirmTimeoutSec: 120,
+            mustContain: ["BASE-SSH"],
+            expectFilters: [],
+          },
+        },
+      },
+      rulesets: { "gw-01.dev": rules },
+      workload: {},
+    };
+  }
+
+  const dSame = mkdtempSync(join(tmpdir(), "hp-same-human-"));
+  let portSame = 0;
+  let closeSame: () => void = () => {};
+
+  before(async () => {
+    const started = await startManager({
+      port: 0, hostname: "127.0.0.1",
+      relays: [{ name: "dev", url: "https://127.0.0.1:1/", pkiDir: dir }],
+      tls: { certFile: join(dir, "server.pem"), keyFile: join(dir, "server.key"), caFile: join(dir, "ca.pem") },
+      // `ops-stranger` stands in for `ops-henry-review`: a second trusted certificate, a second
+      // writer, and — below — the same person.
+      operatorCNs: ["ops-alice", "ops-stranger"],
+      writerCNs: ["ops-alice", "ops-stranger"],
+      timeoutMs: 200,
+      otp: {
+        issuerUrl: "https://idp.example.invalid",
+        serviceToken: "svc",
+        users: new Map([["ops-alice", "one-account"], ["ops-stranger", "one-account"]]),
+        fetchImpl: (async () => new Response(JSON.stringify({ ok: true }), { status: 200 })) as unknown as typeof fetch,
+      },
+      log: () => {},
+    });
+    portSame = (started.server.address() as { port: number }).port;
+    closeSame = () => started.server.close();
+  });
+
+  after(() => { closeSame(); rmSync(dSame, { recursive: true, force: true }); });
+
+  function post(path: string, body: unknown, who: "operator" | "stranger") {
+    const payload = JSON.stringify(body);
+    return new Promise<{ status: number; body: string }>((resolve, reject) => {
+      const r = request({
+        host: "127.0.0.1", port: portSame, path, method: "POST", ca: [readCa()],
+        ...(who === "operator"
+          ? { cert: read("ops.pem"), key: read("ops.key") }
+          : { cert: read("stranger.pem"), key: read("stranger.key") }),
+        headers: { "content-type": "application/json" },
+      }, (res) => {
+        let b = ""; res.on("data", (d) => (b += d));
+        res.on("end", () => resolve({ status: res.statusCode ?? 0, body: b }));
+      });
+      r.on("error", reject); r.write(payload); r.end();
+    });
+  }
+
+  it("refuses the second certificate's approval of the first's plan", async () => {
+    const proposed = await post("/plan", { target: "dev", bundle: sameHumanBundle() }, "operator");
+    assert.equal(proposed.status, 200, proposed.body);
+    const hash = (JSON.parse(proposed.body) as { hash: string }).hash;
+
+    const approved = await post("/approve", { hash, otp: "123456" }, "stranger");
+    assert.equal(approved.status, 403, approved.body);
+    // The reason has to say why two different names are one person, or it reads as the rule
+    // malfunctioning and the operator goes looking at their certificate.
+    assert.match(approved.body, /same person as ops-alice/);
+    assert.match(approved.body, /recorded as two/);
   });
 });
 

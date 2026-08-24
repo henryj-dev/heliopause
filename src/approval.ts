@@ -196,6 +196,38 @@ export function approve(
      * a fact about a single approval, and it is the approval that the audit trail has to explain.
      */
     mayApproveOwn?: boolean;
+    /**
+     * Other names that are **the same human** as `by`, as the deployment itself declares.
+     *
+     * ## Why a string comparison was not enough, measured on the live manager
+     *
+     * The rule below compares `plan.proposedBy` with `by`. Both are certificate names, and one
+     * person can hold two certificates — which the deployment says out loud in its own
+     * configuration. From dev on 2026-08-24:
+     *
+     *     HELIOPAUSE_WRITER_CNS = ops-henry,ops-henry-review
+     *     HELIOPAUSE_OTP_USERS  = ops-henry=5b1ed54b-…, ops-henry-review=5b1ed54b-…
+     *
+     * Two writer names, **one KeyStone user id**. So `ops-henry` proposes, `ops-henry-review`
+     * approves, and the comparison passes because the strings differ. The one-time code does not
+     * catch it either: both names resolve to the same account, so the same TOTP credential answers
+     * for both.
+     *
+     * ## What the harm actually is
+     *
+     * Not that one person can publish alone — this site already permits that deliberately, through
+     * `soloApprovalRoles`, and `approve` records `solo: true` when it happens. The harm is that this
+     * route produces the same outcome **while the record says two people signed off**. An audit
+     * reading that plan cannot tell the two apart, which is the one thing the field exists for.
+     *
+     * `oidc-authz.ts` already argues this exact point in the other direction — an OIDC identity must
+     * alias onto a certificate name, "because one human arriving as `ops-alice` by certificate and
+     * as `jang@…` by OIDC is two strings". The same argument was never applied to two certificates.
+     *
+     * So the caller resolves identity and passes it. Empty or absent keeps the previous behaviour,
+     * which is what every caller without an OTP user map gets.
+     */
+    alsoKnownAs?: readonly string[];
   },
   limits = DEFAULT_LIMITS,
 ): Plan {
@@ -209,11 +241,18 @@ export function approve(
       404,
     );
   }
-  if (plan.proposedBy === input.by && !input.mayApproveOwn) {
+  // The same *person*, not the same string. `alsoKnownAs` carries the other certificate names the
+  // deployment declares to be this human — see its comment for the live configuration where two
+  // writer names shared one identity-provider account.
+  const sameHuman = plan.proposedBy === input.by || (input.alsoKnownAs ?? []).includes(plan.proposedBy);
+  if (sameHuman && !input.mayApproveOwn) {
     // The rule this whole module exists for. Checked against the stored proposer, so it cannot be
     // sidestepped by anything in this request.
     throw new ApprovalError(
-      `${input.by} proposed this plan and cannot approve it — a second operator must`,
+      plan.proposedBy === input.by
+        ? `${input.by} proposed this plan and cannot approve it — a second operator must`
+        : `${input.by} is the same person as ${plan.proposedBy} (both map to one identity-provider ` +
+          `account), so this would be a one-person approval recorded as two — a different operator must`,
       403,
     );
   }
@@ -226,10 +265,15 @@ export function approve(
   // `solo` is recorded, not inferred. Comparing `approval.by` to `proposedBy` later would give the
   // same answer today and would stop doing so the moment either field is ever normalised — and the
   // question "did one person do this alone" is exactly the one an audit asks first.
+  //
+  // `sameHuman`, not `proposedBy === by`. Reaching here with two different names for one person
+  // means `mayApproveOwn` allowed it, and it is still one person — writing `solo` only for the
+  // exact-name case would leave the audit trail saying two, which is the failure this whole
+  // parameter exists to close.
   plan.approval = {
     by: input.by,
     at: input.now.toISOString(),
-    ...(plan.proposedBy === input.by ? { solo: true } : {}),
+    ...(sameHuman ? { solo: true } : {}),
   };
   return plan;
 }
