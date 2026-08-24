@@ -1718,7 +1718,11 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
           hostname: String(body.hostname ?? ""),
           label: typeof body.label === "string" ? body.label : undefined,
           createdBy: who,
-          revokeExisting: body.revokeExisting !== false,
+          ...(body.revokeExisting === undefined
+            ? {}
+            : typeof body.revokeExisting === "boolean"
+              ? { revokeExisting: body.revokeExisting }
+              : (() => { throw new EnrollmentError("revokeExisting must be a boolean"); })()),
           ...(body.ttlSec === undefined
             ? {}
             : { ttlSec: typeof body.ttlSec === "number" ? body.ttlSec : Number.NaN }),

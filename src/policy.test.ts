@@ -7,7 +7,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { contains } from "./test-util.ts";
-import { normalizePolicy, policyFingerprint, PolicyError } from "./policy.ts";
+import { mergePolicy, normalizePolicy, policyFingerprint, PolicyError } from "./policy.ts";
 
 const base = {
   name: "cf edge to mailer 443",
@@ -84,5 +84,23 @@ describe("endpoint kinds that were already refused", () => {
 
   it("still refuses a k8s-service source", () => {
     assert.throws(() => norm({ src: { kind: "k8s-service", value: "ns/svc" } }), PolicyError);
+  });
+});
+
+describe("strict boolean policy fields", () => {
+  it("keeps enabled boolean values and the missing-field default", () => {
+    assert.equal(norm({ enabled: true }).enabled, true);
+    assert.equal(norm({ enabled: false }).enabled, false);
+    assert.equal(norm().enabled, true);
+  });
+
+  it("refuses non-boolean enabled values instead of applying JavaScript truthiness", () => {
+    for (const enabled of ["false", "true", "0", "no", "off", 0, null, "", [], {}]) {
+      assert.throws(() => norm({ enabled }), /enabled must be a boolean/, JSON.stringify(enabled));
+    }
+  });
+
+  it("applies the same check through the library partial-update surface", () => {
+    assert.throws(() => mergePolicy(norm(), { enabled: "false" }, "p-1"), /enabled must be a boolean/);
   });
 });

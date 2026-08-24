@@ -46,6 +46,16 @@ before(async () => {
 after(() => { close(); rmSync(root, { recursive: true, force: true }); });
 
 describe("manager standalone enrollment API", () => {
+  it("refuses a non-boolean revokeExisting without revoking the existing token", async () => {
+    const created = await call("/enrollment/tokens", "POST", { hostname: "node-keep.dev" });
+    assert.equal(created.status, 201);
+    const rowId = created.body.id as string;
+    const malformed = await call("/enrollment/tokens", "POST", { hostname: "node-keep.dev", revokeExisting: "false" });
+    assert.equal(malformed.status, 400);
+    const row = loadEnrollmentDocument(store).tokens.find((token) => token.id === rowId);
+    assert.equal(row?.revokedAt, null);
+  });
+
   it("refuses missing or malformed configured enrollment state at startup", async () => {
     const missing = join(root, "missing-enrollment.json");
     await assert.rejects(startManager(managerOptions(missing)), /enrollment store is unavailable/);

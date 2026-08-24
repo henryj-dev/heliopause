@@ -437,6 +437,11 @@ export function normalizePolicy(input: unknown, id: string): Policy {
     throw bad("priority must be an integer in 1-100000");
   }
 
+  // Keep the raw input type. Coercing here would turn values such as the string "false" into true
+  // and make the downstream readers unable to distinguish invalid input from an enabled policy.
+  const enabled = o.enabled === undefined ? true : o.enabled;
+  if (typeof enabled !== "boolean") throw bad("enabled must be a boolean");
+
   return {
     id,
     name,
@@ -447,7 +452,7 @@ export function normalizePolicy(input: unknown, id: string): Policy {
     action,
     denyMode,
     priority,
-    enabled: o.enabled === undefined ? true : Boolean(o.enabled),
+    enabled,
     notes: String(o.notes ?? "").trim(),
   };
 }

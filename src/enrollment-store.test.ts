@@ -19,6 +19,16 @@ function csr(root: string, name: string, suffix: string) {
 }
 
 describe("standalone enrollment store", () => {
+  it("rejects a non-boolean revokeExisting before changing existing tokens", () => {
+    const document = emptyEnrollmentDocument();
+    const issued = createNodeToken(document, { hostname: "node-keep.dev" });
+    assert.throws(
+      () => createNodeToken(document, { hostname: "node-keep.dev", revokeExisting: "false" as unknown as boolean }),
+      /revokeExisting must be a boolean/,
+    );
+    assert.equal(document.tokens.find((token) => token.id === issued.row.id)?.revokedAt, null);
+  });
+
   it("requires explicit one-time initialization before any transaction", () => {
     const root = mkdtempSync(join(tmpdir(), "heliopause-enroll-init-"));
     const path = join(root, "store.json");

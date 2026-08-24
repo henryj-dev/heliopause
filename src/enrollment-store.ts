@@ -280,11 +280,14 @@ function audit(document: EnrollmentDocument, event: Omit<EnrollmentAuditEvent, "
 }
 export function createNodeToken(document: EnrollmentDocument, input: { hostname: string; label?: string; createdBy?: string; revokeExisting?: boolean; ttlSec?: number; now?: Date }) {
   const host = hostname(input.hostname); const issuedAt = input.now ?? new Date(); const at = nowIso(issuedAt);
+  if (input.revokeExisting !== undefined && typeof input.revokeExisting !== "boolean") {
+    throw new EnrollmentError("revokeExisting must be a boolean");
+  }
   const ttlSec = input.ttlSec ?? DEFAULT_NODE_TOKEN_TTL_SEC;
   if (!Number.isSafeInteger(ttlSec) || ttlSec < MIN_NODE_TOKEN_TTL_SEC || ttlSec > MAX_NODE_TOKEN_TTL_SEC) {
     throw new EnrollmentError(`node token ttlSec must be ${MIN_NODE_TOKEN_TTL_SEC}-${MAX_NODE_TOKEN_TTL_SEC}`);
   }
-  if (input.revokeExisting !== false) for (const token of document.tokens) if (token.hostname === host && !token.revokedAt) token.revokedAt = at;
+  if (input.revokeExisting ?? true) for (const token of document.tokens) if (token.hostname === host && !token.revokedAt) token.revokedAt = at;
   const token = `${NODE_TOKEN_PREFIX}${randomHex(32)}`;
   const row: NodeTokenRecord = { id: randomHex(8), hostname: host, tokenHash: sha256(token), label: input.label?.trim().slice(0, 120) || null,
     createdBy: input.createdBy?.trim().slice(0, 120) || null, createdAt: at,

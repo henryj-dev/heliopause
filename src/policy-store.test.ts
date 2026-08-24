@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -29,6 +29,13 @@ const policy = (id = "P1"): Policy => ({
 });
 
 describe("policy document store", () => {
+  it("rejects a non-boolean enabled value with the policy id in the error", () => {
+    const dir = mkdtempSync(join(tmpdir(), "heliopause-policy-"));
+    const path = join(dir, "policy.json");
+    writeFileSync(path, JSON.stringify({ schemaVersion: 1, policies: [{ ...policy(), enabled: "false" }] }));
+    assert.throws(() => loadPolicyDocument(path), /policy P1: enabled must be a boolean/);
+  });
+
   it("round-trips a normalized document atomically", () => {
     const dir = mkdtempSync(join(tmpdir(), "heliopause-policy-"));
     const path = join(dir, "policy.json");
