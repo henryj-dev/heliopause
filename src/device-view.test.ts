@@ -24,6 +24,43 @@ const approved = (over: Partial<ApprovedDevice> = {}): ApprovedDevice => ({
   ...over,
 });
 
+// ## A zone declared only in `cidrs6`
+//
+// A registration carries both a virtual v4 and a virtual v6 — `cf-devices.ts` files one missing
+// either as `addressless` rather than as a row. Placement asked only about the v4, so a site whose
+// zone is declared in `cidrs6` put every device in "(no zone)" with the addresses sitting right
+// there. The same half-of-the-address-space gap `Zone.cidrs6` itself had.
+const V6_ZONES: Zone[] = [
+  { id: "warp", name: "warp", cidrs: [], cidrs6: ["fd00::/8"], trust: 2 },
+];
+
+describe("placing a device whose zone is declared for the other family", () => {
+  it("finds the zone by the v6 when no v4 zone matches", () => {
+    const rows = deviceRows([approved()], V6_ZONES).rows;
+    assert.equal(rows[0]?.zone?.id, "warp");
+  });
+
+  it("carries that through to the per-user rows", () => {
+    // Two call sites asked the same question, and one moving without the other is how a device shows
+    // a zone on one screen and "(no zone)" on the next.
+    assert.deepEqual(userScreenRows([approved()], V6_ZONES)[0]?.zones, ["warp"]);
+  });
+
+  it("still prefers the v4 zone when there is one", () => {
+    // The fallback only fills a gap. A device whose v4 is placed must not move because a v6 zone
+    // exists — that would change rows that read correctly today.
+    const both: Zone[] = [...ZONES, ...V6_ZONES];
+    assert.equal(deviceRows([approved()], both).rows[0]?.zone?.id, "mgmt");
+  });
+
+  it("says no zone when neither family matches", () => {
+    // The known negative. Without it the fallback could return any zone at all and the tests above
+    // would not notice.
+    const rows = deviceRows([approved({ v4: "203.0.113.9", v6: "2001:db8::9" })], V6_ZONES).rows;
+    assert.equal(rows[0]?.zone, null);
+  });
+});
+
 const live = (over: Partial<Registration> = {}): Registration => ({
   id: "r1",
   deviceId: "d1",

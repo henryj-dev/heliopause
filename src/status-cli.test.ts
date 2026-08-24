@@ -151,12 +151,13 @@ describe("heliopause-status — the size of the answer", () => {
   it("does not read an unbounded body into the workstation's memory", async () => {
     // The real ceiling, streamed for real — it is `MAX_RELAY_RESPONSE_BYTES`, the manager's own bound
     // on this same answer, and eight megabytes of loopback is a fraction of a second.
+    // One write of just over the ceiling, not a pump that floods until backpressure. The pump was
+    // the first version and it made two unrelated timing tests flaky in the full parallel run —
+    // `node --test` runs files concurrently, and a test that saturates the machine is a test that
+    // fails other people's. Exceeding the bound by a byte proves exactly as much.
     handler = (res) => {
       res.writeHead(200, { "content-type": "application/json" });
-      const blob = Buffer.alloc(64 * 1024, 0x20);
-      const push = () => { while (!res.writableEnded && res.write(blob)) { /* until backpressure */ } };
-      res.on("drain", push);
-      push();
+      res.end(Buffer.alloc(8 * 1024 * 1024 + 1, 0x20));
     };
     // A deadline far longer than the flood needs, so the **ceiling** is the only thing that can end
     // this. The first version allowed either reason and therefore pinned neither: removing the

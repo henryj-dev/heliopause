@@ -3,17 +3,27 @@
 // ## Why these three and not the ones the design document lists first
 //
 // `GUI-테이블-설계.md` describes zones (3), address objects (5) and a service catalogue (6) before
-// these. Measured 2026-08-07, all three are empty here:
+// these. Measured 2026-08-07, all three were empty:
 //
-//   - **There is no zone.** `EndpointKind` is host / host-group / cidr / object / internet / any /
-//     k8s-service. Zones are a concept in the design document and not in the model, so screen 3
-//     cannot be projected from a site — it would have to be invented first.
-//   - **This site uses no objects.** Every endpoint across all three VPCs is a literal `cidr` or
-//     `host` (15 and 15 in dev, 4 and 4 in prod and util; `object` appears zero times). The object
-//     model exists in `objects.ts`; nothing references it.
+//   - **There was no zone.** `EndpointKind` is host / host-group / cidr / object / internet / any /
+//     k8s-service. Zones were a concept in the design document and not in the model, so screen 3
+//     could not be projected from a site — it would have had to be invented first.
+//   - **The site used no objects.** Every endpoint across all three VPCs was a literal `cidr` or
+//     `host` (15 and 15 in dev, 4 and 4 in prod and util; `object` appeared zero times). The object
+//     model existed in `objects.ts` and nothing referenced it.
 //
 // Building those first would have produced three empty tables and the impression that the screens
-// were done. What follows is what a site actually contains.
+// were done. What follows is what a site contained then, and still does.
+//
+// ⚠️ **Both were invented afterwards, and this paragraph outlived that.** Read as present tense on
+// 2026-08-24 it says a screen cannot exist while `policy-screen.ts` is building it: `site.zones` is
+// in the model, `zoneRows` and `crossings` project screens 3 and 4, `objectRows` projects screen 5,
+// and `policy-ui.ts` renders all of them. `device-view.ts` places every device in a zone.
+//
+// Left as history rather than deleted, because the reasoning is the useful part and it was correct:
+// a table that can only be empty is worse than no table. The tense is what went stale. Nothing here
+// projects zones or objects — they are built where the policy is, from `site.zones`, and this file
+// is still the three screens below.
 //
 // ## Why baseline is the one that matters most
 //

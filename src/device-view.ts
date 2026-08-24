@@ -64,6 +64,24 @@ export interface UserScreenRow {
  * because refusing to render the approved registry when the network is unavailable would make the
  * screen useless exactly when someone is trying to read it during an incident.
  */
+/**
+ * The zone a device sits in, from either of its addresses.
+ *
+ * A registration carries both a virtual v4 and a virtual v6 — `cf-devices.ts` files one missing
+ * either as `addressless` rather than as a row. This asked only about the v4, so a site that
+ * declares its zones in `cidrs6` placed every device in "(no zone)" while the addresses were right
+ * there. That is the same half-of-the-address-space gap `Zone.cidrs6` had.
+ *
+ * ⚠️ **v4 wins when the two disagree, and nothing here says so.** A device whose families land in
+ * different zones is one machine at two trust levels, which is a finding and not a rendering
+ * question — it belongs in `zoneConflicts` beside the wrong-list check, where a site author sees it
+ * once rather than in a column per device. Recorded rather than resolved here; the fallback below
+ * only changes rows that had no zone at all, so nothing that reads correctly today moves.
+ */
+function deviceZone(zones: readonly Zone[], d: { v4: string; v6: string }): Zone | null {
+  return zoneOf(zones, d.v4) ?? zoneOf(zones, d.v6);
+}
+
 export function deviceRows(
   approved: readonly ApprovedDevice[],
   zones: readonly Zone[],
@@ -74,7 +92,7 @@ export function deviceRows(
     userEmail: d.userEmail,
     v4: d.v4,
     v6: d.v6,
-    zone: zoneOf(zones, d.v4),
+    zone: deviceZone(zones, d),
     notes: d.notes ?? "",
     state: "unchecked" as const,
   }));
@@ -134,7 +152,7 @@ export function userScreenRows(
     }
     u.devices += 1;
     u.v4.push(d.v4);
-    const z = zoneOf(zones, d.v4);
+    const z = deviceZone(zones, d);
     const label = z ? z.id : "(no zone)";
     if (!u.zones.includes(label)) u.zones.push(label);
   }
