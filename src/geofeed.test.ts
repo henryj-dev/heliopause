@@ -340,3 +340,56 @@ describe("selectPrefixes", () => {
     );
   });
 });
+
+// ── IPv6 that is really IPv4 ──────────────────────────────────────────────────
+//
+// `new URL()` folds `::ffff:10.0.0.1` into `::ffff:a00:1`, and every check downstream then sees an
+// ordinary IPv6 address. Two consequences, both measured before this was closed:
+//
+//   · **The reserved list is bypassed by spelling.** It refuses `10.0.0.0/8` for family `ip`; the
+//     same address written this way arrived as family `ip6` and matched none of the v6 rules.
+//   · **It renders a rule that can never match.** An `ip6 saddr` member cannot match IPv4 traffic,
+//     so a geofeed *deny* built from one is an open path behind a clean render.
+//
+// `nft.ts` refuses the same shape one layer down and says why — "it would have to render as one
+// family while reading as the other". These pin the same decision here, where the text still shows
+// what it is.
+describe("parseFeed — IPv6 spellings of IPv4 addresses", () => {
+  const only = (line: string) => {
+    const f = parseFeed(`${GOOD}\n${line}`);
+    assert.equal(f.entries.length, 4, `${line} should not have been accepted`);
+    assert.equal(f.rejects.length, 1);
+    return f.rejects[0]!;
+  };
+
+  it("refuses the dotted form, which is how anyone writes it", () => {
+    contains(only("::ffff:10.0.0.1/128,KR,KR-11,Seoul").reason, "embedded IPv4");
+  });
+
+  it("refuses the same address in pure hex, which the dotted check cannot see", () => {
+    // `::ffff:a00:1` **is** `10.0.0.1`, and looks like nothing in particular. Without the range
+    // check the previous test passes and the bypass stays open.
+    contains(only("::ffff:a00:1/128,KR,KR-11,Seoul").reason, "IPv4-mapped");
+  });
+
+  it("refuses the mapped range itself, and NAT64", () => {
+    contains(only("::ffff:0:0/96,KR,KR-11,Seoul").reason, "IPv4-mapped");
+    contains(only("64:ff9b::/96,KR,KR-11,Seoul").reason, "NAT64");
+  });
+
+  it("leaves documentation space alone, as the IPv4 half does", () => {
+    // `2001:db8::/32` is in `GOOD` above, and the v4 half of `reservedReason` does not refuse
+    // `192.0.2.0/24` either. Refusing one and not the other would make the two halves disagree about
+    // the same question — and it is not a safety question. Asserted so the next person adding to the
+    // reserved list sees why this one is absent.
+    const f = parseFeed(`${GOOD}\n2001:db8:1::/48,KR,KR-11,Seoul`);
+    assert.equal(f.rejects.length, 0, JSON.stringify(f.rejects));
+  });
+
+  it("still accepts a real public IPv6 prefix", () => {
+    // The known positive. Without it every test above passes against a parser that refuses all IPv6.
+    const f = parseFeed(`${GOOD}\n2606:4700::/32,KR,KR-11,Seoul`);
+    assert.equal(f.rejects.length, 0, JSON.stringify(f.rejects));
+    assert.ok(f.entries.some((e) => e.prefix === "2606:4700::/32" && e.family === "ip6"));
+  });
+});

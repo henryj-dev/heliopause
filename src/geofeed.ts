@@ -142,6 +142,29 @@ function reservedReason(prefix: string, family: "ip" | "ip6"): string | null {
   if (/^f[cd]/.test(head)) return "unique local address (fc00::/7)";
   if (/^fe[89ab]/.test(head)) return "link-local (fe80::/10)";
   if (/^ff/.test(head)) return "multicast (ff00::/8)";
+  // ## The ranges that are IPv6 addresses for IPv4 traffic
+  //
+  // `parseV6` refuses the dotted spelling, which is how anyone writes these. These catch the same
+  // ranges written in pure hex — `::ffff:a00:1/128` is `10.0.0.1` and looks like nothing in
+  // particular. A member here matches no IPv6 packet and no IPv4 packet, so it renders cleanly and
+  // enforces nothing, which for a deny is an open path.
+  if (head.startsWith("::ffff:")) return "IPv4-mapped (::ffff:0:0/96)";
+  if (head.startsWith("64:ff9b:")) return "NAT64 (64:ff9b::/96)";
+  // ## Documentation space (`2001:db8::/32`) is deliberately **not** here
+  //
+  // It was, briefly, and the fixtures caught it: `GOOD` in `geofeed.test.ts` is built from
+  // `2001:db8::/32` and three IPv4 documentation ranges. The v4 half of this function does not
+  // refuse `192.0.2.0/24` either, so adding the v6 equivalent would have made the two halves
+  // disagree about the same question — and it is not a safety question. A documentation prefix
+  // renders a rule that matches documentation traffic, which is to say nothing, harmlessly.
+  //
+  // What is above it is a different thing: an address that is IPv4 wearing IPv6, which matches
+  // nothing in *either* family and slips past the v4 reserved list.
+  // ⚠️ **Not detected: the deprecated IPv4-compatible range `::/96` in hex form.** `::102:304` is
+  // `1.2.3.4` and is indistinguishable from an ordinary low address without 128-bit arithmetic this
+  // function does not do. The dotted spelling — the only way it appears in a real feed — is refused
+  // by `parseV6`, and `minIpv6Prefix` bounds how wide any of it can be. Stated rather than left as a
+  // gap somebody has to rediscover.
   return null;
 }
 
@@ -194,6 +217,23 @@ function parseV6(raw: string): { prefix: string; len: number } | { reason: strin
   const len = Number(lenText);
   if (len > 128) return { reason: "IPv6 prefix length above 128" };
   if (!addr.includes(":")) return { reason: "not an IPv6 CIDR" };
+  // ## Embedded IPv4 is refused rather than canonicalised away
+  //
+  // `new URL()` happily folds `::ffff:10.0.0.1` into `::ffff:a00:1`, and every check after this point
+  // then sees an ordinary IPv6 address. Two things follow, and both were measured:
+  //
+  //   · **The reserved-space check is bypassed by spelling.** `reservedReason` refuses `10.0.0.0/8`
+  //     for family `ip`; the same address written this way arrives as family `ip6` and matches none
+  //     of the v6 rules. Before this line, `::ffff:10.0.0.1/128` was accepted.
+  //   · **It renders as a rule that can never match.** An `ip6 saddr` member cannot match IPv4
+  //     traffic, so a geofeed *deny* built from one is an open path with a clean render behind it.
+  //
+  // `nft.ts` already refuses this shape one layer down and says why — "it would have to render as
+  // one family while reading as the other". This is the same decision, made where the text still
+  // shows what it is.
+  if (addr.includes(".")) {
+    return { reason: "embedded IPv4 in an IPv6 address — write it as an IPv4 CIDR" };
+  }
   let canon: string;
   try {
     const u = new URL(`http://[${addr}]/`);
