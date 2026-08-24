@@ -2576,6 +2576,68 @@ class TestStartupRequiresSigningConfiguration(unittest.TestCase):
             hp.signal.signal = saved_signal
         self.assertIn("artifact signing trust is unusable", "\n".join(self.logged))
 
+    def test_an_unreadable_interval_is_refused_by_name(self):
+        """A bad HELIOPAUSE_INTERVAL_SEC reads as a line in agent.env, not as a traceback.
+
+        It used to be `int(os.environ.get(...))` at module scope, which put two failures in the
+        wrong place: a non-numeric value raised `ValueError` **during import**, before this guard
+        could say anything, and `0` was accepted — `sleep_interval` then returns immediately and the
+        host heartbeats as fast as the relay will answer.
+        """
+        saved = hp.INTERVAL_ERROR
+        try:
+            hp.INTERVAL_ERROR = "HELIOPAUSE_INTERVAL_SEC must be a whole number of seconds between 1 and 3600 — got 'thirty'"
+            code, reached = self._run_main()
+            self.assertEqual(code, 2)
+            self.assertFalse(reached, "started despite an unreadable interval")
+            self.assertIn("HELIOPAUSE_INTERVAL_SEC", "\n".join(self.logged))
+        finally:
+            hp.INTERVAL_ERROR = saved
+
+
+class TestIntervalParsing(unittest.TestCase):
+    """`HELIOPAUSE_INTERVAL_SEC`, which is more than the sleep between beats.
+
+    `NFT_CONFIRM_MIN_SEC` is derived from it — `max(90, 2 * INTERVAL_SEC, …)` — so a nonsense value
+    does not merely change the polling rate, it moves the floor under the window the rollback timer
+    honours. That is why this is parsed rather than coerced, and why the parser never raises: a
+    module that cannot finish importing cannot print a sentence about why.
+    """
+
+    def test_unset_or_blank_is_the_default(self):
+        for raw in (None, "", "   "):
+            value, error = hp._interval_from_env(raw)
+            self.assertIsNone(error, f"{raw!r} should be the default, not a refusal")
+            self.assertEqual(value, hp.DEFAULT_INTERVAL_SEC)
+
+    def test_a_whole_number_in_range_is_taken(self):
+        self.assertEqual(hp._interval_from_env("30"), (30, None))
+        self.assertEqual(hp._interval_from_env(" 30 "), (30, None))
+
+    def test_a_non_number_is_reported_not_raised(self):
+        value, error = hp._interval_from_env("thirty")
+        # The default, so the constants derived below the parse stay computable. Nothing acts on
+        # them because `main()` refuses first.
+        self.assertEqual(value, hp.DEFAULT_INTERVAL_SEC)
+        self.assertIn("HELIOPAUSE_INTERVAL_SEC", error)
+        self.assertIn("thirty", error)
+
+    def test_zero_and_negative_are_refused(self):
+        """The hot loop. `_stop.wait(0)` returns immediately, from every host at once."""
+        for raw in ("0", "-1"):
+            _, error = hp._interval_from_env(raw)
+            self.assertIsNotNone(error, f"{raw} must be refused")
+
+    def test_an_interval_longer_than_the_confirm_ceiling_is_refused(self):
+        """Past this the derived window would exceed NFT_CONFIRM_MAX_SEC and the two would disagree."""
+        _, error = hp._interval_from_env(str(hp.MAX_INTERVAL_SEC + 1))
+        self.assertIsNotNone(error)
+
+    def test_a_float_is_refused_rather_than_truncated(self):
+        _, error = hp._interval_from_env("15.9")
+        self.assertIsNotNone(error, "a fraction must not silently become 15")
+
+
 class TestWatchSelectorBounds(unittest.TestCase):
     """H7: a selector watch cannot make the heartbeat thread do unbounded serial kubectl work.
 

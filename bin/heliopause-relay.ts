@@ -7,6 +7,7 @@
 // no build step is involved.
 
 import { startRelay, loadManifest } from "../src/relay.ts";
+import { boundedInteger, EnvSpecError, type NumberBounds } from "../src/env-spec.ts";
 import { formatOperatorLog, installCliLanguage, logLangFromEnv } from "../src/operator-i18n.ts";
 
 const cliLangRequested = process.argv.slice(2).some((arg) => arg === "--lang" || arg.startsWith("--lang="));
@@ -23,10 +24,35 @@ const env = (name: string, fallback?: string): string => {
   return v;
 };
 
+/** Refuse a numeric setting the way `env()` refuses a missing one: a sentence, and exit 2. */
+const number = (name: string, bounds: NumberBounds): number => {
+  try {
+    return boundedInteger(name, process.env[name], bounds);
+  } catch (error) {
+    if (!(error instanceof EnvSpecError)) throw error;
+    console.error(`[relay] ${error.message}`);
+    process.exit(2);
+  }
+};
+
 const artifactDir = env("HELIOPAUSE_ARTIFACT_DIR");
-const port = Number(env("HELIOPAUSE_RELAY_PORT", "8443"));
 const hostname = process.env.HELIOPAUSE_RELAY_HOST ?? "::";
-const reloadSec = Number(process.env.HELIOPAUSE_RELOAD_SEC ?? "30");
+
+/**
+ * Both numbers are parsed rather than coerced, and `reloadSec` is why.
+ *
+ * `Number("thirty")` is `NaN`; `Math.max(5, NaN)` is `NaN`; `setInterval(fn, NaN)` fires **every
+ * millisecond**. This gateway would then re-read and re-validate the whole authorized bundle — up
+ * to 16 MB — roughly 875 times a second, on a machine with under a gigabyte of RAM. Measured.
+ *
+ * The `Math.max(5, …)` that used to guard the interval is what makes this worth a comment: it reads
+ * exactly like the check that would have caught it.
+ */
+// `0` is allowed and means what it means to `listen` — let the kernel choose. It is what the
+// service tests bind, and `heliopause-ui.ts` has accepted it since it grew a check. What this
+// refuses is the value that is not a port at all, which is the one that used to get through.
+const port = number("HELIOPAUSE_RELAY_PORT", { min: 0, max: 65_535, fallback: 8443 });
+const reloadSec = number("HELIOPAUSE_RELOAD_SEC", { min: 5, max: 3600, fallback: 30 });
 
 // Comma-separated certificate CNs allowed to read /status. Unset means the endpoint is off, which
 // is the right default: a fleet-wide view names every host, its generation and its drift state, so
@@ -78,7 +104,9 @@ const { server, reload } = await startRelay({
 // Poll the artifact directory rather than waiting to be told. A webhook would make publishing
 // depend on the gateway being reachable from outside, which is the inbound path this design
 // spent its effort removing.
-const timer = setInterval(() => void reload(), Math.max(5, reloadSec) * 1000);
+// No `Math.max` here any more. The floor is part of the parse above, where a value that cannot
+// satisfy it stops the process instead of becoming `NaN` and slipping past the clamp.
+const timer = setInterval(() => void reload(), reloadSec * 1000);
 timer.unref?.();
 
 for (const sig of ["SIGTERM", "SIGINT"] as const) {

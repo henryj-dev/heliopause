@@ -149,7 +149,52 @@ BREAK_GLASS_KEYS_DIR = os.environ.get("HELIOPAUSE_BREAK_GLASS_KEYS_DIR", "")
 OPENSSL = os.environ.get("HELIOPAUSE_OPENSSL_BIN", "/usr/bin/openssl")
 PINS = [p.strip() for p in os.environ.get("HELIOPAUSE_PINS", "").split(",") if p.strip()]
 
-INTERVAL_SEC = int(os.environ.get("HELIOPAUSE_INTERVAL_SEC", "15"))
+DEFAULT_INTERVAL_SEC = 15
+MIN_INTERVAL_SEC = 1
+# An hour. Past that the confirm window derived below would have to be longer than
+# `NFT_CONFIRM_MAX_SEC`, so the two settings would contradict each other and the rollback promise
+# would be the one that lost.
+MAX_INTERVAL_SEC = 3600
+
+
+def _interval_from_env(raw):
+    """Read HELIOPAUSE_INTERVAL_SEC. Returns (seconds, error) and never raises.
+
+    ## Why this does not just call int()
+
+    It did, at module scope, and that put two failures in the wrong place:
+
+      · A non-numeric value raised `ValueError` **during import** — before `main()` runs, so the
+        agent died with a traceback instead of the "missing required environment" sentence it has
+        for every other misconfiguration. The operator sees a stack trace naming `int()`.
+      · `0` or a negative value was accepted. `sleep_interval` then returns immediately and the
+        agent heartbeats in a loop as fast as the relay will answer — from every host at once.
+
+    The value is also load-bearing beyond the loop: `NFT_CONFIRM_MIN_SEC` is derived from it, so a
+    nonsense interval widens or narrows the window the rollback timer honours.
+
+    Returning the default alongside the error keeps the derived constants below computable. Nothing
+    acts on them, because `main()` refuses first — but a module that cannot finish importing cannot
+    print a useful sentence either.
+    """
+    if raw is None or raw.strip() == "":
+        return DEFAULT_INTERVAL_SEC, None
+    try:
+        value = int(raw.strip(), 10)
+    except ValueError:
+        return DEFAULT_INTERVAL_SEC, (
+            f"HELIOPAUSE_INTERVAL_SEC must be a whole number of seconds between "
+            f"{MIN_INTERVAL_SEC} and {MAX_INTERVAL_SEC} — got {raw.strip()!r}"
+        )
+    if value < MIN_INTERVAL_SEC or value > MAX_INTERVAL_SEC:
+        return DEFAULT_INTERVAL_SEC, (
+            f"HELIOPAUSE_INTERVAL_SEC must be between {MIN_INTERVAL_SEC} and {MAX_INTERVAL_SEC} "
+            f"seconds — got {value}"
+        )
+    return value, None
+
+
+INTERVAL_SEC, INTERVAL_ERROR = _interval_from_env(os.environ.get("HELIOPAUSE_INTERVAL_SEC"))
 # `heliopause-agent`, not `heliopause`: on a gateway the relay also reads under
 # /var/lib/heliopause, and the unit's StateDirectoryMode=0700 on a shared parent locks the relay
 # out of it. Separate directories, no shared permission boundary. See the unit file.
@@ -4556,6 +4601,11 @@ def main():
     ]
     if missing:
         log(f"missing required environment: {', '.join(missing)}")
+        return 2
+    # Beside the missing-variable check rather than at import, so a bad interval reads as the same
+    # kind of problem it is — a line in agent.env — instead of a traceback. See `_interval_from_env`.
+    if INTERVAL_ERROR:
+        log(INTERVAL_ERROR)
         return 2
     if urllib.parse.urlsplit(RELAY_URL).scheme != "https":
         log(f"HELIOPAUSE_RELAY_URL must be https — got {RELAY_URL!r}")

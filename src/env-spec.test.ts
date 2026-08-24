@@ -1,6 +1,6 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { parsePairs, parseRelays, EnvSpecError } from "./env-spec.ts";
+import { boundedInteger, boundedNumber, parsePairs, parseRelays, EnvSpecError } from "./env-spec.ts";
 
 /**
  * The point of this file is one property that had no test when it was fixed: **a refused entry must
@@ -129,5 +129,92 @@ describe("parseRelays", () => {
   test("an empty spec is refused, because there would be nothing to aggregate", () => {
     // Unlike parsePairs: a manager with no relays has no reason to start.
     assert.match(refusal(() => parseRelays("")), /is empty/);
+  });
+});
+
+// ── Numeric settings ──────────────────────────────────────────────────────────
+//
+// These are not tests about tidy parsing. Each row below is a **measured** behaviour of this
+// repository's own code when a numeric environment value came through as `NaN`, and every one of
+// them fails open:
+//
+//   session TTL    `new Date(now + NaN)` is Invalid Date, and `invalid <= now` is false
+//                  → a session that may approve and publish never expires
+//   plan TTL       `elapsed > NaN` is false
+//                  → an approved plan stays publishable forever, which is the thing the window exists to stop
+//   max pending    `size >= NaN` is false
+//                  → the bound on pending plans is gone
+//   reload/refresh `setInterval(fn, NaN)` fires every millisecond
+//                  → a gateway re-reads a 16 MB bundle ~875 times a second
+//
+// So what is pinned here is that an unreadable value **stops the process**, rather than becoming a
+// number that quietly means "no limit".
+describe("boundedInteger", () => {
+  const bounds = { min: 1, max: 100, fallback: 10 };
+
+  test("uses the fallback when unset or blank", () => {
+    assert.equal(boundedInteger("X", undefined, bounds), 10);
+    assert.equal(boundedInteger("X", "", bounds), 10);
+    // `Number(" ")` is 0. Blank means unset, not zero — otherwise an accidentally-cleared variable
+    // becomes the most aggressive value in the range rather than the default.
+    assert.equal(boundedInteger("X", "   ", bounds), 10);
+  });
+
+  test("takes a whole number inside the range", () => {
+    assert.equal(boundedInteger("X", "42", bounds), 42);
+    assert.equal(boundedInteger("X", " 42 ", bounds), 42);
+  });
+
+  test("refuses a value that is not a number at all", () => {
+    assert.throws(
+      () => boundedInteger("HELIOPAUSE_RELOAD_SEC", "thirty", bounds),
+      (e: unknown) =>
+        e instanceof EnvSpecError && /HELIOPAUSE_RELOAD_SEC must be a number/.test((e as Error).message),
+    );
+  });
+
+  test("refuses infinity, which Number() happily produces", () => {
+    assert.throws(() => boundedInteger("X", "Infinity", bounds), EnvSpecError);
+    assert.throws(() => boundedInteger("X", "-Infinity", bounds), EnvSpecError);
+  });
+
+  test("refuses a fraction where a whole number is required", () => {
+    assert.throws(
+      () => boundedInteger("X", "1.5", bounds),
+      (e: unknown) => e instanceof EnvSpecError && /must be a whole number/.test((e as Error).message),
+    );
+  });
+
+  test("refuses either side of the range", () => {
+    assert.throws(() => boundedInteger("X", "0", bounds), /must be between 1 and 100/);
+    assert.throws(() => boundedInteger("X", "101", bounds), /must be between 1 and 100/);
+  });
+
+  test("names the variable and quotes the value, truncated", () => {
+    assert.throws(() => boundedInteger("HELIOPAUSE_PLAN_TTL_SEC", "x".repeat(80), bounds), (e: unknown) => {
+      const message = (e as Error).message;
+      // The variable, so the operator knows which line to look at. `parsePairs` deliberately does
+      // not quote what it refused; these settings hold a port or an interval, never a secret, and
+      // an operator who mistyped needs to see what they typed.
+      assert.ok(message.includes("HELIOPAUSE_PLAN_TTL_SEC"), message);
+      assert.ok(message.includes("…"), message);
+      assert.ok(message.length < 130, `message is ${message.length} chars`);
+      return true;
+    });
+  });
+});
+
+describe("boundedNumber", () => {
+  // `HELIOPAUSE_PUBLIC_RETRY_SEC` is documented as accepting fractions so a test can drive the whole
+  // retry ladder without waiting. Two functions rather than a flag, so the call site says which
+  // kind of number it is asking for.
+  test("accepts a fraction the integer form would refuse", () => {
+    assert.equal(boundedNumber("X", "0.05", { min: 0.001, max: 10, fallback: 5 }), 0.05);
+    assert.throws(() => boundedInteger("X", "0.05", { min: 0.001, max: 10, fallback: 5 }), EnvSpecError);
+  });
+
+  test("still refuses NaN and the range", () => {
+    assert.throws(() => boundedNumber("X", "soon", { min: 0, max: 10, fallback: 5 }), EnvSpecError);
+    assert.throws(() => boundedNumber("X", "11", { min: 0, max: 10, fallback: 5 }), EnvSpecError);
   });
 });

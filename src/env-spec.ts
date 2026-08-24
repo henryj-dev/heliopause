@@ -37,6 +37,88 @@ export class EnvSpecError extends Error {
 }
 
 /**
+ * A numeric setting, its range, and what it is when unset.
+ *
+ * `fallback` is part of the bound rather than applied beside it, so a default that would itself be
+ * refused cannot be introduced by editing one of the two in isolation.
+ */
+export interface NumberBounds {
+  min: number;
+  max: number;
+  fallback: number;
+}
+
+/**
+ * Read a numeric environment value, or refuse it.
+ *
+ * ## Why `Number(x)` on its own is not good enough here
+ *
+ * It yields `NaN`, and **`NaN` fails open through every comparison it touches.** These are not
+ * hypotheticals; each was measured against this repository's own code:
+ *
+ * | setting | with `NaN` |
+ * |---|---|
+ * | `HELIOPAUSE_RELOAD_SEC` | `Math.max(5, NaN)` is `NaN`, and `setInterval(fn, NaN)` fires **every millisecond** — a gateway re-reading a 16 MB bundle ~875 times a second |
+ * | `HELIOPAUSE_PUBLIC_REFRESH_SEC` | the same loop, in the manager |
+ * | `HELIOPAUSE_OIDC_SESSION_TTL_SEC` | `expiresAt` becomes `Invalid Date`, and `invalid <= now` is `false` — **sessions never expire** |
+ * | `HELIOPAUSE_PLAN_TTL_SEC` | `elapsed > NaN` is `false` — **approved plans never expire** |
+ * | `HELIOPAUSE_MAX_PENDING_PLANS` | `size >= NaN` is `false` — **the pending-plan cap is gone** |
+ *
+ * Three of those five are the safety property, switched off by a typo, with nothing anywhere saying
+ * so. `Math.max(5, …)` in particular *looks* like it prevents the first one.
+ *
+ * So the rule is that an unreadable value stops the process where somebody is watching, rather than
+ * becoming a number that silently means "no limit".
+ *
+ * ## The message quotes the value
+ *
+ * Unlike `parsePairs`, which refuses to echo anything it could not parse. The difference is what
+ * these variables hold: a port, an interval, a count. There is no shape of secret that belongs in
+ * one, and an operator who mistyped needs to see what they typed. Truncated anyway, because an
+ * environment variable is whatever somebody put in it.
+ */
+export function boundedInteger(name: string, raw: string | undefined, bounds: NumberBounds): number {
+  const value = readNumber(name, raw, bounds);
+  if (!Number.isInteger(value)) {
+    throw new EnvSpecError(
+      `${name} must be a whole number between ${bounds.min} and ${bounds.max} — got ${quote(raw)}`,
+    );
+  }
+  return value;
+}
+
+/**
+ * The same, for a setting that is legitimately fractional.
+ *
+ * One caller today: `HELIOPAUSE_PUBLIC_RETRY_SEC`, whose own documentation says *"fractional values
+ * are accepted so a test can drive the whole ladder without waiting"*. A separate function rather
+ * than a flag on the one above, so the call site says which kind of number it is asking for.
+ */
+export function boundedNumber(name: string, raw: string | undefined, bounds: NumberBounds): number {
+  return readNumber(name, raw, bounds);
+}
+
+function readNumber(name: string, raw: string | undefined, bounds: NumberBounds): number {
+  const given = raw?.trim();
+  if (given === undefined || given === "") return bounds.fallback;
+  // `Number("")` is 0 and `Number(" ")` is 0, which is why the blank cases are handled above rather
+  // than left to fall through — an empty variable means "unset", not "zero".
+  const value = Number(given);
+  if (!Number.isFinite(value)) {
+    throw new EnvSpecError(`${name} must be a number between ${bounds.min} and ${bounds.max} — got ${quote(raw)}`);
+  }
+  if (value < bounds.min || value > bounds.max) {
+    throw new EnvSpecError(`${name} must be between ${bounds.min} and ${bounds.max} — got ${quote(raw)}`);
+  }
+  return value;
+}
+
+function quote(raw: string | undefined): string {
+  const text = String(raw ?? "");
+  return JSON.stringify(text.length > 32 ? `${text.slice(0, 32)}…` : text);
+}
+
+/**
  * `dev=https://192.0.2.1:8443=./pki,prod=https://192.0.2.2:8443=./pki-prod`
  *
  * Three fields because each VPC has its own CA (V39): the manager presents a different operator

@@ -17,7 +17,9 @@ import { closeSync, constants, fstatSync, openSync, readFileSync } from "node:fs
 import { createPrivateKey, createPublicKey } from "node:crypto";
 import { artifactSigningKeyId, privateKeyFileModeError, privateKeyFileOwnerError } from "../src/artifact-signature.ts";
 import { fetchCert } from "../src/cert-api.ts";
-import { EnvSpecError, parsePairs, parseRelays } from "../src/env-spec.ts";
+import {
+  boundedInteger, boundedNumber, EnvSpecError, parsePairs, parseRelays, type NumberBounds,
+} from "../src/env-spec.ts";
 import { startManager } from "../src/manager-server.ts";
 import type { RelaySource } from "../src/manager.ts";
 import { resolveWebRoot, serveConsole } from "../src/web-console.ts";
@@ -51,6 +53,36 @@ const refuse = (error: unknown): never => {
   throw error;
 };
 
+/**
+ * A numeric setting, refused rather than coerced.
+ *
+ * ## Four of these were fail-open, and that is the reason this exists
+ *
+ * `Number("eight-hours")` is `NaN`, and `NaN` loses every comparison it is put into — so a typo did
+ * not produce a small window or a fast poll, it produced **no limit at all**. Measured against this
+ * process's own code:
+ *
+ *   · `HELIOPAUSE_OIDC_SESSION_TTL_SEC` — `expiresAt` becomes `Invalid Date` and
+ *     `invalid <= now` is `false`. Sessions never expire, including the ones that may publish.
+ *   · `HELIOPAUSE_PLAN_TTL_SEC` — `elapsed > NaN` is `false`. An approved plan stays publishable
+ *     forever, which is exactly what `approval.ts` says the window exists to prevent.
+ *   · `HELIOPAUSE_MAX_PENDING_PLANS` — `size >= NaN` is `false`. The bound is gone.
+ *   · `HELIOPAUSE_PUBLIC_REFRESH_SEC` — `setInterval(fn, NaN)` fires every millisecond.
+ *
+ * None of the four says anything when it happens. Refusing at startup is the only version of this
+ * that an operator finds out about.
+ */
+const number = (name: string, bounds: NumberBounds, fractional = false): number => {
+  try {
+    const read = fractional ? boundedNumber : boundedInteger;
+    return read(name, process.env[name], bounds);
+  } catch (error) {
+    if (!(error instanceof EnvSpecError)) throw error;
+    console.error(`[manager] ${error.message}`);
+    process.exit(2);
+  }
+};
+
 /** A comma-separated environment list, trimmed and without empties. */
 const list = (name: string): string[] =>
   (process.env[name] ?? "").split(",").map((x) => x.trim()).filter(Boolean);
@@ -77,7 +109,9 @@ const relays = relaysFrom(env("HELIOPAUSE_RELAYS")).map((r) => ({
   // the certificate proving it is different per VPC, because the CAs are separate.
   ...(process.env.HELIOPAUSE_OPERATOR_NAME ? { operatorName: process.env.HELIOPAUSE_OPERATOR_NAME } : {}),
 }));
-const port = Number(env("HELIOPAUSE_MANAGER_PORT", "8444"));
+// `0` means "let the kernel choose", which is what the service tests bind. See the note in
+// `heliopause-relay.ts`.
+const port = number("HELIOPAUSE_MANAGER_PORT", { min: 0, max: 65_535, fallback: 8444 });
 const hostname = process.env.HELIOPAUSE_MANAGER_HOST ?? "::";
 
 function loadArtifactSigningKey(path: string) {
@@ -116,7 +150,13 @@ function loadArtifactSigningKey(path: string) {
 }
 
 const artifactSigningKey = loadArtifactSigningKey(env("HELIOPAUSE_ARTIFACT_SIGNING_KEY_FILE"));
-const artifactAuthorizationTtlSec = Number(env("HELIOPAUSE_ARTIFACT_AUTHORIZATION_TTL_SEC", "86400"));
+// `startManager` bounds this again to 900..604800 — the protocol's own limits, which is where they
+// belong. Parsed here so an unreadable value names the variable rather than arriving as `NaN` and
+// being reported as a violated protocol bound.
+const artifactAuthorizationTtlSec = number(
+  "HELIOPAUSE_ARTIFACT_AUTHORIZATION_TTL_SEC",
+  { min: 15 * 60, max: 7 * 24 * 60 * 60, fallback: 86_400 },
+);
 
 // Unset means nobody may read, which is the right default. The site view is strictly more than any
 // single relay exposes — every host across every VPC — so defaulting it open would make this the
@@ -255,13 +295,15 @@ const { server } = await startManager({
           public: {
             serverNames: (process.env.HELIOPAUSE_PUBLIC_SERVER_NAMES ?? env("HELIOPAUSE_PUBLIC_SERVER_NAME"))
               .split(",").map((name) => name.trim()).filter(Boolean),
-            refreshSec: Number(process.env.HELIOPAUSE_PUBLIC_REFRESH_SEC ?? "3600"),
+            refreshSec: number("HELIOPAUSE_PUBLIC_REFRESH_SEC", { min: 60, max: 86_400, fallback: 3600 }),
             // How soon to try again while there is **no** public certificate at all — a different
             // question from the one above, and it got the same answer until 2026-08-18 cost both
             // public names an hour over a cert API that was slow for a second. Given its own knob
             // because the two are tuned against different things: `refreshSec` against how often
             // cert-manager rotates, this against how long the console may be unreachable.
-            retrySec: Number(process.env.HELIOPAUSE_PUBLIC_RETRY_SEC ?? "5"),
+            // Fractional on purpose — `ManagerOptions.tls.public.retrySec` says a test drives the
+            // whole ladder without waiting. So this one is a number, not a whole number.
+            retrySec: number("HELIOPAUSE_PUBLIC_RETRY_SEC", { min: 0.001, max: 3600, fallback: 5 }, true),
             // The token is read from a file, not an environment variable. Env is visible in
             // `/proc/<pid>/environ`, in a crash dump, and in anything that logs the environment —
             // and this one fetches a private key. A mounted Secret is read once, here.
@@ -316,21 +358,27 @@ const { server } = await startManager({
           writerGroups: list("HELIOPAUSE_OIDC_WRITER_ROLES"),
           soloApprovalRoles: list("HELIOPAUSE_OIDC_SOLO_ROLES"),
           aliases: pairs(process.env.HELIOPAUSE_OIDC_ALIASES ?? "", "HELIOPAUSE_OIDC_ALIASES"),
+          // Bounded to a month. A session carries the group claims captured at login, so its
+          // length is also how stale an authority decision may get — and an unreadable value used
+          // to mean `Invalid Date`, which never expires at all.
           ...(process.env.HELIOPAUSE_OIDC_SESSION_TTL_SEC
-            ? { sessionTtlSec: Number(process.env.HELIOPAUSE_OIDC_SESSION_TTL_SEC) }
+            ? { sessionTtlSec: number("HELIOPAUSE_OIDC_SESSION_TTL_SEC", { min: 60, max: 30 * 86_400, fallback: 8 * 3600 }) }
             : {}),
         },
       }
     : {}),
   operatorCNs,
   writerCNs,
-  timeoutMs: Number(process.env.HELIOPAUSE_RELAY_TIMEOUT_MS ?? "5000"),
-  publishTimeoutMs: Number(process.env.HELIOPAUSE_PUBLISH_TIMEOUT_MS ?? "30000"),
+  timeoutMs: number("HELIOPAUSE_RELAY_TIMEOUT_MS", { min: 100, max: 120_000, fallback: 5_000 }),
+  publishTimeoutMs: number("HELIOPAUSE_PUBLISH_TIMEOUT_MS", { min: 1_000, max: 600_000, fallback: 30_000 }),
+  // Both bounded, and both were fail-open: an unreadable TTL made every approved plan publishable
+  // forever, and an unreadable cap removed the bound entirely. `approval.ts` explains what the
+  // window is for — an approval from yesterday published today applies rules nobody approved.
   ...(process.env.HELIOPAUSE_PLAN_TTL_SEC
     ? {
         limits: {
-          ttlSec: Number(process.env.HELIOPAUSE_PLAN_TTL_SEC),
-          maxPending: Number(process.env.HELIOPAUSE_MAX_PENDING_PLANS ?? "32"),
+          ttlSec: number("HELIOPAUSE_PLAN_TTL_SEC", { min: 60, max: 86_400, fallback: 600 }),
+          maxPending: number("HELIOPAUSE_MAX_PENDING_PLANS", { min: 1, max: 1024, fallback: 32 }),
         },
       }
     : {}),

@@ -32,6 +32,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { timingSafeEqual } from "node:crypto";
+import { boundedInteger } from "../src/env-spec.ts";
 import { armedReasons } from "../src/policy-render-guard.ts";
 import { collectPolicySource, type PolicySource } from "../src/policy-source.ts";
 import { policyHead, type ScreenSite } from "../src/policy-screen.ts";
@@ -111,7 +112,19 @@ const allowPaths = (process.env.HELIOPAUSE_POLICY_ALLOW_PATHS ?? "policies.json"
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
-const port = Number(process.env.HELIOPAUSE_POLICY_RENDER_PORT ?? "9099");
+// Parsed, not coerced. `Number("nine-thousand")` is `NaN`, and `listen(NaN)` throws
+// `ERR_SOCKET_BAD_PORT` — loud, but naming neither this variable nor this service. Same rule as
+// every other numeric setting; see `boundedInteger`.
+let port: number;
+try {
+  port = boundedInteger("HELIOPAUSE_POLICY_RENDER_PORT", process.env.HELIOPAUSE_POLICY_RENDER_PORT, {
+    // `0` lets the kernel choose, which is what `policy-render-service.test.ts` binds.
+    min: 0, max: 65_535, fallback: 9099,
+  });
+} catch (error) {
+  console.error(`[policy-render] ${(error as Error).message}`);
+  process.exit(2);
+}
 const hostname = process.env.HELIOPAUSE_POLICY_RENDER_HOST ?? "::";
 /**
  * The bearer this service requires. **Required**, not optional.
