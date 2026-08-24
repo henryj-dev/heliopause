@@ -438,7 +438,9 @@ export function normalizePolicy(input: unknown, id: string): Policy {
   }
 
   // Keep the raw input type. Coercing here would turn values such as the string "false" into true
-  // and make the downstream readers unable to distinguish invalid input from an enabled policy.
+  // and make the downstream readers unable to distinguish invalid input from an enabled policy. The
+  // console readers also cannot catch this after serialisation: they receive the already-normalised
+  // boolean, so this boundary is the place where the raw type must be checked.
   const enabled = o.enabled === undefined ? true : o.enabled;
   if (typeof enabled !== "boolean") throw bad("enabled must be a boolean");
 

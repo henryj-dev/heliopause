@@ -3,7 +3,7 @@
 - 감사일: 2026-08-24
 - **개정: 2026-08-25** — 검증 재실행, 발견 2건 정정, 3건 추가 (→ [개정 이력](#개정-이력--2026-08-25))
 - 감사 기준 커밋: `3de1d05` (재실행 당시 워크트리)
-- 현재 후속 검토 커밋: `8b9c469` — M-01/L-02/I-02 수정과 감사 문서·기대값 갱신을 포함
+- 현재 후속 검토 커밋: `f293884` — M-01/L-02/I-02 수정과 감사 문서·기대값 갱신을 포함
 - 대상: 저장소의 실행 코드 및 테스트 코드 (아래 커버리지 표의 미검토 영역 제외)
 - 제외: README, 설계 문서
   - ⚠️ 초판은 「주석의 보안 주장 자체」도 제외했다. **개정에서 철회한다** — 이 저장소에서는
@@ -50,8 +50,8 @@
 - **L-02 해결됨** — HTTP와 저장소 함수 양쪽에서 `revokeExisting`의 비불리언 입력을 거부한다.
 - **I-02 해결됨** — 스캐폴드 TLS 해석을 순수 함수로 분리하고, 인증서·키 부분 설정 시 즉시
   실패하도록 했다. 양쪽 미설정 시 개발용 자체서명 경로는 유지된다.
-- **O-01 미검증** — KeyStone 외부 설정은 저장소 밖 작업이며, 두 로그아웃 URI의 실제 등록 여부는
-  운영 환경 확인이 필요하다.
+- **O-01 미검증** — KeyStone 외부 설정은 저장소 밖 작업이며, 배포 체크리스트에 이미 기재된
+  `post_logout_redirect_uri`와 달리 Back-channel Logout URI 하나의 실제 등록 여부 확인이 남아 있다.
 
 ⚠️ **「0 Critical / 0 High」는 검토한 범위에 한정된 판정이다.** 아래 「아직 아무 주장도 하지 않은
 영역」은 전수 검토하지 않았으므로, 저장소 전체에 High 이상이 없다고 주장하지 않는다. 초판은
@@ -236,7 +236,7 @@ const tls = process.env.HELIOPAUSE_CERT_FILE && process.env.HELIOPAUSE_KEY_FILE
 
 ## 저장소 밖에서 확인할 항목
 
-### O-01. IdP 로그아웃 URI 등록 여부 미확인
+### O-01. IdP Back-channel Logout URI 등록 여부 미확인
 
 - 상태: **코드 완비 · 외부 IdP 설정 미검증**
 - 코드 위치: `src/manager-server.ts:2980`(백채널 라우트) · `:3188`(시작 로그) ·
@@ -244,8 +244,10 @@ const tls = process.env.HELIOPAUSE_CERT_FILE && process.env.HELIOPAUSE_KEY_FILE
 - 근거: `security-audits/2026-08-24-todo.md` §4.5 — 30항목 중 유일하게 안 닫힌 것
 
 저장소 코드만으로는 KeyStone 클라이언트에 실제로 등록됐는지 확인할 수 없다. 저장소 밖의
-운영 확인 기록(`2026-08-24-todo.md` §4.5)에 따르면 두 URI의 등록이 남은 작업으로 기록되어
-있다. 따라서 코드로 확인된 취약점이 아니라 외부 배포 설정의 미검증 항목으로 기록한다.
+운영 확인 기록(`2026-08-24-todo.md` §4.5)은 Back-channel Logout URI 하나를 남은 작업으로
+기록한다. 배포 체크리스트(`docs/oidc-배포-체크리스트.md`)에는 `post_logout_redirect_uri`가
+이미 등록 목록에 있다. 따라서 코드로 확인된 취약점이 아니라 외부 배포 설정의 미검증 항목으로
+기록한다.
 
 ```
 Back-channel Logout URI:  https://<console>/auth/backchannel-logout
@@ -253,14 +255,14 @@ backchannel_logout_session_required: off
 post_logout_redirect_uri: (packaging/manager.env.example 참조)
 ```
 
-여기서 등록이 필요한 것은 두 URI이며, `backchannel_logout_session_required: off`는 비어 있는
-URI가 아니라 이 구현이 요구하는 설정값이다.
+여기서 실제로 남은 등록 작업은 Back-channel Logout URI 하나이며,
+`backchannel_logout_session_required: off`는 비어 있는 URI가 아니라 이 구현이 요구하는
+설정값이다. Post-logout Redirect URI는 배포 체크리스트에 이미 기재되어 있다.
 
 **둘의 실패 방식이 다르다.**
 
 | | 미등록이면 |
 |---|---|
-| `post_logout_redirect_uri` | **시끄럽다** — 운영자가 IdP 오류 페이지에 떨어질 수 있다. `a6c367b`의 `prompt=login`은 재인증 시 기존 IdP 세션 재사용을 줄이는 보완책이지, 등록 누락 자체를 해결하는 것은 아니다 |
 | Back-channel Logout URI | **조용하다** — 강제 로그아웃이 아무에게도 안 닿고 **IdP 는 성공을 보고한다** |
 
 코드 감사가 「코드는 정상」으로 넘길 수 있는 항목이지만, 넘기면 조용한 쪽의 사실이 어느 문서에도
@@ -405,7 +407,7 @@ dummy branch나 빈 구현은 확인하지 못했다.
 1. **M-01** — 완료. `enabled` 타입 검증과 회귀 테스트를 추가했다.
 2. **L-02** — 완료. `revokeExisting` 두 경계의 입력 검증을 추가했다.
 3. **I-02** — 완료. 스캐폴드 TLS 부분 설정을 실패 처리한다.
-4. **O-01** — KeyStone 클라이언트의 로그아웃 URI 두 개 등록 여부를 운영 환경에서 확인한다.
+4. **O-01** — KeyStone 클라이언트의 Back-channel Logout URI 등록 여부를 운영 환경에서 확인한다.
    저장소 밖 작업이고, 백채널 쪽은 미등록이 조용하다.
 5. 3차 감사를 돌린다면 「아직 아무 주장도 하지 않은 영역」 절부터, 그리고 **주석–코드 대조를
    범위에 넣고**.
