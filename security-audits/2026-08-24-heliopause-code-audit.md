@@ -250,16 +250,16 @@ const tls = process.env.HELIOPAUSE_CERT_FILE && process.env.HELIOPAUSE_KEY_FILE
 기록한다.
 
 ```
-Back-channel Logout URI:  https://<console>/auth/backchannel-logout
+Back-channel Logout URI:  https://heliopause.tinyuniver.se/auth/backchannel-logout
 backchannel_logout_session_required: off
-post_logout_redirect_uri: (packaging/manager.env.example 참조)
+post_logout_redirect_uri: https://heliopause.tinyuniver.se/
 ```
 
 여기서 실제로 남은 등록 작업은 Back-channel Logout URI 하나이며,
 `backchannel_logout_session_required: off`는 비어 있는 URI가 아니라 이 구현이 요구하는
 설정값이다. Post-logout Redirect URI는 배포 체크리스트에 이미 기재되어 있다.
 
-**둘의 실패 방식이 다르다.**
+**미등록 시의 실패 방식은 조용하다.**
 
 | | 미등록이면 |
 |---|---|
