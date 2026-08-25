@@ -1830,6 +1830,7 @@ class TestWorkloadHeartbeat(unittest.TestCase):
         with hp._host_observe_lock:
             hp._host_observe_value = None
             hp._host_observe_at = 0.0
+            hp._host_observe_failure = ""
             hp._host_observe_refreshing = False
 
     def tearDown(self):
@@ -1911,6 +1912,114 @@ class TestWorkloadHeartbeat(unittest.TestCase):
             "least-privilege RBAC intentionally leaves privileged Cilium exec telemetry disabled",
         )
         self.assertTrue(entered.wait(1), "background observers never started")
+
+    def _settle(self, st, want, timeout=1.0):
+        """Beat until `want` appears in the detail, then return the last report."""
+        out = hp._workload_report(st)["workload"]
+        deadline = time.time() + timeout
+        while time.time() < deadline and want not in (out["detail"] or ""):
+            time.sleep(0.01)
+            out = hp._workload_report(st)["workload"]
+        return out
+
+    def test_an_observer_that_raises_says_so_instead_of_saying_pending(self):
+        """The reason must reach the heartbeat, not only the journal.
+
+        The exception path used to leave the cache unwritten, so every later beat found no entry for
+        this key and sent "refresh pending" — a word that promises an answer is coming. Measured
+        2026-08-25 on k3s-01.dev: `observed` was null while 61 expected objects were in the cluster,
+        the relay reported all of `mustExist` missing, and the row said pending. Nothing on it could
+        be told apart from a first beat.
+        """
+        def boom(_refs, _deadline=None):
+            raise OSError("kubeconfig vanished")
+
+        real = hp.observed_objects
+        hp.observed_objects = boom
+        try:
+            st = {**hp._EMPTY_STATE, "workloadState": "confirmed",
+                  "workloadGeneration": "g1", "workloadApplied": ["util/hp-dev-p700"]}
+            out = self._settle(st, "kubeconfig vanished")
+        finally:
+            hp.observed_objects = real
+        self.assertIsNone(out["observed"], "a failed read is not an empty cluster")
+        self.assertIn("workload observation failed", out["detail"])
+        self.assertIn("kubeconfig vanished", out["detail"])
+        self.assertNotIn(
+            "refresh pending", out["detail"],
+            "a failure that repeats must stop describing itself as not-yet-arrived",
+        )
+
+    def test_an_observer_that_cannot_start_is_retried_rather_than_latched(self):
+        """`_workload_refreshing` is raised before the thread exists.
+
+        A `start()` that raises would leave it True forever: no later beat starts another worker, and
+        the cache freezes at whatever it last held while every heartbeat reports it as current. These
+        hosts have under a gigabyte of RAM — thread creation is one of the first things to fail.
+        """
+        st = {**hp._EMPTY_STATE, "workloadState": "confirmed",
+              "workloadGeneration": "g1", "workloadApplied": ["util/hp-dev-p700"]}
+
+        class Refusing:
+            def __init__(self, *a, **k):
+                pass
+
+            def start(self):
+                raise RuntimeError("can't start new thread")
+
+        real = hp.threading.Thread
+        hp.threading.Thread = Refusing
+        try:
+            # Through `build_heartbeat`, not `_workload_report`, because that is where the sharper
+            # failure is: nothing guards these calls, so an escaping spawn error leaves the heartbeat
+            # unbuilt — and the heartbeat is the nft confirm signal. A host mid-apply would roll its
+            # firewall back because it could not start a thread. Without the fix this errors here
+            # rather than failing an assertion, and it takes all three spawn sites with it.
+            heartbeat = hp.build_heartbeat(st)
+        finally:
+            hp.threading.Thread = real
+        out = heartbeat["workload"]
+        self.assertIsNone(out["observed"])
+        self.assertIn("could not start", out["detail"])
+        self.assertIn("could not start", heartbeat["applied"]["detail"])
+        with hp._workload_cache_lock:
+            self.assertFalse(
+                hp._workload_refreshing,
+                "a worker that never started must not hold the flag that stops the next one",
+            )
+        # The flag being clear is only worth anything if a later beat really does observe.
+        out = hp._workload_report(st)["workload"]
+        deadline = time.time() + 1
+        while time.time() < deadline and out["observed"] is None:
+            time.sleep(0.01)
+            out = hp._workload_report(st)["workload"]
+        self.assertEqual(out["observed"], ["util/hp-dev-p700"])
+
+    def test_a_host_reader_that_raises_says_so_instead_of_saying_pending(self):
+        """The same hole as the workload half, on the layer that decides rollback.
+
+        `observed` stays null either way — `hasDrifted` reads null as drift, so this is already loud.
+        What was wrong is the reason attached to it: "refresh pending" describes a first beat, and
+        the failure that produced it will produce it again on every beat after.
+        """
+        def boom():
+            raise OSError("nft is not on PATH")
+
+        real = hp._read_host_observation
+        hp._read_host_observation = boom
+        try:
+            st = {**hp._EMPTY_STATE, "workloadState": None}
+            out = hp.build_heartbeat(st)["applied"]
+            deadline = time.time() + 1
+            while time.time() < deadline and "nft is not on PATH" not in (out["detail"] or ""):
+                time.sleep(0.01)
+                out = hp.build_heartbeat(st)["applied"]
+        finally:
+            hp._read_host_observation = real
+        self.assertIsNone(out["observedHash"], "a failed read is not an empty ruleset")
+        self.assertIn("host observation failed", out["detail"])
+        self.assertIn("nft is not on PATH", out["detail"])
+        self.assertNotIn("refresh pending", out["detail"])
 
 
 class TestPreconditionedUnixSocketDelete(unittest.TestCase):

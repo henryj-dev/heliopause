@@ -4037,6 +4037,9 @@ def fetch_artifact():
 HOST_OBSERVE_SEC = 15
 _host_observe_lock = threading.Lock()
 _host_observe_value = None
+# Why the last refresh failed, or "". Carried so the pending path can name it instead of promising
+# an answer that is not coming.
+_host_observe_failure = ""
 _host_observe_at = 0.0
 _host_observe_refreshing = False
 
@@ -4070,13 +4073,24 @@ def _read_host_observation():
 
 def _refresh_host_observation():
     global _host_observe_value, _host_observe_at, _host_observe_refreshing
+    global _host_observe_failure
     try:
         value = _read_host_observation()
         with _host_observe_lock:
             _host_observe_value = value
             _host_observe_at = time.monotonic()
+            _host_observe_failure = ""
     except Exception as e:  # noqa: BLE001 — advisory observations cannot stop confirmation
+        # The reason is kept, not only logged. Left in the journal alone, the next beat reports
+        # "host observation refresh pending" — the word for an answer that is coming, on a failure
+        # that will repeat. The workload half had the identical hole, and it is what made a permanent
+        # reader failure on k3s-01.dev indistinguishable from a first beat.
+        #
+        # Only the detail is affected. `observed` stays null, which `hasDrifted` already reads as
+        # drift, and no invented observation is cached in place of one that was never taken.
         log(f"host observation refresh failed: {e}")
+        with _host_observe_lock:
+            _host_observe_failure = f"host observation failed: {e}"
     finally:
         with _host_observe_lock:
             _host_observe_refreshing = False
@@ -4094,21 +4108,40 @@ def _host_observation_report():
     """Cached nft observations; refresh all three away from the confirmation-critical loop."""
     global _host_observe_refreshing
     now = time.monotonic()
+    start_failure = ""
     with _host_observe_lock:
         value = _host_observe_value
+        failure = _host_observe_failure
         fresh = value is not None and now - _host_observe_at < HOST_OBSERVE_SEC
         if not fresh and not _host_observe_refreshing:
             # These are three nft subprocesses, each with its own 20-second timeout. The heartbeat
             # is the rollback confirmation signal, so none belongs on its foreground path.
             _host_observe_refreshing = True
-            threading.Thread(
-                target=_refresh_host_observation,
-                name="host-observation",
-                daemon=True,
-            ).start()
-    return value or {
+            try:
+                threading.Thread(
+                    target=_refresh_host_observation,
+                    name="host-observation",
+                    daemon=True,
+                ).start()
+            except RuntimeError as e:
+                # The sharpest of the three spawn sites; the others are the selector membership and
+                # the workload observation. Sharpest because this one feeds the *host*
+                # half: an uncaught spawn failure leaves `build_heartbeat` unbuilt, and the heartbeat
+                # it would have sent is what confirms the nftables generation. A host mid-apply would
+                # roll its firewall back because it could not start a thread to read `nft` with.
+                _host_observe_refreshing = False
+                start_failure = f"host observation could not start: {e}"
+    if start_failure:
+        log(start_failure)
+    if value is not None:
+        # A cached dump is a real observation and stays the answer — this function already serves one
+        # while a refresh is in flight, and a spawn failure is not a reason to downgrade it to null.
+        # `hasDrifted` reads null as drift, so discarding it here would report a healthy host as
+        # having lost its ruleset. The reason for the failed refresh is in the journal.
+        return value
+    return {
         "observed": None,
-        "detail": "host observation refresh pending",
+        "detail": start_failure or failure or "host observation refresh pending",
         "foreignFilters": None,
         "publishedPorts": None,
         # Present and null on the pending path too. `build_heartbeat` reads this with `.get`, so a
@@ -4219,6 +4252,7 @@ def _membership_report(st):
         return {}
     key = json.dumps(watch, sort_keys=True, separators=(",", ":"))
     now = time.monotonic()
+    start_failure = ""
     with _membership_cache_lock:
         value = _membership_cache_value if _membership_cache_key == key else None
         fresh = value is not None and now - _membership_cache_at < MEMBERSHIP_CACHE_SEC
@@ -4228,12 +4262,24 @@ def _membership_report(st):
             # 60-second kubectl timeout. At most one bounded worker exists; later beats use the
             # timestamped cached answer or omit the field while it catches up.
             _membership_refreshing = True
-            threading.Thread(
-                target=_refresh_membership,
-                args=(watch, key),
-                name="selector-membership",
-                daemon=True,
-            ).start()
+            try:
+                threading.Thread(
+                    target=_refresh_membership,
+                    args=(watch, key),
+                    name="selector-membership",
+                    daemon=True,
+                ).start()
+            except RuntimeError as e:
+                # Same two failures as the workload observation below, and for the same reason: this
+                # runs inside `build_heartbeat`, which does not guard it, and the flag is raised
+                # before the thread exists. Uncaught, a failed spawn costs the whole heartbeat; caught
+                # but latched, it costs every later refresh. The field itself is advisory and simply
+                # goes missing, which is honest — but it would go missing permanently, for a reason
+                # nothing on the row could name.
+                _membership_refreshing = False
+                start_failure = f"selector membership could not start: {e}"
+    if start_failure:
+        log(start_failure)
     return {"membership": value} if value else {}
 
 
@@ -4250,7 +4296,30 @@ def _refresh_workload_observation(refs, key):
             _workload_cache_detail = detail
             _workload_cache_at = time.monotonic()
     except Exception as e:  # noqa: BLE001 — telemetry cannot take down the heartbeat loop
+        # ## A failure that only reaches the journal reads as "not yet" on the fleet row
+        #
+        # This used to log and return, leaving the cache unwritten. The next heartbeat then found
+        # no entry for this key and sent `detail: "workload observation refresh pending"` — which
+        # says the answer is coming. If the failure repeats, and the reason it failed the first time
+        # usually makes it fail every time, that sentence is wrong on every beat after the first and
+        # there is nothing on the row that says so.
+        #
+        # Measured 2026-08-25 on k3s-01.dev: `observed` was null while 61 of the expected objects
+        # were in the cluster, so the relay reported all 70 of `mustExist` missing — the whole list,
+        # because `missingObjects` returns it for a null observation. The row said "pending". An
+        # operator has no way to tell that apart from a first beat, and the agent's own re-apply
+        # path (`_workload_objects_missing`) stays quiet for exactly as long, because it declines to
+        # act on an unknown. So the one thing that would have contradicted the applier was off, and
+        # the one field that would have said why was in the journal.
+        #
+        # Cached under `key`, the same as the success path, so the reason is what the next beat
+        # sends and a wedged reader cannot spin: this is a retry throttle as much as a report.
         log(f"workload observation refresh failed: {e}")
+        with _workload_cache_lock:
+            _workload_cache_key = key
+            _workload_cache_observed = None
+            _workload_cache_detail = f"workload observation failed: {e}"
+            _workload_cache_at = time.monotonic()
     finally:
         with _workload_cache_lock:
             _workload_refreshing = False
@@ -4281,6 +4350,7 @@ def _workload_report(st):
         # an immediate re-apply loop.
         key = (st.get("workloadGeneration"), tuple(sorted(identities)))
         now = time.monotonic()
+        start_failure = ""
         with _workload_cache_lock:
             same = _workload_cache_key == key
             observed = _workload_cache_observed if same else None
@@ -4290,13 +4360,35 @@ def _workload_report(st):
                 # At most one worker exists. A large legacy state can name 128 objects and each read
                 # has a kubectl timeout; none of that telemetry is allowed to delay the heartbeat
                 # that confirms (or rolls back) the host firewall.
+                #
+                # `start()` raising is worse than it looks, and worse than "telemetry goes quiet".
+                # `build_heartbeat` does not guard this call, so the exception leaves the heartbeat
+                # unbuilt — and the heartbeat is also the nft confirm signal. A host mid-apply would
+                # roll its firewall back on a failed thread spawn. Measured: without the `try` the
+                # new test does not fail, it errors, with the RuntimeError escaping `_workload_report`.
+                #
+                # Second, the flag is raised before the thread exists, so leaving it True latches the
+                # observation off — no later beat starts another worker, and the cache freezes at
+                # whatever it last held while every heartbeat reports it as current.
+                #
+                # Neither is hypothetical here: `MAX_SIGNED_PAYLOAD_BYTES` exists because these hosts
+                # have under a gigabyte of RAM, and thread creation is among the first things to fail
+                # there. Catching, lowering the flag, and saying so keeps it loud and retryable.
                 _workload_refreshing = True
-                threading.Thread(
-                    target=_refresh_workload_observation,
-                    args=(refs, key),
-                    name="workload-observation",
-                    daemon=True,
-                ).start()
+                try:
+                    threading.Thread(
+                        target=_refresh_workload_observation,
+                        args=(refs, key),
+                        name="workload-observation",
+                        daemon=True,
+                    ).start()
+                except RuntimeError as e:
+                    _workload_refreshing = False
+                    start_failure = f"workload observation could not start: {e}"
+                    detail = start_failure
+        # Outside the lock: the journal write is not something to hold the cache behind.
+        if start_failure:
+            log(start_failure)
     return {
         "workload": {
             "state": (
