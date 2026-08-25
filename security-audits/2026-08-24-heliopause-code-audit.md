@@ -1,9 +1,9 @@
 # heliopause 코드 감사 보고서
 
 - 감사일: 2026-08-24
-- **개정: 2026-08-25** — 검증 재실행, 발견 2건 정정, 3건 추가 (→ [개정 이력](#개정-이력--2026-08-25))
+- **개정: 2026-08-25** — 검증 재실행, 발견 2건 정정, 4건 추가 (→ [개정 이력](#개정-이력--2026-08-25))
 - 감사 기준 커밋: `3de1d05` (재실행 당시 워크트리)
-- 직전 후속 검토 커밋: `1c0bba2` — M-01/L-02/I-02 수정과 감사 문서·기대값 갱신을 포함
+- 직전 후속 검토 커밋: `67635fe` — M-01/L-02/I-02 수정과 감사 문서·기대값 갱신을 포함
 - 대상: 저장소의 실행 코드 및 테스트 코드 (아래 커버리지 표의 미검토 영역 제외)
 - 제외: README, 설계 문서
   - ⚠️ 초판은 「주석의 보안 주장 자체」도 제외했다. **개정에서 철회한다** — 이 저장소에서는
@@ -23,6 +23,7 @@
 | L-01 | Low · 수정 제안 4건 | **Info 로 낮춤.** 넷 중 셋은 이미 되어 있다. 남는 것은 부분 인증서 폴백 하나 |
 | L-02 (`revokeExisting`) | — | **추가.** M-01 과 같은 결함 유형의 두 번째 자리이며, 기존 토큰 폐기로 운영 영향이 있어 Low로 분류 |
 | O-01 | — | **추가.** 저장소 밖에서 확인해야 하는 항목 (IdP 등록 여부; 현재 등록 확인됨) |
+| M-02 | — | **추가.** 실제 `/app` 응답에서 CSP 교집합이 SvelteKit bootstrap과 style attribute를 차단하는 것을 확인 |
 | 미검토 영역 | 없음 | **추가.** 「문제 없음」과 「안 봄」이 구별되지 않았다 |
 
 ## 요약
@@ -33,7 +34,7 @@
 |---|---:|
 | Critical | 0 |
 | High | 0 |
-| Medium | 1 |
+| Medium | 2 |
 | Low | 1 |
 | Info | 1 |
 
@@ -52,12 +53,42 @@
   실패하도록 했다. 양쪽 미설정 시 개발용 자체서명 경로는 유지된다.
 - **O-01 등록 확인됨** — KeyStone 클라이언트에 Back-channel Logout URI가 등록됐다. 강제 로그아웃
   요청이 실제로 도달해 세션을 종료하는지의 운영 검증은 남아 있다.
+- **M-02 해결됨(코드)** — `serveConsole`이 SvelteKit build의 `script-src` hash를 HTTP CSP에도
+  반영하고, `style-src`와 `style-src-attr`를 명시한다. 실제 배포 응답은 새 이미지 반영 후 재확인한다.
 
 ⚠️ **「0 Critical / 0 High」는 검토한 범위에 한정된 판정이다.** 아래 「아직 아무 주장도 하지 않은
 영역」은 전수 검토하지 않았으므로, 저장소 전체에 High 이상이 없다고 주장하지 않는다. 초판은
 테스트가 돌지 않은 상태에서 이 판정을 내렸고, 검사가 안 돌면 「High 없음」이 아니라 「판정 불가」다.
 
 ## 발견 사항
+
+### M-02. `/app` CSP 교집합이 SvelteKit bootstrap을 차단함
+
+- 심각도: Medium (콘솔 가용성·보안 헤더 결합 결함)
+- 위치: `src/web-console.ts:40-80`, `packages/web/svelte.config.js:12-25`,
+  배포 응답 `https://heliopause.tinyuniver.se/app`
+- 공격/장애 시나리오: `/app` 응답의 HTTP 헤더가 `default-src 'self'`만 제공하고
+  `script-src`·`style-src`를 제공하지 않음 → HTML meta에는 SvelteKit inline bootstrap의
+  hash가 있어도 브라우저가 두 정책의 교집합을 적용 → `app:24` script와 `app:23` style이
+  차단되어 콘솔이 초기화되지 않음
+- 확신도: **확인됨** — 2026-08-25 실제 응답 헤더·HTML·브라우저 CSP 오류로 재현
+- 후속 상태: **코드 수정됨 · 배포 후 실응답 재확인 대기**
+
+실제 응답은 다음과 같았다.
+
+```text
+HTTP CSP: default-src 'self'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; form-action 'self'; img-src 'self' data:
+HTML meta: script-src 'self' 'sha256-WDNXFB3LeKGt287ki0fRfip0y8Gl/eiiExD+5O0k8Lk='
+Browser: app:23 style blocked, app:24 inline script blocked
+```
+
+`default-src`는 `script-src`와 `style-src`의 fallback이므로, meta policy에 hash가 있어도
+HTTP policy가 inline script를 허용하지 않으면 hash가 적용되지 않는다. `style-src-attr`가
+없으면 SvelteKit이 생성한 `<div style="display: contents">`도 차단된다.
+
+수정은 build가 생성한 hash를 HTML meta에서 안전하게 추출해 HTTP `script-src`에 복사하고,
+`style-src 'self'` 및 `style-src-attr 'unsafe-inline'`를 명시하는 방식이다. 허용되지 않은
+source token은 복사하지 않고 `script-src 'self'`로 fail-closed 한다.
 
 ### M-01. 비불리언 `enabled` 값이 조용히 활성화됨
 
@@ -408,5 +439,7 @@ dummy branch나 빈 구현은 확인하지 못했다.
 3. **I-02** — 완료. 스캐폴드 TLS 부분 설정을 실패 처리한다.
 4. **O-01** — 등록은 확인됨. KeyStone에서 강제 로그아웃을 실행하고 매니저 저널의
    `backchannel-logout for sub ...` 성공 줄을 확인한다.
-5. 3차 감사를 돌린다면 「아직 아무 주장도 하지 않은 영역」 절부터, 그리고 **주석–코드 대조를
+5. **M-02** — 코드 수정·빌드·12개 CSP 회귀 테스트 완료. 배포 후 `/app`의 HTTP 헤더가
+   HTML meta의 `script-src` hash를 포함하는지 다시 확인한다.
+6. 3차 감사를 돌린다면 「아직 아무 주장도 하지 않은 영역」 절부터, 그리고 **주석–코드 대조를
    범위에 넣고**.

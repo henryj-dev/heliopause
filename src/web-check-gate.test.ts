@@ -11,22 +11,17 @@ describe("the web diagnostic gate", () => {
     assert.match(ci, /- run: npm run typecheck\n[\s\S]*- run: npm run check:web\n[\s\S]*- run: npm test/);
   });
 
-  // ## The two halves of the console's CSP, and why they must stay apart
+  // ## The two halves of the console's CSP, and why the build hash must reach both
   //
-  // `script-src` can only be written by the build — Kit hashes its inline bootstrap and emits the
-  // directive as a `<meta http-equiv>`. `frame-ancestors` can only be written by the server — it is
-  // **ignored** in a meta element. So the policy is split, and the browser enforces the intersection
-  // of the two.
+  // Kit hashes its inline bootstrap and emits the directive as a `<meta http-equiv>`. The server
+  // repeats the exact build hash because the browser intersects the two policies. `frame-ancestors`
+  // can only be written by the server because it is **ignored** in a meta element.
   //
-  // That intersection is what makes this worth a test. If someone later adds `script-src 'self'` to
-  // the header "for completeness", the intersection drops Kit's hash and the console goes blank —
-  // with every unit test still green, because each half is individually valid. This asserts the
-  // split rather than either half.
+  // That intersection is what makes this worth a test. If the server omits the build hash, its
+  // `default-src` blocks the inline bootstrap and the console goes blank. Unsafe sources must not
+  // be copied from the build policy.
   //
-  // Verified end to end once, against a real `npm run build:web`: the meta carried
-  // `script-src 'self' 'sha256-3mqbss…'`, the page's single inline script hashed to exactly that,
-  // and the header carried no `script-src`. That check needs a build, so it is not run here.
-  it("keeps script-src in the build and frame-ancestors in the server", () => {
+  it("keeps the build hash in the HTTP policy and frame-ancestors in the server", () => {
     const svelteConfig = readFileSync(new URL("../packages/web/svelte.config.js", import.meta.url), "utf8");
     const server = readFileSync(new URL("./web-console.ts", import.meta.url), "utf8");
 
@@ -34,13 +29,15 @@ describe("the web diagnostic gate", () => {
     assert.match(svelteConfig, /csp:\s*\{[\s\S]*mode:\s*"hash"/);
     assert.match(svelteConfig, /"script-src"/);
 
-    // The server's half must not restate it — the intersection would drop the hash.
+    // The server's half must provide a fail-closed script fallback and allow only style attributes.
     const headerBlock = /SECURITY_HEADERS[\s\S]*?\n\};/.exec(server)?.[0] ?? "";
     assert.ok(headerBlock, "SECURITY_HEADERS not found in web-console.ts");
     assert.ok(
-      !headerBlock.includes("script-src"),
-      "script-src is in the response header as well as the build — the intersection blanks the console",
+      headerBlock.includes('"script-src \'self\'"'),
+      "the server must provide a fail-closed script-src fallback",
     );
+    assert.match(headerBlock, /style-src 'self'/);
+    assert.match(headerBlock, /style-src-attr 'unsafe-inline'/);
     // And the directive a meta tag cannot deliver has to be here.
     assert.match(headerBlock, /frame-ancestors 'none'/);
   });

@@ -4,7 +4,7 @@
 // and the manager runtime image do not grow a frontend toolchain. Both the manager and
 // the workstation UI call this; the browser then talks to `/api/*` on the same origin.
 
-import { createReadStream, existsSync, statSync } from "node:fs";
+import { createReadStream, existsSync, readFileSync, statSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { extname, join, relative, resolve, sep } from "node:path";
 
@@ -32,19 +32,19 @@ export const CONSOLE_PREFIX = "/app";
  * could reach if one ever existed; `base-uri 'none'` stops a `<base>` tag from repointing every
  * relative fetch this console makes; `form-action 'self'` keeps a form from posting outward.
  *
- * ## `script-src` is deliberately absent from this list
- *
- * SvelteKit's built page starts with an inline module script, so a bare `script-src 'self'` blanks
- * the console. The hashes for it are emitted by `kit.csp` in `packages/web/svelte.config.js`, into
- * a `<meta http-equiv>` in the built HTML, which composes with what is sent here — the browser
- * enforces the intersection. Putting `script-src` in both places would mean two lists to keep in
- * step, and the failure of that is a blank page rather than a warning.
+ * SvelteKit's built page starts with an inline module script. Its hash is emitted by `kit.csp` in
+ * `packages/web/svelte.config.js`, into a `<meta http-equiv>` in the built HTML. The response header
+ * must repeat that exact hash: browsers intersect a header policy with a meta policy, and the
+ * header's `default-src` would otherwise fall back to blocking the inline bootstrap.
  *
  * `img-src` admits `data:` because the icon set is inlined at build time.
  */
 export const SECURITY_HEADERS: Readonly<Record<string, string>> = {
   "content-security-policy": [
     "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self'",
+    "style-src-attr 'unsafe-inline'",
     "frame-ancestors 'none'",
     "base-uri 'none'",
     "object-src 'none'",
@@ -55,6 +55,28 @@ export const SECURITY_HEADERS: Readonly<Record<string, string>> = {
   "referrer-policy": "no-referrer",
   "permissions-policy": "geolocation=(), camera=(), microphone=()",
 };
+
+const SCRIPT_HASH = /^'sha256-[A-Za-z0-9+/=]+'$/;
+
+/**
+ * Add the hash SvelteKit put in the document's meta CSP to the response policy.
+ *
+ * The fallback is intentionally fail-closed: a malformed or missing build policy leaves the
+ * inline bootstrap blocked instead of copying an arbitrary directive into the HTTP header.
+ */
+export function securityHeadersForDocument(html: string): Record<string, string> {
+  const meta = /<meta\s+http-equiv=["']content-security-policy["']\s+content="([^"]*)"\s*\/?>/i.exec(html);
+  const scriptDirective = meta?.[1]
+    ?.split(";")
+    .map((directive) => directive.trim())
+    .find((directive) => directive.toLowerCase().startsWith("script-src"));
+  const tokens = scriptDirective?.split(/\s+/).slice(1) ?? [];
+  const scriptSrc = tokens.length > 0 && tokens.every((token) => token === "'self'" || SCRIPT_HASH.test(token))
+    ? `script-src ${tokens.join(" ")}`
+    : "script-src 'self'";
+  const baseCsp = SECURITY_HEADERS["content-security-policy"] ?? "";
+  return { ...SECURITY_HEADERS, "content-security-policy": baseCsp.replace("script-src 'self'", scriptSrc) };
+}
 
 const TYPES: Record<string, string> = {
   ".css": "text/css; charset=utf-8",
@@ -140,17 +162,23 @@ export function serveConsole(
     }
 
     const type = TYPES[extname(file)] ?? "application/octet-stream";
+    const isDocument = extname(file) === ".html";
+    const document = isDocument ? readFileSync(file, "utf8") : null;
     res.writeHead(200, {
       "content-type": type,
       "cache-control": extname(file) === ".html" ? "no-store" : "public, max-age=31536000, immutable",
       "x-content-type-options": "nosniff",
-      ...SECURITY_HEADERS,
+      ...(document === null ? SECURITY_HEADERS : securityHeadersForDocument(document)),
     });
     if (req.method === "HEAD") {
       res.end();
       return true;
     }
-    createReadStream(file).pipe(res);
+    if (document !== null) {
+      res.end(document);
+    } else {
+      createReadStream(file).pipe(res);
+    }
     return true;
   };
 }

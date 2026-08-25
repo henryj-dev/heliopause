@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { CONSOLE_PREFIX, resolveWebRoot, serveConsole } from "./web-console.ts";
+import { CONSOLE_PREFIX, resolveWebRoot, securityHeadersForDocument, serveConsole } from "./web-console.ts";
 
 function listen(webRoot: string): Promise<{ url: string; close: () => Promise<void> }> {
   const intercept = serveConsole(webRoot);
@@ -107,9 +107,9 @@ describe("serveConsole", () => {
 // this server never sent.
 
 describe("the console's security headers", () => {
-  const headersOf = async (path: string) => {
+  const headersOf = async (path: string, index = "shell") => {
     const dir = mkdtempSync(join(tmpdir(), "hp-web-"));
-    writeFileSync(join(dir, "index.html"), "shell");
+    writeFileSync(join(dir, "index.html"), index);
     writeFileSync(join(dir, "app.js"), "export {}");
     const { url, close } = await listen(dir);
     try {
@@ -137,12 +137,24 @@ describe("the console's security headers", () => {
     assert.ok(h.get("permissions-policy"));
   });
 
-  // `script-src` is Kit's half, emitted as a meta tag with the inline bootstrap's hash. Asserting
-  // its absence here is what keeps the two halves from being written in both places and drifting —
-  // the failure of that is a blank console, which no unit test would show.
-  it("leaves script-src to the build, so the two halves cannot drift", async () => {
-    const csp = (await headersOf(CONSOLE_PREFIX)).get("content-security-policy") ?? "";
-    assert.ok(!csp.includes("script-src"), `script-src belongs in svelte.config.js — got ${csp}`);
+  it("copies only the SvelteKit bootstrap hash into the HTTP policy", async () => {
+    const index = '<meta http-equiv="content-security-policy" content="script-src \'self\' \'sha256-testHash123=\'">';
+    const csp = (await headersOf(CONSOLE_PREFIX, index)).get("content-security-policy") ?? "";
+    assert.match(csp, /script-src 'self' 'sha256-testHash123='/);
+    assert.match(csp, /style-src 'self'/);
+    assert.match(csp, /style-src-attr 'unsafe-inline'/);
+  });
+
+  it("fails closed when the build meta policy is missing or contains unsafe sources", () => {
+    for (const html of [
+      "<html></html>",
+      '<meta http-equiv="content-security-policy" content="script-src \'self\' \'unsafe-inline\'">',
+    ]) {
+      const csp = securityHeadersForDocument(html)["content-security-policy"] ?? "";
+      assert.match(csp, /script-src 'self'(?:;|$)/);
+      const scriptDirective = csp.split(";").find((directive) => directive.trim().startsWith("script-src")) ?? "";
+      assert.doesNotMatch(scriptDirective, /unsafe-inline/);
+    }
   });
 
   it("carries the headers on assets too, not only on the page", async () => {
