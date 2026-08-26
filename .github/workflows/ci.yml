@@ -198,15 +198,38 @@ jobs:
       # General credential detection complements the site-inventory scanner above. A full checkout
       # makes this history-aware.
       #
-      # **The binary, not `gitleaks/gitleaks-action`.** That action refuses to run for a repository
-      # owned by an organisation without a paid licence — `[tiny-universe] is an organization.
-      # License key is required` — so the step passed on the canonical repository and failed forever
-      # on the fork, which is the one that builds and ships. The scanner itself is open source; only
-      # the wrapper is licensed.
+      # **The action, now that a licence exists.** This step used to download the binary instead: the
+      # action refuses to run for a repository owned by an organisation without a paid licence
+      # — `[tiny-universe] is an organization. License key is required` — so it passed on the
+      # canonical repository and failed forever on the fork, which is the one that builds and ships.
+      # `GITLEAKS_LICENSE` is now an org secret, so that failure mode is closed here.
       #
-      # Pinned by version *and* checksum. An action is pinned by commit SHA; a downloaded binary has
-      # no such handle, and an unpinned release URL is a supply chain that changes under you.
-      - name: scan git history for credentials
+      # ⚠️ It is *not* closed for forks. A fork outside this organisation has no licence and this
+      #    step will fail there. That is the same trap as before, moved rather than removed — if a
+      #    fork ever needs to build, give it the binary form back rather than the licence.
+      #
+      # ⚠️ Scope changed with it. The binary ran `gitleaks git .` — the whole history, every run.
+      #    The action scopes by event: the pushed commits on `push`, the pull-request commits on
+      #    `pull_request`, and the full history only on `schedule` / `workflow_dispatch`. The weekly
+      #    cron above is what keeps history-wide coverage; without it this reads recent commits only.
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+      # **A second pass — the whole history.** The action above scopes by event: the pushed
+      # commits on `push`, the pull-request commits on `pull_request`. That never re-reads
+      # what is already in the history, so a rule added tomorrow will not light up a commit
+      # from last year.
+      #
+      # Same scanner, different scope, run again. Both have to pass. `!cancelled()` keeps it
+      # running when the step above is red — one failure hiding the other means you cannot
+      # see what actually broke in a single run.
+      #
+      # ⚠️ Dependabot cannot update the version and checksum here (it is a URL download).
+      #    Whenever the action above moves, read these two lines in the same pull request.
+      - name: gitleaks (full history)
+        if: ${{ !cancelled() }}
         env:
           GITLEAKS_VERSION: "8.30.1"
           GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
@@ -216,7 +239,7 @@ jobs:
           curl -fsSL --retry 3 -o /tmp/gitleaks.tgz "$url"
           echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tgz" | sha256sum -c -
           tar xzf /tmp/gitleaks.tgz -C /tmp gitleaks
-          /tmp/gitleaks git --no-banner --redact --exit-code 1 .
+          /tmp/gitleaks git --no-banner --redact --exit-code 1 --config .gitleaks.toml .
 
   guards:
     name: agent worktree guards
