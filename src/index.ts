@@ -50,6 +50,7 @@ export {
   looksLikeAppToken,
   lookupAppToken,
   appTokenAllowsHostname,
+  appTokenCreatedBy,
   normalizeEnrollmentHostname,
   APP_TOKEN_PREFIX,
   APP_TOKEN_SCOPES,

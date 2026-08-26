@@ -30,6 +30,33 @@ export const APP_TOKEN_PREFIX = "hpapp_";
 export const DEFAULT_APP_TOKEN_TTL_SEC = 90 * 24 * 60 * 60;
 export const MAX_APP_TOKEN_TTL_SEC = 365 * 24 * 60 * 60;
 const MIN_APP_TOKEN_TTL_SEC = 60 * 60;
+/**
+ * The bound on `createdBy`, exported because **something has to compose a value that fits it**.
+ *
+ * 🔴 It was a bare `120` inside `createNodeToken`, and the app-token path built `app:<label>#<id>`
+ * without knowing about it. A label may be 120 characters; the composed string is then 141, and the
+ * slice took the tail off — cutting the id, which is the half that says *which* credential minted
+ * the token. The truncation silently removed the exact property the field had just been widened to
+ * carry, and only for the longest labels.
+ *
+ * A duplicated literal is how that comes back, so the composer reads the same constant the
+ * truncation does.
+ */
+export const MAX_CREATED_BY_CHARS = 120;
+
+/**
+ * `app:<label>#<id>`, built to fit `MAX_CREATED_BY_CHARS` with the id intact.
+ *
+ * The label loses characters and the id never does. That ordering is the decision: two live tokens
+ * may share a label — rotation issues the replacement before revoking the old one — so a trimmed
+ * label still reads as the same program, while a trimmed id names nothing at all. Raising the cap
+ * instead was the other option; it was not taken because the cap bounds a field written from
+ * operator-supplied text on the node-token path too, and widening it there buys nothing.
+ */
+export function appTokenCreatedBy(label: string, id: string): string {
+  const stamp = `#${id}`;
+  return `app:${label}`.slice(0, MAX_CREATED_BY_CHARS - stamp.length) + stamp;
+}
 const OPENSSL_TIMEOUT_MS = 5_000;
 const CSR_WORKER_TIMEOUT_MS = 10_000;
 const MAX_CSR_VALIDATION_WORKERS = 2;
@@ -183,6 +210,25 @@ function parse(raw: unknown, source: string): EnrollmentDocument {
     }
     if (!Array.isArray(row.scopes) || row.scopes.some((scope) => typeof scope !== "string")) {
       throw new EnrollmentError(`${source}: app token scopes must be an array of strings`);
+    }
+    // `expiresAt` decides liveness — `lookupAppToken` compares `Date.parse(expiresAt) > now` — and
+    // `Date.parse` of anything unparseable is `NaN`, which is `>` nothing. So a broken value fails
+    // closed rather than open, and this check is not what stops a forever-token. What it stops is the
+    // *silence*: the row would simply never authenticate, with no reason recorded anywhere, and the
+    // operator would be told their token stopped working. It also now travels out in a response
+    // header, so it must be a value a caller can parse.
+    if (typeof row.expiresAt !== "string" || !Number.isFinite(Date.parse(row.expiresAt))) {
+      throw new EnrollmentError(`${source}: app token expiresAt must be an ISO timestamp`);
+    }
+    for (const field of ["createdAt"] as const) {
+      if (typeof row[field] !== "string") throw new EnrollmentError(`${source}: app token ${field} must be a string`);
+    }
+    // The three nullable ones. `revokedAt` is read for truthiness, so a stray `0` or `false` would
+    // read as "not revoked" — the one direction this must never be wrong in.
+    for (const field of ["revokedAt", "lastUsedAt", "createdBy"] as const) {
+      if (row[field] !== null && typeof row[field] !== "string") {
+        throw new EnrollmentError(`${source}: app token ${field} must be a string or null`);
+      }
     }
   }
   return {
@@ -360,7 +406,7 @@ export function createNodeToken(document: EnrollmentDocument, input: { hostname:
   if (input.revokeExisting ?? true) for (const token of document.tokens) if (token.hostname === host && !token.revokedAt) token.revokedAt = at;
   const token = `${NODE_TOKEN_PREFIX}${randomHex(32)}`;
   const row: NodeTokenRecord = { id: randomHex(8), hostname: host, tokenHash: sha256(token), label: input.label?.trim().slice(0, 120) || null,
-    createdBy: input.createdBy?.trim().slice(0, 120) || null, createdAt: at,
+    createdBy: input.createdBy?.trim().slice(0, MAX_CREATED_BY_CHARS) || null, createdAt: at,
     expiresAt: new Date(issuedAt.getTime() + ttlSec * 1_000).toISOString(), lastUsedAt: null, revokedAt: null };
   document.tokens.push(row);
   audit(document, {
@@ -477,7 +523,7 @@ export function createAppToken(document: EnrollmentDocument, input: {
   const token = `${APP_TOKEN_PREFIX}${randomHex(32)}`;
   const row: AppTokenRecord = {
     id: randomHex(8), label, tokenHash: sha256(token), scopes, hostnamePattern,
-    createdBy: input.createdBy?.trim().slice(0, 120) || null, createdAt: at,
+    createdBy: input.createdBy?.trim().slice(0, MAX_CREATED_BY_CHARS) || null, createdAt: at,
     expiresAt: new Date(issuedAt.getTime() + ttlSec * 1_000).toISOString(), lastUsedAt: null, revokedAt: null,
   };
   // A label is not an identifier and two live tokens may share one. Refusing a duplicate would make

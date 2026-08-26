@@ -280,6 +280,30 @@ describe("app tokens over the manager API", () => {
     assert.equal(audit.find((row) => row.target === bySecond.body.id)!.detail.appTokenId, second.body.id);
   });
 
+  it("keeps the id in createdBy even at the longest label the manager will accept", async () => {
+    // 🔴 `createdBy` is truncated to 120 characters on the way into the store, and a 120-character
+    // label made `app:<label>#<id>` 141 long — the slice ate the id, which is the whole reason the
+    // id is there. Invisible for every label short enough to test casually.
+    const label = "l".repeat(120);
+    const created = await issueAppToken({
+      label, scopes: ["enrollment:token-create"], hostnamePattern: "*.dev",
+    });
+    assert.equal(created.status, 201);
+    assert.equal(created.body.row.label, label);
+
+    const issued = await app("/enrollment/tokens", "POST", { hostname: "long-label.dev" }, created.body.token);
+    assert.equal(issued.status, 201);
+    assert.equal(
+      issued.body.row.createdBy.endsWith(`#${created.body.id}`), true,
+      `createdBy lost the app token id: ${issued.body.row.createdBy}`,
+    );
+    assert.ok(issued.body.row.createdBy.length <= 120);
+    assert.ok(issued.body.row.createdBy.startsWith("app:llll"), "the label half disappeared instead of the id");
+    // The structured copy is never truncated, whatever the label does.
+    const event = loadEnrollmentDocument(appStore).audit.filter((row) => row.target === issued.body.id).at(-1)!;
+    assert.equal(event.detail.appTokenId, created.body.id);
+  });
+
   it("refuses a hostname outside the pattern, and names both halves", async () => {
     const created = await issueAppToken({
       label: "dev-only", scopes: ["enrollment:token-create"], hostnamePattern: "*.dev",
@@ -502,9 +526,61 @@ describe("app tokens reading the CSR queue", () => {
       const malformed = await read("?hostname=not%20a%20hostname");
       assert.equal(malformed.status, 400);
       assert.match(malformed.body.error, /invalid hostname/);
-      assert.equal((await read("?hostname=")).status, 400);
       assert.equal((await read("?status=nonsense")).status, 400);
+
+      // An empty value is "no filter", not "filter by nothing". This route has behaved that way for
+      // `?status=` since it was written, `heliopause-enrollment` builds its query from flags that may
+      // be absent, and a 400 for a parameter somebody left blank is a regression dressed as
+      // strictness. Both parameters, both principals.
+      const blank = await read("?status=&hostname=");
+      assert.equal(blank.status, 200);
+      assert.equal(blank.body.requests.length, all.body.requests.length, "an empty value filtered something out");
+      assert.equal((await read("?hostname=&status=pending")).status, 200);
     }
+  });
+
+  it("shows an app token only the zone its pattern covers, and does not confirm the rest", async () => {
+    // 🔴 This route returned the whole fleet's queue. A `*.dev` token could read every hostname and
+    // every public-key digest in prod and util — zones it cannot mint for and has no business
+    // enumerating. The pattern bounded what the token may create; it now bounds what it may see.
+    seedCsr("gw-01.prod", "pending");
+    seedCsr("gw-01.util", "signed");
+    const dev = await issueAppToken({
+      label: "dev-reader", scopes: ["enrollment:requests-read"], hostnamePattern: "*.dev",
+    });
+    const exact = await issueAppToken({
+      label: "one-host", scopes: ["enrollment:requests-read"], hostnamePattern: "filter-b.dev",
+    });
+
+    const seenByDev = await app("/enrollment/requests", "GET", undefined, dev.body.token);
+    assert.equal(seenByDev.status, 200);
+    assert.ok(seenByDev.body.requests.length > 0);
+    assert.ok(
+      seenByDev.body.requests.every((row: { hostname: string }) => row.hostname.endsWith(".dev")),
+      "an app token read a zone outside its pattern",
+    );
+
+    // An exact-hostname pattern is a window one host wide.
+    const seenByExact = await app("/enrollment/requests", "GET", undefined, exact.body.token);
+    assert.ok(seenByExact.body.requests.length > 0);
+    assert.ok(seenByExact.body.requests.every((row: { hostname: string }) => row.hostname === "filter-b.dev"));
+
+    // Asking for a host outside the pattern is an empty list, not a refusal. A 403 there would
+    // answer "is this host inside your pattern?" for any name the caller cares to try, turning a
+    // read into an oracle for a boundary the caller is not supposed to map.
+    const outside = await app("/enrollment/requests?hostname=gw-01.prod", "GET", undefined, dev.body.token);
+    assert.equal(outside.status, 200);
+    assert.deepEqual(outside.body.requests, []);
+    const alsoOutside = await app("/enrollment/requests?hostname=filter-a.dev", "GET", undefined, exact.body.token);
+    assert.equal(alsoOutside.status, 200);
+    assert.deepEqual(alsoOutside.body.requests, []);
+    // A hostname that is not a hostname is still a 400: that is a typo, not a boundary.
+    assert.equal((await app("/enrollment/requests?hostname=not%20a%20host", "GET", undefined, dev.body.token)).status, 400);
+
+    // The operator sees everything, unchanged — the narrowing is a property of the credential.
+    const asOperator = await operator("/enrollment/requests", "GET");
+    assert.ok(asOperator.body.requests.some((row: { hostname: string }) => row.hostname === "gw-01.prod"));
+    assert.ok(asOperator.body.requests.some((row: { hostname: string }) => row.hostname === "gw-01.util"));
   });
 
   it("answers an app token at the bootstrap routes with the node-token refusal, by ordering", async () => {

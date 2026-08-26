@@ -115,7 +115,7 @@ import {
   type PlanSummary,
 } from "./approval.ts";
 import {
-  APP_TOKEN_SCOPES, EnrollmentError, appTokenAllowsHostname, createAppToken, createNodeToken,
+  APP_TOKEN_SCOPES, EnrollmentError, appTokenAllowsHostname, appTokenCreatedBy, createAppToken, createNodeToken,
   fetchNodeCertificate, looksLikeAppToken, looksLikeNodeToken, lookupAppToken,
   normalizeEnrollmentHostname, preflightNodeCsr, rejectNodeCsr, requireEnrollmentDocument,
   revokeAppToken, revokeCertificate, revokeNodeToken, storeNodeCertificate,
@@ -3231,9 +3231,14 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       // or a pattern change landing between them would be honoured by neither. The cost is that a
       // pattern-mismatch 403 does take the lock. That is the correct side to err on.
       //
-      // The read route re-checks against a fresh read rather than a transaction: it writes nothing,
-      // so there is nothing for a lock to protect.
-      const gate = lookupAppToken(requireEnrollmentDocument(storeFile), plaintext);
+      // The read route answers **from this same document**. A second `requireEnrollmentDocument`
+      // would parse the file again with no lock held between the two, so it is not a fresher answer
+      // — it is a second answer to the same question, and the one that arrives second is no more
+      // authoritative than the one that arrived first. The `POST` path re-checks inside its
+      // transaction because there the lock *is* the boundary: the document it authorises against is
+      // the document it commits.
+      const document = requireEnrollmentDocument(storeFile);
+      const gate = lookupAppToken(document, plaintext);
       if (!gate) {
         log(`refused ${url.pathname}: unknown, expired or revoked app token`, `${url.pathname} 거부: 모르거나 만료·폐기된 앱 토큰`);
         return send(res, 401, { error: "unauthorized app token" });
@@ -3253,16 +3258,26 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         // on this route would then serialise against every token issue and every certificate upload
         // in the deployment.
         //
-        // So `lastUsedAt` records **token creation only**. `lookupAppToken` still sets it on the
-        // document read below, and that document is discarded — deliberately. The field answers "is
+        // So `lastUsedAt` records **token creation only**. `lookupAppToken` still set it on the
+        // document read above, and that document is discarded — deliberately. The field answers "is
         // anything still minting with this credential", which is the question asked before revoking
         // one; it does not answer "did anyone read the queue". The README says so where the field is
         // documented, because a timestamp that means less than its name is worse than no timestamp.
+        //
+        // ## The queue is narrowed to the token's own pattern
+        //
+        // 🔴 This returned the whole fleet's queue. A `*.dev` token could read every hostname and
+        // every public-key digest in `prod` and `util` — zones it cannot mint for and has no business
+        // enumerating. The pattern already bounds what the token may *create*; it now bounds what it
+        // may *see*, so the two halves of the grant say the same thing.
+        //
+        // A `?hostname=` outside the pattern is an empty list rather than a 403. A refusal there
+        // would answer "is this host inside your pattern?" for any name the caller cares to try,
+        // turning a read into an oracle for a boundary the caller is not supposed to map.
         const filter = csrQueryFilter(url);
-        const document = requireEnrollmentDocument(storeFile);
-        const row = authoriseAppToken(document, plaintext, scope, url.pathname);
-        return send(res, 200, { requests: document.requests.filter((request) => matchesCsrFilter(request, filter)) },
-          { "x-heliopause-app-token-expires-at": row.expiresAt });
+        const requests = document.requests.filter((request) =>
+          appTokenAllowsHostname(gate.hostnamePattern, request.hostname) && matchesCsrFilter(request, filter));
+        return send(res, 200, { requests }, { "x-heliopause-app-token-expires-at": gate.expiresAt });
       }
 
       const body = JSON.parse(await readBody(req)) as {
@@ -3314,7 +3329,10 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
             // one so that a rotation has no gap, and `app:dispatcher` alone cannot say which of them
             // minted this. The id is also in the audit row's `detail.appTokenId`, structured, for
             // the reader that is a query rather than a person.
-            createdBy: `app:${row.label}#${row.id}`,
+            //
+            // Composed by the store rather than here: the field is truncated on the way in, and a
+            // 120-character label made that truncation eat the id — see `appTokenCreatedBy`.
+            createdBy: appTokenCreatedBy(row.label, row.id),
             appTokenId: row.id,
             ...(revokeExisting === undefined ? {} : { revokeExisting }),
             ...(ttlSec === undefined ? {} : { ttlSec }),
@@ -3649,11 +3667,16 @@ function crossSiteRequest(req: IncomingMessage): boolean {
  * list reads as "there are no CSRs", and that is the sentence somebody acts on.
  */
 function csrQueryFilter(url: URL): { status: string | null; hostname: string | null } {
-  const status = url.searchParams.get("status");
-  if (status !== null && !["pending", "conflict", "rejected", "signed"].includes(status)) {
+  // `?status=` with an empty value means "no filter", not "filter by nothing". That has been this
+  // route's behaviour since it was written, `heliopause-enrollment` reaches it by building a query
+  // string from possibly-absent flags, and a 400 for a parameter somebody left blank is a
+  // regression dressed as strictness. A *non-empty* unknown value is still refused: that is a
+  // caller who believes in a status this store does not have.
+  const status = url.searchParams.get("status") || null;
+  if (status && !["pending", "conflict", "rejected", "signed"].includes(status)) {
     throw new EnrollmentError("invalid status");
   }
-  const hostname = url.searchParams.get("hostname");
+  const hostname = url.searchParams.get("hostname") || null;
   return { status, hostname: hostname === null ? null : normalizeEnrollmentHostname(hostname) };
 }
 

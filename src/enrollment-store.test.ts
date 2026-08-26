@@ -5,7 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
-  APP_TOKEN_PREFIX, appTokenAllowsHostname, createAppToken, createNodeToken, emptyEnrollmentDocument,
+  APP_TOKEN_PREFIX, MAX_CREATED_BY_CHARS, appTokenAllowsHostname, appTokenCreatedBy,
+  createAppToken, createNodeToken, emptyEnrollmentDocument,
   fetchNodeCertificate, initializeEnrollmentDocument,
   loadEnrollmentDocument, looksLikeAppToken, looksLikeNodeToken, lookupAppToken, lookupNodeToken, NODE_TOKEN_PREFIX,
   rejectNodeCsr, revokeAppToken, saveEnrollmentDocument, storeNodeCertificate, submitNodeCsr, validateNodeCsrAsync,
@@ -485,6 +486,59 @@ describe("app tokens", () => {
     // An operator issuing by hand has no app token, and the field must not appear for them.
     createNodeToken(document, { hostname: "k3s-02.dev", createdBy: "ops-alice" });
     assert.equal("appTokenId" in document.audit.at(-1)!.detail, false);
+  });
+
+  it("keeps the id whole in createdBy when the label is long enough to have eaten it", () => {
+    // 🔴 `createNodeToken` slices `createdBy` to 120 characters. A 120-character label made
+    // `app:<label>#<id>` 141 long, and the slice took the tail — the id, which is the only half that
+    // says *which* credential minted the token. The bug was invisible for short labels.
+    const document = emptyEnrollmentDocument();
+    const label = "x".repeat(120);
+    const issued = createAppToken(document, {
+      label, scopes: ["enrollment:token-create"], hostnamePattern: "*.dev",
+    });
+    const createdBy = appTokenCreatedBy(issued.row.label, issued.row.id);
+    assert.equal(createdBy.length <= MAX_CREATED_BY_CHARS, true, "the composed value does not fit the field");
+    assert.equal(createdBy.endsWith(`#${issued.row.id}`), true, "the id was truncated away");
+
+    // Through the store, which is where the slice lives.
+    const minted = createNodeToken(document, { hostname: "long.dev", createdBy, appTokenId: issued.row.id });
+    assert.equal(minted.row.createdBy, createdBy, "the store truncated a value built to fit it");
+    assert.equal(minted.row.createdBy!.endsWith(`#${issued.row.id}`), true);
+    assert.equal(document.audit.at(-1)!.detail.appTokenId, issued.row.id);
+
+    // A short label loses nothing at all.
+    assert.equal(appTokenCreatedBy("dispatcher", "abc123"), "app:dispatcher#abc123");
+  });
+
+  it("refuses a row whose timestamps are the wrong type, since expiresAt decides liveness", () => {
+    const root = mkdtempSync(join(tmpdir(), "heliopause-enroll-apptoken-times-"));
+    const path = join(root, "store.json");
+    try {
+      const document = emptyEnrollmentDocument();
+      const row = createAppToken(document, {
+        label: "dispatcher", scopes: ["enrollment:token-create"], hostnamePattern: "*.dev",
+      }).row;
+      const write = (patch: Record<string, unknown>) =>
+        writeFileSync(path, JSON.stringify({ ...document, appTokens: [{ ...row, ...patch }] }));
+
+      for (const bad of [7, null, "not-a-date", undefined]) {
+        write({ expiresAt: bad });
+        assert.throws(() => loadEnrollmentDocument(path), /expiresAt must be an ISO timestamp/, `expiresAt: ${bad}`);
+      }
+      write({ createdAt: 7 });
+      assert.throws(() => loadEnrollmentDocument(path), /createdAt must be a string/);
+      // Nullable, but not anything. `revokedAt` is read for truthiness, so `0` or `false` would read
+      // as "not revoked" — the one direction this must never be wrong in.
+      for (const field of ["revokedAt", "lastUsedAt", "createdBy"]) {
+        write({ [field]: 0 });
+        assert.throws(() => loadEnrollmentDocument(path), new RegExp(`${field} must be a string or null`));
+        write({ [field]: null });
+        assert.equal(loadEnrollmentDocument(path).appTokens.length, 1, `${field}: null must be accepted`);
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("opens a store written before app tokens existed, and still refuses an unknown field", () => {

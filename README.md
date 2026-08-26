@@ -580,7 +580,10 @@ one has none of them.
 **Two scopes exist and no more.** `enrollment:token-create` reaches `POST /enrollment/tokens`;
 `enrollment:requests-read` reaches `GET /enrollment/requests`, which takes `?status=` and
 `?hostname=` in any combination — a caller that just planted a token can wait for that host's CSR to
-appear instead of reading the whole queue. Any other route answers 403 naming the token, and an
+appear instead of reading the whole queue. **That read is narrowed to the token's own hostname
+pattern**: a `*.dev` token sees dev CSRs and is not told that prod or util exist. Asking for a host
+outside the pattern returns an empty list rather than a refusal, so the route cannot be used to map
+where the boundary is. Any other route answers 403 naming the token, and an
 unknown, expired or revoked token answers 401 saying only that. **An app token cannot sign, upload,
 reject or revoke anything** — the worst a leaked one can do is mint node tokens inside its hostname
 pattern and read the CSR queue, and a certificate still requires an operator holding a one-time code.
@@ -599,6 +602,13 @@ only**: reading the CSR queue takes no lock and writes nothing, so a poller leav
 field — it answers "is anything still issuing with this credential", the question asked before
 revoking one. And app-token requests are counted by the same per-source bound as the certificate-less
 enrollment routes: **30 per minute per address**, per manager process, refused with 429.
+
+That bound is per *address*, not per token, and minting and polling spend the same budget. A
+dispatcher that does both from one egress address should poll no faster than about once every four
+seconds, and should treat a 429 as backpressure rather than a failure — the CSR it is waiting for
+will still be there. Several callers behind one NAT share the budget, which is the case to size
+for. A per-token bucket would remove that coupling; it is a planned follow-up and **is not present
+today**, so do not design a caller that assumes it.
 
 Point the manager at its revocation source with `HELIOPAUSE_REVOCATION_FILE`. It replicates a
 minimal snapshot to every relay over the existing publisher mTLS identity at startup, after each
