@@ -7,6 +7,7 @@
 | `heliopause-agent.service` | 정책을 적용하는 호스트 전부 (python3, root + `CAP_NET_ADMIN`) |
 | `heliopause-agent-applier.conf` | 지정된 Cilium 적용자 한 대만 쓰는 kubeconfig 가시성 drop-in |
 | `heliopause-enroll.service` · `.timer` | 호스트가 로컬 키로 CSR을 만들고 승인된 인증서를 회수 |
+| `heliopause-agent.path` | 회수된 `agent.pem` 이 나타나는 순간 에이전트를 켠다 — 등록으로 부팅하는 호스트용 |
 | `heliopause-relay.service` | 각 VPC의 gw (node 22+, `DynamicUser`, 무권한) |
 | `heliopause-revocation-writer.service` · `.socket` | relay가 직접 수정할 수 없는 단조 폐기목록 writer |
 | `heliopause-revocations.conf` | 잠긴 writer 계정과 relay socket 제출 보조그룹 (`sysusers.d`) |
@@ -110,8 +111,24 @@ node bin/heliopause-enrollment.ts token-create ./enrollment.json host-01.example
 ```bash
 install -m 644 agent/heliopause-enroll.py /opt/heliopause/agent/
 install -m 644 packaging/systemd/heliopause-enroll.{service,timer} /etc/systemd/system/
-systemctl daemon-reload && systemctl enable --now heliopause-enroll.timer
+install -m 644 packaging/systemd/heliopause-agent.path /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now heliopause-enroll.timer
+systemctl enable --now heliopause-agent.path        # `heliopause-agent` 자체는 enable 하지 않는다
 ```
+
+등록으로 부팅하는 호스트에서는 위의 `systemctl enable --now heliopause-agent` 를 **하지 않는다.**
+인증서가 오기 전의 에이전트는 `ssl_context()` 에서 죽고, 유닛이 `Restart=always` ·
+`StartLimitIntervalSec=0` 이라 서명이 올 때까지 5초마다 다시 죽는다 — 해는 없지만 저널이 「깨진
+에이전트」로 읽힌다. `heliopause-agent.path` 가 대신 `/etc/heliopause/pki/agent.pem` 을 지켜보다
+켠다. `heliopause-enroll.py` 는 `ca.pem` 을 먼저, `agent.pem` 을 마지막에 각각 원자 rename 으로
+쓰므로 그 파일이 보이는 순간 번들 전체가 있다. 재부팅 뒤에도 같은 경로로 뜬다 — 파일이 이미
+있으면 path 유닛이 부팅 즉시 서비스를 당긴다.
+
+`HELIOPAUSE_ENROLL_URL` 은 **매니저의 등록 이름**이다(이 배포에서는 `node-enroll.tinyuniver.se`).
+Dispatcher 나 다른 수집 이름이 아니다 — 그 이름으로 보내면 엉뚱한 서버가 401 을 주고, 타이머는
+5분마다 영원히 재시도하며, 콘솔에는 아무것도 뜨지 않는다. 「승인 대기인가 보다」로 읽히는
+무증상 오배송이다.
 
 CSR은 매니저 콘솔의 **등록**(`/app/enrollment`, 상태별로 `pending`·`conflict`·`rejected`·
 `signed`) 화면에서 DER SHA-256 지문을 **별도 채널로** 대조해 승인하고, 오프라인 서명기로 발급한
@@ -128,7 +145,10 @@ node bin/heliopause-enrollment.ts cert-upload https://manager.example:8444 REQUE
 `--expect-sha256` 은 선택이 아니다 — 지문 없이 서명하면 대조 단계가 통째로 사라진다.
 
 설치 완료 뒤에는 상태 파일을 `completed`로 기록하여 타이머가 등록 엔드포인트를 다시 호출하지
-않는다. 그 뒤 토큰 파일을 제거하고 agent를 시작한다.
+않는다. 스크립트가 소모된 토큰 파일을 스스로 지우고(`ConditionPathExists` 로 타이머 발화가
+no-op 이 된다 — 실패가 아니라 종착 상태다), `heliopause-agent.path` 가 에이전트를 켠다. 사람이
+할 일은 남지 않는다. 예전 판의 「그 뒤 토큰 파일을 제거하고 agent 를 시작한다」는 두 동작 다
+이제 자동이다.
 
 중계자 — gw만:
 

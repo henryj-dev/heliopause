@@ -58,6 +58,22 @@ describe("the agent's required configuration is documented where it is copied fr
     }
   });
 
+  it("starts the agent from the certificate path the agent is configured to read", () => {
+    // `heliopause-agent.path` watches one file and the agent reads one file, and nothing but this
+    // test says they are the same file. If the example moved the certificate — or the unit did —
+    // an enrolled host would sit with a valid certificate and an agent that never starts, which is
+    // the exact silence the path unit exists to remove.
+    const unit = read("../packaging/systemd/heliopause-agent.path");
+    const watched = /^PathExists=(.+)$/m.exec(unit)?.[1];
+    const example = read("../packaging/systemd/agent.env.example");
+    const configured = /^HELIOPAUSE_CERT_FILE=(.+)$/m.exec(example)?.[1];
+    assert.ok(watched && configured, "could not find the watched path or the configured certificate path");
+    assert.equal(watched, configured);
+    assert.match(unit, /^Unit=heliopause-agent\.service$/m);
+    // The README is what an installer copies from; a unit nobody is told to install is not installed.
+    assert.match(read("../packaging/systemd/README.md"), /enable --now heliopause-agent\.path/);
+  });
+
   it("documents every setting the manager cannot start without", () => {
     // The same gap, one process over. `env(name)` with no fallback exits 2 when unset, and the
     // signing path added one of those — a manager that would not come up after the image rolled

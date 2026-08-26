@@ -568,7 +568,7 @@ fails closed rather than restoring a revoked credential. See
 initialization, socket and enable order.
 
 When one publicly trusted certificate covers more than one entry name, set the exact SNI allowlist
-with `HELIOPAUSE_PUBLIC_SERVER_NAMES=manager.example,node-ingest.example`. The singular
+with `HELIOPAUSE_PUBLIC_SERVER_NAMES=manager.example,node-enroll.example`. The singular
 `HELIOPAUSE_PUBLIC_SERVER_NAME` remains accepted for one-name deployments.
 
 <br/>
