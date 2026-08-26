@@ -58,7 +58,9 @@ jobs:
           # read it — a separate act from running the analysis, and one that puts this repository's
           # posture on a third-party endpoint. The findings are already public in the Security tab of
           # a public repository; there is nothing here a badge adds that a reader cannot see.
-          publish_results: false
+          # **결과를 공개한다.** 다섯 저장소 중 이 저장소만 숨기고 있었다. 공개 저장소의
+          # 점수를 숨기면 남는 것은 배지뿐이고, 배지만 있는 점수는 아무것도 말하지 않는다.
+          publish_results: true
 
       # Kept as an artifact as well as a SARIF upload: code scanning keeps only the alerts it can
       # map to a rule, and the parts of a Scorecard run worth reading — the per-check reasoning —
