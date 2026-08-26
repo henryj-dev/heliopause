@@ -164,6 +164,27 @@ function parse(raw: unknown, source: string): EnrollmentDocument {
   if (d.appTokens !== undefined && !Array.isArray(d.appTokens)) {
     throw new EnrollmentError(`${source}: enrollment store appTokens must be an array`);
   }
+  // ## Why each row is checked and not merely counted
+  //
+  // 🔴 `scopes` is the field that decides authority, and the check that reads it is
+  // `row.scopes.includes(scope)`. **A string answers that call too**: `"enrollment:token-create,
+  // enrollment:requests-read".includes("enrollment:token-create")` is `true`, and so is
+  // `.includes("token-cre")`. A store row written by hand, by an older tool, or by anything that
+  // flattened the array to a comma-joined string would therefore authorise *substrings* of a scope
+  // name. Refusing it at load is the only place that costs nothing.
+  //
+  // The other three are what every refusal message, audit row and revoke lookup is keyed on. A
+  // non-string `id` cannot be revoked by an operator reading the list; a non-string `tokenHash`
+  // silently never matches, which reads as "the token stopped working" with no reason anywhere.
+  for (const row of (d.appTokens ?? []) as AppTokenRecord[]) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) throw new EnrollmentError(`${source}: app token rows must be objects`);
+    for (const field of ["id", "label", "tokenHash", "hostnamePattern"] as const) {
+      if (typeof row[field] !== "string") throw new EnrollmentError(`${source}: app token ${field} must be a string`);
+    }
+    if (!Array.isArray(row.scopes) || row.scopes.some((scope) => typeof scope !== "string")) {
+      throw new EnrollmentError(`${source}: app token scopes must be an array of strings`);
+    }
+  }
   return {
     schemaVersion: ENROLLMENT_SCHEMA,
     tokens,
@@ -318,7 +339,16 @@ export function withEnrollmentTransaction<T>(
 function audit(document: EnrollmentDocument, event: Omit<EnrollmentAuditEvent, "at">, now?: Date): void {
   document.audit.push({ at: nowIso(now), ...event });
 }
-export function createNodeToken(document: EnrollmentDocument, input: { hostname: string; label?: string; createdBy?: string; revokeExisting?: boolean; ttlSec?: number; now?: Date }) {
+/**
+ * `appTokenId` is optional and additive: an operator issuing a token by hand does not have one.
+ *
+ * It exists because `createdBy` is text an operator reads, and **a label is not an identifier** —
+ * two live app tokens may carry the same one, deliberately, so that a rotation has no gap. Writing
+ * only the label into the audit row would mean the trail cannot say *which* credential minted a node
+ * token, which is exactly the question asked when one of them turns out to be leaked. So the id goes
+ * into `detail.appTokenId`, structured, next to a `createdBy` that carries both.
+ */
+export function createNodeToken(document: EnrollmentDocument, input: { hostname: string; label?: string; createdBy?: string; appTokenId?: string; revokeExisting?: boolean; ttlSec?: number; now?: Date }) {
   const host = hostname(input.hostname); const issuedAt = input.now ?? new Date(); const at = nowIso(issuedAt);
   if (input.revokeExisting !== undefined && typeof input.revokeExisting !== "boolean") {
     throw new EnrollmentError("revokeExisting must be a boolean");
@@ -332,7 +362,11 @@ export function createNodeToken(document: EnrollmentDocument, input: { hostname:
   const row: NodeTokenRecord = { id: randomHex(8), hostname: host, tokenHash: sha256(token), label: input.label?.trim().slice(0, 120) || null,
     createdBy: input.createdBy?.trim().slice(0, 120) || null, createdAt: at,
     expiresAt: new Date(issuedAt.getTime() + ttlSec * 1_000).toISOString(), lastUsedAt: null, revokedAt: null };
-  document.tokens.push(row); audit(document, { actor: row.createdBy ?? "operator", action: "node-token.create", target: row.id, sourceIp: null, detail: { hostname: host } }, input.now);
+  document.tokens.push(row);
+  audit(document, {
+    actor: row.createdBy ?? "operator", action: "node-token.create", target: row.id, sourceIp: null,
+    detail: { hostname: host, ...(input.appTokenId === undefined ? {} : { appTokenId: input.appTokenId }) },
+  }, input.now);
   return { document, token, row };
 }
 export function revokeNodeToken(document: EnrollmentDocument, id: string, actor = "operator", now = new Date()): NodeTokenRecord {

@@ -432,6 +432,61 @@ describe("app tokens", () => {
     assert.equal(lookupAppToken(emptyEnrollmentDocument(), APP_TOKEN_PREFIX), null);
   });
 
+  it("refuses a row whose scopes are a string, because `includes` would authorise substrings", () => {
+    const root = mkdtempSync(join(tmpdir(), "heliopause-enroll-apptoken-rows-"));
+    const path = join(root, "store.json");
+    try {
+      const document = emptyEnrollmentDocument();
+      const row = createAppToken(document, {
+        label: "dispatcher", scopes: ["enrollment:token-create"], hostnamePattern: "*.dev",
+      }).row;
+      const write = (patch: Record<string, unknown>) =>
+        writeFileSync(path, JSON.stringify({ ...document, appTokens: [{ ...row, ...patch }] }));
+
+      // 🔑 The one that matters. Authority is decided by `row.scopes.includes(scope)`, and a string
+      // answers that call: "enrollment:token-create,enrollment:requests-read".includes(…) is true,
+      // and so is .includes("token-cre"). A flattened row must never load.
+      write({ scopes: "enrollment:token-create,enrollment:requests-read" });
+      assert.throws(() => loadEnrollmentDocument(path), /scopes must be an array of strings/);
+      assert.equal(
+        "enrollment:token-create,enrollment:requests-read".includes("token-cre"), true,
+        "the check this test defends against changed shape",
+      );
+      write({ scopes: ["enrollment:token-create", 7] });
+      assert.throws(() => loadEnrollmentDocument(path), /scopes must be an array of strings/);
+
+      for (const field of ["id", "label", "tokenHash", "hostnamePattern"]) {
+        write({ [field]: 7 });
+        assert.throws(() => loadEnrollmentDocument(path), new RegExp(`app token ${field} must be a string`));
+      }
+      writeFileSync(path, JSON.stringify({ ...document, appTokens: ["not-a-row"] }));
+      assert.throws(() => loadEnrollmentDocument(path), /app token rows must be objects/);
+
+      write({});
+      assert.equal(loadEnrollmentDocument(path).appTokens.length, 1, "a well-formed row stopped loading");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("records which app token minted a node token, since two may share a label", () => {
+    const document = emptyEnrollmentDocument();
+    const one = createAppToken(document, { label: "dispatcher", scopes: ["enrollment:token-create"], hostnamePattern: "*.dev" }).row;
+    const two = createAppToken(document, { label: "dispatcher", scopes: ["enrollment:token-create"], hostnamePattern: "*.dev" }).row;
+    assert.notEqual(one.id, two.id);
+
+    createNodeToken(document, { hostname: "k3s-01.dev", createdBy: `app:${two.label}#${two.id}`, appTokenId: two.id });
+    const event = document.audit.at(-1)!;
+    assert.equal(event.action, "node-token.create");
+    assert.equal(event.actor, `app:dispatcher#${two.id}`);
+    assert.equal(event.detail.appTokenId, two.id, "the trail cannot say which of two same-label tokens minted this");
+    assert.equal(event.detail.hostname, "k3s-01.dev");
+
+    // An operator issuing by hand has no app token, and the field must not appear for them.
+    createNodeToken(document, { hostname: "k3s-02.dev", createdBy: "ops-alice" });
+    assert.equal("appTokenId" in document.audit.at(-1)!.detail, false);
+  });
+
   it("opens a store written before app tokens existed, and still refuses an unknown field", () => {
     const root = mkdtempSync(join(tmpdir(), "heliopause-enroll-apptoken-"));
     const path = join(root, "store.json");

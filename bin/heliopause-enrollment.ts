@@ -2,7 +2,8 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import {
-  createAppToken, createNodeToken, initializeEnrollmentDocument, requireEnrollmentDocument, rejectNodeCsr,
+  createAppToken, createNodeToken, initializeEnrollmentDocument, normalizeEnrollmentHostname,
+  requireEnrollmentDocument, rejectNodeCsr,
   revokeAppToken, revokeNodeToken, storeNodeCertificate, type CsrStatus,
   revokeCertificate,
   withEnrollmentTransaction,
@@ -25,7 +26,7 @@ const usage = `usage:
   heliopause-enrollment app-token-create <store.json> --label=TEXT --scopes=A,B --hostname-pattern=PATTERN [--ttl-sec=SECONDS] [--actor=NAME]
   heliopause-enrollment app-token-list <store.json> [--json]
   heliopause-enrollment app-token-revoke <store.json> <app-token-id> [--actor=NAME]
-  heliopause-enrollment csr-list <store.json> [--status=pending|conflict|rejected|signed] [--json]
+  heliopause-enrollment csr-list <store.json> [--status=pending|conflict|rejected|signed] [--hostname=NAME] [--json]
   heliopause-enrollment csr-show <store.json> <request-id> [--json]
   heliopause-enrollment csr-export <store.json> <request-id> --out=FILE
   heliopause-enrollment csr-reject <store.json> <request-id> --reason=TEXT [--actor=NAME]
@@ -82,7 +83,12 @@ async function remote(): Promise<void> {
   } else if (command === "app-token-revoke") {
     if (!subject) throw new Error(usage); await call(`/enrollment/app-tokens/${encodeURIComponent(subject)}/revoke`, "POST", { otp }); console.log(`revoked ${subject}`);
   } else if (command === "csr-list" || command === "csr-show" || command === "csr-export") {
-    const status = flags.get("status"); const answer = await call<{ requests: Array<Record<string, unknown> & { id: string; csrPem: string }> }>(`/enrollment/requests${status ? `?status=${encodeURIComponent(status)}` : ""}`, "GET");
+    // Filtered by the manager rather than here: the same two parameters mean the same thing to every
+    // caller of that route, and a client that filtered locally would quietly diverge from it.
+    const query = new URLSearchParams();
+    if (flags.get("status")) query.set("status", flags.get("status")!);
+    if (flags.get("hostname")) query.set("hostname", flags.get("hostname")!);
+    const answer = await call<{ requests: Array<Record<string, unknown> & { id: string; csrPem: string }> }>(`/enrollment/requests${query.size ? `?${query}` : ""}`, "GET");
     const rows = subject ? answer.requests.filter((row) => row.id === subject) : answer.requests;
     if (subject && rows.length === 0) throw new Error(`CSR ${subject} not found`);
     if (command === "csr-export") { const out = requiredFlag("out"); if (existsSync(out)) throw new Error(`refusing to overwrite ${out}`); writeFileSync(out, rows[0]!.csrPem, { mode: 0o644, flag: "wx" }); console.log(`exported ${subject} to ${out}`); }
@@ -138,7 +144,11 @@ try {
   } else if (command === "csr-list") {
     const status = flags.get("status") as CsrStatus | undefined;
     if (status && !["pending", "conflict", "rejected", "signed"].includes(status)) throw new Error("invalid --status");
-    const rows = requireEnrollmentDocument(store).requests.filter((row) => !status || row.status === status);
+    // Normalised through the store's own function, so `--hostname=K3S-01.DEV` matches locally exactly
+    // as it does over the API, and a malformed name is refused rather than matching nothing.
+    const host = flags.get("hostname") ? normalizeEnrollmentHostname(flags.get("hostname")!) : undefined;
+    const rows = requireEnrollmentDocument(store).requests
+      .filter((row) => (!status || row.status === status) && (!host || row.hostname === host));
     if (flags.has("json")) console.log(JSON.stringify({ requests: rows }, null, 2));
     else rows.forEach((row) => console.log(`${row.id}\t${row.status}\t${row.hostname}\t${row.csrSha256}\t${row.createdAt}`));
   } else if (command === "csr-show") {

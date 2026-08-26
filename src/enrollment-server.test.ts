@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import {
   createAppToken, initializeEnrollmentDocument, loadEnrollmentDocument, withEnrollmentTransaction,
+  type NodeCsrRecord,
 } from "./enrollment-store.ts";
 import { startManager } from "./manager-server.ts";
 
@@ -26,12 +27,12 @@ const managerOptions = (storeFile: string): Parameters<typeof startManager>[0] =
 });
 
 function call(path: string, method: "GET" | "POST", body?: unknown, mode: "operator" | "agent" = "operator", token?: string, target = port) {
-  return new Promise<{ status: number; body: any }>((resolve, reject) => {
+  return new Promise<{ status: number; body: any; headers: Record<string, string | string[] | undefined> }>((resolve, reject) => {
     const payload = body === undefined ? "" : JSON.stringify(body);
     const req = request({ host: "127.0.0.1", port: target, path, method, ca: readFileSync(join(pki, "ca.pem")),
       ...(mode === "operator" ? { cert: readFileSync(join(pki, "operator-ops.pem")), key: readFileSync(join(pki, "operator-ops.key")) } : {}),
       headers: { ...(payload ? { "content-type": "application/json", "content-length": Buffer.byteLength(payload) } : {}), ...(token ? { authorization: `Bearer ${token}` } : {}) },
-    }, (res) => { let text = ""; res.on("data", (part) => text += part); res.on("end", () => resolve({ status: res.statusCode ?? 0, body: JSON.parse(text) })); });
+    }, (res) => { let text = ""; res.on("data", (part) => text += part); res.on("end", () => resolve({ status: res.statusCode ?? 0, body: JSON.parse(text), headers: res.headers })); });
     req.setTimeout(5_000, () => req.destroy(new Error(`request timed out: ${method} ${path}`)));
     req.on("error", reject); if (payload) req.write(payload); req.end();
   });
@@ -111,40 +112,62 @@ describe("manager standalone enrollment API", () => {
 
 // ── The third principal, over HTTP ────────────────────────────────────────────
 //
-// A manager of its own, with a one-time code configured, because the two halves of this feature only
-// make sense against each other: issuing an app token keeps every operator check there is, and using
-// one has none of them. A deployment without OTP would exercise the second half and quietly skip the
-// first — which is the half that decides the grant.
+// A manager with a one-time code configured, because the two halves of this feature only make sense
+// against each other: issuing an app token keeps every operator check there is, and using one has
+// none of them. A deployment without OTP would exercise the second half and quietly skip the first —
+// which is the half that decides the grant.
+//
+// ⚠️ **One manager per group of tests, and that is not tidiness.** App-token requests are counted by
+// the same per-source bound as the certificate-less enrollment routes: 30 per minute per address,
+// held in a `Map` that lives inside one `startManager` call. Every test here arrives from 127.0.0.1,
+// so a single instance gives the whole file one shared budget of 30 — and the tests that exceeded it
+// failed as `429`, from a limit they were not testing. A second instance is a second budget. The
+// bound itself is pinned by its own group at the bottom, because a polling caller has to know it.
+const startAppTokenManager = async (storeFile: string) => {
+  const started = await startManager({
+    ...managerOptions(storeFile),
+    otp: {
+      issuerUrl: "https://idp.example.invalid",
+      serviceToken: "svc",
+      users: new Map([["ops", "keystone-user-1"]]),
+      fetchImpl: (async (_u: string | URL, init?: RequestInit) => {
+        const asked = JSON.parse(String(init?.body ?? "{}")) as { code?: string };
+        return asked.code === "123456"
+          ? new Response(JSON.stringify({ ok: true }), { status: 200 })
+          : new Response(JSON.stringify({ ok: false }), { status: 401 });
+      }) as unknown as typeof fetch,
+    },
+  });
+  return {
+    port: (started.server.address() as { port: number }).port,
+    close: () => started.server.close(),
+  };
+};
+
+const appTokenCalls = (livePort: () => number) => {
+  const app = (path: string, method: "GET" | "POST", body?: unknown, token?: string) =>
+    call(path, method, body, "agent", token, livePort());
+  const operator = (path: string, method: "GET" | "POST", body?: unknown) =>
+    call(path, method, body, "operator", undefined, livePort());
+  return {
+    app, operator,
+    issueAppToken: (body: Record<string, unknown>) =>
+      operator("/enrollment/app-tokens", "POST", { otp: "123456", ...body }),
+  };
+};
+
+const appStore = join(root, "app-enrollment.json");
+
 describe("app tokens over the manager API", () => {
-  const appStore = join(root, "app-enrollment.json");
   let appPort = 0;
   let closeApp = () => {};
-  let idpAnswer: { status: number; body: unknown } = { status: 200, body: { ok: true } };
-
-  const app = (path: string, method: "GET" | "POST", body?: unknown, token?: string) =>
-    call(path, method, body, "agent", token, appPort);
-  const operator = (path: string, method: "GET" | "POST", body?: unknown) =>
-    call(path, method, body, "operator", undefined, appPort);
-  const issueAppToken = (body: Record<string, unknown>) =>
-    operator("/enrollment/app-tokens", "POST", { otp: "123456", ...body });
+  const { app, operator, issueAppToken } = appTokenCalls(() => appPort);
 
   before(async () => {
     initializeEnrollmentDocument(appStore);
-    const started = await startManager({
-      ...managerOptions(appStore),
-      otp: {
-        issuerUrl: "https://idp.example.invalid",
-        serviceToken: "svc",
-        users: new Map([["ops", "keystone-user-1"]]),
-        fetchImpl: (async (_u: string | URL, init?: RequestInit) => {
-          const asked = JSON.parse(String(init?.body ?? "{}")) as { code?: string };
-          const answer = asked.code === "123456" ? idpAnswer : { status: 401, body: { ok: false } };
-          return new Response(JSON.stringify(answer.body), { status: answer.status });
-        }) as unknown as typeof fetch,
-      },
-    });
-    appPort = (started.server.address() as { port: number }).port;
-    closeApp = () => started.server.close();
+    const started = await startAppTokenManager(appStore);
+    appPort = started.port;
+    closeApp = started.close;
   });
   after(() => { closeApp(); });
 
@@ -211,9 +234,14 @@ describe("app tokens over the manager API", () => {
     assert.match(issued.body.token, /^stnode_[0-9a-f]{64}$/);
     assert.equal(issued.body.row.hostname, "k3s-07.dev");
     // The whole point of the audit line: a node token minted by a program is distinguishable from
-    // one an operator minted, without reading a timestamp against a chat log.
-    assert.equal(issued.body.row.createdBy, "app:dispatcher");
+    // one an operator minted, without reading a timestamp against a chat log — and the id is there
+    // because a label is not an identifier.
+    assert.equal(issued.body.row.createdBy, `app:dispatcher#${created.body.id}`);
     assert.equal(issued.body.row.tokenHash, undefined);
+    assert.equal(
+      issued.headers["x-heliopause-app-token-expires-at"], created.body.row.expiresAt,
+      "an accepted answer did not carry the app token's expiry",
+    );
     assert.equal(
       Date.parse(issued.body.row.expiresAt) - Date.parse(issued.body.row.createdAt), 86_400_000,
       "the app path dropped the requested node token TTL",
@@ -226,9 +254,30 @@ describe("app tokens over the manager API", () => {
     assert.equal(trail.includes(issued.body.token), false, "the audit trail carries the node token plaintext");
     for (const row of document.appTokens) assert.equal(trail.includes(row.tokenHash), false);
     for (const row of document.tokens) assert.equal(trail.includes(row.tokenHash), false);
-    // Using a token is recorded, because "is anything still holding this?" is the question an
-    // operator asks before revoking one.
+    // Minting is recorded, because "is anything still issuing with this?" is the question an
+    // operator asks before revoking one. Reads are not — see the next test.
     assert.ok(document.appTokens.find((row) => row.id === created.body.id)?.lastUsedAt);
+    const event = document.audit.filter((row) => row.action === "node-token.create").at(-1)!;
+    assert.equal(event.actor, `app:dispatcher#${created.body.id}`);
+    assert.equal(event.detail.appTokenId, created.body.id);
+  });
+
+  it("distinguishes two live tokens that share a label, which is why the id travels", async () => {
+    // Rotation issues the replacement before revoking the old one, so a label is deliberately not
+    // unique. `app:dispatcher` alone could not say which credential minted what.
+    const first = await issueAppToken({ label: "rotating", scopes: ["enrollment:token-create"], hostnamePattern: "*.dev" });
+    const second = await issueAppToken({ label: "rotating", scopes: ["enrollment:token-create"], hostnamePattern: "*.dev" });
+    assert.notEqual(first.body.id, second.body.id);
+
+    const byFirst = await app("/enrollment/tokens", "POST", { hostname: "rot-a.dev" }, first.body.token);
+    const bySecond = await app("/enrollment/tokens", "POST", { hostname: "rot-b.dev" }, second.body.token);
+    assert.equal(byFirst.body.row.createdBy, `app:rotating#${first.body.id}`);
+    assert.equal(bySecond.body.row.createdBy, `app:rotating#${second.body.id}`);
+    assert.notEqual(byFirst.body.row.createdBy, bySecond.body.row.createdBy);
+
+    const audit = loadEnrollmentDocument(appStore).audit;
+    assert.equal(audit.find((row) => row.target === byFirst.body.id)!.detail.appTokenId, first.body.id);
+    assert.equal(audit.find((row) => row.target === bySecond.body.id)!.detail.appTokenId, second.body.id);
   });
 
   it("refuses a hostname outside the pattern, and names both halves", async () => {
@@ -342,5 +391,170 @@ describe("app tokens over the manager API", () => {
     });
     assert.equal(answer.status, 403);
     assert.match(answer.body.error, /cross-site/);
+  });
+});
+
+// A second manager over the same store, for the reason recorded above `startAppTokenManager`: the
+// per-source request bound lives in one `startManager` call, and these reads would otherwise spend a
+// budget the tests above are already using.
+describe("app tokens reading the CSR queue", () => {
+  let readPort = 0;
+  let closeRead = () => {};
+  const { app, operator, issueAppToken } = appTokenCalls(() => readPort);
+
+  /**
+   * A CSR row written straight into the store.
+   *
+   * The filter under test reads `hostname` and `status` and nothing else, and producing real rows
+   * would mean a key, an OpenSSL run and a node token each — which tests the enrollment path again
+   * rather than the filter.
+   */
+  let seeded = 0;
+  const seedCsr = (hostname: string, status: NodeCsrRecord["status"]) =>
+    withEnrollmentTransaction(appStore, (document) => {
+      seeded += 1;
+      document.requests.push({
+        id: `seed-${seeded}`, hostname, nodeTokenId: "seed", status,
+        csrPem: "-----BEGIN CERTIFICATE REQUEST-----\nAAAA\n-----END CERTIFICATE REQUEST-----\n",
+        csrSha256: "0".repeat(64), publicKeySha256: "1".repeat(64), keyAlgorithm: "ECDSA-P256",
+        createdAt: new Date().toISOString(), sourceIp: null, decidedAt: null, decidedBy: null,
+        decisionReason: null, signedAt: null, caName: null, certificatePem: null, caPem: null,
+        certificateSha256: null, certificateNotBefore: null, certificateNotAfter: null, retrievedAt: null,
+      });
+    });
+
+  before(async () => {
+    const started = await startAppTokenManager(appStore);
+    readPort = started.port;
+    closeRead = started.close;
+  });
+  after(() => { closeRead(); });
+
+  it("reads the queue without taking the enrollment lock, so lastUsedAt means minting only", async () => {
+    // 🔴 This route used to wrap itself in a write transaction purely to stamp `lastUsedAt` — an
+    // exclusive lock, a full re-serialisation and an fsync for a request that changes nothing, which
+    // would serialise a poller against every token issue in the deployment.
+    const created = await issueAppToken({
+      label: "poller", scopes: ["enrollment:requests-read"], hostnamePattern: "*.dev",
+    });
+    const before = loadEnrollmentDocument(appStore);
+    const beforeRow = before.appTokens.find((row) => row.id === created.body.id)!;
+    assert.equal(beforeRow.lastUsedAt, null);
+    const beforeBytes = readFileSync(appStore, "utf8");
+
+    const answer = await app("/enrollment/requests", "GET", undefined, created.body.token);
+    assert.equal(answer.status, 200);
+    assert.equal(answer.headers["x-heliopause-app-token-expires-at"], created.body.row.expiresAt);
+
+    assert.equal(readFileSync(appStore, "utf8"), beforeBytes, "a read of the CSR queue rewrote the store");
+    assert.equal(
+      loadEnrollmentDocument(appStore).appTokens.find((row) => row.id === created.body.id)!.lastUsedAt, null,
+      "lastUsedAt must record minting only — the README documents it that way",
+    );
+    assert.equal(existsSync(`${appStore}.lock`), false);
+  });
+
+  it("carries the expiry only on answers it accepted", async () => {
+    const created = await issueAppToken({
+      label: "expiring", scopes: ["enrollment:requests-read"], hostnamePattern: "*.dev",
+    });
+    // A 401 must not become a way to ask whether a guessed token exists and when it dies.
+    const unknown = await app("/enrollment/requests", "GET", undefined, `hpapp_${"b".repeat(64)}`);
+    assert.equal(unknown.status, 401);
+    assert.equal(unknown.headers["x-heliopause-app-token-expires-at"], undefined);
+    // Nor may a refusal for a token that *is* real leak it.
+    const outOfScope = await app("/enrollment/tokens", "POST", { hostname: "k3s-01.dev" }, created.body.token);
+    assert.equal(outOfScope.status, 403);
+    assert.equal(outOfScope.headers["x-heliopause-app-token-expires-at"], undefined);
+    // And the operator routes, which are a different principal, never carry it at all.
+    assert.equal((await operator("/enrollment/app-tokens", "GET")).headers["x-heliopause-app-token-expires-at"], undefined);
+  });
+
+  it("filters the CSR queue by hostname, for both principals, composed with status", async () => {
+    seedCsr("filter-a.dev", "pending");
+    seedCsr("filter-a.dev", "signed");
+    seedCsr("filter-b.dev", "pending");
+    const created = await issueAppToken({
+      label: "queue-reader", scopes: ["enrollment:requests-read"], hostnamePattern: "*.dev",
+    });
+    const asApp = (query: string) => app(`/enrollment/requests${query}`, "GET", undefined, created.body.token);
+    const asOperator = (query: string) => operator(`/enrollment/requests${query}`, "GET");
+
+    for (const read of [asApp, asOperator]) {
+      const all = await read("");
+      assert.equal(all.status, 200);
+      const byHost = await read("?hostname=filter-a.dev");
+      assert.equal(byHost.status, 200);
+      assert.equal(byHost.body.requests.length, 2);
+      assert.ok(byHost.body.requests.every((row: { hostname: string }) => row.hostname === "filter-a.dev"));
+      assert.ok(all.body.requests.length > byHost.body.requests.length, "the filter matched everything");
+
+      // Normalised the same way a hostname is normalised anywhere else in this store.
+      assert.equal((await read("?hostname=FILTER-A.DEV")).body.requests.length, 2);
+      // Composed, not exclusive.
+      const both = await read("?hostname=filter-a.dev&status=pending");
+      assert.equal(both.body.requests.length, 1);
+      assert.equal(both.body.requests[0].status, "pending");
+      assert.equal((await read("?hostname=filter-b.dev&status=signed")).body.requests.length, 0);
+
+      // A malformed name is refused rather than matching nothing: an empty list reads as "there are
+      // no CSRs", and that is the sentence somebody acts on.
+      const malformed = await read("?hostname=not%20a%20hostname");
+      assert.equal(malformed.status, 400);
+      assert.match(malformed.body.error, /invalid hostname/);
+      assert.equal((await read("?hostname=")).status, 400);
+      assert.equal((await read("?status=nonsense")).status, 400);
+    }
+  });
+
+  it("answers an app token at the bootstrap routes with the node-token refusal, by ordering", async () => {
+    // `/infra/node-csrs` is dispatched above the app-token split and gates on `looksLikeNodeToken`,
+    // which an app token fails. Pinned because the answer is correct but not obvious: those two
+    // routes are the agent's own credential path, and an app token has no CSR of its own.
+    const created = await issueAppToken({
+      label: "not-an-agent", scopes: ["enrollment:token-create", "enrollment:requests-read"], hostnamePattern: "*.dev",
+    });
+    const submitted = await app("/infra/node-csrs", "POST", { csrPem: "x" }, created.body.token);
+    assert.equal(submitted.status, 401);
+    assert.equal(submitted.body.error, "unauthorized node token");
+    const fetched = await app("/infra/node-csrs/any-id/certificate", "GET", undefined, created.body.token);
+    assert.equal(fetched.status, 401);
+    assert.equal(fetched.body.error, "unauthorized node token");
+  });
+});
+
+// The budget a polling caller actually has, pinned. Its own manager because pinning it means
+// spending it, and its own group because every other test here would then fail on a limit it is not
+// testing — which is exactly how this was found.
+describe("the per-source bound on app-token requests", () => {
+  let boundPort = 0;
+  let closeBound = () => {};
+  const { app, issueAppToken } = appTokenCalls(() => boundPort);
+
+  before(async () => {
+    const started = await startAppTokenManager(appStore);
+    boundPort = started.port;
+    closeBound = started.close;
+  });
+  after(() => { closeBound(); });
+
+  it("counts app-token requests against the same bound as the certificate-less routes", async () => {
+    const created = await issueAppToken({
+      label: "chatty", scopes: ["enrollment:requests-read"], hostnamePattern: "*.dev",
+    });
+    // Not a rate limit on a credential: it is a bound on what one *address* can make this process
+    // read synchronously, which is why it applies before the store is opened and why a refused
+    // request still counts. 30 per minute — the number a dispatcher's polling interval has to fit
+    // inside, and the reason a bounded wait for a CSR to appear is a wait, not a spin.
+    let refusedAt = 0;
+    for (let n = 1; n <= 31 && refusedAt === 0; n += 1) {
+      const answer = await app("/enrollment/requests", "GET", undefined, created.body.token);
+      if (answer.status === 429) refusedAt = n;
+      else assert.equal(answer.status, 200, `request ${n} answered ${answer.status}`);
+    }
+    assert.equal(refusedAt, 31, "the app-token path is not counted by the enrollment bound");
+    // An unknown token is refused before the store is read but after the counter — the bound exists
+    // for callers who are guessing, so it must not be something guessing can step around.
+    assert.equal((await app("/enrollment/requests", "GET", undefined, `hpapp_${"c".repeat(64)}`)).status, 429);
   });
 });

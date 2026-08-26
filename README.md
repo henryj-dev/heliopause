@@ -578,16 +578,27 @@ revoking one keeps every operator check there is — that is where the grant is 
 one has none of them.
 
 **Two scopes exist and no more.** `enrollment:token-create` reaches `POST /enrollment/tokens`;
-`enrollment:requests-read` reaches `GET /enrollment/requests`. Any other route answers 403 naming the
-token, and an unknown, expired or revoked token answers 401 saying only that. **An app token cannot
-sign, upload, reject or revoke anything** — the worst a leaked one can do is mint node tokens inside
-its hostname pattern and read the CSR queue, and a certificate still requires an operator holding a
-one-time code.
+`enrollment:requests-read` reaches `GET /enrollment/requests`, which takes `?status=` and
+`?hostname=` in any combination — a caller that just planted a token can wait for that host's CSR to
+appear instead of reading the whole queue. Any other route answers 403 naming the token, and an
+unknown, expired or revoked token answers 401 saying only that. **An app token cannot sign, upload,
+reject or revoke anything** — the worst a leaked one can do is mint node tokens inside its hostname
+pattern and read the CSR queue, and a certificate still requires an operator holding a one-time code.
 
 The hostname pattern is an exact hostname or **one leading wildcard label**: `*.dev` covers
 `k3s-01.dev`, and covers neither `dev` nor `a.b.dev`. Node tokens issued this way are recorded with
-`createdBy: app:<label>`, so a program's work is distinguishable from a person's in the audit trail
-without reading timestamps against a chat log.
+`createdBy: app:<label>#<id>` and an `appTokenId` in the audit row's detail — **the label alone is
+not an identifier**, because two live tokens may share one so that a rotation has no gap.
+
+Every accepted answer carries `X-Heliopause-App-Token-Expires-At`. The caller already holds the
+token, so this discloses nothing, and without it the first sign of a lapsed credential is a 401 in
+the middle of a provisioning run. Refusals never carry it.
+
+Two limits worth knowing before writing a caller. `lastUsedAt` on an app token records **minting
+only**: reading the CSR queue takes no lock and writes nothing, so a poller leaves no trace in that
+field — it answers "is anything still issuing with this credential", the question asked before
+revoking one. And app-token requests are counted by the same per-source bound as the certificate-less
+enrollment routes: **30 per minute per address**, per manager process, refused with 429.
 
 Point the manager at its revocation source with `HELIOPAUSE_REVOCATION_FILE`. It replicates a
 minimal snapshot to every relay over the existing publisher mTLS identity at startup, after each
