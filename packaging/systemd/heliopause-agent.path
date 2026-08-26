@@ -1,0 +1,24 @@
+[Unit]
+Description=heliopause agent — start once this host's certificate has been installed
+Documentation=https://github.com/tiny-universe/heliopause/blob/main/packaging/systemd/README.md
+# Why a path unit and not `enable --now heliopause-agent`
+#
+# A host that enrolls itself boots with no certificate: `heliopause-enroll.timer` creates the key,
+# submits the CSR and polls until an operator signs it — minutes or days. The agent cannot start
+# before then (`ssl_context()` fails on the missing file), and its own unit is `Restart=always` with
+# `StartLimitIntervalSec=0`, so enabling it early means a restart every five seconds until the
+# certificate lands. Harmless, and it reads as a broken agent in the journal.
+#
+# This unit waits instead. `heliopause-enroll.py` writes `ca.pem` first and `agent.pem` last, each
+# by atomic rename, so the moment `agent.pem` exists the whole bundle does. Watching that one file is
+# enough. A host provisioned the older way — certificate copied in by hand — trips the condition at
+# boot and starts the agent immediately, which is what `enable --now heliopause-agent` used to do.
+#
+# Once triggered, the path unit keeps watching but the service manages its own restarts from there.
+
+[Path]
+PathExists=/etc/heliopause/pki/agent.pem
+Unit=heliopause-agent.service
+
+[Install]
+WantedBy=multi-user.target
