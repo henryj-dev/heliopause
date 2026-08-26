@@ -1,0 +1,9 @@
+# gitleaks configuration — allow narrowly, and say why
+#
+# Nothing is excluded yet: the history scan has never flagged anything here. The file
+# exists so `--config` can be passed unconditionally, which makes a missing or unreadable
+# config a loud failure rather than a silent pass, and so an exception has an obvious
+# place to live with its reason attached.
+
+[extend]
+useDefault = true
