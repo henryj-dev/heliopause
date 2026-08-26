@@ -159,6 +159,9 @@ jobs:
       # generation and a host nobody can reach.
       - run: ./scripts/rollback-test.sh
 
+  # gitleaks moved to the shared policy layer (the `policy` job below). What stays here is
+  # the axis only this repository has: the site-inventory scanner, which knows what a *site*
+  # looks like and cannot be shared with repositories that have no sites.
   leaks:
     name: defense-in-depth leak scan
     runs-on: ubuntu-latest
@@ -182,64 +185,6 @@ jobs:
         run: >-
           node scripts/scan-public-history.mjs
           --base "$SCAN_BASE" --head "$SCAN_HEAD" --default-branch "$DEFAULT_BRANCH"
-
-      # This job intentionally receives no repository secret and is not the merge gate: a candidate
-      # can alter a `pull_request` workflow. The default-branch `pull_request_target` workflow is the
-      # authoritative, out-of-tree scanner; this is a detection backstop on pull requests and pushes.
-      #
-      # **Not on the schedule, whatever the `on:` block suggests.** A scheduled run has neither a
-      # pull request base nor `github.event.before`, so the scanner falls back to
-      # `merge-base(HEAD, origin/main)` — on `main` that is HEAD, the range is empty, and the step
-      # passes having read nothing. The whole-history sweep is `--all` in the scheduled
-      # `trusted-leaks.yml` job, which owns it because it is the one holding the hostname pattern.
-      # Copying `--all` here would only add a second permanently-red check: SECURITY.md records that
-      # the sweep stays red until the already-distributed history is rewritten.
-
-      # General credential detection complements the site-inventory scanner above. A full checkout
-      # makes this history-aware.
-      #
-      # **The action, now that a licence exists.** This step used to download the binary instead: the
-      # action refuses to run for a repository owned by an organisation without a paid licence
-      # — `[tiny-universe] is an organization. License key is required` — so it passed on the
-      # canonical repository and failed forever on the fork, which is the one that builds and ships.
-      # `GITLEAKS_LICENSE` is now an org secret, so that failure mode is closed here.
-      #
-      # ⚠️ It is *not* closed for forks. A fork outside this organisation has no licence and this
-      #    step will fail there. That is the same trap as before, moved rather than removed — if a
-      #    fork ever needs to build, give it the binary form back rather than the licence.
-      #
-      # ⚠️ Scope changed with it. The binary ran `gitleaks git .` — the whole history, every run.
-      #    The action scopes by event: the pushed commits on `push`, the pull-request commits on
-      #    `pull_request`, and the full history only on `schedule` / `workflow_dispatch`. The weekly
-      #    cron above is what keeps history-wide coverage; without it this reads recent commits only.
-      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
-
-      # **A second pass — the whole history.** The action above scopes by event: the pushed
-      # commits on `push`, the pull-request commits on `pull_request`. That never re-reads
-      # what is already in the history, so a rule added tomorrow will not light up a commit
-      # from last year.
-      #
-      # Same scanner, different scope, run again. Both have to pass. `!cancelled()` keeps it
-      # running when the step above is red — one failure hiding the other means you cannot
-      # see what actually broke in a single run.
-      #
-      # ⚠️ Dependabot cannot update the version and checksum here (it is a URL download).
-      #    Whenever the action above moves, read these two lines in the same pull request.
-      - name: gitleaks (full history)
-        if: ${{ !cancelled() }}
-        env:
-          GITLEAKS_VERSION: "8.30.1"
-          GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
-        run: |
-          set -euo pipefail
-          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
-          curl -fsSL --retry 3 -o /tmp/gitleaks.tgz "$url"
-          echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tgz" | sha256sum -c -
-          tar xzf /tmp/gitleaks.tgz -C /tmp gitleaks
-          /tmp/gitleaks git --no-banner --redact --exit-code 1 --config .gitleaks.toml .
 
   guards:
     name: agent worktree guards
@@ -285,67 +230,25 @@ jobs:
           python3 scripts/claude-hooks/test-codex-hooks.py
           python3 scripts/git-hooks/test-pre-commit.py
 
-  # The workflows are themselves an attack surface: the runner executes code that came
-  # from outside, and a `${{ }}` inside a `run:` body is shell code by the time the
-  # shell sees it. A reviewer will miss it.
-  workflow-audit:
-    name: workflow audit
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: actionlint
-        env:
-          ACTIONLINT_VERSION: "1.7.12"
-          ACTIONLINT_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
-        run: |
-          set -euo pipefail
-          url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
-          curl -fsSL --retry 3 -o /tmp/actionlint.tgz "$url"
-          echo "${ACTIONLINT_SHA256}  /tmp/actionlint.tgz" | sha256sum -c -
-          tar xzf /tmp/actionlint.tgz -C /tmp actionlint
-          /tmp/actionlint -color .github/workflows/*.yml
-      - name: zizmor
-        env:
-          ZIZMOR_VERSION: "1.29.0"
-          ZIZMOR_SHA256: "dd96df044a6e8538d5f423790f453bdd03d49e5b2bcc38214acc41a2f1297839"
-        run: |
-          set -euo pipefail
-          url="https://github.com/zizmorcore/zizmor/releases/download/v${ZIZMOR_VERSION}/zizmor-x86_64-unknown-linux-gnu.tar.gz"
-          curl -fsSL --retry 3 -o /tmp/zizmor.tgz "$url"
-          echo "${ZIZMOR_SHA256}  /tmp/zizmor.tgz" | sha256sum -c -
-          tar xzf /tmp/zizmor.tgz -C /tmp
-          /tmp/zizmor --no-progress --persona=regular .github/workflows
-
-  # What is this pull request dragging in? `npm ci` stands the lockfile up as written,
-  # so CI says nothing about a package that arrived today — green reads as "this
-  # dependency is fine" when nobody asked.
-  dependency-review:
-    name: dependency review
-    # Only meaningful on a pull request: without a base there is no "what is new".
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+  # **The policy layer does not belong to this repository.** Credential scanning, workflow
+  # auditing and dependency review ask the same question of all five repositories, whatever
+  # each one builds. Kept as copies they drift, and once they drift nothing says which one
+  # is the standard.
+  #
+  # A reusable workflow runs in the **caller's** context — the checkout is this repository
+  # and `.gitleaks.toml` is this repository's. Each keeps its own allowlist with its reasons.
+  #
+  # ⚠️ Pinned by commit SHA. At `@main`, one line over there changes this gate.
+  #    Dependabot updates this SHA.
+  policy:
+    uses: henryj-dev/.github/.github/workflows/policy-checks.yml@f8eab7393216bd0054e6b65297a0cc5baa865630
     permissions:
       contents: read
-      # Say inside the pull request what was blocked and why. A contributor who has to
-      # open the log to find out just feels blocked.
+      # dependency-review says inside the pull request what was blocked and why.
       pull-requests: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
-        with:
-          # Blocking from `moderate` buries the signal in transitive noise. The line is
-          # drawn at what cannot be taken back.
-          fail-on-severity: high
-          # Copyleft is refused. If something genuinely needed is caught here, say why in
-          # the pull request and change this line — do not add a one-off exception.
-          deny-licenses: AGPL-1.0-only, AGPL-1.0-or-later, AGPL-3.0-only, AGPL-3.0-or-later, GPL-2.0-only, GPL-2.0-or-later, GPL-3.0-only, GPL-3.0-or-later, SSPL-1.0
-          comment-summary-in-pr: on-failure
+    secrets:
+      # A licence is required for organisation-owned repositories. It is an org secret.
+      GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
 
   # The one check name the branch ruleset requires.
   #
@@ -355,7 +258,7 @@ jobs:
   # one-line change to `needs:`, and leaves the ruleset alone.
   gate:
     name: gate
-    needs: [check, e2e, rollback, leaks, guards, workflow-audit, dependency-review]
+    needs: [check, e2e, rollback, leaks, guards, policy]
     # This job must run even when something upstream is red. Otherwise it is a check that
     # never reported, the rule waits forever, and nothing records what broke.
     if: always()
