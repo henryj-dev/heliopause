@@ -1,6 +1,6 @@
 <div align="center">
 
-<h1>🛰️ heliopause</h1>
+<h1>heliopause</h1>
 
 ### **A host firewall you can't lock yourself out of.**
 
@@ -35,6 +35,7 @@ control plane borrowed from network gear and made to work on Linux hosts.
 ## Contents
 
 - [The problem](#the-problem)
+- [What it does](#what-it-does)
 - [Safety invariants](#safety-invariants)
 - [Quick start](#quick-start)
 - [How it fits together](#how-it-fits-together)
@@ -97,6 +98,24 @@ sequenceDiagram
 The last branch is the product. Everything else in this repository is arrangements around it —
 and it is exercised against a **real kernel** in CI on every pull request
 (`scripts/rollback-test.sh`).
+
+---
+
+## What it does
+
+| | |
+| --- | --- |
+| **Declarative fleet firewalls** | One policy document renders `nftables` for every host in the site. Policies name sources, destinations and ports — never nftables |
+| **Commit → confirm → auto-rollback** | Every apply arms a rollback timer that the host disarms only by reaching the relay. The undo needs nothing off the host still working |
+| **Two enforcement points** | Host traffic renders to `nft -j -f`; pod and ClusterIP traffic, which never reaches a netfilter hook under Cilium, renders to `CiliumNetworkPolicy`. The two are tracked as separate states because they genuinely disagree |
+| **Endpoint kinds** | `host` · `host-group` · `cidr` · `object` · `internet` · `any`, four Kubernetes selectors, `geofeed`, and Cloudflare WARP devices and users |
+| **Staged rollout** | canary → general → gateway, each stage gated on every host at the previous one having confirmed. A policy that locks hosts out locks out the canary and stops there |
+| **Two-person publishing** | The approver may not be the proposer, and both name the same bytes. Plans are content-addressed with a 10-minute TTL |
+| **Artifact signing** | Ed25519 over the exact host payload, verified by the agent before the kernel is touched. The relay is an untrusted courier that never holds the key |
+| **Built-in PKI** | `ca` · `relay` · `agent` · `operator` roles, ECDSA P-256, issued from the host list in your own site module. No external PKI is required or assumed |
+| **Fail-closed revocation** | A locked, socket-activated writer owns the denylist; updates may add rows but never omit or rewrite one |
+| **Console and CLI** | One SvelteKit console in English and Korean that loads nothing from a CDN, and 15 executables covering PKI, publishing, approval, status, enrollment, revocation, feeds and coverage |
+| **No build step** | Node 22 runs the `.ts` sources directly, and the library has zero runtime dependencies. The console is optional on top |
 
 ---
 
