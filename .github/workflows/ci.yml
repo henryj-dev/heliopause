@@ -291,3 +291,94 @@ jobs:
           python3 scripts/claude-hooks/test-session-end-cleanup.py
           python3 scripts/claude-hooks/test-codex-hooks.py
           python3 scripts/git-hooks/test-pre-commit.py
+
+  # The workflows are themselves an attack surface: the runner executes code that came
+  # from outside, and a `${{ }}` inside a `run:` body is shell code by the time the
+  # shell sees it. A reviewer will miss it.
+  workflow-audit:
+    name: workflow audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: actionlint
+        env:
+          ACTIONLINT_VERSION: "1.7.12"
+          ACTIONLINT_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+        run: |
+          set -euo pipefail
+          url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL --retry 3 -o /tmp/actionlint.tgz "$url"
+          echo "${ACTIONLINT_SHA256}  /tmp/actionlint.tgz" | sha256sum -c -
+          tar xzf /tmp/actionlint.tgz -C /tmp actionlint
+          /tmp/actionlint -color .github/workflows/*.yml
+      - name: zizmor
+        env:
+          ZIZMOR_VERSION: "1.29.0"
+          ZIZMOR_SHA256: "dd96df044a6e8538d5f423790f453bdd03d49e5b2bcc38214acc41a2f1297839"
+        run: |
+          set -euo pipefail
+          url="https://github.com/zizmorcore/zizmor/releases/download/v${ZIZMOR_VERSION}/zizmor-x86_64-unknown-linux-gnu.tar.gz"
+          curl -fsSL --retry 3 -o /tmp/zizmor.tgz "$url"
+          echo "${ZIZMOR_SHA256}  /tmp/zizmor.tgz" | sha256sum -c -
+          tar xzf /tmp/zizmor.tgz -C /tmp
+          /tmp/zizmor --no-progress --persona=regular .github/workflows
+
+  # What is this pull request dragging in? `npm ci` stands the lockfile up as written,
+  # so CI says nothing about a package that arrived today — green reads as "this
+  # dependency is fine" when nobody asked.
+  dependency-review:
+    name: dependency review
+    # Only meaningful on a pull request: without a base there is no "what is new".
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # Say inside the pull request what was blocked and why. A contributor who has to
+      # open the log to find out just feels blocked.
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          # Blocking from `moderate` buries the signal in transitive noise. The line is
+          # drawn at what cannot be taken back.
+          fail-on-severity: high
+          # Copyleft is refused. If something genuinely needed is caught here, say why in
+          # the pull request and change this line — do not add a one-off exception.
+          deny-licenses: AGPL-1.0-only, AGPL-1.0-or-later, AGPL-3.0-only, AGPL-3.0-or-later, GPL-2.0-only, GPL-2.0-or-later, GPL-3.0-only, GPL-3.0-or-later, SSPL-1.0
+          comment-summary-in-pr: on-failure
+
+  # The one check name the branch ruleset requires.
+  #
+  # Listing job names one by one means that the day a name changes, that required check
+  # becomes a check that does not exist — and the protection quietly disappears. GitHub
+  # says nothing when it happens. Collecting them here makes adding or removing a job a
+  # one-line change to `needs:`, and leaves the ruleset alone.
+  gate:
+    name: gate
+    needs: [check, e2e, rollback, leaks, guards, workflow-audit, dependency-review]
+    # This job must run even when something upstream is red. Otherwise it is a check that
+    # never reported, the rule waits forever, and nothing records what broke.
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: every upstream job settled green
+        # Never interpolate `${{ }}` into a `run:` body: it is substituted before the
+        # shell reads the script, so a quote or a `$(...)` in the value becomes shell code.
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          jq -r 'to_entries[] | "  \(.key): \(.value.result)"' <<<"$NEEDS"
+          # `skipped` passes: some jobs do not apply to this event (dependency review only
+          # means something on a pull request). Skipped and failed are different words.
+          bad="$(jq '[.[] | select(.result == "failure" or .result == "cancelled")] | length' <<<"$NEEDS")"
+          test "$bad" = "0" || { echo "::error::$bad upstream job(s) did not pass"; exit 1; }
+          echo "gate passed"

@@ -90,3 +90,28 @@ jobs:
         uses: github/codeql-action/analyze@c16c0f3f2812ec4bb3750a5ed64873fe2ce0fbef # codeql-bundle-v2.26.3
         with:
           category: /language:${{ matrix.language }}
+
+  # The one check name the branch ruleset requires.
+  #
+  # A matrix job carries its matrix value into the check name (`analyze python`), so
+  # adding a language moves the name the ruleset was told to wait for, and the
+  # protection quietly disappears. Collecting here leaves the ruleset alone.
+  #
+  # This check asks whether the analysis ran, not whether it found nothing. Findings
+  # land in the Security tab and do not block a merge; what is blocked here is a broken
+  # query pack going green while scanning nothing.
+  codeql:
+    name: codeql
+    needs: [analyze]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: the analysis ran to completion
+        env:
+          RESULT: ${{ needs.analyze.result }}
+        run: |
+          set -euo pipefail
+          echo "analyze: $RESULT"
+          test "$RESULT" = "success" \
+            || { echo "::error::CodeQL analysis did not complete ($RESULT)"; exit 1; }

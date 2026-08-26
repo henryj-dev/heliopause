@@ -48,6 +48,12 @@ jobs:
     name: publish to npm
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # Past this point nothing can be taken back — a published version stays published.
+    # The environment is where the approval and the deployment record live, and it is
+    # what narrows `NPM_TOKEN` to this job instead of to every workflow in the repository.
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/${{ github.event.repository.name }}
     permissions:
       contents: read
       # npm provenance: the registry records which workflow, at which commit, built the tarball, and
