@@ -39,10 +39,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: false          # never cancel a publish mid-flight
-
 jobs:
   publish:
     name: publish to npm

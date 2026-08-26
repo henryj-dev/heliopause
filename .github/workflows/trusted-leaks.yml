@@ -19,17 +19,6 @@ on: # zizmor: ignore[dangerous-triggers]
 permissions:
   contents: read
 
-# Newest run per pull request wins; a `synchronize` push cancels the scan still running for the
-# commit it replaced. The scanner reads Git objects and writes nothing, so there is no half-applied
-# state a cancellation could leave behind.
-#
-# The key stays keyed on the pull request number rather than a branch name: a fork's branch may be
-# called anything, including the name of one of ours, and no candidate should be able to cancel this
-# gate's run for a different pull request.
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
-
 jobs:
   scan:
     name: trusted site-data leak gate

@@ -30,36 +30,6 @@ on:
 permissions:
   contents: read
 
-# Only the newest run of this workflow for a given ref survives; pushing again cancels the run the
-# earlier commit started. A stale run that finishes after the newer one reports a verdict for code
-# nobody is looking at any more, and on a public repository the minutes are shared with everyone
-# else's pull requests.
-#
-# This used to carry a second reason — `rollback` and `e2e` bound the relay on a fixed port and
-# started privileged containers on a shared self-hosted machine, so two live runs collided. Every
-# job now gets its own ephemeral VM, so that collision is gone. The line stays for the reasons
-# above; the claim that no longer holds does not.
-#
-# `github.event_name` is part of the key on purpose. Without it the `push` and `pull_request` runs
-# of the same branch land in one group and cancel each other — and a cancelled run is not a passing
-# check, so whichever event arrived first leaves a required check dead on the pull request. Now that
-# `push` is narrowed to `main` the two cannot collide on a ref either, but the key stays: the reason
-# it was added is a property of the group, not of which branches happen to be listed above.
-#
-# **Superseding only makes sense for a pull request**, which is why `cancel-in-progress` is now
-# conditional rather than `true`. On a push to `main` there is no later run that republishes the
-# verdict for the cancelled commit — that commit *is* the branch, and killing its run leaves `main`
-# with no answer for a state that is already published. A pull request has the opposite property:
-# the next push re-runs every check against the new head, so the old run's answer is about code
-# nobody will merge.
-#
-# Cancelling `rollback` mid-flight is safe by construction: its ruleset lives in the container's own
-# network namespace, never the runner's, and `docker rm -f` in the EXIT trap runs on the SIGINT the
-# cancellation sends. A SIGKILL after the grace period leaves a stray container, not a locked host.
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
 # ── Every job runs on a GitHub-hosted runner ─────────────────────────────────
 #
 # This workflow used to split by whether the pull request came from a fork, because two jobs ran on
