@@ -8,11 +8,27 @@
 에이전트의 `Edit`/`Write`/트리 변경 git 명령은 메인에서 **항상 거부**된다. 사람은 메인에서
 수정·커밋·push 할 수 있다. 에이전트 작업 흐름: 하네스 전용 worktree 도구 또는
 `python3 scripts/claude-hooks/enter-worktree.py <이름>` → 생성된 경로에서 작업·커밋 →
-`git fetch origin && git rebase origin/main && git push origin HEAD:main`
 
-**대화(작업 사이클)가 끝났다고 선언하려면 이 push 까지 끝나 있어야 한다 — 그것이 곧
-「메인 브랜치로 머지」다.** 별도의 병합 절차는 없다. 워크트리에 커밋만 남기고 push 를
-미루면 그 사이클은 아직 메인에 반영되지 않은 것이다.
+```bash
+git fetch origin && git rebase origin/main
+git push -u origin <워크트리 브랜치>            # HEAD:main 이 아니다 — 아래
+gh pr create --base main --fill                  # 본문에 무엇·왜·돌린 검사와 수
+gh pr checks <n> --watch                         # 필수 검사 3개 + 나머지, 전부 초록까지
+gh pr merge <n> --squash                         # 이것이 「메인 브랜치로 머지」다
+```
+
+**대화(작업 사이클)가 끝났다고 선언하려면 이 머지까지 끝나 있어야 한다.** 워크트리에 커밋만
+남기거나 PR 만 열어 두고 미루면 그 사이클은 아직 메인에 반영되지 않은 것이다.
+
+`main` 은 저장소 규칙으로 **PR 전용**이다(2026-08-26 실측: `git push origin HEAD:main` 이
+`GH013 … Changes must be made through a pull request · 3 of 3 required status checks are expected`
+로 거부된다). `gh pr merge --auto` 도 이 저장소에서는 꺼져 있어(`Auto merge is not allowed`)
+검사가 끝난 뒤 사람 또는 에이전트가 머지 명령을 직접 친다. 가장 오래 걸리는 필수 검사는
+`auto-rollback against a real kernel` 로 수 분이다. 여기에는 오래 「`push origin HEAD:main`
+이 곧 머지」라고 적혀 있었고, 규칙이 바뀐 뒤(PR #10~#13 즈음)에도 그대로여서 첫 push 가
+거부되고서야 알았다. `scripts/claude-hooks/main-tree-guard.py` 가 거부 메세지에 인쇄하는
+`git push origin HEAD:<branch>` 힌트는 stardust 정본의 일반형이라 이 저장소에서는 **그대로
+따르면 막힌다** — 그 훅은 사본이라 여기서 고치지 않는다.
 
 메인은 세션 시작·종료에 깨끗할 때만 자동 fast-forward 된다. 사람이 메인에 미커밋을
 쌓으면 그 최신화는 더러워서 건너뛴다 — 그것이 이 허용의 대가다. 사용자는 기다리지
@@ -101,7 +117,7 @@ python3 scripts/git-hooks/test-pre-commit.py              # 실패 0 (사람 통
 `if __name__ == "__main__"` 이 파일 중간에 있어서 그 아래 다섯 클래스(라우트 안전 검사
 39개)가 정의조차 되지 않은 채 몇 달을 지났고, 초록불은 그동안 한 번도 흔들리지 않았다
 — 수가 줄어든 게 아니라 센 적이 없어 비교할 기준선이 없었다. 현재 기대값(정책 심링크 연결):
-`npm test` 1,771 + 8 (`@heliopause/manager`) + 194 (`@heliopause/web`) ·
+`npm test` 1,772 + 8 (`@heliopause/manager`) + 194 (`@heliopause/web`) ·
 `test_validate.py` 244 (실행 232 · skip 12) · `test_enroll.py` 16.
 
 ⚠️ 훅 검사 7종은 `refs/remotes/origin/HEAD` 를 필요로 한다. `git clone` 은 그것을 쓰지만
