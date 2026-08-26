@@ -142,7 +142,7 @@ Not aspirations. Each is enforced in code, and each came from a measured failure
 
 `defineConfig` throws rather than letting you build it:
 
-```
+```text
 hookPolicy.input is 'drop' with an empty baseline — this locks every host out of itself.
 Define the management paths in `baseline` first.
 ```
@@ -173,7 +173,7 @@ node bin/heliopause-ui.ts examples/site.ts     # → http://127.0.0.1:8500
 
 The dry run prints what *would* be published and writes nothing:
 
-```
+```text
 generation 1981732-dirty-9b73df1b  (2 hosts)
   web-01.example.com canary   2 policy rules  sha256:af470349ff80a
   web-02.example.com general  2 policy rules  sha256:af470349ff80a
@@ -404,7 +404,7 @@ But a *verdict* is not the same as a state. `state` is the last thing a host sai
 about now. One host was dead for nine hours while the site view printed a green `confirmed`,
 because that genuinely was its last word. So one ordering decides both views:
 
-```
+```text
 drift ▸ rolled-back ▸ maintenance ▸ never-seen ▸ silent (>90s) ▸ behind ▸ confirmed
 ```
 
@@ -686,7 +686,7 @@ including one from a fork.
 
 ### Layout
 
-```
+```text
 src/          the library — pure renderers, protocol, gating, stores. Zero runtime dependencies
 bin/          15 executables, run directly by node 22
 agent/        the host agent — python3 standard library only, plus the nft binary
