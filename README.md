@@ -12,12 +12,15 @@ control plane borrowed from network gear and made to work on Linux hosts.
 [![ci](https://github.com/henryj-dev/heliopause/actions/workflows/ci.yml/badge.svg)](https://github.com/henryj-dev/heliopause/actions/workflows/ci.yml)
 [![codeql](https://github.com/henryj-dev/heliopause/actions/workflows/codeql.yml/badge.svg)](https://github.com/henryj-dev/heliopause/actions/workflows/codeql.yml)
 [![scorecard](https://github.com/henryj-dev/heliopause/actions/workflows/scorecard.yml/badge.svg)](https://github.com/henryj-dev/heliopause/actions/workflows/scorecard.yml)
+[![trusted-leaks](https://github.com/henryj-dev/heliopause/actions/workflows/trusted-leaks.yml/badge.svg)](https://github.com/henryj-dev/heliopause/actions/workflows/trusted-leaks.yml)
 
-![node](https://img.shields.io/badge/node-22%2B-3c873a?logo=node.js&logoColor=white)
+<br/>
+
+![node](https://img.shields.io/badge/node-22%2B-5FA04E?logo=node.js&logoColor=white)
 ![agent](https://img.shields.io/badge/agent-python3%20stdlib-3776ab?logo=python&logoColor=white)
 ![runtime deps](https://img.shields.io/badge/runtime%20deps-0-success)
 ![build step](https://img.shields.io/badge/build%20step-none-success)
-![license](https://img.shields.io/badge/license-Apache--2.0-blue)
+[![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
 <br/>
 
@@ -29,7 +32,25 @@ control plane borrowed from network gear and made to work on Linux hosts.
 
 ---
 
-## ✦ The failure this exists to prevent
+## Contents
+
+- [The problem](#the-problem)
+- [Safety invariants](#safety-invariants)
+- [Quick start](#quick-start)
+- [How it fits together](#how-it-fits-together)
+- [The policy model](#the-policy-model)
+- [Two enforcement points, reported separately](#two-enforcement-points-reported-separately)
+- [Staged rollout](#staged-rollout)
+- [Trust, identity and the chain of custody](#trust-identity-and-the-chain-of-custody)
+- [Command line](#command-line)
+- [The console](#the-console)
+- [Development](#development)
+- [Status & limitations](#status--limitations)
+- [License](#license)
+
+---
+
+## The problem
 
 Managing host firewalls at scale usually means one of three things:
 
@@ -79,7 +100,7 @@ and it is exercised against a **real kernel** in CI on every pull request
 
 ---
 
-## ✦ Safety invariants
+## Safety invariants
 
 Not aspirations. Each is enforced in code, and each came from a measured failure.
 
@@ -115,7 +136,37 @@ reads as "heliopause is broken" rather than "this number is wrong".
 
 ---
 
-## ✦ How it fits together
+## Quick start
+
+[`examples/site.ts`](examples/site.ts) is a complete, runnable site module — two hosts, a staged
+rollout, a dropping input hook with a real baseline, and every address an RFC 5737 documentation
+range. It is the file to copy when starting a real policy, and the first thing to change in it is
+every address.
+
+```bash
+git clone https://github.com/henryj-dev/heliopause && cd heliopause
+npm ci
+
+npm test                    # renders the example and asserts the invariants above
+node bin/heliopause-publish.ts examples/site.ts ./artifacts --dry-run --allow-dirty
+node bin/heliopause-ui.ts examples/site.ts     # → http://127.0.0.1:8500
+```
+
+The dry run prints what *would* be published and writes nothing:
+
+```
+generation 1981732-dirty-9b73df1b  (2 hosts)
+  web-01.example.com canary   2 policy rules  sha256:af470349ff80a
+  web-02.example.com general  2 policy rules  sha256:af470349ff80a
+dry run — nothing written
+```
+
+Both hosts render the same digest because they enforce the same two policies — content-addressing
+is what lets drift, approval and cross-generation comparison all be one question about bytes.
+
+---
+
+## How it fits together
 
 ```mermaid
 flowchart LR
@@ -209,7 +260,7 @@ becomes decorative.
 
 ---
 
-## ✦ The policy model
+## The policy model
 
 A policy says *"this source, to this destination, on these ports → allow or deny."* It never
 mentions nftables. Rendering happens separately; resolving names to addresses is **injected**.
@@ -280,7 +331,7 @@ refuses to route a packet *into* the internal supernet unless it came from there
 
 ---
 
-## ✦ Two enforcement points, reported separately
+## Two enforcement points, reported separately
 
 On a node running Cilium, pod and ClusterIP traffic is resolved in eBPF and **never reaches a
 netfilter hook**. No nftables rule can govern it. So a policy naming a pod destination is rendered
@@ -307,7 +358,7 @@ name is left alone rather than overwritten.
 
 ---
 
-## ✦ Staged rollout
+## Staged rollout
 
 ```mermaid
 flowchart LR
@@ -347,7 +398,7 @@ produced.
 
 ---
 
-## ✦ Trust, identity and the chain of custody
+## Trust, identity and the chain of custody
 
 ```mermaid
 flowchart TD
@@ -391,57 +442,7 @@ no prefix rules. An agent certificate gets `403`.
 
 ---
 
-## ✦ The console
-
-One SvelteKit build, served by both the manager and the workstation UI. **English and Korean**,
-switchable at runtime. Icons are generated into the source tree so a firewall console **loads
-nothing from a CDN** — and `npm run icons:check` fails the build if any of the 20 names stops
-existing upstream, because a missing icon renders as *nothing at all*.
-
-<div align="center">
-
-| 🚦 fleet | 🔍 evidence | 📜 policy |
-|:---:|:---:|:---:|
-| `/fleet` · `/changes` · `/enrollment` | `/lookup` · `/traffic` · `/routing` | `/policy` |
-| *what is the fleet doing* | *what does the evidence say* | *what do the rules say* |
-
-</div>
-
-The policy screen carries **17 tables** — `policies` · `rules` · `files` · `baseline` · `zones` ·
-`crossings` · `coverage` · `devices` · `users` · `workload` · `hosts` · `membership` · `objects` ·
-`services` · `feeds` · `address-space` · `history` — each addressable as a path
-(`/app/policy/zones`) so a link can be copied and sent to the person who has to approve what it
-shows.
-
-<details>
-<summary><b>Two surfaces, and why one of them binds to loopback with no login</b></summary>
-
-<br/>
-
-**`heliopause-ui` is not the other half of the product.** It is what reads your *uncommitted*
-working tree, and what still works when the cluster does not.
-
-Anyone who can run it can already read `policy/*.ts` — it is a file in a repository they have
-checked out, so a login would guard a door beside an open wall. **The bind address is the
-control:** on `0.0.0.0` this becomes an unauthenticated policy-disclosure service, and the policy is
-a map of every allowed path into the site. There is therefore no flag to change the host.
-
-It also *runs* the renderer rather than reading the site module's lists, because "listed against 3
-hosts" and "renders on 3 hosts" are different sentences — and a policy that protects nothing would
-otherwise look identical to one that works.
-
-**The manager renders the policy screen without holding the policy.**
-`heliopause-policy-render` is a separate deployment carrying a checkout and no credential; the
-console reads JSON from it. That process refuses to start if it finds credential-shaped
-environment, a Kubernetes service-account token, or a signing key — all three are deployment facts
-a manifest can get wrong silently, and every one of them has been got wrong here at least once.
-Failing to start costs the console; coming up armed costs the fleet.
-
-</details>
-
----
-
-## ✦ Command line
+## Command line
 
 <div align="center">
 
@@ -467,22 +468,32 @@ Failing to start costs the console; coming up armed costs the fleet.
 
 ### A generation, end to end
 
-```bash
-# 1 — certificates for everything the site module names
-node bin/heliopause-pki.ts site ./pki policy/dev.ts
+1. Certificates for everything the site module names.
 
-# 2 — render and submit for review (nothing has changed yet)
-node bin/heliopause-publish.ts policy/dev.ts dev \
-  --propose=https://manager.example:8444 --pki=./pki --operator=ops-alice
+   ```bash
+   node bin/heliopause-pki.ts site ./pki policy/dev.ts
+   ```
 
-# 3 — a different person, a different certificate
-node bin/heliopause-approve.ts https://manager.example:8444 --pki=./pki --operator=ops-bob
-node bin/heliopause-approve.ts https://manager.example:8444 <plan-hash> --approve
-node bin/heliopause-approve.ts https://manager.example:8444 <plan-hash> --push
+2. Render and submit for review — nothing has changed yet.
 
-# 4 — watch it land, stage by stage
-node bin/heliopause-status.ts https://manager.example:8444 --site --pki=./pki --watch
-```
+   ```bash
+   node bin/heliopause-publish.ts policy/dev.ts dev \
+     --propose=https://manager.example:8444 --pki=./pki --operator=ops-alice
+   ```
+
+3. A different person, a different certificate.
+
+   ```bash
+   node bin/heliopause-approve.ts https://manager.example:8444 --pki=./pki --operator=ops-bob
+   node bin/heliopause-approve.ts https://manager.example:8444 <plan-hash> --approve
+   node bin/heliopause-approve.ts https://manager.example:8444 <plan-hash> --push
+   ```
+
+4. Watch it land, stage by stage.
+
+   ```bash
+   node bin/heliopause-status.ts https://manager.example:8444 --site --pki=./pki --watch
+   ```
 
 Approving and pushing are separate flags on purpose. They could be one step — except the approver
 is the person who did *not* render the plan, and making their action also push means the fleet
@@ -561,37 +572,57 @@ CA private key stays in `./offline-ca`; the host private key never reaches it.
 
 ---
 
-## ✦ Try it in one minute
+## The console
 
-[`examples/site.ts`](examples/site.ts) is a complete, runnable site module — two hosts, a staged
-rollout, a dropping input hook with a real baseline, and every address an RFC 5737 documentation
-range. It is the file to copy when starting a real policy, and the first thing to change in it is
-every address.
+One SvelteKit build, served by both the manager and the workstation UI. **English and Korean**,
+switchable at runtime. Icons are generated into the source tree so a firewall console **loads
+nothing from a CDN** — and `npm run icons:check` fails the build if any of the 20 names stops
+existing upstream, because a missing icon renders as *nothing at all*.
 
-```bash
-git clone https://github.com/henryj-dev/heliopause && cd heliopause
-npm ci
+<div align="center">
 
-npm test                    # renders the example and asserts the invariants above
-node bin/heliopause-publish.ts examples/site.ts ./artifacts --dry-run --allow-dirty
-node bin/heliopause-ui.ts examples/site.ts     # → http://127.0.0.1:8500
-```
+| 🚦 fleet | 🔍 evidence | 📜 policy |
+|:---:|:---:|:---:|
+| `/fleet` · `/changes` · `/enrollment` | `/lookup` · `/traffic` · `/routing` | `/policy` |
+| *what is the fleet doing* | *what does the evidence say* | *what do the rules say* |
 
-The dry run prints what *would* be published and writes nothing:
+</div>
 
-```
-generation 1981732-dirty-9b73df1b  (2 hosts)
-  web-01.example.com canary   2 policy rules  sha256:af470349ff80a
-  web-02.example.com general  2 policy rules  sha256:af470349ff80a
-dry run — nothing written
-```
+The policy screen carries **17 tables** — `policies` · `rules` · `files` · `baseline` · `zones` ·
+`crossings` · `coverage` · `devices` · `users` · `workload` · `hosts` · `membership` · `objects` ·
+`services` · `feeds` · `address-space` · `history` — each addressable as a path
+(`/app/policy/zones`) so a link can be copied and sent to the person who has to approve what it
+shows.
 
-Both hosts render the same digest because they enforce the same two policies — content-addressing
-is what lets drift, approval and cross-generation comparison all be one question about bytes.
+<details>
+<summary><b>Two surfaces, and why one of them binds to loopback with no login</b></summary>
+
+<br/>
+
+**`heliopause-ui` is not the other half of the product.** It is what reads your *uncommitted*
+working tree, and what still works when the cluster does not.
+
+Anyone who can run it can already read `policy/*.ts` — it is a file in a repository they have
+checked out, so a login would guard a door beside an open wall. **The bind address is the
+control:** on `0.0.0.0` this becomes an unauthenticated policy-disclosure service, and the policy is
+a map of every allowed path into the site. There is therefore no flag to change the host.
+
+It also *runs* the renderer rather than reading the site module's lists, because "listed against 3
+hosts" and "renders on 3 hosts" are different sentences — and a policy that protects nothing would
+otherwise look identical to one that works.
+
+**The manager renders the policy screen without holding the policy.**
+`heliopause-policy-render` is a separate deployment carrying a checkout and no credential; the
+console reads JSON from it. That process refuses to start if it finds credential-shaped
+environment, a Kubernetes service-account token, or a signing key — all three are deployment facts
+a manifest can get wrong silently, and every one of them has been got wrong here at least once.
+Failing to start costs the console; coming up armed costs the fleet.
+
+</details>
 
 ---
 
-## ✦ Development
+## Development
 
 ```bash
 npm ci
@@ -646,33 +677,29 @@ packaging/    systemd units, Kubernetes RBAC, container image, signing-key runbo
 scripts/      e2e and rollback harnesses, icon generation, fleet deploy, repository guards
 ```
 
----
-
-## ✦ Status
-
-**Early.** The core — policy model, renderer, agent, orchestration — is extracted from a system
-running on production hosts. The packaging, the configuration surface and the public API are newer
-and will change. **Pin exact versions.**
-
-The wire protocol is at **schema 4**, and agents below it are refused work rather than sent
-something they would misread — with the reason on the fleet view, not only in one host's journal.
-The core stays as it is: zero runtime dependencies, no build step. The console is optional on top,
-because installing this as a library must not pull a frontend toolchain, and everything the console
-can do has the same core API and a CLI caller.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the conventions and why they are what they are, and
+[SECURITY.md](SECURITY.md) for what this promises, what it does not, and where to send a
+vulnerability.
 
 ---
 
-<div align="center">
+## Status & limitations
 
-**[CONTRIBUTING.md](CONTRIBUTING.md)** — conventions, and why they are what they are
-&nbsp;·&nbsp;
-**[SECURITY.md](SECURITY.md)** — what this promises, what it does not, and where to send a vulnerability
+**What works.** The core — policy model, renderer, agent, orchestration — is extracted from a
+system running on production hosts. Zero runtime dependencies, no build step. The console is
+optional on top, because installing this as a library must not pull a frontend toolchain, and
+everything the console can do has the same core API and a CLI caller.
 
-<br/>
+**Not frozen.** The packaging, the configuration surface and the public API are newer than the
+core and will change. **Pin exact versions.** The wire protocol is at **schema 4**, and agents
+below it are refused work rather than sent something they would misread — with the reason on the
+fleet view, not only in one host's journal.
 
-Licensed under **Apache-2.0**.
+---
 
-<sub>Every address in this repository is an RFC 5737 documentation range and every name an RFC 2606
-example. That is enforced, not conventional.</sub>
+## License
 
-</div>
+Apache-2.0. See [LICENSE](LICENSE).
+
+Every address in this repository is an RFC 5737 documentation range and every name an RFC 2606
+example. That is enforced, not conventional.
