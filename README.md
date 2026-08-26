@@ -556,6 +556,39 @@ manager and every write command refuse a missing or malformed store — they nev
 deleted revocation ledger is a harmless first boot. **Back this file up and restore it**; do not
 run `init` again once it has held any certificate revocation.
 
+<br/>
+
+**App tokens — the credential a program holds.** `POST /enrollment/tokens` otherwise needs an
+operator: a certificate or a browser session, plus a one-time code bound to that person's identity
+provider account. A dispatcher provisioning a host is not a person and has neither. An app token is
+the third principal — a scoped bearer token, issued by an operator, presented as
+`Authorization: Bearer hpapp_…` with no certificate and no code:
+
+```bash
+node bin/heliopause-enrollment.ts app-token-create https://manager.example:8444 \
+  --label=dispatcher --scopes=enrollment:token-create,enrollment:requests-read \
+  --hostname-pattern='*.dev' --ttl-sec=7776000 --pki=./pki --otp=123456
+node bin/heliopause-enrollment.ts app-token-list https://manager.example:8444 --pki=./pki
+node bin/heliopause-enrollment.ts app-token-revoke https://manager.example:8444 TOKEN_ID \
+  --pki=./pki --otp=123456
+```
+
+The plaintext is printed once and only its SHA-256 is stored, like a node token. Creating and
+revoking one keeps every operator check there is — that is where the grant is decided — and *using*
+one has none of them.
+
+**Two scopes exist and no more.** `enrollment:token-create` reaches `POST /enrollment/tokens`;
+`enrollment:requests-read` reaches `GET /enrollment/requests`. Any other route answers 403 naming the
+token, and an unknown, expired or revoked token answers 401 saying only that. **An app token cannot
+sign, upload, reject or revoke anything** — the worst a leaked one can do is mint node tokens inside
+its hostname pattern and read the CSR queue, and a certificate still requires an operator holding a
+one-time code.
+
+The hostname pattern is an exact hostname or **one leading wildcard label**: `*.dev` covers
+`k3s-01.dev`, and covers neither `dev` nor `a.b.dev`. Node tokens issued this way are recorded with
+`createdBy: app:<label>`, so a program's work is distinguishable from a person's in the audit trail
+without reading timestamps against a chat log.
+
 Point the manager at its revocation source with `HELIOPAUSE_REVOCATION_FILE`. It replicates a
 minimal snapshot to every relay over the existing publisher mTLS identity at startup, after each
 revocation, and once per minute. Provision each relay's empty denylist exactly once with

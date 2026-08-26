@@ -5,9 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
-  createNodeToken, emptyEnrollmentDocument, fetchNodeCertificate, initializeEnrollmentDocument,
-  loadEnrollmentDocument, looksLikeNodeToken, lookupNodeToken, NODE_TOKEN_PREFIX,
-  rejectNodeCsr, saveEnrollmentDocument, storeNodeCertificate, submitNodeCsr, validateNodeCsrAsync,
+  APP_TOKEN_PREFIX, appTokenAllowsHostname, createAppToken, createNodeToken, emptyEnrollmentDocument,
+  fetchNodeCertificate, initializeEnrollmentDocument,
+  loadEnrollmentDocument, looksLikeAppToken, looksLikeNodeToken, lookupAppToken, lookupNodeToken, NODE_TOKEN_PREFIX,
+  rejectNodeCsr, revokeAppToken, saveEnrollmentDocument, storeNodeCertificate, submitNodeCsr, validateNodeCsrAsync,
   withEnrollmentTransaction,
 } from "./enrollment-store.ts";
 
@@ -286,5 +287,176 @@ describe("looksLikeNodeToken", () => {
     const document = emptyEnrollmentDocument();
     createNodeToken(document, { hostname: "gw-01.dev" });
     assert.equal(lookupNodeToken(document, NODE_TOKEN_PREFIX), null);
+  });
+});
+
+// ── App tokens: the credential a program holds ────────────────────────────────
+//
+// The whole grant is "mint node tokens inside one hostname pattern, and read the CSR queue". Every
+// check below exists because the value of that narrowness is entirely in the checks: a scope list
+// that accepts an unknown string, or a pattern that matches one label too many, gives away exactly
+// the thing this credential was designed not to give away.
+describe("app tokens", () => {
+  it("stores only a hash, hands the plaintext back once, and records use", () => {
+    const now = new Date("2026-08-26T00:00:00.000Z");
+    const document = emptyEnrollmentDocument();
+    const issued = createAppToken(document, {
+      label: "stardust dispatcher", scopes: ["enrollment:token-create"], hostnamePattern: "*.dev",
+      createdBy: "ops-alice", ttlSec: 3_600, now,
+    });
+    assert.equal(looksLikeAppToken(issued.token), true);
+    assert.equal(issued.token.startsWith(APP_TOKEN_PREFIX), true);
+    assert.equal(JSON.stringify(document).includes(issued.token), false, "the plaintext reached the store");
+    assert.equal(issued.row.expiresAt, "2026-08-26T01:00:00.000Z");
+    assert.equal(issued.row.lastUsedAt, null);
+
+    const used = new Date("2026-08-26T00:30:00.000Z");
+    assert.equal(lookupAppToken(document, issued.token, used)?.id, issued.row.id);
+    assert.equal(issued.row.lastUsedAt, used.toISOString());
+    assert.equal(lookupAppToken(document, issued.token, new Date("2026-08-26T01:00:00.000Z")), null, "an expired token was honoured");
+
+    revokeAppToken(document, issued.row.id, "ops-alice", used);
+    assert.equal(lookupAppToken(document, issued.token, used), null, "a revoked token was honoured");
+    assert.throws(() => revokeAppToken(document, "no-such-id"), (e: unknown) => (e as { statusCode?: number }).statusCode === 404);
+  });
+
+  it("writes an audit trail that names the token and never its secret", () => {
+    const document = emptyEnrollmentDocument();
+    const issued = createAppToken(document, {
+      label: "dispatcher", scopes: ["enrollment:requests-read", "enrollment:token-create"],
+      hostnamePattern: "*.dev", createdBy: "ops-alice",
+    });
+    const created = document.audit.at(-1)!;
+    assert.equal(created.action, "app-token.create");
+    assert.equal(created.target, issued.row.id);
+    assert.deepEqual(created.detail, {
+      label: "dispatcher", scopes: "enrollment:requests-read,enrollment:token-create", hostnamePattern: "*.dev",
+    });
+    revokeAppToken(document, issued.row.id, "ops-bob");
+    assert.equal(document.audit.at(-1)!.action, "app-token.revoke");
+    const trail = JSON.stringify(document.audit);
+    assert.equal(trail.includes(issued.token), false, "the audit trail carries the plaintext");
+    assert.equal(trail.includes(issued.row.tokenHash), false, "the audit trail carries the hash");
+  });
+
+  it("refuses an empty, unknown or non-string scope, and keeps one copy of a repeated one", () => {
+    const document = emptyEnrollmentDocument();
+    const attempt = (scopes: readonly unknown[]) =>
+      createAppToken(document, { label: "x", scopes: scopes as readonly string[], hostnamePattern: "*.dev" });
+    assert.throws(() => attempt([]), /at least one/);
+    assert.throws(() => attempt(["enrollment:sign"]), /unknown app token scope/);
+    assert.throws(() => attempt(["enrollment:token-create", "enrollment:everything"]), /unknown app token scope/);
+    assert.throws(() => attempt([1]), /unknown app token scope/);
+    assert.throws(
+      () => createAppToken(document, { label: "x", scopes: "enrollment:token-create" as unknown as string[], hostnamePattern: "*.dev" }),
+      /at least one/,
+      "a bare string must not be read as a list of scopes",
+    );
+    assert.equal(document.appTokens.length, 0, "a refused creation left a row behind");
+    const issued = attempt(["enrollment:token-create", "enrollment:token-create"]);
+    assert.deepEqual(issued.row.scopes, ["enrollment:token-create"]);
+  });
+
+  it("refuses a label that is empty after trimming or longer than 120", () => {
+    const document = emptyEnrollmentDocument();
+    const attempt = (label: string) =>
+      createAppToken(document, { label, scopes: ["enrollment:token-create"], hostnamePattern: "*.dev" });
+    assert.throws(() => attempt("   "), /label must be 1-120/);
+    assert.throws(() => attempt("x".repeat(121)), /label must be 1-120/);
+    assert.equal(attempt("  dispatcher  ").row.label, "dispatcher");
+    // A label is not an identifier: rotation needs the replacement to exist before the old one dies.
+    assert.equal(attempt("dispatcher").row.label, "dispatcher");
+    assert.equal(document.appTokens.filter((row) => row.label === "dispatcher" && !row.revokedAt).length, 2);
+  });
+
+  it("bounds the TTL at both ends", () => {
+    const document = emptyEnrollmentDocument();
+    const attempt = (ttlSec: number) =>
+      createAppToken(document, { label: "x", scopes: ["enrollment:token-create"], hostnamePattern: "*.dev", ttlSec });
+    assert.throws(() => attempt(60 * 60 - 1), /ttlSec must be/);
+    assert.throws(() => attempt(366 * 24 * 60 * 60), /ttlSec must be/);
+    assert.throws(() => attempt(Number.NaN), /ttlSec must be/);
+    assert.ok(attempt(60 * 60).row.expiresAt);
+  });
+
+  it("refuses a wildcard anywhere but the whole first label", () => {
+    const document = emptyEnrollmentDocument();
+    const attempt = (hostnamePattern: string) =>
+      createAppToken(document, { label: "x", scopes: ["enrollment:token-create"], hostnamePattern });
+    for (const bad of ["", "   ", "*", "**.dev", "*dev", "a.*.dev", "*.dev.*", "*.*", "dev.*", "k3s-*.dev"]) {
+      assert.throws(() => attempt(bad), /hostnamePattern/, `${JSON.stringify(bad)} was accepted as a pattern`);
+    }
+    assert.equal(attempt("  *.DEV  ").row.hostnamePattern, "*.dev", "a pattern was not normalised");
+    assert.equal(attempt("K3S-01.dev").row.hostnamePattern, "k3s-01.dev");
+  });
+
+  it("matches exactly one wildcard label, and never a suffix", () => {
+    // The `a.b.dev` row is the one that matters: a suffix match would make `*.dev` cover
+    // `k3s-01.attacker.dev`, and the token holder chooses the hostname it asks for.
+    const table: Array<[string, string, boolean]> = [
+      ["*.dev", "k3s-01.dev", true],
+      ["*.dev", "gw-01.dev", true],
+      ["*.dev", "MAILER-01.DEV", true],
+      ["*.a.b.dev", "host.a.b.dev", true],
+      ["k3s-01.dev", "k3s-01.dev", true],
+      ["k3s-01.dev", "K3S-01.DEV", true],
+      ["*.dev", "dev", false],
+      ["*.dev", "a.b.dev", false],
+      ["*.dev", ".dev", false],
+      ["*.dev", "k3s-01.prod", false],
+      ["*.dev", "k3s-01.dev.attacker.example", false],
+      ["k3s-01.dev", "k3s-02.dev", false],
+      ["k3s-01.dev", "k3s-01.dev.evil", false],
+      ["*.dev", "", false],
+      ["", "k3s-01.dev", false],
+    ];
+    for (const [pattern, candidate, expected] of table) {
+      assert.equal(
+        appTokenAllowsHostname(pattern, candidate), expected,
+        `${JSON.stringify(pattern)} vs ${JSON.stringify(candidate)}`,
+      );
+    }
+  });
+
+  it("refuses the bare prefix and the wrong alphabet, like the node token gate", () => {
+    assert.equal(looksLikeAppToken(APP_TOKEN_PREFIX), false);
+    assert.equal(looksLikeAppToken(`${APP_TOKEN_PREFIX}${"a".repeat(63)}`), false);
+    assert.equal(looksLikeAppToken(`${APP_TOKEN_PREFIX}${"a".repeat(65)}`), false);
+    assert.equal(looksLikeAppToken(`${APP_TOKEN_PREFIX}${"A".repeat(64)}`), false);
+    assert.equal(looksLikeAppToken(`${APP_TOKEN_PREFIX}${"z".repeat(64)}`), false);
+    assert.equal(looksLikeAppToken(""), false);
+    // A node token is not an app token and must not be admitted by the app-token gate, or the two
+    // credentials would be interchangeable at the routes that screen on shape.
+    const node = createNodeToken(emptyEnrollmentDocument(), { hostname: "gw-01.dev" }).token;
+    assert.equal(looksLikeAppToken(node), false);
+    assert.equal(lookupAppToken(emptyEnrollmentDocument(), APP_TOKEN_PREFIX), null);
+  });
+
+  it("opens a store written before app tokens existed, and still refuses an unknown field", () => {
+    const root = mkdtempSync(join(tmpdir(), "heliopause-enroll-apptoken-"));
+    const path = join(root, "store.json");
+    try {
+      // Schema 1 was deliberately not raised. A store from before this field is a correct store.
+      writeFileSync(path, JSON.stringify({ schemaVersion: 1, tokens: [], requests: [], audit: [] }));
+      assert.deepEqual(loadEnrollmentDocument(path).appTokens, []);
+
+      writeFileSync(path, JSON.stringify({ schemaVersion: 1, tokens: [], requests: [], audit: [], appTokens: {} }));
+      assert.throws(() => loadEnrollmentDocument(path), /appTokens must be an array/);
+
+      writeFileSync(path, JSON.stringify({ schemaVersion: 1, tokens: [], requests: [], audit: [], surprise: [] }));
+      assert.throws(() => loadEnrollmentDocument(path), /unsupported fields/);
+
+      const document = emptyEnrollmentDocument();
+      const issued = createAppToken(document, { label: "dispatcher", scopes: ["enrollment:requests-read"], hostnamePattern: "*.dev" });
+      rmSync(path);
+      saveEnrollmentDocument(path, document);
+      const reloaded = loadEnrollmentDocument(path);
+      assert.equal(reloaded.appTokens.length, 1);
+      assert.equal(reloaded.appTokens[0]!.id, issued.row.id);
+      assert.deepEqual(reloaded.appTokens[0]!.scopes, ["enrollment:requests-read"]);
+      assert.ok(lookupAppToken(reloaded, issued.token), "a round-tripped token stopped authenticating");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
