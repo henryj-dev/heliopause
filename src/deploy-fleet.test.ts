@@ -62,6 +62,20 @@ describe("deploy-fleet.sh ships every source the relay imports", () => {
     );
   });
 
+  it("handles a path shipped for the first time (backup skip, parent made)", () => {
+    // The relay ship list now carries `packages/i18n`, a path that is not on a host until the first
+    // schema-4 deploy. The deploy must not `cp` a backup source that is not there (`set -e` aborts),
+    // and rsync into `.../packages/i18n/` needs the parent `packages/` made first — it creates the
+    // leaf, not the tree. Both were measured on gw-01.util 2026-08-27; this pins the guards.
+    // `[^"]*` rather than the exact `\$p`: the loop variable is written inside a heredoc, so on disk
+    // it is the escaped `\$p`, and pinning that escaping would test the quoting more than the guard.
+    const script = read("../scripts/deploy-fleet.sh");
+    assert.match(script, /if \[ -e "\/opt\/heliopause\/[^"]*" \]; then sudo cp -a/,
+      "the backup must skip a path that does not exist yet, or the first deploy of a new path aborts");
+    assert.match(script, /sudo mkdir -p "\/opt\/heliopause\/[^"]*"; sudo rsync/,
+      "rsync must have its parent directory made first, or a new nested path fails");
+  });
+
   it("still ships the repo's own bin and src", () => {
     // Not decoration: the packages line is additive, and a careless edit that replaced rather than
     // extended the list would strip the relay's own code and pass the check above.

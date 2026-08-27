@@ -117,7 +117,7 @@ python3 scripts/git-hooks/test-pre-commit.py              # 실패 0 (사람 통
 `if __name__ == "__main__"` 이 파일 중간에 있어서 그 아래 다섯 클래스(라우트 안전 검사
 39개)가 정의조차 되지 않은 채 몇 달을 지났고, 초록불은 그동안 한 번도 흔들리지 않았다
 — 수가 줄어든 게 아니라 센 적이 없어 비교할 기준선이 없었다. 현재 기대값(정책 심링크 연결):
-`npm test` 1,806 + 8 (`@heliopause/manager`) + 206 (`@heliopause/web`) ·
+`npm test` 1,807 + 8 (`@heliopause/manager`) + 206 (`@heliopause/web`) ·
 `test_validate.py` 244 (실행 232 · skip 12) · `test_enroll.py` 16.
 
 ⚠️ 훅 검사 7종은 `refs/remotes/origin/HEAD` 를 필요로 한다. `git clone` 은 그것을 쓰지만
