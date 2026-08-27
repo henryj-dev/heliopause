@@ -135,6 +135,18 @@ describe("parseRelays", () => {
     // Unlike parsePairs: a manager with no relays has no reason to start.
     assert.match(refusal(() => parseRelays("")), /is empty/);
   });
+
+  test("a duplicate zone name is refused, and the message names it", () => {
+    // The name keys the CA, the agent's TARGET, the site module and every host id's suffix. Two
+    // entries sharing it collapse the fleet to ambiguity, and the `/site` map would keep only the
+    // last — the first relay vanishing with nothing said. The name is not a secret, so it is quoted
+    // to point the operator at the offending pair.
+    const message = refusal(() =>
+      parseRelays("dev=https://192.0.2.1:8443=./pki,dev=https://192.0.2.9:8443=./pki-2"),
+    );
+    assert.match(message, /named twice/);
+    assert.match(message, /"dev"/);
+  });
 });
 
 // ── Numeric settings ──────────────────────────────────────────────────────────

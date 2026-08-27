@@ -192,6 +192,17 @@ export function parseRelays(spec: string): RelaySpec[] {
       // over this connection.
       throw new EnvSpecError(`relay ${name} must be https — got ${JSON.stringify(url)}`);
     }
+    // The name is the zone's whole identity — it keys the CA (`pkiDir`), the agent's
+    // `HELIOPAUSE_TARGET`, the site module, and the last label of every host id under it
+    // (`k3s-01.dev`). Two entries sharing a name collapse all of that to ambiguity: a heartbeat from
+    // `k3s-01.dev` could belong to either relay, `/site` shows two VPCs with one name, and an app
+    // token scoped `*.dev` mints for both. The map that feeds `/site` would silently keep only the
+    // last entry, so the earlier relay would vanish from the fleet view with nothing said. Unlike a
+    // malformed entry, the name is not a secret and quoting it is how the operator finds the
+    // duplicate — the two commas that look identical.
+    if (out.some((r) => r.name === name)) {
+      throw new EnvSpecError(`relay ${JSON.stringify(name)} is named twice — each zone name must be unique`);
+    }
     out.push({ name, url, pkiDir });
   }
   if (out.length === 0) {
