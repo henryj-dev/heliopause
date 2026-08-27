@@ -1,12 +1,16 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  activeAppTokenCount,
   activeTokenCount,
   canDecideCsr,
+  canIssueAppToken,
   canIssueToken,
+  canRevokeAppToken,
   canRevokeCert,
   canRevokeToken,
   readEnrollmentView,
+  type AppTokenRow,
   type RequestRow,
   type TokenRow,
 } from "./store.ts";
@@ -17,6 +21,18 @@ const token: TokenRow = {
   label: "lab",
   createdAt: "2026-08-18T00:00:00.000Z",
   expiresAt: "2026-08-18T00:10:00.000Z",
+  lastUsedAt: null,
+  revokedAt: null,
+};
+
+const appToken: AppTokenRow = {
+  id: "app-1",
+  label: "ci",
+  scopes: ["enrollment:token-create", "enrollment:requests-read"],
+  hostnamePattern: "*.dev",
+  createdBy: "ops-alice",
+  createdAt: "2026-08-18T00:00:00.000Z",
+  expiresAt: "2026-09-18T00:00:00.000Z",
   lastUsedAt: null,
   revokedAt: null,
 };
@@ -40,6 +56,7 @@ describe("readEnrollmentView", () => {
   it("accepts the four listings the manager would send", () => {
     const read = readEnrollmentView({
       tokens: [token],
+      appTokens: [appToken],
       requests: [pending],
       revocations: [{
         fingerprint256: "cc".repeat(32),
@@ -59,6 +76,7 @@ describe("readEnrollmentView", () => {
     assert.equal(read.ok, true);
     if (read.ok) {
       assert.equal(read.view.tokens[0]?.id, "tok-1");
+      assert.equal(read.view.appTokens[0]?.id, "app-1");
       assert.equal(read.view.events?.[0]?.action, "token.create");
     }
   });
@@ -66,6 +84,7 @@ describe("readEnrollmentView", () => {
   it("refuses a token listing that still carries the hash", () => {
     const read = readEnrollmentView({
       tokens: [{ ...token, tokenHash: "secret" }],
+      appTokens: [],
       requests: [],
       revocations: [],
       events: [],
@@ -73,10 +92,48 @@ describe("readEnrollmentView", () => {
     assert.equal(read.ok, false);
   });
 
+  it("refuses an app-token listing that still carries the hash", () => {
+    const read = readEnrollmentView({
+      tokens: [],
+      appTokens: [{ ...appToken, tokenHash: "secret" }],
+      requests: [],
+      revocations: [],
+      events: [],
+    });
+    assert.equal(read.ok, false);
+  });
+
+  it("reports a reason when app tokens is not an array", () => {
+    const read = readEnrollmentView({ tokens: [], appTokens: undefined, requests: [], revocations: [], events: null });
+    assert.equal(read.ok, false);
+    if (!read.ok) assert.equal(read.reason, "app tokens is missing");
+  });
+
   it("keeps a missing audit trail as null rather than empty", () => {
-    const read = readEnrollmentView({ tokens: [], requests: [], revocations: [], events: null });
+    const read = readEnrollmentView({ tokens: [], appTokens: [], requests: [], revocations: [], events: null });
     assert.equal(read.ok, true);
     if (read.ok) assert.equal(read.view.events, null);
+  });
+});
+
+describe("readAppToken", () => {
+  it("accepts a well-shaped row, and refuses rows shaped wrong", () => {
+    const ok = readEnrollmentView({ tokens: [], appTokens: [appToken], requests: [], revocations: [], events: [] });
+    assert.equal(ok.ok, true);
+    if (ok.ok) {
+      assert.equal(ok.view.appTokens[0]?.hostnamePattern, "*.dev");
+      assert.deepEqual(ok.view.appTokens[0]?.scopes, ["enrollment:token-create", "enrollment:requests-read"]);
+    }
+
+    const scopesNotArray = readEnrollmentView({
+      tokens: [], appTokens: [{ ...appToken, scopes: "enrollment:token-create" }], requests: [], revocations: [], events: [],
+    });
+    assert.equal(scopesNotArray.ok, false);
+
+    const missingPattern = readEnrollmentView({
+      tokens: [], appTokens: [{ ...appToken, hostnamePattern: undefined }], requests: [], revocations: [], events: [],
+    });
+    assert.equal(missingPattern.ok, false);
   });
 });
 
@@ -92,5 +149,15 @@ describe("enrollment actions", () => {
     assert.equal(canRevokeCert({ ...pending, status: "signed", certificatePem: "pem" }, true), true);
     assert.equal(canRevokeCert({ ...pending, status: "signed", certificatePem: null }, true), false);
     assert.equal(activeTokenCount([token, { ...token, id: "tok-2", revokedAt: "x" }]), 1);
+  });
+
+  it("gates app-token writes on write capability and freshness", () => {
+    assert.equal(canIssueAppToken(true), true);
+    assert.equal(canIssueAppToken(false), false);
+    assert.equal(canIssueAppToken(true, true), false);
+    assert.equal(canRevokeAppToken(appToken, true), true);
+    assert.equal(canRevokeAppToken(appToken, false), false);
+    assert.equal(canRevokeAppToken({ ...appToken, revokedAt: "2026-08-18T02:00:00.000Z" }, true), false);
+    assert.equal(activeAppTokenCount([appToken, { ...appToken, id: "app-2", revokedAt: "x" }]), 1);
   });
 });

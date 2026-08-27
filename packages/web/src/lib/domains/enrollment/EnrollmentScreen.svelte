@@ -12,8 +12,12 @@
   import { whoQuery } from "$lib/shell/who.svelte";
   import CsrPane from "./CsrPane.svelte";
   import {
+    appTokenState,
+    appTokenTone,
+    APP_TOKEN_STATE_KEY,
     auditActionLabel,
     auditDetailLine,
+    daysUntil,
     enrollmentFocus,
     enrollmentPath,
     enrollmentPipeline,
@@ -22,6 +26,7 @@
     requestCardClass,
     REQUEST_STATUS_KEY,
     requestTone,
+    scopeLabel,
     shortDigest,
     TOKEN_STATE_KEY,
     tokenState,
@@ -29,14 +34,18 @@
   } from "./present";
   import {
     canDecideCsr,
+    canIssueAppToken,
     canIssueToken,
+    canRevokeAppToken,
     canRevokeCert,
     canRevokeToken,
+    type AppTokenRow,
     type RequestRow,
     type TokenRow,
   } from "./store";
   import { ENROLLMENT_POLL_MS, enrollmentQuery } from "./query.svelte";
   import {
+    appTokenCreateBody,
     certRevokeBody,
     certUploadBody,
     csrRejectBody,
@@ -44,6 +53,8 @@
     tokenCreateBody,
     writeHeaders,
   } from "./write";
+
+  const APP_SCOPES = ["enrollment:token-create", "enrollment:requests-read"];
 
   let { asked = "" }: { asked?: string } = $props();
 
@@ -61,6 +72,12 @@
   let caNames = $state<Record<string, string>>({});
   let revealed = $state<{ token: string; hostname: string } | null>(null);
   let tokenAck = $state(false);
+  let appLabel = $state("");
+  let appPattern = $state("");
+  let appTtlDays = $state(90);
+  let appScopes = $state<string[]>([...APP_SCOPES]);
+  let revealedApp = $state<{ token: string; label: string } | null>(null);
+  let appAck = $state(false);
 
   const filter = $derived(readCsrFilter(asked));
   const canWrite = $derived(who.state.kind === "ok" && who.state.view.canWrite);
@@ -157,6 +174,68 @@
     busy = `token-revoke:${token.id}`;
     try {
       await post(`/api/enrollment/tokens/${encodeURIComponent(token.id)}/revoke`, otpBody(answer.otp), t(prefs.lang, "m.tokenRevoked"));
+    } catch (e) {
+      fail(e);
+    } finally {
+      busy = "";
+    }
+  }
+
+  async function issueAppToken(): Promise<void> {
+    if (appLabel.trim() === "") {
+      fail(new Error(t(prefs.lang, "m.appNeedLabel")));
+      return;
+    }
+    if (appScopes.length === 0) {
+      fail(new Error(t(prefs.lang, "m.appNeedScope")));
+      return;
+    }
+    if (appPattern.trim() === "") {
+      fail(new Error(t(prefs.lang, "m.appNeedPattern")));
+      return;
+    }
+    const answer = await askWrite({ what: t(prefs.lang, "m.otpIssueApp") });
+    if (answer === null) return;
+    busy = "app-token-create";
+    try {
+      const token = await post(
+        "/api/enrollment/app-tokens",
+        appTokenCreateBody(appLabel, appScopes, appPattern, appTtlDays * 86400, answer.otp),
+        t(prefs.lang, "m.appTokenIssuedOnce"),
+      );
+      if (token) {
+        revealedApp = { token, label: appLabel };
+        appAck = false;
+      }
+    } catch (e) {
+      fail(e);
+    } finally {
+      busy = "";
+    }
+  }
+
+  async function copyRevealedApp(): Promise<void> {
+    if (!revealedApp) return;
+    try {
+      await navigator.clipboard.writeText(revealedApp.token);
+    } catch (e) {
+      fail(e);
+    }
+  }
+
+  async function revokeAppToken(row: AppTokenRow): Promise<void> {
+    const answer = await askWrite({
+      what: t(prefs.lang, "m.otpRevokeApp"),
+      warning: t(prefs.lang, "m.revokeAppConfirm", { id: row.id }),
+    });
+    if (answer === null) return;
+    busy = `app-token-revoke:${row.id}`;
+    try {
+      await post(
+        `/api/enrollment/app-tokens/${encodeURIComponent(row.id)}/revoke`,
+        otpBody(answer.otp),
+        t(prefs.lang, "m.appTokenRevoked"),
+      );
     } catch (e) {
       fail(e);
     } finally {
@@ -381,6 +460,96 @@
             <td>
               {#if canRevokeToken(token, canWrite)}
                 <button type="button" disabled={busy !== ""} onclick={() => void revokeToken(token)}>{t(prefs.lang, "m.revoke")}</button>
+              {/if}
+            </td>
+          </tr>
+        {/each}
+      </tbody>
+    </table>
+    </div>
+  {/if}
+
+  <h2>{t(prefs.lang, "m.appTokens")}</h2>
+  <p class="dim">{t(prefs.lang, "m.appTokensExplain")}</p>
+
+  {#if revealedApp}
+    <div class="banner bad">
+      <div class="lead">{t(prefs.lang, "m.tokenOnce")}</div>
+      <p>{t(prefs.lang, "m.tokenOnceNote")}</p>
+      <p><code class="name">{revealedApp.token}</code> · {revealedApp.label}</p>
+      <p class="act">
+        <button type="button" onclick={() => void copyRevealedApp()}>{t(prefs.lang, "m.copy")}</button>
+        <label>
+          <input type="checkbox" bind:checked={appAck}>
+          {t(prefs.lang, "m.tokenAck")}
+        </label>
+        <button type="button" disabled={!appAck} onclick={() => (revealedApp = null, appAck = false)}>
+          {t(prefs.lang, "m.tokenDismiss")}
+        </button>
+      </p>
+      {#if !appAck}
+        <p class="dim">{t(prefs.lang, "m.tokenNeedAck")}</p>
+      {/if}
+    </div>
+  {/if}
+
+  {#if canIssueAppToken(canWrite, stale)}
+    <p>
+      <input bind:value={appLabel} placeholder={t(prefs.lang, "m.appLabel")}>
+      {#each APP_SCOPES as scope (scope)}
+        <label>
+          <input type="checkbox" bind:group={appScopes} value={scope}>
+          {scopeLabel(scope, prefs.lang)}
+        </label>
+      {/each}
+      <input bind:value={appPattern} placeholder={t(prefs.lang, "m.appPattern")}>
+      <input type="number" min="1" bind:value={appTtlDays} aria-label={t(prefs.lang, "m.appTtlDays")}>
+      <button type="button" disabled={busy !== ""} onclick={() => void issueAppToken()}>{t(prefs.lang, "m.issueAppToken")}</button>
+    </p>
+  {/if}
+
+  {#if view.appTokens.length === 0}
+    <div class="empty-card">
+      <div class="lead ok">{t(prefs.lang, "m.emptyAppTokens")}</div>
+      <p class="dim">{t(prefs.lang, "m.emptyAppTokensExplain")}</p>
+    </div>
+  {:else}
+    <div class="scroll" class:stale-hold={stale}>
+    <table>
+      <thead>
+        <tr>
+          <th>{t(prefs.lang, "c.id")}</th>
+          <th>{t(prefs.lang, "c.label")}</th>
+          <th>{t(prefs.lang, "m.scopes")}</th>
+          <th>{t(prefs.lang, "m.hostnamePattern")}</th>
+          <th>{t(prefs.lang, "c.created")}</th>
+          <th>{t(prefs.lang, "c.expires")}</th>
+          <th>{t(prefs.lang, "c.lastUsed")}</th>
+          <th>{t(prefs.lang, "c.state")}</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {#each view.appTokens as row (row.id)}
+          {@const state = appTokenState(row, fresh.now)}
+          {@const left = daysUntil(row.expiresAt, fresh.now)}
+          <tr>
+            <td><code>{row.id}</code></td>
+            <td>{row.label}</td>
+            <td>{row.scopes.map((s) => scopeLabel(s, prefs.lang)).join(", ")}</td>
+            <td><code>{row.hostnamePattern}</code></td>
+            <td>{row.createdAt}</td>
+            <td>{row.expiresAt}</td>
+            <td>{row.lastUsedAt ?? t(prefs.lang, "m.never")}</td>
+            <td>
+              <span class="chip {appTokenTone(state)}">{t(prefs.lang, APP_TOKEN_STATE_KEY[state])}</span>
+              {#if state === "expiring" && left !== null}
+                <span class="dim">{t(prefs.lang, "m.expiringDays", { n: left })}</span>
+              {/if}
+            </td>
+            <td>
+              {#if canRevokeAppToken(row, canWrite)}
+                <button type="button" disabled={busy !== ""} onclick={() => void revokeAppToken(row)}>{t(prefs.lang, "m.revoke")}</button>
               {/if}
             </td>
           </tr>

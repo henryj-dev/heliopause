@@ -16,6 +16,18 @@ export interface TokenRow {
   revokedAt: string | null;
 }
 
+export interface AppTokenRow {
+  id: string;
+  label: string;
+  scopes: string[];
+  hostnamePattern: string;
+  createdBy: string | null;
+  createdAt: string;
+  expiresAt: string;
+  lastUsedAt: string | null;
+  revokedAt: string | null;
+}
+
 export interface RequestRow {
   id: string;
   hostname: string;
@@ -49,6 +61,7 @@ export interface AuditRow {
 
 export interface EnrollmentView {
   tokens: TokenRow[];
+  appTokens: AppTokenRow[];
   requests: RequestRow[];
   revocations: RevocationRow[];
   events: AuditRow[] | null;
@@ -74,6 +87,25 @@ function readToken(value: unknown): TokenRow | null {
     label: typeof value.label === "string" ? value.label : null,
     createdAt: value.createdAt,
     expiresAt: typeof value.expiresAt === "string" ? value.expiresAt : null,
+    lastUsedAt: typeof value.lastUsedAt === "string" ? value.lastUsedAt : null,
+    revokedAt: typeof value.revokedAt === "string" ? value.revokedAt : null,
+  };
+}
+
+function readAppToken(value: unknown): AppTokenRow | null {
+  if (!isRecord(value) || typeof value.id !== "string" || typeof value.label !== "string") return null;
+  if (typeof value.hostnamePattern !== "string" || typeof value.createdAt !== "string") return null;
+  if (typeof value.expiresAt !== "string") return null;
+  if (!Array.isArray(value.scopes) || !value.scopes.every((s) => typeof s === "string")) return null;
+  if ("tokenHash" in value) return null;
+  return {
+    id: value.id,
+    label: value.label,
+    scopes: value.scopes as string[],
+    hostnamePattern: value.hostnamePattern,
+    createdBy: typeof value.createdBy === "string" ? value.createdBy : null,
+    createdAt: value.createdAt,
+    expiresAt: value.expiresAt,
     lastUsedAt: typeof value.lastUsedAt === "string" ? value.lastUsedAt : null,
     revokedAt: typeof value.revokedAt === "string" ? value.revokedAt : null,
   };
@@ -146,12 +178,15 @@ function readList<T>(value: unknown, read: (row: unknown) => T | null, label: st
 
 export function readEnrollmentView(parts: {
   tokens: unknown;
+  appTokens: unknown;
   requests: unknown;
   revocations: unknown;
   events: unknown;
 }): EnrollmentRead {
   const tokens = readList(parts.tokens, readToken, "tokens");
   if (!tokens.ok) return tokens;
+  const appTokens = readList(parts.appTokens, readAppToken, "app tokens");
+  if (!appTokens.ok) return appTokens;
   const requests = readList(parts.requests, readRequest, "requests");
   if (!requests.ok) return requests;
   const revocations = readList(parts.revocations, readRevocation, "revocations");
@@ -162,7 +197,10 @@ export function readEnrollmentView(parts: {
     if (!parsed.ok) return parsed;
     events = parsed.rows;
   }
-  return { ok: true, view: { tokens: tokens.rows, requests: requests.rows, revocations: revocations.rows, events } };
+  return {
+    ok: true,
+    view: { tokens: tokens.rows, appTokens: appTokens.rows, requests: requests.rows, revocations: revocations.rows, events },
+  };
 }
 
 export function canIssueToken(canWrite: boolean, stale = false): boolean {
@@ -183,4 +221,16 @@ export function canRevokeCert(request: RequestRow, canWrite: boolean): boolean {
 
 export function activeTokenCount(tokens: readonly TokenRow[]): number {
   return tokens.filter((token) => token.revokedAt === null).length;
+}
+
+export function canIssueAppToken(canWrite: boolean, stale = false): boolean {
+  return canWrite && !stale;
+}
+
+export function canRevokeAppToken(row: AppTokenRow, canWrite: boolean): boolean {
+  return canWrite && row.revokedAt === null;
+}
+
+export function activeAppTokenCount(rows: readonly AppTokenRow[]): number {
+  return rows.filter((row) => row.revokedAt === null).length;
 }

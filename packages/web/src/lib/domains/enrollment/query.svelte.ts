@@ -35,11 +35,12 @@ export function enrollmentQuery() {
 
   async function refresh(): Promise<void> {
     try {
-      const [requestsRes, tokensRes, revokeRes, auditRes] = await Promise.all([
+      const [requestsRes, tokensRes, revokeRes, auditRes, appTokensRes] = await Promise.all([
         fetch("/api/enrollment/requests", { credentials: "include" }),
         fetch("/api/enrollment/tokens", { credentials: "include" }),
         fetch("/api/enrollment/revocations", { credentials: "include" }),
         fetch("/api/enrollment/audit", { credentials: "include" }),
+        fetch("/api/enrollment/app-tokens", { credentials: "include" }),
       ]);
       if (requestsRes.status === 401) {
         paint(applyHeldPoll(held, { kind: "unauth" }));
@@ -50,7 +51,7 @@ export function enrollmentQuery() {
         state = { kind: "absent" };
         return;
       }
-      if (!requestsRes.ok || !tokensRes.ok || !revokeRes.ok) {
+      if (!requestsRes.ok || !tokensRes.ok || !revokeRes.ok || !appTokensRes.ok) {
         const reason = `GET /api/enrollment/* returned ${requestsRes.status}`;
         paint(applyHeldPoll(held, { kind: "fail", reason }), reason);
         return;
@@ -58,9 +59,11 @@ export function enrollmentQuery() {
       const requestsBody = await readJson(requestsRes) as { requests?: unknown };
       const tokensBody = await readJson(tokensRes) as { tokens?: unknown };
       const revokeBody = await readJson(revokeRes) as { revocations?: unknown };
+      const appTokensBody = await readJson(appTokensRes) as { tokens?: unknown };
       const events = auditRes.ok ? (await readJson(auditRes) as { events?: unknown }).events ?? null : null;
       const read = readEnrollmentView({
         tokens: tokensBody.tokens,
+        appTokens: appTokensBody.tokens,
         requests: requestsBody.requests,
         revocations: revokeBody.revocations,
         events,

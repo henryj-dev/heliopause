@@ -2,10 +2,14 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 import {
+  appTokenActive,
+  appTokenState,
+  appTokenTone,
   auditActionLabel,
   AUDIT_ACTION_KEY,
   auditDetailLine,
   CSR_FILTERS,
+  daysUntil,
   enrollmentFocus,
   enrollmentPath,
   enrollmentPipeline,
@@ -14,10 +18,11 @@ import {
   readCsrFilter,
   REQUEST_STATUS_KEY,
   requestCardClass,
+  scopeLabel,
   shortDigest,
   tokenState,
 } from "./present.ts";
-import type { EnrollmentView, RequestRow, TokenRow } from "./store.ts";
+import type { AppTokenRow, EnrollmentView, RequestRow, TokenRow } from "./store.ts";
 
 const now = Date.parse("2026-08-18T00:05:00.000Z");
 
@@ -48,7 +53,20 @@ const request = (over: Partial<RequestRow> = {}): RequestRow => ({
   ...over,
 });
 
-const empty: EnrollmentView = { tokens: [], requests: [], revocations: [], events: [] };
+const empty: EnrollmentView = { tokens: [], appTokens: [], requests: [], revocations: [], events: [] };
+
+const appToken = (over: Partial<AppTokenRow> = {}): AppTokenRow => ({
+  id: "app-1",
+  label: "ci",
+  scopes: ["enrollment:token-create"],
+  hostnamePattern: "*.dev",
+  createdBy: "ops-alice",
+  createdAt: "2026-08-18T00:00:00.000Z",
+  expiresAt: "2026-09-18T00:00:00.000Z",
+  lastUsedAt: null,
+  revokedAt: null,
+  ...over,
+});
 
 describe("isTokenActive", () => {
   it("treats revoked and expired as not active, and unused as still active", () => {
@@ -97,6 +115,58 @@ describe("tokenState", () => {
   });
 });
 
+describe("appTokenActive", () => {
+  it("treats revoked and expired as not active, and a future expiry as active", () => {
+    assert.equal(appTokenActive(appToken(), now), true);
+    assert.equal(appTokenActive(appToken({ revokedAt: "2026-08-18T00:01:00.000Z" }), now), false);
+    assert.equal(appTokenActive(appToken({ expiresAt: "2026-08-17T00:00:00.000Z" }), now), false);
+  });
+});
+
+describe("daysUntil", () => {
+  it("floors the whole days ahead, and returns null on an unparseable date", () => {
+    assert.equal(daysUntil(new Date(now + 13 * 86_400_000).toISOString(), now), 13);
+    assert.equal(daysUntil(new Date(now - 2 * 86_400_000).toISOString(), now), -2);
+    assert.equal(daysUntil("not-a-date", now), null);
+  });
+});
+
+describe("appTokenState", () => {
+  it("walks every state, with expiring winning over unused/used", () => {
+    assert.equal(appTokenState(appToken(), now), "unused");
+    assert.equal(appTokenState(appToken({ lastUsedAt: "2026-08-18T00:02:00.000Z" }), now), "used");
+    assert.equal(appTokenState(appToken({ expiresAt: "2026-08-17T00:00:00.000Z" }), now), "expired");
+    assert.equal(appTokenState(appToken({ revokedAt: "2026-08-18T00:01:00.000Z" }), now), "revoked");
+    assert.equal(
+      appTokenState(appToken({ expiresAt: new Date(now + 5 * 86_400_000).toISOString(), lastUsedAt: "2026-08-18T00:02:00.000Z" }), now),
+      "expiring",
+    );
+  });
+
+  it("treats exactly 14 days as not yet expiring, and 13 days as expiring", () => {
+    assert.equal(appTokenState(appToken({ expiresAt: new Date(now + 14 * 86_400_000).toISOString() }), now), "unused");
+    assert.equal(appTokenState(appToken({ expiresAt: new Date(now + 13 * 86_400_000).toISOString() }), now), "expiring");
+  });
+});
+
+describe("appTokenTone", () => {
+  it("maps each state to the chip tone the node-token chips use", () => {
+    assert.equal(appTokenTone("expiring"), "warn");
+    assert.equal(appTokenTone("unused"), "info");
+    assert.equal(appTokenTone("used"), "ok");
+    assert.equal(appTokenTone("expired"), "mute");
+    assert.equal(appTokenTone("revoked"), "mute");
+  });
+});
+
+describe("scopeLabel", () => {
+  it("names the two known scopes, and leaves an unknown scope as its raw string", () => {
+    assert.equal(scopeLabel("enrollment:token-create", "en"), "issue node tokens");
+    assert.equal(scopeLabel("enrollment:requests-read", "ko"), "CSR 목록 읽기");
+    assert.equal(scopeLabel("enrollment:something-else", "ko"), "enrollment:something-else");
+  });
+});
+
 describe("requestCardClass", () => {
   it("marks conflict apart from pending, and signed-not-retrieved apart from retrieved", () => {
     assert.equal(requestCardClass(request()), "awaiting");
@@ -142,7 +212,9 @@ describe("auditActionLabel", () => {
     assert.equal(auditActionLabel("node-token.create", "ko"), "노드 토큰을 발급했다");
     assert.equal(auditActionLabel("certificate.revoke", "en"), "revoked a certificate");
     assert.equal(auditActionLabel("unknown.event", "ko"), "unknown.event");
-    assert.equal(Object.keys(AUDIT_ACTION_KEY).length, 7);
+    assert.equal(auditActionLabel("app-token.create", "en"), "issued an app token");
+    assert.equal(auditActionLabel("app-token.revoke", "ko"), "앱 토큰을 폐기했다");
+    assert.equal(Object.keys(AUDIT_ACTION_KEY).length, 9);
   });
 });
 
