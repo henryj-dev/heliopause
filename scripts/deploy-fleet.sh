@@ -87,7 +87,13 @@ deploy() {
 
   local unit paths
   case "$what" in
-    relay) unit=heliopause-relay; paths="bin src" ;;
+    # `packages/i18n` because `src/i18n.ts` imports `../packages/i18n/src/index.ts` by relative path,
+    # so the running relay needs that file on the host — shipping `bin src` alone leaves it
+    # ERR_MODULE_NOT_FOUND and the relay never starts. This was measured 2026-08-27: the first attempt
+    # to roll a schema-4 relay onto the fleet failed exactly there, because i18n became a shared
+    # package after the last relay deploy and this list did not follow. `src/deploy-fleet.test.ts`
+    # holds it: every `packages/<x>` that a non-test `src` file imports must appear here.
+    relay) unit=heliopause-relay; paths="bin src packages/i18n" ;;
     agent) unit=heliopause-agent; paths="agent" ;;
     *) usage ;;
   esac
