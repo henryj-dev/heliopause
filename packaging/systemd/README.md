@@ -91,9 +91,17 @@ Cilium Pod 안에서 명령을 실행할 권한은 CNP CRUD보다 훨씬 크다.
 명시적으로 부여한 배포만 `HELIOPAUSE_CILIUM_EXPOSURE=1`을 설정한다.
 
 새 호스트는 개인키를 중앙으로 복사하는 대신 등록 타이머를 먼저 실행할 수 있다. 일회성
-`stnode_…` 토큰을 `/etc/heliopause/enroll-token`에 `0600 root:root`로 놓고, `agent.env`의
+`stnode_…` 토큰을 `/var/lib/heliopause-agent/enroll-token`에 `0600 root:root`로 놓고, `agent.env`의
 enrollment 항목을 채운다. 스크립트는 P-256 키와 CSR을 한 번만 만들며 승인 대기 중에는 같은
 요청 ID만 조회한다.
+
+토큰 자리가 `/etc/heliopause/` 가 **아닌** 이유: 등록 유닛은 `ProtectSystem=strict` 라 `ReadWritePaths`
+(`/etc/heliopause/pki` · `/var/lib/heliopause-agent`) 밖은 root 에게도 읽기 전용이다. 2026-08-27 까지
+여기에는 `/etc/heliopause/enroll-token` 이 적혀 있었고, 그러면 설치 뒤 스크립트의 토큰 삭제가 `EROFS`
+로 실패한다 — 비치명이라 등록은 끝나지만 토큰이 TTL 까지 남고 `ConditionPathExists` 가 계속 참이라
+타이머가 5분마다 no-op 을 반복한다. stardust 가 첫 호스트를 만들기 전에 유닛 파일에서 읽어 냈다(교환
+102 §4). `/etc/heliopause` 를 통째로 여는 대신 파일을 이미 쓰기 가능한 디렉터리로 옮겼다 — 그쪽이
+`agent.env` 까지 쓰기 가능해지는 것을 짚었고 맞다.
 
 **토큰 발급에 외부 시스템은 필요 없다.** 매니저에 `HELIOPAUSE_ENROLLMENT_STORE` 를 걸면 등록
 저장소가 곧 발급처다 — Dispatcher·데이터베이스·IdP 중 무엇도 전제하지 않는다. 예전 판에는
