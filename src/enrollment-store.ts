@@ -14,6 +14,49 @@ export const DEFAULT_NODE_TOKEN_TTL_SEC = 7 * 24 * 60 * 60;
 export const MAX_NODE_TOKEN_TTL_SEC = 30 * 24 * 60 * 60;
 export const MAX_PENDING_CSRS_PER_HOST = 2;
 const MIN_NODE_TOKEN_TTL_SEC = 5 * 60;
+/**
+ * The third principal: a credential a *program* holds.
+ *
+ * A different prefix from `stnode_` on purpose. The two are checked in different places and grant
+ * different things, and a shared prefix would make the shape gates in front of both admit each
+ * other's callers — the manager would then have to distinguish them by a store read, which is the
+ * read the gate exists to avoid.
+ *
+ * The TTL floor is an hour rather than the node token's five minutes because nothing renews these:
+ * an operator issues one, pastes it into another system's configuration, and does not come back.
+ * A ceiling of a year is the point past which "still valid" stops meaning anything.
+ */
+export const APP_TOKEN_PREFIX = "hpapp_";
+export const DEFAULT_APP_TOKEN_TTL_SEC = 90 * 24 * 60 * 60;
+export const MAX_APP_TOKEN_TTL_SEC = 365 * 24 * 60 * 60;
+const MIN_APP_TOKEN_TTL_SEC = 60 * 60;
+/**
+ * The bound on `createdBy`, exported because **something has to compose a value that fits it**.
+ *
+ * 🔴 It was a bare `120` inside `createNodeToken`, and the app-token path built `app:<label>#<id>`
+ * without knowing about it. A label may be 120 characters; the composed string is then 141, and the
+ * slice took the tail off — cutting the id, which is the half that says *which* credential minted
+ * the token. The truncation silently removed the exact property the field had just been widened to
+ * carry, and only for the longest labels.
+ *
+ * A duplicated literal is how that comes back, so the composer reads the same constant the
+ * truncation does.
+ */
+export const MAX_CREATED_BY_CHARS = 120;
+
+/**
+ * `app:<label>#<id>`, built to fit `MAX_CREATED_BY_CHARS` with the id intact.
+ *
+ * The label loses characters and the id never does. That ordering is the decision: two live tokens
+ * may share a label — rotation issues the replacement before revoking the old one — so a trimmed
+ * label still reads as the same program, while a trimmed id names nothing at all. Raising the cap
+ * instead was the other option; it was not taken because the cap bounds a field written from
+ * operator-supplied text on the node-token path too, and widening it there buys nothing.
+ */
+export function appTokenCreatedBy(label: string, id: string): string {
+  const stamp = `#${id}`;
+  return `app:${label}`.slice(0, MAX_CREATED_BY_CHARS - stamp.length) + stamp;
+}
 const OPENSSL_TIMEOUT_MS = 5_000;
 const CSR_WORKER_TIMEOUT_MS = 10_000;
 const MAX_CSR_VALIDATION_WORKERS = 2;
@@ -48,6 +91,21 @@ export interface EnrollmentAuditEvent {
 }
 export interface CertificateRevocation { fingerprint256: string; subject: string | null; reason: string; actor: string; revokedAt: string; }
 /**
+ * Everything an app token is allowed to ask for. **These two and no more.**
+ *
+ * There is no `enrollment:sign`, no `enrollment:certificate-upload` and no `enrollment:revoke`, and
+ * that is the argument for issuing these at all: the worst a leaked app token can do is mint node
+ * tokens inside its hostname pattern and read the CSR queue. Signing stays with an operator holding
+ * a certificate and a one-time code. Adding a scope here moves that line — do not do it to make a
+ * caller's day easier.
+ */
+export const APP_TOKEN_SCOPES = ["enrollment:token-create", "enrollment:requests-read"] as const;
+export type AppTokenScope = (typeof APP_TOKEN_SCOPES)[number];
+export interface AppTokenRecord {
+  id: string; label: string; tokenHash: string; scopes: AppTokenScope[]; hostnamePattern: string;
+  createdBy: string | null; createdAt: string; expiresAt: string; lastUsedAt: string | null; revokedAt: string | null;
+}
+/**
  * The whole store, read and written as one document.
  *
  * ## `audit` and `requests` have no retention policy, and that is a decision rather than an omission
@@ -77,6 +135,7 @@ export interface CertificateRevocation { fingerprint256: string; subject: string
 export interface EnrollmentDocument {
   schemaVersion: typeof ENROLLMENT_SCHEMA;
   tokens: NodeTokenRecord[]; requests: NodeCsrRecord[]; audit: EnrollmentAuditEvent[]; revocations: CertificateRevocation[];
+  appTokens: AppTokenRecord[];
 }
 export class EnrollmentError extends Error { readonly statusCode: number; constructor(message: string, statusCode = 400) { super(message); this.statusCode = statusCode; } }
 
@@ -105,7 +164,7 @@ function openssl(args: string[], input?: string | Buffer): Buffer {
 function parse(raw: unknown, source: string): EnrollmentDocument {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new EnrollmentError(`${source}: enrollment store must be an object`);
   const d = raw as Partial<EnrollmentDocument>;
-  const allowed = ["schemaVersion", "tokens", "requests", "audit", "revocations"];
+  const allowed = ["schemaVersion", "tokens", "requests", "audit", "revocations", "appTokens"];
   if (Object.keys(d).some((key) => !allowed.includes(key))) {
     throw new EnrollmentError(`${source}: enrollment store contains unsupported fields`);
   }
@@ -125,15 +184,63 @@ function parse(raw: unknown, source: string): EnrollmentDocument {
   const revocations = d.revocations === undefined
     ? []
     : parseRevocationSnapshot({ schemaVersion: 1, revocations: d.revocations }).revocations;
+  // `appTokens` arrived after schema 1 shipped and **the version was deliberately not raised**: a
+  // store written before app tokens existed is a correct store, and a missing field there is the
+  // normal case rather than damage. Present-but-not-an-array is refused, because that is a file
+  // somebody broke rather than a file somebody wrote earlier.
+  if (d.appTokens !== undefined && !Array.isArray(d.appTokens)) {
+    throw new EnrollmentError(`${source}: enrollment store appTokens must be an array`);
+  }
+  // ## Why each row is checked and not merely counted
+  //
+  // 🔴 `scopes` is the field that decides authority, and the check that reads it is
+  // `row.scopes.includes(scope)`. **A string answers that call too**: `"enrollment:token-create,
+  // enrollment:requests-read".includes("enrollment:token-create")` is `true`, and so is
+  // `.includes("token-cre")`. A store row written by hand, by an older tool, or by anything that
+  // flattened the array to a comma-joined string would therefore authorise *substrings* of a scope
+  // name. Refusing it at load is the only place that costs nothing.
+  //
+  // The other three are what every refusal message, audit row and revoke lookup is keyed on. A
+  // non-string `id` cannot be revoked by an operator reading the list; a non-string `tokenHash`
+  // silently never matches, which reads as "the token stopped working" with no reason anywhere.
+  for (const row of (d.appTokens ?? []) as AppTokenRecord[]) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) throw new EnrollmentError(`${source}: app token rows must be objects`);
+    for (const field of ["id", "label", "tokenHash", "hostnamePattern"] as const) {
+      if (typeof row[field] !== "string") throw new EnrollmentError(`${source}: app token ${field} must be a string`);
+    }
+    if (!Array.isArray(row.scopes) || row.scopes.some((scope) => typeof scope !== "string")) {
+      throw new EnrollmentError(`${source}: app token scopes must be an array of strings`);
+    }
+    // `expiresAt` decides liveness — `lookupAppToken` compares `Date.parse(expiresAt) > now` — and
+    // `Date.parse` of anything unparseable is `NaN`, which is `>` nothing. So a broken value fails
+    // closed rather than open, and this check is not what stops a forever-token. What it stops is the
+    // *silence*: the row would simply never authenticate, with no reason recorded anywhere, and the
+    // operator would be told their token stopped working. It also now travels out in a response
+    // header, so it must be a value a caller can parse.
+    if (typeof row.expiresAt !== "string" || !Number.isFinite(Date.parse(row.expiresAt))) {
+      throw new EnrollmentError(`${source}: app token expiresAt must be an ISO timestamp`);
+    }
+    for (const field of ["createdAt"] as const) {
+      if (typeof row[field] !== "string") throw new EnrollmentError(`${source}: app token ${field} must be a string`);
+    }
+    // The three nullable ones. `revokedAt` is read for truthiness, so a stray `0` or `false` would
+    // read as "not revoked" — the one direction this must never be wrong in.
+    for (const field of ["revokedAt", "lastUsedAt", "createdBy"] as const) {
+      if (row[field] !== null && typeof row[field] !== "string") {
+        throw new EnrollmentError(`${source}: app token ${field} must be a string or null`);
+      }
+    }
+  }
   return {
     schemaVersion: ENROLLMENT_SCHEMA,
     tokens,
     requests: d.requests as NodeCsrRecord[],
     audit: d.audit as EnrollmentAuditEvent[],
     revocations,
+    appTokens: (d.appTokens as AppTokenRecord[] | undefined) ?? [],
   };
 }
-export const emptyEnrollmentDocument = (): EnrollmentDocument => ({ schemaVersion: 1, tokens: [], requests: [], audit: [], revocations: [] });
+export const emptyEnrollmentDocument = (): EnrollmentDocument => ({ schemaVersion: 1, tokens: [], requests: [], audit: [], revocations: [], appTokens: [] });
 function readEnrollmentDocument(path: string): EnrollmentDocument {
   const full = resolve(path);
   try { return parse(JSON.parse(readFileSync(full, "utf8")), full); }
@@ -278,7 +385,16 @@ export function withEnrollmentTransaction<T>(
 function audit(document: EnrollmentDocument, event: Omit<EnrollmentAuditEvent, "at">, now?: Date): void {
   document.audit.push({ at: nowIso(now), ...event });
 }
-export function createNodeToken(document: EnrollmentDocument, input: { hostname: string; label?: string; createdBy?: string; revokeExisting?: boolean; ttlSec?: number; now?: Date }) {
+/**
+ * `appTokenId` is optional and additive: an operator issuing a token by hand does not have one.
+ *
+ * It exists because `createdBy` is text an operator reads, and **a label is not an identifier** —
+ * two live app tokens may carry the same one, deliberately, so that a rotation has no gap. Writing
+ * only the label into the audit row would mean the trail cannot say *which* credential minted a node
+ * token, which is exactly the question asked when one of them turns out to be leaked. So the id goes
+ * into `detail.appTokenId`, structured, next to a `createdBy` that carries both.
+ */
+export function createNodeToken(document: EnrollmentDocument, input: { hostname: string; label?: string; createdBy?: string; appTokenId?: string; revokeExisting?: boolean; ttlSec?: number; now?: Date }) {
   const host = hostname(input.hostname); const issuedAt = input.now ?? new Date(); const at = nowIso(issuedAt);
   if (input.revokeExisting !== undefined && typeof input.revokeExisting !== "boolean") {
     throw new EnrollmentError("revokeExisting must be a boolean");
@@ -290,9 +406,13 @@ export function createNodeToken(document: EnrollmentDocument, input: { hostname:
   if (input.revokeExisting ?? true) for (const token of document.tokens) if (token.hostname === host && !token.revokedAt) token.revokedAt = at;
   const token = `${NODE_TOKEN_PREFIX}${randomHex(32)}`;
   const row: NodeTokenRecord = { id: randomHex(8), hostname: host, tokenHash: sha256(token), label: input.label?.trim().slice(0, 120) || null,
-    createdBy: input.createdBy?.trim().slice(0, 120) || null, createdAt: at,
+    createdBy: input.createdBy?.trim().slice(0, MAX_CREATED_BY_CHARS) || null, createdAt: at,
     expiresAt: new Date(issuedAt.getTime() + ttlSec * 1_000).toISOString(), lastUsedAt: null, revokedAt: null };
-  document.tokens.push(row); audit(document, { actor: row.createdBy ?? "operator", action: "node-token.create", target: row.id, sourceIp: null, detail: { hostname: host } }, input.now);
+  document.tokens.push(row);
+  audit(document, {
+    actor: row.createdBy ?? "operator", action: "node-token.create", target: row.id, sourceIp: null,
+    detail: { hostname: host, ...(input.appTokenId === undefined ? {} : { appTokenId: input.appTokenId }) },
+  }, input.now);
   return { document, token, row };
 }
 export function revokeNodeToken(document: EnrollmentDocument, id: string, actor = "operator", now = new Date()): NodeTokenRecord {
@@ -329,6 +449,116 @@ export function lookupNodeToken(document: EnrollmentDocument, plaintext: string,
   if (!looksLikeNodeToken(plaintext)) return null; const digest = sha256(plaintext);
   const row = document.tokens.find((token) => token.tokenHash === digest && !token.revokedAt && Date.parse(token.expiresAt) > now.getTime()) ?? null;
   if (row) row.lastUsedAt = nowIso(now); return row;
+}
+
+/**
+ * The hostname normaliser, exported so a caller can tell "not a hostname" from "not yours".
+ *
+ * Without it the app-token route would have to run an unvalidated string through
+ * `appTokenAllowsHostname`, and a caller who typed nonsense would be told their token is not
+ * authorised for it — advice pointing at the wrong thing, which `refuseWrite` already records as
+ * costing more than a vague refusal. 400 for a malformed hostname, 403 for a real one outside the
+ * pattern.
+ */
+export const normalizeEnrollmentHostname = (value: string): string => hostname(value);
+
+/**
+ * Does this app token's pattern cover this hostname? Pure, and deliberately narrow.
+ *
+ * A pattern is either an exact hostname or a leading `*.` — and the `*` stands for **exactly one
+ * label**. `*.dev` covers `k3s-01.dev`; it does not cover `dev`, and it does not cover `a.b.dev`.
+ * The second exclusion is the one worth stating: a suffix match would make `*.dev` cover
+ * `k3s-01.attacker.dev`, and the token holder chooses the hostname it asks for.
+ */
+export function appTokenAllowsHostname(pattern: string, candidate: string): boolean {
+  const p = pattern.trim().toLowerCase();
+  const h = candidate.trim().toLowerCase();
+  if (!p || !h) return false;
+  if (!p.startsWith("*.")) return p === h;
+  const dot = h.indexOf(".");
+  // `dot > 0` rejects both "no label boundary at all" (`dev`) and an empty first label (`.dev`).
+  return dot > 0 && h.slice(dot + 1) === p.slice(2);
+}
+
+function appTokenHostnamePattern(value: string): string {
+  const out = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (!out) throw new EnrollmentError("app token hostnamePattern is required");
+  const rest = out.startsWith("*.") ? out.slice(2) : out;
+  // A `*` anywhere but the first label is refused rather than interpreted. `**.dev`, `*`, `a.*.dev`
+  // and `*.*` all land here: every one of them is a caller believing in a matcher this does not
+  // implement, and guessing what they meant is how a pattern ends up wider than it reads.
+  if (rest.includes("*") || !HOSTNAME.test(rest)) {
+    throw new EnrollmentError(
+      `invalid app token hostnamePattern: ${JSON.stringify(value)} — use an exact hostname or one ` +
+        `leading wildcard label such as "*.dev"`,
+    );
+  }
+  return out.startsWith("*.") ? `*.${rest}` : rest;
+}
+
+export function createAppToken(document: EnrollmentDocument, input: {
+  label: string; scopes: readonly string[]; hostnamePattern: string; createdBy?: string; ttlSec?: number; now?: Date;
+}) {
+  const issuedAt = input.now ?? new Date(); const at = nowIso(issuedAt);
+  const label = typeof input.label === "string" ? input.label.trim() : "";
+  // Not truncated to 120 like a node token's label, refused. A node token's label is a note; this one
+  // is what every refusal message and audit row names the caller by, and a silently shortened name
+  // is a name two tokens can share.
+  if (!label || label.length > 120) throw new EnrollmentError("app token label must be 1-120 characters after trimming");
+  if (!Array.isArray(input.scopes) || input.scopes.length === 0) {
+    throw new EnrollmentError(`app token scopes must name at least one of: ${APP_TOKEN_SCOPES.join(", ")}`);
+  }
+  const scopes: AppTokenScope[] = [];
+  for (const scope of input.scopes) {
+    if (typeof scope !== "string" || !(APP_TOKEN_SCOPES as readonly string[]).includes(scope)) {
+      throw new EnrollmentError(`unknown app token scope: ${JSON.stringify(scope)}`);
+    }
+    if (!scopes.includes(scope as AppTokenScope)) scopes.push(scope as AppTokenScope);
+  }
+  const hostnamePattern = appTokenHostnamePattern(input.hostnamePattern);
+  const ttlSec = input.ttlSec ?? DEFAULT_APP_TOKEN_TTL_SEC;
+  if (!Number.isSafeInteger(ttlSec) || ttlSec < MIN_APP_TOKEN_TTL_SEC || ttlSec > MAX_APP_TOKEN_TTL_SEC) {
+    throw new EnrollmentError(`app token ttlSec must be ${MIN_APP_TOKEN_TTL_SEC}-${MAX_APP_TOKEN_TTL_SEC}`);
+  }
+  const token = `${APP_TOKEN_PREFIX}${randomHex(32)}`;
+  const row: AppTokenRecord = {
+    id: randomHex(8), label, tokenHash: sha256(token), scopes, hostnamePattern,
+    createdBy: input.createdBy?.trim().slice(0, MAX_CREATED_BY_CHARS) || null, createdAt: at,
+    expiresAt: new Date(issuedAt.getTime() + ttlSec * 1_000).toISOString(), lastUsedAt: null, revokedAt: null,
+  };
+  // A label is not an identifier and two live tokens may share one. Refusing a duplicate would make
+  // rotation — issue the replacement, hand it over, revoke the old one — impossible without a gap.
+  document.appTokens.push(row);
+  audit(document, {
+    actor: row.createdBy ?? "operator", action: "app-token.create", target: row.id, sourceIp: null,
+    detail: { label, scopes: scopes.join(","), hostnamePattern },
+  }, input.now);
+  return { document, token, row };
+}
+
+export function revokeAppToken(document: EnrollmentDocument, id: string, actor = "operator", now = new Date()): AppTokenRecord {
+  const row = document.appTokens.find((appToken) => appToken.id === id);
+  if (!row) throw new EnrollmentError(`app token ${id} not found`, 404);
+  if (!row.revokedAt) row.revokedAt = nowIso(now);
+  audit(document, { actor, action: "app-token.revoke", target: id, sourceIp: null, detail: { label: row.label } }, now);
+  return row;
+}
+
+/** The shape gate, for the same reason `looksLikeNodeToken` is one — see its comment. */
+export function looksLikeAppToken(plaintext: string): boolean {
+  return APP_TOKEN_RE.test(plaintext);
+}
+
+const APP_TOKEN_RE = new RegExp(`^${APP_TOKEN_PREFIX}[0-9a-f]{64}$`);
+
+export function lookupAppToken(document: EnrollmentDocument, plaintext: string, now = new Date()): AppTokenRecord | null {
+  if (!looksLikeAppToken(plaintext)) return null;
+  const digest = sha256(plaintext);
+  const row = document.appTokens.find(
+    (appToken) => appToken.tokenHash === digest && !appToken.revokedAt && Date.parse(appToken.expiresAt) > now.getTime(),
+  ) ?? null;
+  if (row) row.lastUsedAt = nowIso(now);
+  return row;
 }
 
 function normalizeCsrPem(csrPem: string): string {

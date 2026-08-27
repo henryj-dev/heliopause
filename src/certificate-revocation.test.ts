@@ -40,4 +40,31 @@ describe("certificate fingerprint revocation", () => {
     writeFileSync(store, JSON.stringify({ ...document, revocations: [{ ...row, tokens: [] }] }));
     assert.equal(certificateIsRevoked(store, req, "enrollment"), true);
   });
+
+  it("reads a store the enrollment writer actually produces, whichever fields it has", () => {
+    // 🔑 The regression that this file did not have. Every case above asserts `true`, and `true` is
+    // also what an unreadable file returns — so a reader that rejected the *whole store format*
+    // would have looked correct here while reporting every valid certificate as revoked. That is
+    // exactly what happened when the store gained `appTokens`: 30 tests failed with "client
+    // certificate has been revoked", none of them in this file.
+    //
+    // Pinned from `saveEnrollmentDocument`, not from a literal, so the next field added to the store
+    // fails here rather than in a manager an operator is locked out of.
+    const root = mkdtempSync(join(tmpdir(), "heliopause-revocation-current-"));
+    const store = join(root, "store.json");
+    const req = { socket: { authorized: true, getPeerCertificate: () => ({ fingerprint256: "aa:bb" }) } } as any;
+
+    saveEnrollmentDocument(store, emptyEnrollmentDocument());
+    assert.equal(
+      certificateIsRevoked(store, req, "enrollment"), false,
+      "a store this repository just wrote was read as an unusable denylist, which revokes everyone",
+    );
+
+    // And the shape a deployment written before app tokens has on disk.
+    writeFileSync(store, JSON.stringify({ schemaVersion: 1, tokens: [], requests: [], audit: [], revocations: [] }));
+    assert.equal(certificateIsRevoked(store, req, "enrollment"), false);
+    // Missing is still missing: a truncated denylist must never read as "nobody is revoked".
+    writeFileSync(store, JSON.stringify({ schemaVersion: 1, tokens: [], requests: [], appTokens: [] }));
+    assert.equal(certificateIsRevoked(store, req, "enrollment"), true);
+  });
 });

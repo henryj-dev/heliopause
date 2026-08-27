@@ -115,10 +115,12 @@ import {
   type PlanSummary,
 } from "./approval.ts";
 import {
-  EnrollmentError, createNodeToken, fetchNodeCertificate, looksLikeNodeToken, requireEnrollmentDocument,
-  preflightNodeCsr, rejectNodeCsr, revokeCertificate, revokeNodeToken, storeNodeCertificate,
+  APP_TOKEN_SCOPES, EnrollmentError, appTokenAllowsHostname, appTokenCreatedBy, createAppToken, createNodeToken,
+  fetchNodeCertificate, looksLikeAppToken, looksLikeNodeToken, lookupAppToken,
+  normalizeEnrollmentHostname, preflightNodeCsr, rejectNodeCsr, requireEnrollmentDocument,
+  revokeAppToken, revokeCertificate, revokeNodeToken, storeNodeCertificate,
   submitValidatedNodeCsr, touchExistingNodeCsr, validateNodeCsrAsync, withEnrollmentTransaction,
-  type EnrollmentDocument,
+  type AppTokenRecord, type AppTokenScope, type EnrollmentDocument, type NodeCsrRecord,
 } from "./enrollment-store.ts";
 import { certificateIsRevoked } from "./certificate-revocation.ts";
 import { MAX_REVOCATION_ROWS, serializeRevocationSnapshot } from "./revocation-snapshot.ts";
@@ -195,6 +197,7 @@ export const API_ROUTES: ReadonlySet<string> = new Set([
   "/policy/plan",
   "/enrollment/requests",
   "/enrollment/tokens",
+  "/enrollment/app-tokens",
   "/enrollment/audit",
   "/enrollment/revocations",
 ]);
@@ -216,6 +219,7 @@ export const API_ROUTE_PATTERNS: readonly RegExp[] = [
   /^\/plans\/[^/]+\/ruleset$/,
   /^\/plans\/[^/]+\/ruleset-diff$/,
   /^\/enrollment\/tokens\/[^/]+\/revoke$/,
+  /^\/enrollment\/app-tokens\/[^/]+\/revoke$/,
   /^\/enrollment\/requests\/[^/]+\/reject$/,
   /^\/enrollment\/requests\/[^/]+\/certificate$/,
 ];
@@ -1504,6 +1508,26 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       } catch (e) { return sendEnrollmentError(res, e); }
     }
 
+    // ── The third principal: a program holding a scoped bearer token ──────────
+    //
+    // Split off **before** the certificate and session resolution below, and not folded into it.
+    // Three reasons, and the middle one is the whole feature:
+    //
+    //   · an app token is not a person, so it must never reach `requireOtp` — that function resolves
+    //     a KeyStone *user* and checks that user's one-time code, and there is nobody here to check;
+    //   · it is not a browser, so it must not pick up a cookie session, a login redirect, or the
+    //     CSRF header check, all of which are written against a session that does not exist;
+    //   · a caller presenting a certificate *and* an app token is resolved as one of them rather
+    //     than as whichever turns out to be more permissive further down.
+    //
+    // Shape first for the same reason as the two routes above: `looksLikeAppToken` is not
+    // authentication, it is what keeps a caller who typed something else out of a synchronous read
+    // of the whole enrollment store. The store read comes after it and after the rate limit.
+    if (opts.enrollment) {
+      const bearer = String(req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
+      if (looksLikeAppToken(bearer)) return await handleAppToken(bearer, url, req, res, opts.enrollment.storeFile);
+    }
+
     // ── The login routes, before any authorisation ────────────────────────────
     //
     // Deliberately reachable without a principal: their whole job is to produce one. Each is
@@ -1628,13 +1652,22 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       principal.via === "oidc" && principal.groups.some((g) => soloRoles.has(g));
 
     if (opts.enrollment && req.method === "GET" && url.pathname === "/enrollment/requests") {
-      const status = url.searchParams.get("status");
-      if (status && !["pending", "conflict", "rejected", "signed"].includes(status)) return send(res, 400, { error: "invalid status" });
-      const requests = requireEnrollmentDocument(opts.enrollment.storeFile).requests.filter((row) => !status || row.status === status);
-      return send(res, 200, { requests });
+      try {
+        const filter = csrQueryFilter(url);
+        const requests = requireEnrollmentDocument(opts.enrollment.storeFile).requests
+          .filter((row) => matchesCsrFilter(row, filter));
+        return send(res, 200, { requests });
+      } catch (e) { return sendEnrollmentError(res, e); }
     }
     if (opts.enrollment && req.method === "GET" && url.pathname === "/enrollment/tokens") {
       const tokens = requireEnrollmentDocument(opts.enrollment.storeFile).tokens.map(({ tokenHash: _secret, ...row }) => row);
+      return send(res, 200, { tokens });
+    }
+    // The hash is stripped for the same reason the node token list strips its own: the store holds
+    // only a digest, and a digest is still an offline guessing target for a value this file also
+    // says is 32 random bytes.
+    if (opts.enrollment && req.method === "GET" && url.pathname === "/enrollment/app-tokens") {
+      const tokens = requireEnrollmentDocument(opts.enrollment.storeFile).appTokens.map(({ tokenHash: _secret, ...row }) => row);
       return send(res, 200, { tokens });
     }
     if (opts.enrollment && req.method === "GET" && url.pathname === "/enrollment/audit") {
@@ -1691,13 +1724,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     if (req.method === "POST") {
       const origin = req.headers["origin"];
       const site = req.headers["sec-fetch-site"];
-      const selfOrigins = new Set([`https://${req.headers["host"] ?? ""}`]);
-      // `Origin: null` is an opaque browser origin (for example a sandboxed iframe), not the CLI.
-      // The CLI sends no Origin header at all, so rejecting the literal value closes that browser
-      // path without changing the certificate-based command line API.
-      const foreignOrigin = typeof origin === "string" && !selfOrigins.has(origin);
-      const foreignSite = typeof site === "string" && site !== "same-origin" && site !== "none";
-      if (foreignOrigin || foreignSite) {
+      if (crossSiteRequest(req)) {
         log(`refused ${url.pathname} for ${who}: cross-site request (origin=${origin ?? "-"}, sec-fetch-site=${site ?? "-"})`, `${who}의 ${url.pathname} 거부: 교차 사이트 요청 (origin=${origin ?? "-"}, sec-fetch-site=${site ?? "-"})`);
         return send(res, 403, {
           error:
@@ -1729,6 +1756,55 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         }));
         const { tokenHash: _secret, ...row } = result.row;
         return send(res, 201, { ok: true, id: row.id, token: result.token, row });
+      } catch (e) { return sendEnrollmentError(res, e); }
+    }
+    // ## Issuing the credential a program will hold, with a person and a one-time code in front of it
+    //
+    // The route an app token *uses* has no second factor — that is the point of it. The route that
+    // creates one keeps every check the operator path has, because this is where the grant is
+    // decided: which scopes, and which hostnames. `createAppToken` is the only place that validates
+    // either, so nothing here interprets a scope string or a pattern on its own.
+    if (opts.enrollment && req.method === "POST" && url.pathname === "/enrollment/app-tokens") {
+      if (!mayWrite) return refuseWrite(res, who, url.pathname, principal.via);
+      try {
+        const body = JSON.parse(await readBody(req)) as {
+          label?: unknown; scopes?: unknown; hostnamePattern?: unknown; ttlSec?: unknown; otp?: unknown;
+        };
+        if ((await requireOtp(principal, body, res, url.pathname)) === "answered") return;
+        // Checked, not coerced — A1 again. `scopes` is the field where that matters most: a single
+        // string would coerce into an array of characters, and every one of them is an unknown scope.
+        if (typeof body.label !== "string") throw new EnrollmentError("label must be a string");
+        if (typeof body.hostnamePattern !== "string") throw new EnrollmentError("hostnamePattern must be a string");
+        if (!Array.isArray(body.scopes) || !body.scopes.every((s: unknown) => typeof s === "string")) {
+          throw new EnrollmentError(`scopes must be an array of strings from: ${APP_TOKEN_SCOPES.join(", ")}`);
+        }
+        const scopes: string[] = body.scopes;
+        const ttlSec = typeof body.ttlSec === "number" ? body.ttlSec : undefined;
+        if (body.ttlSec !== undefined && ttlSec === undefined) throw new EnrollmentError("ttlSec must be a number");
+        const label = body.label;
+        const hostnamePattern = body.hostnamePattern;
+        const result = enrollmentWrite(opts.enrollment.storeFile, (document) => createAppToken(document, {
+          label, scopes, hostnamePattern, createdBy: who, ...(ttlSec === undefined ? {} : { ttlSec }),
+        }));
+        const { tokenHash: _secret, ...row } = result.row;
+        log(
+          `created app token ${row.id} (${row.label}) for ${row.hostnamePattern}: ${row.scopes.join(",")}`,
+          `앱 토큰 ${row.id} (${row.label}) 생성 — 대상 ${row.hostnamePattern}, 스코프 ${row.scopes.join(",")}`,
+        );
+        return send(res, 201, { ok: true, id: row.id, token: result.token, row });
+      } catch (e) { return sendEnrollmentError(res, e); }
+    }
+    const appTokenRevoke = /^\/enrollment\/app-tokens\/([^/]+)\/revoke$/.exec(url.pathname);
+    if (opts.enrollment && req.method === "POST" && appTokenRevoke) {
+      if (!mayWrite) return refuseWrite(res, who, url.pathname, principal.via);
+      try {
+        const body = JSON.parse(await readBody(req)) as { otp?: unknown };
+        if ((await requireOtp(principal, body, res, url.pathname)) === "answered") return;
+        const revoked = enrollmentWrite(opts.enrollment.storeFile, (document) =>
+          revokeAppToken(document, decodeURIComponent(appTokenRevoke[1]!), who));
+        const { tokenHash: _secret, ...row } = revoked;
+        log(`revoked app token ${row.id} (${row.label})`, `앱 토큰 ${row.id} (${row.label}) 폐기`);
+        return send(res, 200, { ok: true, row });
       } catch (e) { return sendEnrollmentError(res, e); }
     }
     const tokenRevoke = /^\/enrollment\/tokens\/([^/]+)\/revoke$/.exec(url.pathname);
@@ -3084,6 +3160,214 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
   }
 
   /**
+   * Everything an app token is allowed to reach, and the two refusals in front of it.
+   *
+   * The route table is **two entries and no more**, and that narrowness is the argument for issuing
+   * these credentials at all — a leaked app token mints node tokens inside its hostname pattern and
+   * reads the CSR queue. It cannot sign, upload, reject or revoke anything.
+   *
+   * ## Why an unknown token and a wrong route answer differently
+   *
+   * An unknown, expired or revoked token is 401 and says only "unauthorized app token": from outside,
+   * the three are one answer, because telling a holder which of them applies tells them whether the
+   * value they hold was ever real. A *valid* token asking for a route outside its grant is 403 and
+   * names the token, because the person reading that log is an operator deciding whether to widen a
+   * scope or fix a caller, and "401" would send them looking for a credential problem that is not
+   * there.
+   *
+   * ## The two bootstrap routes answer 401 here, and that is the ordering, not a bug
+   *
+   * `POST /infra/node-csrs` and `GET /infra/node-csrs/<id>/certificate` are dispatched **above** this
+   * split, and their gate is `looksLikeNodeToken`. An app token fails that shape test and is refused
+   * `unauthorized node token` before this function is reached — so those two never appear in the
+   * route table below and never could. That is the right answer rather than an accident: they are
+   * the agent's own credential path, an app token has no CSR of its own, and moving the split above
+   * them would put a lookup for app-token shapes in front of the one route every fleet host has to
+   * reach at boot.
+   *
+   * ## What the expiry header is for
+   *
+   * Every accepted answer carries `X-Heliopause-App-Token-Expires-At`. The caller already holds the
+   * token, so its expiry tells them nothing they could not learn by trying — and without it the first
+   * sign of a lapsed credential is a 401 in the middle of somebody's provisioning saga. It is absent
+   * from refusals on purpose: a 401 must not become a way to ask whether a guessed token exists and
+   * when it dies.
+   */
+  async function handleAppToken(
+    plaintext: string, url: URL, req: IncomingMessage, res: ServerResponse, storeFile: string,
+  ): Promise<void> {
+    try {
+      // Same bound as the certificate-less enrollment routes, and applied for the same reason: the
+      // read below is synchronous and the transaction after it takes the `O_EXCL` lock.
+      if (enrollmentFloodRefused(req, res)) return;
+
+      // The cross-site refusal is kept exactly as it is for operators. A dispatcher sends neither
+      // header, so it costs that caller nothing; a browser page that somehow obtained an app token
+      // is precisely the case this refuses. The CSRF check is deliberately *not* kept — it reads a
+      // cookie session, and an app token never has one.
+      if (req.method === "POST" && crossSiteRequest(req)) {
+        log(
+          `refused ${url.pathname} for an app token: cross-site request`,
+          `앱 토큰의 ${url.pathname} 거부: 교차 사이트 요청`,
+        );
+        return send(res, 403, { error: "cross-site requests cannot change the fleet" });
+      }
+
+      const scope: AppTokenScope | null =
+        req.method === "POST" && url.pathname === "/enrollment/tokens" ? "enrollment:token-create"
+          : req.method === "GET" && url.pathname === "/enrollment/requests" ? "enrollment:requests-read"
+            : null;
+
+      // ## The gate: a read, and what it does and does not settle
+      //
+      // Everything refused from here down to the route split — an unknown, expired or revoked token
+      // (401), a route outside the table (403), a scope the token does not carry (403) — is settled
+      // **before any lock is taken**, from this one read. `lastUsedAt` is not persisted for them: a
+      // use that was refused is not a use.
+      //
+      // What is *not* settled here is the hostname against the pattern. That check is deliberately
+      // inside the write transaction below, next to the issue it guards — a 403 taken from this read
+      // and an issue taken from a later document are two decisions about two documents, and a revoke
+      // or a pattern change landing between them would be honoured by neither. The cost is that a
+      // pattern-mismatch 403 does take the lock. That is the correct side to err on.
+      //
+      // The read route answers **from this same document**. A second `requireEnrollmentDocument`
+      // would parse the file again with no lock held between the two, so it is not a fresher answer
+      // — it is a second answer to the same question, and the one that arrives second is no more
+      // authoritative than the one that arrived first. The `POST` path re-checks inside its
+      // transaction because there the lock *is* the boundary: the document it authorises against is
+      // the document it commits.
+      const document = requireEnrollmentDocument(storeFile);
+      const gate = lookupAppToken(document, plaintext);
+      if (!gate) {
+        log(`refused ${url.pathname}: unknown, expired or revoked app token`, `${url.pathname} 거부: 모르거나 만료·폐기된 앱 토큰`);
+        return send(res, 401, { error: "unauthorized app token" });
+      }
+      if (scope === null || !gate.scopes.includes(scope)) {
+        log(
+          `refused ${url.pathname} for app token ${gate.label} (${gate.id}): outside its scopes (${gate.scopes.join(",")})`,
+          `앱 토큰 ${gate.label} (${gate.id})의 ${url.pathname} 거부: 스코프(${gate.scopes.join(",")}) 밖`,
+        );
+        return send(res, 403, { error: `app token ${gate.label} is not authorised for ${url.pathname}` });
+      }
+
+      if (scope === "enrollment:requests-read") {
+        // 🔴 Reading the queue must not take the `O_EXCL` lock, and this route used to — it wrapped
+        // itself in `enrollmentWrite` for no reason but to persist `lastUsedAt`, paying an exclusive
+        // lock, a full re-serialisation and an `fsync` for a request that changes nothing. A poller
+        // on this route would then serialise against every token issue and every certificate upload
+        // in the deployment.
+        //
+        // So `lastUsedAt` records **token creation only**. `lookupAppToken` still set it on the
+        // document read above, and that document is discarded — deliberately. The field answers "is
+        // anything still minting with this credential", which is the question asked before revoking
+        // one; it does not answer "did anyone read the queue". The README says so where the field is
+        // documented, because a timestamp that means less than its name is worse than no timestamp.
+        //
+        // ## The queue is narrowed to the token's own pattern
+        //
+        // 🔴 This returned the whole fleet's queue. A `*.dev` token could read every hostname and
+        // every public-key digest in `prod` and `util` — zones it cannot mint for and has no business
+        // enumerating. The pattern already bounds what the token may *create*; it now bounds what it
+        // may *see*, so the two halves of the grant say the same thing.
+        //
+        // A `?hostname=` outside the pattern is an empty list rather than a 403. A refusal there
+        // would answer "is this host inside your pattern?" for any name the caller cares to try,
+        // turning a read into an oracle for a boundary the caller is not supposed to map.
+        const filter = csrQueryFilter(url);
+        const requests = document.requests.filter((request) =>
+          appTokenAllowsHostname(gate.hostnamePattern, request.hostname) && matchesCsrFilter(request, filter));
+        return send(res, 200, { requests }, { "x-heliopause-app-token-expires-at": gate.expiresAt });
+      }
+
+      const body = JSON.parse(await readBody(req)) as {
+        hostname?: unknown; label?: unknown; revokeExisting?: unknown; ttlSec?: unknown; otp?: unknown;
+      };
+      // An OTP arriving here is not a harmless extra field: it means the caller believes it is on the
+      // operator path, where a one-time code is checked against a person. Ignoring it would let that
+      // belief live in somebody's configuration until the day they rely on a second factor that was
+      // never read. Refused rather than dropped.
+      if (body.otp !== undefined) {
+        throw new EnrollmentError(
+          "an app token has no operator behind it, so a one-time code cannot be checked — omit `otp`",
+        );
+      }
+      // Type-checked, never coerced: `String(undefined)`, `Boolean("false")` and `Number("x")` each
+      // turn a malformed field into a plausible value. See `security-audits/2026-08-25-audit-todo.md`
+      // A1 for the measured version of that mistake.
+      if (typeof body.hostname !== "string") throw new EnrollmentError("hostname must be a string");
+      const label = typeof body.label === "string" ? body.label : undefined;
+      if (body.label !== undefined && label === undefined) throw new EnrollmentError("label must be a string");
+      const revokeExisting = typeof body.revokeExisting === "boolean" ? body.revokeExisting : undefined;
+      if (body.revokeExisting !== undefined && revokeExisting === undefined) {
+        throw new EnrollmentError("revokeExisting must be a boolean");
+      }
+      const ttlSec = typeof body.ttlSec === "number" ? body.ttlSec : undefined;
+      if (body.ttlSec !== undefined && ttlSec === undefined) throw new EnrollmentError("ttlSec must be a number");
+      // Normalised before the pattern is consulted so that a hostname which is not a hostname is a
+      // 400 rather than a 403 — "yours is not among these" is the wrong advice for a typo.
+      const wanted = normalizeEnrollmentHostname(body.hostname);
+
+      // One transaction: authorise, check the pattern, issue. Split into two, a revoke landing
+      // between them would be checked against a token the store no longer honours.
+      const issued = enrollmentWrite(storeFile, (document) => {
+        const row = authoriseAppToken(document, plaintext, scope, url.pathname);
+        if (!appTokenAllowsHostname(row.hostnamePattern, wanted)) {
+          // Both halves named on purpose: the operator reading this has to decide whether the caller
+          // asked for the wrong host or the token was issued with the wrong pattern.
+          throw new EnrollmentError(
+            `app token ${row.label} is scoped to ${row.hostnamePattern}, and ${wanted} is outside it`,
+            403,
+          );
+        }
+        return {
+          label: row.label, id: row.id, expiresAt: row.expiresAt,
+          ...createNodeToken(document, {
+            hostname: wanted,
+            ...(label === undefined ? {} : { label }),
+            // Both halves, because **a label is not an identifier**: two live app tokens may share
+            // one so that a rotation has no gap, and `app:dispatcher` alone cannot say which of them
+            // minted this. The id is also in the audit row's `detail.appTokenId`, structured, for
+            // the reader that is a query rather than a person.
+            //
+            // Composed by the store rather than here: the field is truncated on the way in, and a
+            // 120-character label made that truncation eat the id — see `appTokenCreatedBy`.
+            createdBy: appTokenCreatedBy(row.label, row.id),
+            appTokenId: row.id,
+            ...(revokeExisting === undefined ? {} : { revokeExisting }),
+            ...(ttlSec === undefined ? {} : { ttlSec }),
+          }),
+        };
+      });
+      const { tokenHash: _secret, ...row } = issued.row;
+      // The label and the two ids, never the plaintext and never the hash. What an operator needs
+      // from this line is which program asked and for which host.
+      log(
+        `issued node token ${row.id} for ${row.hostname} to app token ${issued.label} (${issued.id})`,
+        `앱 토큰 ${issued.label} (${issued.id})에 ${row.hostname}용 노드 토큰 ${row.id} 발급`,
+      );
+      return send(res, 201, { ok: true, id: row.id, token: issued.token, row },
+        { "x-heliopause-app-token-expires-at": issued.expiresAt });
+    } catch (e) { return sendEnrollmentError(res, e); }
+  }
+
+  /**
+   * The authoritative app-token check, run inside a transaction.
+   *
+   * The gate in `handleAppToken` answers 401 and 403 from a read taken before the lock. This repeats
+   * it against the document the write will be committed against, so a revoke that lands in between
+   * is honoured rather than raced past.
+   */
+  function authoriseAppToken(
+    document: EnrollmentDocument, plaintext: string, scope: AppTokenScope, path: string,
+  ): AppTokenRecord {
+    const row = lookupAppToken(document, plaintext);
+    if (!row) throw new EnrollmentError("unauthorized app token", 401);
+    if (!row.scopes.includes(scope)) throw new EnrollmentError(`app token ${row.label} is not authorised for ${path}`, 403);
+    return row;
+  }
+
+  /**
    * The refusal for a caller who may read and may not change.
    *
    * `via` is not cosmetic. The message used to say "this certificate", which is advice pointing at
@@ -3354,9 +3638,55 @@ async function readBody(req: IncomingMessage, limit = 256 * 1024): Promise<strin
   return Buffer.concat(chunks).toString("utf8");
 }
 
-function send(res: ServerResponse, status: number, body: unknown) {
+/**
+ * Was this POST caused by another site?
+ *
+ * One copy, two callers — the operator path and the app-token path. A second inline copy is how the
+ * two would come to disagree, and the one that would be left behind is the newer one.
+ *
+ * `Origin: null` is an opaque browser origin (a sandboxed iframe, for example), not the CLI. The CLI
+ * sends no `Origin` header at all, so refusing the literal value closes that browser path without
+ * changing the command line API. `Sec-Fetch-Site` is checked too because page script cannot forge
+ * it, while `Origin` is absent on some navigations.
+ */
+function crossSiteRequest(req: IncomingMessage): boolean {
+  const origin = req.headers["origin"];
+  const site = req.headers["sec-fetch-site"];
+  const foreignOrigin = typeof origin === "string" && origin !== `https://${req.headers["host"] ?? ""}`;
+  const foreignSite = typeof site === "string" && site !== "same-origin" && site !== "none";
+  return foreignOrigin || foreignSite;
+}
+
+/**
+ * The `?status=` and `?hostname=` filter on the CSR queue, parsed once for both principals.
+ *
+ * One function because there are two callers — an operator with a certificate or a session, and an
+ * app token carrying `enrollment:requests-read` — and a filter that means two things depending on
+ * who asked is a filter nobody can reason about. `normalizeEnrollmentHostname` throws a 400 for a
+ * malformed name, which is the right answer: an unmatchable filter that silently returns an empty
+ * list reads as "there are no CSRs", and that is the sentence somebody acts on.
+ */
+function csrQueryFilter(url: URL): { status: string | null; hostname: string | null } {
+  // `?status=` with an empty value means "no filter", not "filter by nothing". That has been this
+  // route's behaviour since it was written, `heliopause-enrollment` reaches it by building a query
+  // string from possibly-absent flags, and a 400 for a parameter somebody left blank is a
+  // regression dressed as strictness. A *non-empty* unknown value is still refused: that is a
+  // caller who believes in a status this store does not have.
+  const status = url.searchParams.get("status") || null;
+  if (status && !["pending", "conflict", "rejected", "signed"].includes(status)) {
+    throw new EnrollmentError("invalid status");
+  }
+  const hostname = url.searchParams.get("hostname") || null;
+  return { status, hostname: hostname === null ? null : normalizeEnrollmentHostname(hostname) };
+}
+
+const matchesCsrFilter = (row: NodeCsrRecord, filter: { status: string | null; hostname: string | null }): boolean =>
+  (!filter.status || row.status === filter.status) && (!filter.hostname || row.hostname === filter.hostname);
+
+function send(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}) {
   const payload = JSON.stringify(body);
   res.writeHead(status, {
+    ...headers,
     "content-type": "application/json",
     "content-length": Buffer.byteLength(payload),
     // The static console has carried this since it grew security headers; the API answers did not,

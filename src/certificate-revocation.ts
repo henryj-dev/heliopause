@@ -17,8 +17,23 @@ export function peerFingerprint256(req: IncomingMessage): string | null {
 function parseEnrollmentRevocations(value: unknown): RevocationSnapshot {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("enrollment revocation source must be an object");
   const document = value as Record<string, unknown>;
-  const allowed = ["schemaVersion", "tokens", "requests", "audit", "revocations"];
-  if (Object.keys(document).length !== allowed.length || Object.keys(document).some((key) => !allowed.includes(key))) {
+  // ## Two lists over one file, and the cost of them disagreeing
+  //
+  // `enrollment-store.ts` decides what an enrollment store may contain; this decides what this
+  // reader will accept of it. They are separate on purpose — this one must not be widened by a field
+  // the store gains — and **the day they disagree, every operator is locked out of the manager**:
+  // an unrecognised field lands in the `catch` below, which fails closed, and a valid certificate is
+  // reported as revoked. Measured, not imagined: adding `appTokens` to the store made 30 tests fail
+  // with "client certificate has been revoked" before this list learned the name.
+  //
+  // So `appTokens` is optional rather than required. A store written before app tokens existed is a
+  // correct store — schema 1 was deliberately not raised — and this reader has no opinion about the
+  // field either way. The five below stay required: their absence is a truncated file, and a
+  // truncated denylist is the thing that must never read as "nobody is revoked".
+  const required = ["schemaVersion", "tokens", "requests", "audit", "revocations"];
+  const optional = ["appTokens"];
+  const keys = Object.keys(document);
+  if (required.some((key) => !keys.includes(key)) || keys.some((key) => !required.includes(key) && !optional.includes(key))) {
     throw new Error("enrollment revocation source contains unsupported or missing fields");
   }
   if (document.schemaVersion !== 1 || !Array.isArray(document.tokens)

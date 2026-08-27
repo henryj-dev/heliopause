@@ -2,8 +2,9 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import {
-  createNodeToken, initializeEnrollmentDocument, requireEnrollmentDocument, rejectNodeCsr,
-  revokeNodeToken, storeNodeCertificate, type CsrStatus,
+  createAppToken, createNodeToken, initializeEnrollmentDocument, normalizeEnrollmentHostname,
+  requireEnrollmentDocument, rejectNodeCsr,
+  revokeAppToken, revokeNodeToken, storeNodeCertificate, type CsrStatus,
   revokeCertificate,
   withEnrollmentTransaction,
 } from "../src/enrollment-store.ts";
@@ -22,7 +23,10 @@ const usage = `usage:
   heliopause-enrollment token-create <store.json> <hostname> [--label=TEXT] [--actor=NAME] [--ttl-sec=SECONDS] [--keep-existing]
   heliopause-enrollment token-list <store.json> [--json]
   heliopause-enrollment token-revoke <store.json> <token-id> [--actor=NAME]
-  heliopause-enrollment csr-list <store.json> [--status=pending|conflict|rejected|signed] [--json]
+  heliopause-enrollment app-token-create <store.json> --label=TEXT --scopes=A,B --hostname-pattern=PATTERN [--ttl-sec=SECONDS] [--actor=NAME]
+  heliopause-enrollment app-token-list <store.json> [--json]
+  heliopause-enrollment app-token-revoke <store.json> <app-token-id> [--actor=NAME]
+  heliopause-enrollment csr-list <store.json> [--status=pending|conflict|rejected|signed] [--hostname=NAME] [--json]
   heliopause-enrollment csr-show <store.json> <request-id> [--json]
   heliopause-enrollment csr-export <store.json> <request-id> --out=FILE
   heliopause-enrollment csr-reject <store.json> <request-id> --reason=TEXT [--actor=NAME]
@@ -33,7 +37,10 @@ const usage = `usage:
 
 Use an https manager URL instead of <store.json> for remote operation, with
 --pki=DIR [--operator=NAME] [--otp=CODE]. Remote cert-upload needs --cert and --ca-name; the
-manager reads the trusted CA from HELIOPAUSE_ENROLLMENT_TRUSTED_CAS.`;
+manager reads the trusted CA from HELIOPAUSE_ENROLLMENT_TRUSTED_CAS.
+
+App token scopes: enrollment:token-create, enrollment:requests-read. A hostname pattern is an exact
+hostname or one leading wildcard label, quoted so the shell does not expand it: --hostname-pattern='*.dev'`;
 
 const requiredFlag = (name: string): string => { const value = flags.get(name); if (!value || value === "true") throw new Error(`--${name}=VALUE is required`); return value; };
 const actor = (): string => flags.get("actor")?.trim().slice(0, 120) || "operator";
@@ -43,6 +50,9 @@ const publicToken = (row: ReturnType<typeof requireEnrollmentDocument>["tokens"]
   id: row.id, hostname: row.hostname, label: row.label, createdBy: row.createdBy,
   createdAt: row.createdAt, expiresAt: row.expiresAt, lastUsedAt: row.lastUsedAt, revokedAt: row.revokedAt,
 });
+const publicAppToken = ({ tokenHash: _secret, ...row }: ReturnType<typeof requireEnrollmentDocument>["appTokens"][number]) => row;
+/** Split once, here, so the store sees the same list whether it was typed locally or posted. */
+const scopeList = (): string[] => requiredFlag("scopes").split(",").map((scope) => scope.trim()).filter(Boolean);
 
 async function remote(): Promise<void> {
   const { api, operatorCreds } = await import("../src/api-client.ts");
@@ -60,8 +70,25 @@ async function remote(): Promise<void> {
     console.log(`created node token ${answer.row.id} for ${answer.row.hostname}`); console.log(answer.token); console.log("  plaintext is shown once");
   } else if (command === "token-revoke") {
     if (!subject) throw new Error(usage); await call(`/enrollment/tokens/${encodeURIComponent(subject)}/revoke`, "POST", { otp }); console.log(`revoked ${subject}`);
+  } else if (command === "app-token-list") {
+    console.log(JSON.stringify(await call("/enrollment/app-tokens", "GET"), null, 2));
+  } else if (command === "app-token-create") {
+    const ttlRaw = flags.get("ttl-sec");
+    const answer = await call<{ token: string; row: { id: string; label: string; hostnamePattern: string } }>("/enrollment/app-tokens", "POST", {
+      label: requiredFlag("label"), scopes: scopeList(), hostnamePattern: requiredFlag("hostname-pattern"),
+      ...(ttlRaw ? { ttlSec: Number(ttlRaw) } : {}), otp,
+    });
+    console.log(`created app token ${answer.row.id} (${answer.row.label}) for ${answer.row.hostnamePattern}`);
+    console.log(answer.token); console.log("  plaintext is shown once");
+  } else if (command === "app-token-revoke") {
+    if (!subject) throw new Error(usage); await call(`/enrollment/app-tokens/${encodeURIComponent(subject)}/revoke`, "POST", { otp }); console.log(`revoked ${subject}`);
   } else if (command === "csr-list" || command === "csr-show" || command === "csr-export") {
-    const status = flags.get("status"); const answer = await call<{ requests: Array<Record<string, unknown> & { id: string; csrPem: string }> }>(`/enrollment/requests${status ? `?status=${encodeURIComponent(status)}` : ""}`, "GET");
+    // Filtered by the manager rather than here: the same two parameters mean the same thing to every
+    // caller of that route, and a client that filtered locally would quietly diverge from it.
+    const query = new URLSearchParams();
+    if (flags.get("status")) query.set("status", flags.get("status")!);
+    if (flags.get("hostname")) query.set("hostname", flags.get("hostname")!);
+    const answer = await call<{ requests: Array<Record<string, unknown> & { id: string; csrPem: string }> }>(`/enrollment/requests${query.size ? `?${query}` : ""}`, "GET");
     const rows = subject ? answer.requests.filter((row) => row.id === subject) : answer.requests;
     if (subject && rows.length === 0) throw new Error(`CSR ${subject} not found`);
     if (command === "csr-export") { const out = requiredFlag("out"); if (existsSync(out)) throw new Error(`refusing to overwrite ${out}`); writeFileSync(out, rows[0]!.csrPem, { mode: 0o644, flag: "wx" }); console.log(`exported ${subject} to ${out}`); }
@@ -99,10 +126,29 @@ try {
     else rows.forEach((row) => console.log(`${row.id}\t${row.revokedAt ? "revoked" : "active"}\t${row.hostname}\t${row.lastUsedAt ?? "never used"}\t${row.label ?? ""}`));
   } else if (command === "token-revoke") {
     if (!subject) throw new Error(usage); const row = persist((document) => revokeNodeToken(document, subject, actor())); console.log(`revoked ${row.id} for ${row.hostname}`);
+  } else if (command === "app-token-create") {
+    const ttlRaw = flags.get("ttl-sec");
+    const result = persist((document) => createAppToken(document, {
+      label: requiredFlag("label"), scopes: scopeList(), hostnamePattern: requiredFlag("hostname-pattern"),
+      createdBy: actor(), ...(ttlRaw ? { ttlSec: Number(ttlRaw) } : {}),
+    }));
+    console.log(`created app token ${result.row.id} (${result.row.label}) for ${result.row.hostnamePattern}`);
+    console.log(`  scopes ${result.row.scopes.join(",")}`);
+    console.log(result.token); console.log("  plaintext is shown once; the store contains only its SHA-256 hash");
+  } else if (command === "app-token-list") {
+    const rows = requireEnrollmentDocument(store).appTokens.map(publicAppToken);
+    if (flags.has("json")) console.log(JSON.stringify({ tokens: rows }, null, 2));
+    else rows.forEach((row) => console.log(`${row.id}\t${row.revokedAt ? "revoked" : "active"}\t${row.hostnamePattern}\t${row.scopes.join(",")}\t${row.lastUsedAt ?? "never used"}\t${row.label}`));
+  } else if (command === "app-token-revoke") {
+    if (!subject) throw new Error(usage); const row = persist((document) => revokeAppToken(document, subject, actor())); console.log(`revoked ${row.id} (${row.label})`);
   } else if (command === "csr-list") {
     const status = flags.get("status") as CsrStatus | undefined;
     if (status && !["pending", "conflict", "rejected", "signed"].includes(status)) throw new Error("invalid --status");
-    const rows = requireEnrollmentDocument(store).requests.filter((row) => !status || row.status === status);
+    // Normalised through the store's own function, so `--hostname=K3S-01.DEV` matches locally exactly
+    // as it does over the API, and a malformed name is refused rather than matching nothing.
+    const host = flags.get("hostname") ? normalizeEnrollmentHostname(flags.get("hostname")!) : undefined;
+    const rows = requireEnrollmentDocument(store).requests
+      .filter((row) => (!status || row.status === status) && (!host || row.hostname === host));
     if (flags.has("json")) console.log(JSON.stringify({ requests: rows }, null, 2));
     else rows.forEach((row) => console.log(`${row.id}\t${row.status}\t${row.hostname}\t${row.csrSha256}\t${row.createdAt}`));
   } else if (command === "csr-show") {

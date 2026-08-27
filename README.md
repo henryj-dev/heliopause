@@ -556,6 +556,60 @@ manager and every write command refuse a missing or malformed store — they nev
 deleted revocation ledger is a harmless first boot. **Back this file up and restore it**; do not
 run `init` again once it has held any certificate revocation.
 
+<br/>
+
+**App tokens — the credential a program holds.** `POST /enrollment/tokens` otherwise needs an
+operator: a certificate or a browser session, plus a one-time code bound to that person's identity
+provider account. A dispatcher provisioning a host is not a person and has neither. An app token is
+the third principal — a scoped bearer token, issued by an operator, presented as
+`Authorization: Bearer hpapp_…` with no certificate and no code:
+
+```bash
+node bin/heliopause-enrollment.ts app-token-create https://manager.example:8444 \
+  --label=dispatcher --scopes=enrollment:token-create,enrollment:requests-read \
+  --hostname-pattern='*.dev' --ttl-sec=7776000 --pki=./pki --otp=123456
+node bin/heliopause-enrollment.ts app-token-list https://manager.example:8444 --pki=./pki
+node bin/heliopause-enrollment.ts app-token-revoke https://manager.example:8444 TOKEN_ID \
+  --pki=./pki --otp=123456
+```
+
+The plaintext is printed once and only its SHA-256 is stored, like a node token. Creating and
+revoking one keeps every operator check there is — that is where the grant is decided — and *using*
+one has none of them.
+
+**Two scopes exist and no more.** `enrollment:token-create` reaches `POST /enrollment/tokens`;
+`enrollment:requests-read` reaches `GET /enrollment/requests`, which takes `?status=` and
+`?hostname=` in any combination — a caller that just planted a token can wait for that host's CSR to
+appear instead of reading the whole queue. **That read is narrowed to the token's own hostname
+pattern**: a `*.dev` token sees dev CSRs and is not told that prod or util exist. Asking for a host
+outside the pattern returns an empty list rather than a refusal, so the route cannot be used to map
+where the boundary is. Any other route answers 403 naming the token, and an
+unknown, expired or revoked token answers 401 saying only that. **An app token cannot sign, upload,
+reject or revoke anything** — the worst a leaked one can do is mint node tokens inside its hostname
+pattern and read the CSR queue, and a certificate still requires an operator holding a one-time code.
+
+The hostname pattern is an exact hostname or **one leading wildcard label**: `*.dev` covers
+`k3s-01.dev`, and covers neither `dev` nor `a.b.dev`. Node tokens issued this way are recorded with
+`createdBy: app:<label>#<id>` and an `appTokenId` in the audit row's detail — **the label alone is
+not an identifier**, because two live tokens may share one so that a rotation has no gap.
+
+Every accepted answer carries `X-Heliopause-App-Token-Expires-At`. The caller already holds the
+token, so this discloses nothing, and without it the first sign of a lapsed credential is a 401 in
+the middle of a provisioning run. Refusals never carry it.
+
+Two limits worth knowing before writing a caller. `lastUsedAt` on an app token records **minting
+only**: reading the CSR queue takes no lock and writes nothing, so a poller leaves no trace in that
+field — it answers "is anything still issuing with this credential", the question asked before
+revoking one. And app-token requests are counted by the same per-source bound as the certificate-less
+enrollment routes: **30 per minute per address**, per manager process, refused with 429.
+
+That bound is per *address*, not per token, and minting and polling spend the same budget. A
+dispatcher that does both from one egress address should poll no faster than about once every four
+seconds, and should treat a 429 as backpressure rather than a failure — the CSR it is waiting for
+will still be there. Several callers behind one NAT share the budget, which is the case to size
+for. A per-token bucket would remove that coupling; it is a planned follow-up and **is not present
+today**, so do not design a caller that assumes it.
+
 Point the manager at its revocation source with `HELIOPAUSE_REVOCATION_FILE`. It replicates a
 minimal snapshot to every relay over the existing publisher mTLS identity at startup, after each
 revocation, and once per minute. Provision each relay's empty denylist exactly once with
