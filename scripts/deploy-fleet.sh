@@ -116,10 +116,17 @@ deploy() {
 
   ssh -o ConnectTimeout=10 -o BatchMode=yes "${SSH_USER}@${addr}" "bash -s" <<EOS
 set -euo pipefail
-for p in $paths; do sudo cp -a /opt/heliopause/\$p /opt/heliopause/\$p.bak-$stamp; done
+# A path may be shipped here for the first time — `packages/i18n` was, when the relay grew a shared
+# package it had never needed before. Backing it up would `cp` a source that is not there yet and
+# `set -e` would abort the whole deploy; a path with no prior version simply has no backup to make.
+# And rsync writes into `/opt/heliopause/\$p/` but does not create a missing *parent* (`packages/`),
+# so a new nested path needs the tree made first. Both were measured on gw-01.util 2026-08-27.
+for p in $paths; do
+  if [ -e "/opt/heliopause/\$p" ]; then sudo cp -a "/opt/heliopause/\$p" "/opt/heliopause/\$p.bak-$stamp"; else echo "  \$p: new path, no backup"; fi
+done
 T=\$(mktemp -d)
 tar xzf /tmp/hp-code.tgz -C "\$T"
-for p in $paths; do sudo rsync -a --delete "\$T/\$p/" "/opt/heliopause/\$p/"; done
+for p in $paths; do sudo mkdir -p "/opt/heliopause/\$p"; sudo rsync -a --delete "\$T/\$p/" "/opt/heliopause/\$p/"; done
 rm -rf "\$T" /tmp/hp-code.tgz
 sudo systemctl restart $unit
 sleep 5
