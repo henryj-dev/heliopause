@@ -74,6 +74,30 @@ describe("the agent's required configuration is documented where it is copied fr
     assert.match(read("../packaging/systemd/README.md"), /enable --now heliopause-agent\.path/);
   });
 
+  it("keeps the enrollment token where the enrollment unit is allowed to delete it", () => {
+    // Three places name the token file — the script's default, the example the operator copies, and
+    // the unit's ConditionPathExists — and the unit is ProtectSystem=strict, so a fourth thing has to
+    // hold: the path must sit under one of the unit's ReadWritePaths, or the spent token can never be
+    // removed and the timer never reaches its no-op end state. It sat outside for a month
+    // (/etc/heliopause/enroll-token) and nothing here said so; stardust read it off the unit file.
+    const script = read("../agent/heliopause-enroll.py");
+    const scriptDefault = /HELIOPAUSE_ENROLL_TOKEN_FILE",\s*"([^"]+)"\)/.exec(script)?.[1];
+    const example = read("../packaging/systemd/agent.env.example");
+    const exampleValue = /^#?HELIOPAUSE_ENROLL_TOKEN_FILE=(.+)$/m.exec(example)?.[1];
+    const unit = read("../packaging/systemd/heliopause-enroll.service");
+    const condition = /^ConditionPathExists=(.+)$/m.exec(unit)?.[1];
+    assert.ok(scriptDefault && exampleValue && condition, "could not find all three copies of the token path");
+    assert.equal(exampleValue, scriptDefault);
+    assert.equal(condition, scriptDefault);
+    const writable = (/^ReadWritePaths=(.+)$/m.exec(unit)?.[1] ?? "").split(/\s+/).filter(Boolean);
+    assert.ok(writable.length > 0, "the enrollment unit declares no ReadWritePaths");
+    assert.ok(
+      writable.some((dir) => scriptDefault.startsWith(dir.endsWith("/") ? dir : `${dir}/`)),
+      `${scriptDefault} is outside the unit's ReadWritePaths (${writable.join(" ")}) — the spent token could not be unlinked`,
+    );
+    assert.match(unit, /^ProtectSystem=strict$/m, "the invariant above only matters under ProtectSystem=strict; if that changed, revisit this test");
+  });
+
   it("documents every setting the manager cannot start without", () => {
     // The same gap, one process over. `env(name)` with no fallback exits 2 when unset, and the
     // signing path added one of those — a manager that would not come up after the image rolled

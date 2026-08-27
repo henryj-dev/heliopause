@@ -3,7 +3,12 @@ Description=heliopause host certificate enrollment
 Documentation=https://github.com/henryj-dev/heliopause
 Wants=network-online.target
 After=network-online.target
-ConditionPathExists=/etc/heliopause/enroll-token
+# The token lives under StateDirectory, which is the one place this unit may write. It used to be
+# /etc/heliopause/enroll-token, and with ProtectSystem=strict below the script's unlink of the spent
+# token could never have succeeded there (EROFS) — the file stayed until its TTL and this condition
+# kept the timer firing no-ops. The path must equal HELIOPAUSE_ENROLL_TOKEN_FILE in agent.env;
+# src/agent-provisioning.test.ts holds the three copies together.
+ConditionPathExists=/var/lib/heliopause-agent/enroll-token
 
 [Service]
 Type=oneshot

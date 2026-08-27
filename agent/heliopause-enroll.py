@@ -20,7 +20,16 @@ import urllib.request
 
 URL = os.environ.get("HELIOPAUSE_ENROLL_URL", "").rstrip("/")
 HOST_ID = os.environ.get("HELIOPAUSE_HOST_ID", "")
-TOKEN_FILE = os.environ.get("HELIOPAUSE_ENROLL_TOKEN_FILE", "/etc/heliopause/enroll-token")
+# Under the unit's StateDirectory, not under /etc/heliopause. The unit runs with
+# `ProtectSystem=strict`, which makes everything outside `ReadWritePaths` read-only — root included —
+# and /etc/heliopause is not in that list (only its pki/ subdirectory is). The token was at
+# /etc/heliopause/enroll-token until 2026-08-27, so `main()`'s unlink of the spent token would have
+# failed with EROFS on every enrolled host: non-fatal by design, but the token then sat on disk until
+# its TTL and `ConditionPathExists` kept the timer firing a no-op every five minutes — the opposite of
+# the end state the unlink exists to reach. Widening ReadWritePaths to /etc/heliopause would have made
+# agent.env writable too; moving one file into a directory that is already writable is the narrower
+# fix. Read by stardust from our unit file before the first host was built (exchange 102 §4).
+TOKEN_FILE = os.environ.get("HELIOPAUSE_ENROLL_TOKEN_FILE", "/var/lib/heliopause-agent/enroll-token")
 PKI_DIR = os.environ.get("HELIOPAUSE_PKI_DIR", "/etc/heliopause/pki")
 # The expected anchor, distributed out of band beside the enrollment token.
 #
@@ -299,9 +308,10 @@ def main():
     # next run has no token and no record of having finished, and the timer retries forever against a
     # credential that is gone.
     #
-    # The unit's `ConditionPathExists=/etc/heliopause/enroll-token` then makes the timer a no-op
-    # rather than a failure, which is the intended end state — re-enrolling means issuing a new token,
-    # which is already the procedure.
+    # The unit's `ConditionPathExists=` on this same path then makes the timer a no-op rather than a
+    # failure, which is the intended end state — re-enrolling means issuing a new token, which is
+    # already the procedure. That end state is only reachable because the file lives under a path the
+    # unit may write to; see the note at TOKEN_FILE.
     try:
         os.unlink(TOKEN_FILE)
     except OSError as e:
