@@ -10,6 +10,16 @@ export function tokenCreateBody(hostname: string, label: string, otp: string): s
   return JSON.stringify({ hostname, label, otp });
 }
 
+export function appTokenCreateBody(
+  label: string,
+  scopes: string[],
+  hostnamePattern: string,
+  ttlSec: number,
+  otp: string,
+): string {
+  return JSON.stringify({ label, scopes, hostnamePattern, ttlSec, otp });
+}
+
 export function otpBody(otp: string): string {
   return JSON.stringify({ otp });
 }

@@ -1,5 +1,5 @@
 import { t, type Lang } from "../../i18n.ts";
-import type { EnrollmentView, RequestRow, TokenRow } from "./store.ts";
+import type { AppTokenRow, EnrollmentView, RequestRow, TokenRow } from "./store.ts";
 
 export function isTokenActive(token: TokenRow, nowMs: number): boolean {
   if (token.revokedAt) return false;
@@ -69,6 +69,56 @@ export const TOKEN_STATE_KEY = {
   revoked: "m.revoked",
 } as const;
 
+export const APP_TOKEN_EXPIRING_DAYS = 14;
+
+export function appTokenActive(row: AppTokenRow, nowMs: number): boolean {
+  if (row.revokedAt) return false;
+  if (Number.isFinite(Date.parse(row.expiresAt)) && Date.parse(row.expiresAt) <= nowMs) return false;
+  return true;
+}
+
+export function daysUntil(iso: string, nowMs: number): number | null {
+  const parsed = Date.parse(iso);
+  if (!Number.isFinite(parsed)) return null;
+  return Math.floor((parsed - nowMs) / 86_400_000);
+}
+
+export type AppTokenState = "unused" | "used" | "expiring" | "expired" | "revoked";
+
+export function appTokenState(row: AppTokenRow, nowMs: number): AppTokenState {
+  if (row.revokedAt) return "revoked";
+  if (!appTokenActive(row, nowMs)) return "expired";
+  const left = daysUntil(row.expiresAt, nowMs);
+  if (left !== null && left < APP_TOKEN_EXPIRING_DAYS) return "expiring";
+  if (row.lastUsedAt === null) return "unused";
+  return "used";
+}
+
+export function appTokenTone(state: AppTokenState): "ok" | "warn" | "bad" | "info" | "mute" {
+  if (state === "expiring") return "warn";
+  if (state === "unused") return "info";
+  if (state === "used") return "ok";
+  return "mute";
+}
+
+export const APP_TOKEN_STATE_KEY = {
+  unused: "m.unused",
+  used: "m.used",
+  expiring: "m.appTokenExpiring",
+  expired: "m.expired",
+  revoked: "m.revoked",
+} as const;
+
+const SCOPE_KEY = {
+  "enrollment:token-create": "m.scopeTokenCreate",
+  "enrollment:requests-read": "m.scopeRequestsRead",
+} as const;
+
+export function scopeLabel(scope: string, lang: Lang = "en"): string {
+  const key = SCOPE_KEY[scope as keyof typeof SCOPE_KEY];
+  return key ? t(lang, key) : scope;
+}
+
 export const REQUEST_STATUS_KEY = {
   pending: "m.pending",
   conflict: "m.conflict",
@@ -84,6 +134,8 @@ export const AUDIT_ACTION_KEY = {
   "node-cert.upload": "m.auditCertUpload",
   "node-cert.fetch": "m.auditCertFetch",
   "certificate.revoke": "m.auditCertRevoke",
+  "app-token.create": "m.auditAppTokenCreate",
+  "app-token.revoke": "m.auditAppTokenRevoke",
 } as const;
 
 export function auditActionLabel(action: string, lang: Lang = "en"): string {
@@ -100,6 +152,10 @@ export const AUDIT_DETAIL_KEY = {
   caName: "m.caName",
   certificateSha256: "m.certSha",
   subject: "m.certSubject",
+  hostnamePattern: "m.hostnamePattern",
+  scopes: "m.scopes",
+  appTokenId: "m.appTokenId",
+  label: "c.label",
 } as const;
 
 export function auditDetailLine(
