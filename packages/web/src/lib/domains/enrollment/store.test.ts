@@ -135,6 +135,18 @@ describe("readAppToken", () => {
     });
     assert.equal(missingPattern.ok, false);
   });
+
+  it("rejects a row whose required string field is missing or the wrong type", () => {
+    for (const field of ["id", "label", "createdAt", "expiresAt"] as const) {
+      for (const bad of [undefined, 42, null]) {
+        const read = readEnrollmentView({
+          tokens: [], appTokens: [{ ...appToken, [field]: bad }], requests: [], revocations: [], events: [],
+        });
+        assert.equal(read.ok, false, `${field}=${String(bad)}`);
+        if (!read.ok) assert.equal(read.reason, "a app tokens row is malformed", `${field}=${String(bad)}`);
+      }
+    }
+  });
 });
 
 describe("enrollment actions", () => {

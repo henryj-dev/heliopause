@@ -533,6 +533,7 @@ export const MESSAGES = {
   "m.appNeedLabel": { en: "enter a label for the app token", ko: "앱 토큰 라벨을 적으십시오" },
   "m.appNeedScope": { en: "choose at least one scope", ko: "스코프를 하나 이상 고르십시오" },
   "m.appNeedPattern": { en: "enter a hostname pattern", ko: "호스트명 패턴을 적으십시오" },
+  "m.appNeedTtl": { en: "valid days must be a whole number of at least 1", ko: "유효 일수는 1 이상의 정수여야 한다" },
   "m.auditAppTokenCreate": { en: "issued an app token", ko: "앱 토큰을 발급했다" },
   "m.auditAppTokenRevoke": { en: "revoked an app token", ko: "앱 토큰을 폐기했다" },
   "m.hostnamePattern": { en: "hostname pattern", ko: "호스트명 패턴" },

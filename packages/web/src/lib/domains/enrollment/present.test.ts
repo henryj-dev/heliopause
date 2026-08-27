@@ -238,6 +238,13 @@ describe("the enrollment screen", () => {
     assert.doesNotMatch(pane, /csr sha256/);
     assert.match(pane, /m\.csrSha/);
   });
+
+  it("guards the app-token ttl and heads the scope picker", () => {
+    const src = readFileSync(new URL("./EnrollmentScreen.svelte", import.meta.url), "utf8");
+    assert.match(src, /Number\.isInteger\(appTtlDays\)/);
+    assert.match(src, /m\.appNeedTtl/);
+    assert.match(src, /m\.appScopesLabel/);
+  });
 });
 
 describe("readCsrFilter", () => {

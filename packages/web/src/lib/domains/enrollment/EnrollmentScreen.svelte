@@ -194,6 +194,10 @@
       fail(new Error(t(prefs.lang, "m.appNeedPattern")));
       return;
     }
+    if (!Number.isInteger(appTtlDays) || appTtlDays < 1) {
+      fail(new Error(t(prefs.lang, "m.appNeedTtl")));
+      return;
+    }
     const answer = await askWrite({ what: t(prefs.lang, "m.otpIssueApp") });
     if (answer === null) return;
     busy = "app-token-create";
@@ -496,6 +500,7 @@
   {#if canIssueAppToken(canWrite, stale)}
     <p>
       <input bind:value={appLabel} placeholder={t(prefs.lang, "m.appLabel")}>
+      <span class="dim">{t(prefs.lang, "m.appScopesLabel")}</span>
       {#each APP_SCOPES as scope (scope)}
         <label>
           <input type="checkbox" bind:group={appScopes} value={scope}>
