@@ -98,6 +98,25 @@ describe("the agent's required configuration is documented where it is copied fr
     assert.match(unit, /^ProtectSystem=strict$/m, "the invariant above only matters under ProtectSystem=strict; if that changed, revisit this test");
   });
 
+  it("creates its own /etc/heliopause/pki so a never-touched host does not die 226/NAMESPACE", () => {
+    // The script makedirs() the pki dir, but that is unreachable under ProtectSystem=strict: a
+    // directory named in ReadWritePaths is bind-mounted at namespace setup and must already exist,
+    // and a fresh host has no /etc/heliopause/pki — so the unit failed at step NAMESPACE before the
+    // script ran (measured on the first saga onboarding, web-01, 2026-08-28). ConfigurationDirectory
+    // creates it before the sandbox and makes it writable; a bare ReadWritePaths entry cannot.
+    const unit = read("../packaging/systemd/heliopause-enroll.service");
+    assert.match(
+      unit,
+      /^ConfigurationDirectory=heliopause\/pki$/m,
+      "the unit must create /etc/heliopause/pki itself (ConfigurationDirectory), not require it to pre-exist",
+    );
+    assert.doesNotMatch(
+      unit,
+      /^ReadWritePaths=[^\n]*\/etc\/heliopause\/pki/m,
+      "/etc/heliopause/pki as a bare ReadWritePaths requires it to pre-exist and 226s a never-touched host",
+    );
+  });
+
   it("documents every setting the manager cannot start without", () => {
     // The same gap, one process over. `env(name)` with no fallback exits 2 when unset, and the
     // signing path added one of those — a manager that would not come up after the image rolled
