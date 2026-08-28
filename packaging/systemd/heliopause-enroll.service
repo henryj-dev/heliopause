@@ -37,4 +37,14 @@ SystemCallErrorNumber=EPERM
 SystemCallArchitectures=native
 StateDirectory=heliopause-agent
 StateDirectoryMode=0700
-ReadWritePaths=/etc/heliopause/pki /var/lib/heliopause-agent
+# The script writes the signed certificate under /etc/heliopause/pki and makedirs() it if absent.
+# That self-creation is unreachable under ProtectSystem=strict: naming the directory in ReadWritePaths
+# makes systemd bind-mount it at namespace setup, which needs it to *already exist* — a fresh host has
+# no /etc/heliopause/pki, so the unit died `226/NAMESPACE` before the script ever ran. Measured on the
+# first saga onboarding (web-01.dev-icn-vtr, 2026-08-28): every timer fire failed at step NAMESPACE.
+# ConfigurationDirectory creates it (and its parent) with the right mode *before* the sandbox is built,
+# and makes it writable, so a host that was never touched by hand enrolls on its own. Persistent, not
+# reset on stop; contents (the cert) survive.
+ConfigurationDirectory=heliopause/pki
+ConfigurationDirectoryMode=0700
+ReadWritePaths=/var/lib/heliopause-agent
