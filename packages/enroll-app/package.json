@@ -1,0 +1,18 @@
+{
+  "name": "heliopause-enroll",
+  "version": "0.1.0",
+  "description": "Desktop GUI to list and approve/sign host-enrollment CSRs by shelling out to the vetted heliopause Node CLIs.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

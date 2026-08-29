@@ -1,0 +1,25 @@
+[package]
+name = "heliopause-enroll"
+version = "0.1.0"
+description = "GUI to list and approve/sign host-enrollment CSRs"
+authors = ["Henry Jang"]
+edition = "2021"
+rust-version = "1.77.2"
+
+# The binary crate (main.rs) delegates to the library crate (lib.rs), the
+# standard Tauri v2 split so the same entrypoint can serve desktop and mobile.
+[lib]
+name = "heliopause_enroll_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+# Used by `tauri build`; leaves `tauri dev` (uses the dev server) unaffected.
+custom-protocol = ["tauri/custom-protocol"]
