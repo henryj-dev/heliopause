@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
   APP_TOKEN_PREFIX, MAX_CREATED_BY_CHARS, appTokenAllowsHostname, appTokenCreatedBy,
-  createAppToken, createNodeToken, emptyEnrollmentDocument,
+  beginHostDeregistration, createAppToken, createNodeToken, emptyEnrollmentDocument,
   fetchNodeCertificate, initializeEnrollmentDocument,
   loadEnrollmentDocument, looksLikeAppToken, looksLikeNodeToken, lookupAppToken, lookupNodeToken, NODE_TOKEN_PREFIX,
   rejectNodeCsr, revokeAppToken, saveEnrollmentDocument, storeNodeCertificate, submitNodeCsr, validateNodeCsrAsync,
@@ -114,6 +114,69 @@ describe("standalone enrollment store", () => {
     delete legacy.tokens[0]!.expiresAt;
     saveEnrollmentDocument(path, legacy as never);
     assert.ok(Number.isFinite(Date.parse(loadEnrollmentDocument(path).tokens[0]!.expiresAt)));
+  });
+
+  it("migrates a missing lifecycle as legacy but refuses a malformed persisted lifecycle", () => {
+    const root = mkdtempSync(join(tmpdir(), "heliopause-enroll-lifecycle-"));
+    const path = join(root, "store.json");
+    try {
+      const document = emptyEnrollmentDocument();
+      createNodeToken(document, { hostname: "legacy.dev" });
+      const legacy = structuredClone(document) as unknown as { tokens: Array<Record<string, unknown>> };
+      delete legacy.tokens[0]!.hostLifecycleId;
+      writeFileSync(path, JSON.stringify(legacy));
+      assert.equal(loadEnrollmentDocument(path).tokens[0]!.hostLifecycleId, null);
+      for (const malformed of [7, {}, "", " lifecycle "]) {
+        legacy.tokens[0]!.hostLifecycleId = malformed;
+        writeFileSync(path, JSON.stringify(legacy));
+        assert.throws(() => loadEnrollmentDocument(path), /hostLifecycleId/);
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when persisted policy evidence skips credential and infrastructure ordering", () => {
+    const root = mkdtempSync(join(tmpdir(), "heliopause-enroll-order-"));
+    const path = join(root, "store.json");
+    try {
+      const document = emptyEnrollmentDocument();
+      createNodeToken(document, { hostname: "ordered.dev", hostLifecycleId: "life-1" });
+      const row = beginHostDeregistration(document, {
+        hostname: "ordered.dev", externalOperationId: "destroy-1", hostLifecycleId: "life-1",
+        reason: "instance-destroy", requestedBy: "stardust:ops", actor: "app:destroyer",
+        scope: { appTokenId: "app-1", label: "destroyer", hostnamePattern: "*.dev" }, relayNames: ["dev"],
+      }).row;
+      const ordered = structuredClone(document);
+      row.policy = {
+        state: "completed", queuedAt: row.createdAt, completedAt: row.createdAt, completedBy: "ops",
+        pullRequestUrl: "https://example.invalid/pull/1", commitSha: "a".repeat(40),
+        publishedGeneration: "generation-1", relays: [{ name: "dev", absentAt: row.createdAt }],
+      };
+      row.status = "completed";
+      writeFileSync(path, JSON.stringify(document));
+      assert.throws(() => loadEnrollmentDocument(path), /advanced policy before infrastructure destruction/);
+
+      const waitingWithEvidence = structuredClone(ordered);
+      waitingWithEvidence.hostDeregistrations[0]!.infrastructure = {
+        state: "waiting", provider: "vultr", providerInstanceId: "vm-1", destroyedAt: ordered.hostDeregistrations[0]!.createdAt,
+      };
+      writeFileSync(path, JSON.stringify(waitingWithEvidence));
+      assert.throws(() => loadEnrollmentDocument(path), /waiting infrastructure carries destruction evidence/);
+
+      const destroyedWithoutEvidence = structuredClone(ordered);
+      const malformed = destroyedWithoutEvidence.hostDeregistrations[0]!;
+      malformed.credentials.state = "ready_for_infrastructure_destroy";
+      malformed.credentials.relays[0]!.state = "installed";
+      malformed.infrastructure.state = "destroyed";
+      malformed.policy.state = "queued";
+      malformed.policy.queuedAt = malformed.createdAt;
+      malformed.status = "policy_pending";
+      writeFileSync(path, JSON.stringify(destroyedWithoutEvidence));
+      assert.throws(() => loadEnrollmentDocument(path), /destroyed infrastructure lacks confirmation evidence/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("runs attacker-controlled OpenSSL parsing off the event-loop thread", async () => {

@@ -115,9 +115,12 @@ import {
   type PlanSummary,
 } from "./approval.ts";
 import {
-  APP_TOKEN_SCOPES, EnrollmentError, appTokenAllowsHostname, appTokenCreatedBy, createAppToken, createNodeToken,
+  APP_TOKEN_SCOPES, EnrollmentError, appTokenAllowsHostname, appTokenCreatedBy, beginHostDeregistration,
+  completeHostDeregistrationPolicy, confirmHostInfrastructureDestroyed, createAppToken, createNodeToken,
   fetchNodeCertificate, looksLikeAppToken, looksLikeNodeToken, lookupAppToken,
   normalizeEnrollmentHostname, preflightNodeCsr, rejectNodeCsr, requireEnrollmentDocument,
+  recordHostDeregistrationReplication, reconcileHostDeregistrationRelays,
+  normalizeExternalOperationId,
   revokeAppToken, revokeCertificate, revokeNodeToken, storeNodeCertificate,
   submitValidatedNodeCsr, touchExistingNodeCsr, validateNodeCsrAsync, withEnrollmentTransaction,
   type AppTokenRecord, type AppTokenScope, type EnrollmentDocument, type NodeCsrRecord,
@@ -200,6 +203,7 @@ export const API_ROUTES: ReadonlySet<string> = new Set([
   "/enrollment/app-tokens",
   "/enrollment/audit",
   "/enrollment/revocations",
+  "/enrollment/host-deregistrations",
 ]);
 
 /**
@@ -222,6 +226,8 @@ export const API_ROUTE_PATTERNS: readonly RegExp[] = [
   /^\/enrollment\/app-tokens\/[^/]+\/revoke$/,
   /^\/enrollment\/requests\/[^/]+\/reject$/,
   /^\/enrollment\/requests\/[^/]+\/certificate$/,
+  /^\/enrollment\/host-deregistrations\/[^/]+\/[^/]+(?:\/infrastructure-destroyed)?$/,
+  /^\/enrollment\/host-deregistrations\/[^/]+\/[^/]+\/policy-completed$/,
 ];
 
 export type PendingOidcLogin = {
@@ -1039,16 +1045,25 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     if (!opts.enrollment) return [];
     const document = requireEnrollmentDocument(opts.enrollment.storeFile);
     const body = revocationReplicationBody(document.revocations);
-    return Promise.all(opts.relays.map(async (relay) => {
+    const snapshotFingerprints = document.revocations.map((row) => row.fingerprint256);
+    const results = await Promise.all(opts.relays.map(async (relay) => {
       try {
         const tls = await loadRelayCreds(relay);
         const answer = await relayCall<{ count: number }>(relay.url, "/revocations", "POST", body, tls, opts.timeoutMs ?? 5_000);
-        return { name: relay.name, ok: true as const, count: answer.count };
+        if (answer.count !== document.revocations.length) {
+          throw new Error(`relay installed ${answer.count} revocations; expected ${document.revocations.length}`);
+        }
+        return { name: relay.name, ok: true as const, count: answer.count, snapshotFingerprints };
       } catch (e) {
         log(`revocation sync to ${relay.name} FAILED: ${(e as Error).message}`, `${relay.name}(으)로의 폐기 동기화 실패: ${(e as Error).message}`);
-        return { name: relay.name, ok: false as const, error: (e as Error).message };
+        return { name: relay.name, ok: false as const, error: (e as Error).message, snapshotFingerprints };
       }
     }));
+    if (document.hostDeregistrations.length > 0) {
+      enrollmentWrite(opts.enrollment.storeFile, (current) =>
+        recordHostDeregistrationReplication(current, results, opts.relays.map((relay) => relay.name)));
+    }
+    return results;
   };
 
   // Only built when OIDC is configured, so a certificate-only deployment carries no session table and
@@ -1721,7 +1736,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     // Read routes are deliberately not covered. A cross-site `GET` cannot read the response without
     // CORS headers this server never sends, and refusing them would break nothing an attacker needs
     // while adding a way for the console to fail confusingly.
-    if (req.method === "POST") {
+    if (req.method === "POST" || req.method === "PUT") {
       const origin = req.headers["origin"];
       const site = req.headers["sec-fetch-site"];
       if (crossSiteRequest(req)) {
@@ -1734,15 +1749,56 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       }
     }
 
+    const policyComplete = /^\/enrollment\/host-deregistrations\/([^/]+)\/([^/]+)\/policy-completed$/.exec(url.pathname);
+    if (opts.enrollment && req.method === "PUT" && policyComplete) {
+      if (!mayWrite) return refuseWrite(res, who, url.pathname, principal.via);
+      try {
+        const rawBody: unknown = JSON.parse(await readBody(req));
+        if (!rawBody || typeof rawBody !== "object" || Array.isArray(rawBody)) {
+          throw new EnrollmentError("request body must be an object");
+        }
+        const body = rawBody as Record<string, unknown>;
+        if ((await requireOtp(principal, body, res, url.pathname)) === "answered") return;
+        const allowed = ["hostLifecycleId", "pullRequestUrl", "commitSha", "publishedGeneration", "relayConfirmations", "otp"];
+        if (Object.keys(body).some((key) => !allowed.includes(key))) throw new EnrollmentError("request contains unsupported fields");
+        if (typeof body.hostLifecycleId !== "string" || typeof body.pullRequestUrl !== "string"
+          || typeof body.commitSha !== "string" || typeof body.publishedGeneration !== "string"
+          || !Array.isArray(body.relayConfirmations)) {
+          throw new EnrollmentError("policy completion evidence is malformed");
+        }
+        const relayConfirmations = body.relayConfirmations.map((entry) => {
+          if (!entry || typeof entry !== "object" || Array.isArray(entry)
+            || Object.keys(entry).some((key) => !["name", "absentAt"].includes(key))) {
+            throw new EnrollmentError("relayConfirmations entries must contain only name and absentAt");
+          }
+          const candidate = entry as Record<string, unknown>;
+          if (typeof candidate.name !== "string" || typeof candidate.absentAt !== "string") {
+            throw new EnrollmentError("relayConfirmations entries require string name and absentAt");
+          }
+          return { name: candidate.name, absentAt: candidate.absentAt };
+        });
+        const row = enrollmentWrite(opts.enrollment.storeFile, (document) => completeHostDeregistrationPolicy(document, {
+          hostname: decodeURIComponent(policyComplete[1]!), externalOperationId: decodeURIComponent(policyComplete[2]!),
+          hostLifecycleId: body.hostLifecycleId as string, pullRequestUrl: body.pullRequestUrl as string,
+          commitSha: body.commitSha as string, publishedGeneration: body.publishedGeneration as string,
+          relayConfirmations, relayNames: opts.relays.map((relay) => relay.name), actor: who,
+        }));
+        return send(res, 200, { operation: row });
+      } catch (e) { return sendEnrollmentError(res, e); }
+    }
+
     if (opts.enrollment && req.method === "POST" && url.pathname === "/enrollment/tokens") {
       if (!mayWrite) return refuseWrite(res, who, url.pathname, principal.via);
       try {
         const body = JSON.parse(await readBody(req)) as {
-          hostname?: unknown; label?: unknown; revokeExisting?: unknown; ttlSec?: unknown; otp?: unknown;
+          hostname?: unknown; hostLifecycleId?: unknown; label?: unknown; revokeExisting?: unknown; ttlSec?: unknown; otp?: unknown;
         };
         if ((await requireOtp(principal, body, res, url.pathname)) === "answered") return;
+        if (typeof body.hostLifecycleId !== "string") throw new EnrollmentError("hostLifecycleId must be a string");
+        const hostLifecycleId = body.hostLifecycleId;
         const result = enrollmentWrite(opts.enrollment.storeFile, (document) => createNodeToken(document, {
           hostname: String(body.hostname ?? ""),
+          hostLifecycleId,
           label: typeof body.label === "string" ? body.label : undefined,
           createdBy: who,
           ...(body.revokeExisting === undefined
@@ -3162,9 +3218,10 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
   /**
    * Everything an app token is allowed to reach, and the two refusals in front of it.
    *
-   * The route table is **two entries and no more**, and that narrowness is the argument for issuing
-   * these credentials at all — a leaked app token mints node tokens inside its hostname pattern and
-   * reads the CSR queue. It cannot sign, upload, reject or revoke anything.
+   * The route table is explicit. Token minting and CSR reads remain non-destructive;
+   * `enrollment:host-deregister` is a separately issued destructive grant, constrained by the same
+   * hostname pattern and an immutable lifecycle id. It still cannot sign, upload, reject, or invoke
+   * arbitrary token/certificate revocation routes.
    *
    * ## Why an unknown token and a wrong route answer differently
    *
@@ -3205,7 +3262,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       // header, so it costs that caller nothing; a browser page that somehow obtained an app token
       // is precisely the case this refuses. The CSRF check is deliberately *not* kept — it reads a
       // cookie session, and an app token never has one.
-      if (req.method === "POST" && crossSiteRequest(req)) {
+      if ((req.method === "POST" || req.method === "PUT") && crossSiteRequest(req)) {
         log(
           `refused ${url.pathname} for an app token: cross-site request`,
           `앱 토큰의 ${url.pathname} 거부: 교차 사이트 요청`,
@@ -3213,9 +3270,11 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         return send(res, 403, { error: "cross-site requests cannot change the fleet" });
       }
 
+      const deregistrationRoute = /^\/enrollment\/host-deregistrations\/([^/]+)\/([^/]+)(?:\/(infrastructure-destroyed))?$/.exec(url.pathname);
       const scope: AppTokenScope | null =
         req.method === "POST" && url.pathname === "/enrollment/tokens" ? "enrollment:token-create"
           : req.method === "GET" && url.pathname === "/enrollment/requests" ? "enrollment:requests-read"
+            : deregistrationRoute && (req.method === "GET" || req.method === "PUT") ? "enrollment:host-deregister"
             : null;
 
       // ## The gate: a read, and what it does and does not settle
@@ -3280,8 +3339,103 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         return send(res, 200, { requests }, { "x-heliopause-app-token-expires-at": gate.expiresAt });
       }
 
+      if (scope === "enrollment:host-deregister" && deregistrationRoute) {
+        let wanted: string;
+        let externalOperationId: string;
+        try {
+          wanted = normalizeEnrollmentHostname(decodeURIComponent(deregistrationRoute[1]!));
+          externalOperationId = normalizeExternalOperationId(decodeURIComponent(deregistrationRoute[2]!));
+        } catch {
+          throw new EnrollmentError("host deregistration path is malformed");
+        }
+        if (!appTokenAllowsHostname(gate.hostnamePattern, wanted)) {
+          return send(res, 404, { error: "host deregistration not found" });
+        }
+        const responseHeaders = { "x-heliopause-app-token-expires-at": gate.expiresAt };
+        if (req.method === "GET") {
+          if (deregistrationRoute[3]) return send(res, 403, { error: `app token ${gate.label} is not authorised for ${url.pathname}` });
+          const row = enrollmentWrite(storeFile, (current) => {
+            const authorised = authoriseAppToken(current, plaintext, scope, url.pathname);
+            if (!appTokenAllowsHostname(authorised.hostnamePattern, wanted)) {
+              throw new EnrollmentError("host deregistration not found", 404);
+            }
+            const operation = current.hostDeregistrations.find((candidate) =>
+              candidate.hostname === wanted && candidate.externalOperationId === externalOperationId);
+            if (!operation || operation.scope.hostnamePattern !== authorised.hostnamePattern) {
+              throw new EnrollmentError("host deregistration not found", 404);
+            }
+            return operation.status === "completed"
+              ? operation
+              : reconcileHostDeregistrationRelays(operation, opts.relays.map((relay) => relay.name));
+          });
+          return send(res, 200, { operation: row }, responseHeaders);
+        }
+
+        const rawBody: unknown = JSON.parse(await readBody(req));
+        if (!rawBody || typeof rawBody !== "object" || Array.isArray(rawBody)) {
+          throw new EnrollmentError("request body must be an object");
+        }
+        const parsed = rawBody as Record<string, unknown>;
+        const allowedFields = deregistrationRoute[3]
+          ? ["hostLifecycleId", "provider", "providerInstanceId", "destroyedAt"]
+          : ["hostLifecycleId", "reason", "requestedBy"];
+        if (Object.keys(parsed).some((key) => !allowedFields.includes(key))) {
+          throw new EnrollmentError("request contains unsupported fields");
+        }
+        if (typeof parsed.hostLifecycleId !== "string") throw new EnrollmentError("hostLifecycleId must be a string");
+        if (deregistrationRoute[3] === "infrastructure-destroyed") {
+          if (parsed.provider !== "vultr") throw new EnrollmentError('provider must be exactly "vultr"');
+          if (typeof parsed.providerInstanceId !== "string") throw new EnrollmentError("providerInstanceId must be a string");
+          if (typeof parsed.destroyedAt !== "string") throw new EnrollmentError("destroyedAt must be a string");
+          const row = enrollmentWrite(storeFile, (current) => {
+            const authorised = authoriseAppToken(current, plaintext, scope, url.pathname);
+            if (!appTokenAllowsHostname(authorised.hostnamePattern, wanted)) {
+              throw new EnrollmentError("host deregistration not found", 404);
+            }
+            const existing = current.hostDeregistrations.find((candidate) =>
+              candidate.hostname === wanted && candidate.externalOperationId === externalOperationId);
+            if (!existing || existing.scope.hostnamePattern !== authorised.hostnamePattern) {
+              throw new EnrollmentError("host deregistration not found", 404);
+            }
+            return confirmHostInfrastructureDestroyed(current, {
+              hostname: wanted, externalOperationId, hostLifecycleId: parsed.hostLifecycleId as string,
+              provider: "vultr", providerInstanceId: parsed.providerInstanceId as string,
+              destroyedAt: parsed.destroyedAt as string, actor: appTokenCreatedBy(authorised.label, authorised.id),
+            });
+          });
+          return send(res, row.status === "completed" ? 200 : 202, { operation: row }, responseHeaders);
+        }
+        if (parsed.reason !== "instance-destroy") throw new EnrollmentError('reason must be exactly "instance-destroy"');
+        if (typeof parsed.requestedBy !== "string") throw new EnrollmentError("requestedBy must be a string");
+        const result = enrollmentWrite(storeFile, (current) => {
+          const authorised = authoriseAppToken(current, plaintext, scope, url.pathname);
+          if (!appTokenAllowsHostname(authorised.hostnamePattern, wanted)) {
+            throw new EnrollmentError("host deregistration not found", 404);
+          }
+          const existing = current.hostDeregistrations.find((candidate) =>
+            candidate.hostname === wanted && candidate.externalOperationId === externalOperationId);
+          if (existing && existing.scope.hostnamePattern !== authorised.hostnamePattern) {
+            throw new EnrollmentError("host deregistration not found", 404);
+          }
+          return beginHostDeregistration(current, {
+            hostname: wanted, externalOperationId, hostLifecycleId: parsed.hostLifecycleId as string,
+            reason: "instance-destroy", requestedBy: parsed.requestedBy as string,
+            actor: appTokenCreatedBy(authorised.label, authorised.id),
+            scope: { appTokenId: authorised.id, label: authorised.label, hostnamePattern: authorised.hostnamePattern },
+            relayNames: opts.relays.map((relay) => relay.name),
+          });
+        });
+        if (result.row.credentials.state !== "blocked") await replicateRevocations();
+        const current = requireEnrollmentDocument(storeFile).hostDeregistrations.find((candidate) =>
+          candidate.hostname === wanted && candidate.externalOperationId === externalOperationId)!;
+        return send(res, 202, { operation: current }, {
+          ...responseHeaders,
+          location: `/enrollment/host-deregistrations/${encodeURIComponent(wanted)}/${encodeURIComponent(externalOperationId)}`,
+        });
+      }
+
       const body = JSON.parse(await readBody(req)) as {
-        hostname?: unknown; label?: unknown; revokeExisting?: unknown; ttlSec?: unknown; otp?: unknown;
+        hostname?: unknown; hostLifecycleId?: unknown; label?: unknown; revokeExisting?: unknown; ttlSec?: unknown; otp?: unknown;
       };
       // An OTP arriving here is not a harmless extra field: it means the caller believes it is on the
       // operator path, where a one-time code is checked against a person. Ignoring it would let that
@@ -3296,6 +3450,8 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       // turn a malformed field into a plausible value. See `security-audits/2026-08-25-audit-todo.md`
       // A1 for the measured version of that mistake.
       if (typeof body.hostname !== "string") throw new EnrollmentError("hostname must be a string");
+      if (typeof body.hostLifecycleId !== "string") throw new EnrollmentError("hostLifecycleId must be a string");
+      const hostLifecycleId = body.hostLifecycleId;
       const label = typeof body.label === "string" ? body.label : undefined;
       if (body.label !== undefined && label === undefined) throw new EnrollmentError("label must be a string");
       const revokeExisting = typeof body.revokeExisting === "boolean" ? body.revokeExisting : undefined;
@@ -3324,6 +3480,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
           label: row.label, id: row.id, expiresAt: row.expiresAt,
           ...createNodeToken(document, {
             hostname: wanted,
+            hostLifecycleId,
             ...(label === undefined ? {} : { label }),
             // Both halves, because **a label is not an identifier**: two live app tokens may share
             // one so that a rotation has no gap, and `app:dispatcher` alone cannot say which of them
@@ -3497,7 +3654,14 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     );
   }
 
-  await new Promise<void>((resolve) => server.listen(opts.port, opts.hostname ?? "::", resolve));
+  await new Promise<void>((resolve, reject) => {
+    const failed = (error: Error) => reject(error);
+    server.once("error", failed);
+    server.listen(opts.port, opts.hostname ?? "::", () => {
+      server.off("error", failed);
+      resolve();
+    });
+  });
   logEvent("server.listening", {
     address: `${opts.hostname ?? "::"}:${opts.port}, aggregating ${opts.relays.length} relay(s): ${opts.relays.map((r) => r.name).join(", ")}`,
   });

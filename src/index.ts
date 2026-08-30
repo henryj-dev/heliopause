@@ -31,6 +31,11 @@ export {
   saveEnrollmentDocument,
   withEnrollmentTransaction,
   createNodeToken,
+  beginHostDeregistration,
+  recordHostDeregistrationReplication,
+  reconcileHostDeregistrationRelays,
+  confirmHostInfrastructureDestroyed,
+  completeHostDeregistrationPolicy,
   revokeNodeToken,
   lookupNodeToken,
   looksLikeNodeToken,
@@ -52,6 +57,8 @@ export {
   appTokenAllowsHostname,
   appTokenCreatedBy,
   normalizeEnrollmentHostname,
+  normalizeHostLifecycleId,
+  normalizeExternalOperationId,
   APP_TOKEN_PREFIX,
   APP_TOKEN_SCOPES,
   DEFAULT_APP_TOKEN_TTL_SEC,
@@ -66,6 +73,12 @@ export {
   type NodeCsrPreflight,
   type CsrStatus,
   type CertificateRevocation,
+  type HostDeregistrationRecord,
+  type HostDeregistrationRequest,
+  type HostDeregistrationCredentialState,
+  type HostDeregistrationRelay,
+  type HostLifecycleTombstone,
+  type RevocationReplicationResult,
 } from "./enrollment-store.ts";
 export { certificateIsRevoked, peerFingerprint256, type RevocationSourceFormat } from "./certificate-revocation.ts";
 export {
