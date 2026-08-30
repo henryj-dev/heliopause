@@ -1,0 +1,17 @@
+node_modules/
+src-tauri/target/
+dist/
+
+# Tauri generated
+src-tauri/gen/schemas/
+
+# OS / editor cruft
+.DS_Store
+
+# Generated icons (binary — this repo forbids NUL in tracked files; regenerate before build)
+src-tauri/icons/*.png
+src-tauri/icons/*.ico
+src-tauri/icons/*.icns
+
+# OMC session state (never commit)
+.omc/
