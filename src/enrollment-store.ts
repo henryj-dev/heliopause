@@ -6,7 +6,9 @@ import {
 } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { isMainThread, parentPort, Worker, workerData } from "node:worker_threads";
-import { parseRevocationSnapshot } from "./revocation-snapshot.ts";
+import {
+  MAX_REVOCATION_ROWS, parseRevocationSnapshot, serializeRevocationSnapshot,
+} from "./revocation-snapshot.ts";
 
 export const ENROLLMENT_SCHEMA = 1 as const;
 export const NODE_TOKEN_PREFIX = "stnode_";
@@ -68,13 +70,15 @@ const SHA256 = /^[0-9a-f]{64}$/;
 const CSR_PEM = /^-----BEGIN CERTIFICATE REQUEST-----\r?\n[A-Za-z0-9+/=\r\n]+-----END CERTIFICATE REQUEST-----\r?\n?$/;
 const CERT_PEM = /^-----BEGIN CERTIFICATE-----\r?\n[A-Za-z0-9+/=\r\n]+-----END CERTIFICATE-----\r?\n?$/;
 
-export type CsrStatus = "pending" | "conflict" | "rejected" | "signed";
+export type CsrStatus = "pending" | "conflict" | "rejected" | "signed" | "host-deregistered";
 export interface NodeTokenRecord {
   id: string; hostname: string; tokenHash: string; label: string | null; createdBy: string | null;
+  hostLifecycleId: string | null;
   createdAt: string; expiresAt: string; lastUsedAt: string | null; revokedAt: string | null;
 }
 export interface NodeCsrRecord {
   id: string; hostname: string; nodeTokenId: string; status: CsrStatus; csrPem: string;
+  hostLifecycleId: string | null;
   csrSha256: string; publicKeySha256: string; keyAlgorithm: "ECDSA-P256"; createdAt: string;
   sourceIp: string | null; decidedAt: string | null; decidedBy: string | null;
   decisionReason: string | null; signedAt: string | null; caName: string | null;
@@ -90,16 +94,51 @@ export interface EnrollmentAuditEvent {
   detail: Record<string, string | number | boolean | null>;
 }
 export interface CertificateRevocation { fingerprint256: string; subject: string | null; reason: string; actor: string; revokedAt: string; }
+export type HostDeregistrationCredentialState =
+  "accepted" | "closing" | "replicating" | "ready_for_infrastructure_destroy" | "blocked";
+export interface HostLifecycleTombstone {
+  hostname: string; hostLifecycleId: string; externalOperationId: string; createdAt: string;
+}
+export interface HostDeregistrationRelay {
+  name: string; state: "pending" | "installed" | "failed"; updatedAt: string | null; error: string | null;
+}
+export interface HostDeregistrationRecord {
+  id: string;
+  status: "credentials_pending" | "ready_for_infrastructure_destroy" | "policy_pending" | "completed" | "blocked";
+  hostname: string; externalOperationId: string; hostLifecycleId: string;
+  reason: "instance-destroy"; requestedBy: string; createdAt: string; updatedAt: string;
+  scope: { appTokenId: string; label: string; hostnamePattern: string };
+  credentials: {
+    state: HostDeregistrationCredentialState; tombstone: "persisted";
+    tokens: { revoked: number; alreadyRevoked: number };
+    requests: { closed: number; alreadyClosed: number };
+    certificates: { revoked: number; alreadyRevoked: number; expired: number };
+    requiredRevocationFingerprints: string[];
+    relays: HostDeregistrationRelay[];
+  };
+  infrastructure: {
+    state: "waiting" | "destroyed"; provider: "vultr" | null; providerInstanceId: string | null;
+    destroyedAt: string | null;
+  };
+  policy: {
+    state: "waiting_for_infrastructure_destroy" | "queued" | "pr_open" | "merged" | "published" | "completed" | "blocked";
+    queuedAt: string | null; completedAt: string | null; completedBy: string | null;
+    pullRequestUrl: string | null; commitSha: string | null; publishedGeneration: string | null;
+    relays: Array<{ name: string; absentAt: string }>;
+  };
+  blocked: { code: string; operatorAction: string } | null;
+}
 /**
- * Everything an app token is allowed to ask for. **These two and no more.**
+ * Everything an app token is allowed to ask for.
  *
- * There is no `enrollment:sign`, no `enrollment:certificate-upload` and no `enrollment:revoke`, and
- * that is the argument for issuing these at all: the worst a leaked app token can do is mint node
- * tokens inside its hostname pattern and read the CSR queue. Signing stays with an operator holding
- * a certificate and a one-time code. Adding a scope here moves that line — do not do it to make a
- * caller's day easier.
+ * There is no general `enrollment:sign`, `enrollment:certificate-upload` or `enrollment:revoke`.
+ * `enrollment:host-deregister` is destructive, but only for one lifecycle under the token's
+ * hostname pattern; issue it solely to the zone authority that already destroys those VMs. Signing
+ * and arbitrary revocation stay with an operator holding a certificate and one-time code.
  */
-export const APP_TOKEN_SCOPES = ["enrollment:token-create", "enrollment:requests-read"] as const;
+export const APP_TOKEN_SCOPES = [
+  "enrollment:token-create", "enrollment:requests-read", "enrollment:host-deregister",
+] as const;
 export type AppTokenScope = (typeof APP_TOKEN_SCOPES)[number];
 export interface AppTokenRecord {
   id: string; label: string; tokenHash: string; scopes: AppTokenScope[]; hostnamePattern: string;
@@ -136,6 +175,8 @@ export interface EnrollmentDocument {
   schemaVersion: typeof ENROLLMENT_SCHEMA;
   tokens: NodeTokenRecord[]; requests: NodeCsrRecord[]; audit: EnrollmentAuditEvent[]; revocations: CertificateRevocation[];
   appTokens: AppTokenRecord[];
+  hostLifecycleTombstones: HostLifecycleTombstone[];
+  hostDeregistrations: HostDeregistrationRecord[];
 }
 export class EnrollmentError extends Error { readonly statusCode: number; constructor(message: string, statusCode = 400) { super(message); this.statusCode = statusCode; } }
 
@@ -146,6 +187,55 @@ function hostname(value: string): string {
   const out = value.trim().toLowerCase();
   if (!HOSTNAME.test(out)) throw new EnrollmentError(`invalid hostname: ${JSON.stringify(value)}`);
   return out;
+}
+const EXTERNAL_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const RFC3339 = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(Z|([+-])(\d{2}):(\d{2}))$/;
+function boundedExternalId(value: string, field: string): string {
+  const out = value.trim();
+  if (!EXTERNAL_ID.test(out)) throw new EnrollmentError(`${field} must be 1-128 safe identifier characters`);
+  return out;
+}
+export const normalizeHostLifecycleId = (value: string): string => boundedExternalId(value, "hostLifecycleId");
+export const normalizeExternalOperationId = (value: string): string => boundedExternalId(value, "externalOperationId");
+function normalizeRfc3339(value: string, field: string): string {
+  const match = RFC3339.exec(value);
+  if (!match) throw new EnrollmentError(`${field} must be an RFC3339 timestamp`);
+  const [, year, month, day, hour, minute, second, fraction = "", zone, sign, offsetHour, offsetMinute] = match;
+  const parts = [year, month, day, hour, minute, second].map(Number);
+  const milliseconds = Number(fraction.padEnd(3, "0"));
+  const wallClock = new Date(Date.UTC(parts[0]!, parts[1]! - 1, parts[2]!, parts[3]!, parts[4]!, parts[5]!, milliseconds));
+  if (wallClock.getUTCFullYear() !== parts[0] || wallClock.getUTCMonth() !== parts[1]! - 1
+    || wallClock.getUTCDate() !== parts[2] || wallClock.getUTCHours() !== parts[3]
+    || wallClock.getUTCMinutes() !== parts[4] || wallClock.getUTCSeconds() !== parts[5]
+    || (zone !== "Z" && (Number(offsetHour) > 23 || Number(offsetMinute) > 59))) {
+    throw new EnrollmentError(`${field} must be a valid RFC3339 timestamp`);
+  }
+  const offset = zone === "Z" ? 0 : (Number(offsetHour) * 60 + Number(offsetMinute)) * (sign === "+" ? 1 : -1);
+  return new Date(wallClock.getTime() - offset * 60_000).toISOString();
+}
+function normalizePastEvidenceTimestamp(value: string, field: string, now: Date): string {
+  const canonical = normalizeRfc3339(value, field);
+  if (Date.parse(canonical) > now.getTime()) throw new EnrollmentError(`${field} cannot be in the future`);
+  return canonical;
+}
+function isCanonicalRfc3339(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  try { return normalizeRfc3339(value, "timestamp") === value; } catch { return false; }
+}
+function lifecycleTombstone(document: EnrollmentDocument, host: string, lifecycle: string | null): HostLifecycleTombstone | null {
+  return document.hostLifecycleTombstones.find((row) =>
+    row.hostname === host && (lifecycle === null || row.hostLifecycleId === lifecycle)) ?? null;
+}
+function assertLifecycleMayProvision(document: EnrollmentDocument, host: string, lifecycle: string | null): void {
+  const exact = lifecycleTombstone(document, host, lifecycle);
+  if (exact) throw new EnrollmentError(`host lifecycle ${exact.hostLifecycleId} is deregistered`, 409);
+  const retired = document.hostDeregistrations.find((row) => row.hostname === host);
+  if (retired) {
+    throw new EnrollmentError(
+      `hostname ${host} is retired by deregistration ${retired.externalOperationId}; an operator must explicitly reopen it before reuse`,
+      409,
+    );
+  }
 }
 function openssl(args: string[], input?: string | Buffer): Buffer {
   try {
@@ -164,7 +254,10 @@ function openssl(args: string[], input?: string | Buffer): Buffer {
 function parse(raw: unknown, source: string): EnrollmentDocument {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new EnrollmentError(`${source}: enrollment store must be an object`);
   const d = raw as Partial<EnrollmentDocument>;
-  const allowed = ["schemaVersion", "tokens", "requests", "audit", "revocations", "appTokens"];
+  const allowed = [
+    "schemaVersion", "tokens", "requests", "audit", "revocations", "appTokens",
+    "hostLifecycleTombstones", "hostDeregistrations",
+  ];
   if (Object.keys(d).some((key) => !allowed.includes(key))) {
     throw new EnrollmentError(`${source}: enrollment store contains unsupported fields`);
   }
@@ -172,12 +265,15 @@ function parse(raw: unknown, source: string): EnrollmentDocument {
     throw new EnrollmentError(`${source}: invalid enrollment schema`);
   }
   const tokens = (d.tokens as NodeTokenRecord[]).map((token) => {
-    if (typeof token.expiresAt === "string" && Number.isFinite(Date.parse(token.expiresAt))) return token;
+    const lifecycle = parsedStoredLifecycle(token.hostLifecycleId, source, "node token");
+    if (typeof token.expiresAt === "string" && Number.isFinite(Date.parse(token.expiresAt))) {
+      return { ...token, hostLifecycleId: lifecycle };
+    }
     // Schema-1 stores written before expiry was introduced are bounded from their original issue
     // time. They do not become immortal merely because they predate this field.
     const created = Date.parse(String(token.createdAt));
     return {
-      ...token,
+      ...token, hostLifecycleId: lifecycle,
       expiresAt: new Date(Number.isFinite(created) ? created + DEFAULT_NODE_TOKEN_TTL_SEC * 1_000 : 0).toISOString(),
     };
   });
@@ -191,6 +287,15 @@ function parse(raw: unknown, source: string): EnrollmentDocument {
   if (d.appTokens !== undefined && !Array.isArray(d.appTokens)) {
     throw new EnrollmentError(`${source}: enrollment store appTokens must be an array`);
   }
+  if (d.hostLifecycleTombstones !== undefined && !Array.isArray(d.hostLifecycleTombstones)) {
+    throw new EnrollmentError(`${source}: enrollment store hostLifecycleTombstones must be an array`);
+  }
+  if (d.hostDeregistrations !== undefined && !Array.isArray(d.hostDeregistrations)) {
+    throw new EnrollmentError(`${source}: enrollment store hostDeregistrations must be an array`);
+  }
+  const requests = (d.requests as NodeCsrRecord[]).map((request) => ({
+    ...request, hostLifecycleId: parsedStoredLifecycle(request.hostLifecycleId, source, "CSR request"),
+  }));
   // ## Why each row is checked and not merely counted
   //
   // 🔴 `scopes` is the field that decides authority, and the check that reads it is
@@ -231,16 +336,186 @@ function parse(raw: unknown, source: string): EnrollmentDocument {
       }
     }
   }
+  const tombstones = (d.hostLifecycleTombstones ?? []) as HostLifecycleTombstone[];
+  const tombstoneKeys = new Set<string>();
+  for (const row of tombstones) {
+    exactObject(row, ["hostname", "hostLifecycleId", "externalOperationId", "createdAt"], `${source}: lifecycle tombstone`);
+    if (hostname(row.hostname) !== row.hostname || normalizeHostLifecycleId(row.hostLifecycleId) !== row.hostLifecycleId
+      || normalizeExternalOperationId(row.externalOperationId) !== row.externalOperationId
+      || !Number.isFinite(Date.parse(row.createdAt))) {
+      throw new EnrollmentError(`${source}: invalid lifecycle tombstone`);
+    }
+    const key = `${row.hostname}\0${row.hostLifecycleId}`;
+    if (tombstoneKeys.has(key)) throw new EnrollmentError(`${source}: duplicate lifecycle tombstone`);
+    tombstoneKeys.add(key);
+  }
+  const deregistrations = (d.hostDeregistrations ?? []) as HostDeregistrationRecord[];
+  const keys = new Set<string>();
+  for (const row of deregistrations) {
+    exactObject(row, [
+      "id", "status", "hostname", "externalOperationId", "hostLifecycleId", "reason", "requestedBy", "scope",
+      "credentials", "infrastructure", "policy", "blocked", "createdAt", "updatedAt",
+    ], `${source}: host deregistration`);
+    normalizeExternalOperationId(row.id);
+    if (hostname(row.hostname) !== row.hostname || normalizeExternalOperationId(row.externalOperationId) !== row.externalOperationId
+      || normalizeHostLifecycleId(row.hostLifecycleId) !== row.hostLifecycleId || row.reason !== "instance-destroy"
+      || typeof row.requestedBy !== "string" || !row.requestedBy || row.requestedBy.length > 200
+      || !Number.isFinite(Date.parse(row.createdAt)) || !Number.isFinite(Date.parse(row.updatedAt))) {
+      throw new EnrollmentError(`${source}: invalid host deregistration identity`);
+    }
+    const key = `${row.hostname}\0${row.externalOperationId}`;
+    if (keys.has(key)) throw new EnrollmentError(`${source}: duplicate host deregistration key`);
+    keys.add(key);
+    if (!["credentials_pending", "ready_for_infrastructure_destroy", "policy_pending", "completed", "blocked"].includes(row.status)) {
+      throw new EnrollmentError(`${source}: invalid host deregistration status`);
+    }
+    exactObject(row.scope, ["appTokenId", "label", "hostnamePattern"], `${source}: host deregistration scope`);
+    if (![row.scope.appTokenId, row.scope.label, row.scope.hostnamePattern].every((value) => typeof value === "string" && value.length > 0)
+      || appTokenHostnamePattern(row.scope.hostnamePattern) !== row.scope.hostnamePattern) {
+      throw new EnrollmentError(`${source}: invalid host deregistration scope`);
+    }
+    exactObject(row.credentials, [
+      "state", "tombstone", "tokens", "requests", "certificates", "requiredRevocationFingerprints", "relays",
+    ], `${source}: host deregistration credentials`);
+    if (!["accepted", "closing", "replicating", "ready_for_infrastructure_destroy", "blocked"].includes(row.credentials.state)
+      || row.credentials.tombstone !== "persisted" || !Array.isArray(row.credentials.relays)
+      || !Array.isArray(row.credentials.requiredRevocationFingerprints)
+      || row.credentials.requiredRevocationFingerprints.some((value) => typeof value !== "string" || !SHA256.test(value))) {
+      throw new EnrollmentError(`${source}: invalid host deregistration credentials`);
+    }
+    for (const [value, fields, what] of [
+      [row.credentials.tokens, ["revoked", "alreadyRevoked"], "tokens"],
+      [row.credentials.requests, ["closed", "alreadyClosed"], "requests"],
+      [row.credentials.certificates, ["revoked", "alreadyRevoked", "expired"], "certificates"],
+    ] as const) {
+      exactObject(value, fields, `${source}: host deregistration ${what}`);
+      const counts = value as Record<string, unknown>;
+      if (fields.some((field) => !Number.isSafeInteger(counts[field]) || (counts[field] as number) < 0)) {
+        throw new EnrollmentError(`${source}: invalid host deregistration ${what} counts`);
+      }
+    }
+    const relayNames = new Set<string>();
+    for (const relay of row.credentials.relays) {
+      exactObject(relay, ["name", "state", "updatedAt", "error"], `${source}: host deregistration relay`);
+      if (typeof relay.name !== "string" || !relay.name || relay.name.length > 120 || relayNames.has(relay.name)
+        || !["pending", "installed", "failed"].includes(relay.state)
+        || (relay.updatedAt !== null && (typeof relay.updatedAt !== "string" || !Number.isFinite(Date.parse(relay.updatedAt))))
+        || (relay.error !== null && typeof relay.error !== "string")) {
+        throw new EnrollmentError(`${source}: invalid host deregistration relay`);
+      }
+      relayNames.add(relay.name);
+    }
+    exactObject(row.infrastructure, ["state", "provider", "providerInstanceId", "destroyedAt"], `${source}: host deregistration infrastructure`);
+    if (!["waiting", "destroyed"].includes(row.infrastructure.state)
+      || (row.infrastructure.provider !== null && row.infrastructure.provider !== "vultr")
+      || (row.infrastructure.providerInstanceId !== null && typeof row.infrastructure.providerInstanceId !== "string")
+      || (row.infrastructure.destroyedAt !== null && !isCanonicalRfc3339(row.infrastructure.destroyedAt))) {
+      throw new EnrollmentError(`${source}: invalid host deregistration infrastructure`);
+    }
+    if (row.infrastructure.state === "waiting" && (row.infrastructure.provider !== null
+      || row.infrastructure.providerInstanceId !== null || row.infrastructure.destroyedAt !== null)) {
+      throw new EnrollmentError(`${source}: waiting infrastructure carries destruction evidence`);
+    }
+    if (row.infrastructure.state === "destroyed" && (row.infrastructure.provider !== "vultr"
+      || typeof row.infrastructure.providerInstanceId !== "string"
+      || boundedExternalId(row.infrastructure.providerInstanceId, "providerInstanceId") !== row.infrastructure.providerInstanceId
+      || !isCanonicalRfc3339(row.infrastructure.destroyedAt))) {
+      throw new EnrollmentError(`${source}: destroyed infrastructure lacks confirmation evidence`);
+    }
+    exactObject(row.policy, [
+      "state", "queuedAt", "completedAt", "completedBy", "pullRequestUrl", "commitSha", "publishedGeneration", "relays",
+    ], `${source}: host deregistration policy`);
+    if (!["waiting_for_infrastructure_destroy", "queued", "pr_open", "merged", "published", "completed", "blocked"].includes(row.policy.state)) {
+      throw new EnrollmentError(`${source}: invalid host deregistration policy`);
+    }
+    for (const field of ["queuedAt", "completedAt"] as const) {
+      if (row.policy[field] !== null && (typeof row.policy[field] !== "string" || !Number.isFinite(Date.parse(row.policy[field]!)))) {
+        throw new EnrollmentError(`${source}: invalid host deregistration policy timestamp`);
+      }
+    }
+    for (const field of ["completedBy", "pullRequestUrl", "commitSha", "publishedGeneration"] as const) {
+      if (row.policy[field] !== null && typeof row.policy[field] !== "string") throw new EnrollmentError(`${source}: invalid host deregistration policy evidence`);
+    }
+    if (!Array.isArray(row.policy.relays)) throw new EnrollmentError(`${source}: invalid host deregistration policy relays`);
+    const policyRelayNames = new Set<string>();
+    for (const relay of row.policy.relays) {
+      exactObject(relay, ["name", "absentAt"], `${source}: host deregistration policy relay`);
+      if (typeof relay.name !== "string" || !relay.name || policyRelayNames.has(relay.name)
+        || !isCanonicalRfc3339(relay.absentAt)) {
+        throw new EnrollmentError(`${source}: invalid host deregistration policy relay`);
+      }
+      policyRelayNames.add(relay.name);
+    }
+    if (row.blocked !== null) {
+      exactObject(row.blocked, ["code", "operatorAction"], `${source}: host deregistration block`);
+      if (typeof row.blocked.code !== "string" || typeof row.blocked.operatorAction !== "string") {
+        throw new EnrollmentError(`${source}: invalid host deregistration block`);
+      }
+    }
+    const matchingTombstone = tombstones.filter((tombstone) =>
+      tombstone.hostname === row.hostname && tombstone.hostLifecycleId === row.hostLifecycleId
+      && tombstone.externalOperationId === row.externalOperationId);
+    if (matchingTombstone.length !== 1) throw new EnrollmentError(`${source}: host deregistration has no unique matching tombstone`);
+    if (row.credentials.state === "ready_for_infrastructure_destroy"
+      && (row.credentials.relays.length === 0 || row.credentials.relays.some((relay) => relay.state !== "installed"))) {
+      throw new EnrollmentError(`${source}: host deregistration claims ready without relay installation evidence`);
+    }
+    if (row.infrastructure.state === "destroyed" && row.credentials.state !== "ready_for_infrastructure_destroy") {
+      throw new EnrollmentError(`${source}: host deregistration destroyed infrastructure before credentials were ready`);
+    }
+    const policyAdvanced = row.policy.state !== "waiting_for_infrastructure_destroy";
+    if (policyAdvanced && row.infrastructure.state !== "destroyed") {
+      throw new EnrollmentError(`${source}: host deregistration advanced policy before infrastructure destruction`);
+    }
+    if (row.infrastructure.state === "destroyed" && row.policy.state === "waiting_for_infrastructure_destroy") {
+      throw new EnrollmentError(`${source}: destroyed infrastructure did not queue policy removal`);
+    }
+    if (row.status !== hostDeregistrationStatus(row)) {
+      throw new EnrollmentError(`${source}: host deregistration top-level status is inconsistent`);
+    }
+    if (row.policy.state === "completed" && (row.credentials.state !== "ready_for_infrastructure_destroy"
+      || row.infrastructure.state !== "destroyed" || !row.policy.completedAt || !row.policy.completedBy
+      || !row.policy.pullRequestUrl || !row.policy.commitSha || !row.policy.publishedGeneration
+      || row.policy.relays.length === 0)) {
+      throw new EnrollmentError(`${source}: completed host deregistration lacks policy publication evidence`);
+    }
+  }
+  for (const tombstone of tombstones) {
+    const operations = deregistrations.filter((row) => row.hostname === tombstone.hostname
+      && row.hostLifecycleId === tombstone.hostLifecycleId && row.externalOperationId === tombstone.externalOperationId);
+    if (operations.length !== 1) throw new EnrollmentError(`${source}: lifecycle tombstone has no unique operation`);
+  }
   return {
     schemaVersion: ENROLLMENT_SCHEMA,
     tokens,
-    requests: d.requests as NodeCsrRecord[],
+    requests,
     audit: d.audit as EnrollmentAuditEvent[],
     revocations,
     appTokens: (d.appTokens as AppTokenRecord[] | undefined) ?? [],
+    hostLifecycleTombstones: tombstones,
+    hostDeregistrations: deregistrations,
   };
 }
-export const emptyEnrollmentDocument = (): EnrollmentDocument => ({ schemaVersion: 1, tokens: [], requests: [], audit: [], revocations: [], appTokens: [] });
+
+function parsedStoredLifecycle(value: unknown, source: string, what: string): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string" || normalizeHostLifecycleId(value) !== value) {
+    throw new EnrollmentError(`${source}: ${what} hostLifecycleId is invalid`);
+  }
+  return value;
+}
+
+function exactObject(value: unknown, fields: readonly string[], what: string): asserts value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || Object.keys(value).some((key) => !fields.includes(key))
+    || fields.some((key) => !Object.prototype.hasOwnProperty.call(value, key))) {
+    throw new EnrollmentError(`${what} has an invalid shape`);
+  }
+}
+export const emptyEnrollmentDocument = (): EnrollmentDocument => ({
+  schemaVersion: 1, tokens: [], requests: [], audit: [], revocations: [], appTokens: [],
+  hostLifecycleTombstones: [], hostDeregistrations: [],
+});
 function readEnrollmentDocument(path: string): EnrollmentDocument {
   const full = resolve(path);
   try { return parse(JSON.parse(readFileSync(full, "utf8")), full); }
@@ -394,8 +669,10 @@ function audit(document: EnrollmentDocument, event: Omit<EnrollmentAuditEvent, "
  * token, which is exactly the question asked when one of them turns out to be leaked. So the id goes
  * into `detail.appTokenId`, structured, next to a `createdBy` that carries both.
  */
-export function createNodeToken(document: EnrollmentDocument, input: { hostname: string; label?: string; createdBy?: string; appTokenId?: string; revokeExisting?: boolean; ttlSec?: number; now?: Date }) {
+export function createNodeToken(document: EnrollmentDocument, input: { hostname: string; hostLifecycleId?: string; label?: string; createdBy?: string; appTokenId?: string; revokeExisting?: boolean; ttlSec?: number; now?: Date }) {
   const host = hostname(input.hostname); const issuedAt = input.now ?? new Date(); const at = nowIso(issuedAt);
+  const hostLifecycleId = input.hostLifecycleId === undefined ? null : normalizeHostLifecycleId(input.hostLifecycleId);
+  assertLifecycleMayProvision(document, host, hostLifecycleId);
   if (input.revokeExisting !== undefined && typeof input.revokeExisting !== "boolean") {
     throw new EnrollmentError("revokeExisting must be a boolean");
   }
@@ -406,12 +683,12 @@ export function createNodeToken(document: EnrollmentDocument, input: { hostname:
   if (input.revokeExisting ?? true) for (const token of document.tokens) if (token.hostname === host && !token.revokedAt) token.revokedAt = at;
   const token = `${NODE_TOKEN_PREFIX}${randomHex(32)}`;
   const row: NodeTokenRecord = { id: randomHex(8), hostname: host, tokenHash: sha256(token), label: input.label?.trim().slice(0, 120) || null,
-    createdBy: input.createdBy?.trim().slice(0, MAX_CREATED_BY_CHARS) || null, createdAt: at,
+    createdBy: input.createdBy?.trim().slice(0, MAX_CREATED_BY_CHARS) || null, hostLifecycleId, createdAt: at,
     expiresAt: new Date(issuedAt.getTime() + ttlSec * 1_000).toISOString(), lastUsedAt: null, revokedAt: null };
   document.tokens.push(row);
   audit(document, {
     actor: row.createdBy ?? "operator", action: "node-token.create", target: row.id, sourceIp: null,
-    detail: { hostname: host, ...(input.appTokenId === undefined ? {} : { appTokenId: input.appTokenId }) },
+    detail: { hostname: host, ...(hostLifecycleId === null ? {} : { hostLifecycleId }), ...(input.appTokenId === undefined ? {} : { appTokenId: input.appTokenId }) },
   }, input.now);
   return { document, token, row };
 }
@@ -687,6 +964,7 @@ export function preflightNodeCsr(
 ): NodeCsrPreflight {
   const token = lookupNodeToken(document, input.token, input.now);
   if (!token) throw new EnrollmentError("unauthorized node token", 401);
+  assertLifecycleMayProvision(document, token.hostname, token.hostLifecycleId);
   const pem = normalizeCsrPem(input.csrPem);
   const existing = document.requests.find((row) => row.hostname === token.hostname && row.csrPem === pem) ?? null;
   if (!existing) {
@@ -715,6 +993,7 @@ export function submitValidatedNodeCsr(
 ) {
   const token = lookupNodeToken(document, input.token, input.now);
   if (!token) throw new EnrollmentError("unauthorized node token", 401);
+  assertLifecycleMayProvision(document, token.hostname, token.hostLifecycleId);
   const csr = input.csr;
   if (csr.hostname !== token.hostname || csr.pem !== normalizeCsrPem(csr.pem)) {
     throw new EnrollmentError("validated CSR does not match the node token", 409);
@@ -724,7 +1003,8 @@ export function submitValidatedNodeCsr(
   const unresolved = document.requests.filter((row) => row.hostname === csr.hostname && (row.status === "pending" || row.status === "conflict"));
   if (unresolved.length >= MAX_PENDING_CSRS_PER_HOST) throw new EnrollmentError("too many unresolved CSRs for hostname", 429);
   const status: CsrStatus = unresolved.length ? "conflict" : "pending";
-  const row: NodeCsrRecord = { id: randomHex(16), hostname: csr.hostname, nodeTokenId: token.id, status, csrPem: csr.pem, csrSha256: csr.csrSha256,
+  const row: NodeCsrRecord = { id: randomHex(16), hostname: csr.hostname, nodeTokenId: token.id, hostLifecycleId: token.hostLifecycleId,
+    status, csrPem: csr.pem, csrSha256: csr.csrSha256,
     publicKeySha256: csr.publicKeySha256, keyAlgorithm: csr.keyAlgorithm, createdAt: nowIso(input.now), sourceIp: input.sourceIp ?? null,
     decidedAt: null, decidedBy: null, decisionReason: null, signedAt: null, caName: null, certificatePem: null, caPem: null,
     certificateSha256: null, certificateNotBefore: null, certificateNotAfter: null, retrievedAt: null };
@@ -762,6 +1042,7 @@ export function validateNodeCertificate(certificatePem: string, caPem: string, r
 }
 export function storeNodeCertificate(document: EnrollmentDocument, input: { requestId: string; certificatePem: string; caPem: string; caName: string; actor: string; now?: Date }): NodeCsrRecord {
   const row = document.requests.find((request) => request.id === input.requestId); if (!row || !["pending", "conflict"].includes(row.status)) throw new EnrollmentError("CSR not found or already decided", 404);
+  assertLifecycleMayProvision(document, row.hostname, row.hostLifecycleId);
   const rivals = document.requests.filter((request) => request.hostname === row.hostname && request.id !== row.id && ["pending", "conflict"].includes(request.status));
   if (rivals.length) throw new EnrollmentError("unresolved CSR conflict for hostname", 409);
   const cert = validateNodeCertificate(input.certificatePem, input.caPem, row, input.now); row.status = "signed"; row.decidedAt = nowIso(input.now); row.decidedBy = input.actor; row.signedAt = row.decidedAt;
@@ -770,6 +1051,7 @@ export function storeNodeCertificate(document: EnrollmentDocument, input: { requ
 }
 export function fetchNodeCertificate(document: EnrollmentDocument, requestId: string, plaintextToken: string, sourceIp?: string | null, now = new Date()) {
   const token = lookupNodeToken(document, plaintextToken, now); if (!token) throw new EnrollmentError("unauthorized node token", 401);
+  assertLifecycleMayProvision(document, token.hostname, token.hostLifecycleId);
   const row = document.requests.find((request) => request.id === requestId && request.nodeTokenId === token.id && request.status === "signed");
   if (!row?.certificatePem || !row.caPem || !row.certificateSha256) {
     // ## Why this can be "not ready" for a certificate that is sitting right there
@@ -812,6 +1094,329 @@ export function revokeCertificate(document: EnrollmentDocument, input: { certifi
   const existing = document.revocations.find((row) => row.fingerprint256 === fingerprint256); if (existing) return existing;
   const row: CertificateRevocation = { fingerprint256, subject: cert.subject || null, reason: input.reason.trim().slice(0, 500), actor: input.actor, revokedAt: nowIso(input.now) };
   document.revocations.push(row); audit(document, { actor: input.actor, action: "certificate.revoke", target: fingerprint256, sourceIp: null, detail: { subject: row.subject, reason: row.reason } }, input.now); return row;
+}
+
+export type HostDeregistrationRequest = {
+  hostname: string; externalOperationId: string; hostLifecycleId: string;
+  reason: "instance-destroy"; requestedBy: string; actor: string; relayNames: readonly string[];
+  scope: { appTokenId: string; label: string; hostnamePattern: string }; now?: Date;
+};
+
+function normalizedRelayNames(names: readonly string[]): string[] {
+  const out = [...new Set(names.map((name) => name.trim()).filter(Boolean))].sort();
+  if (out.length !== names.length || out.some((name) => name.length > 120)) {
+    throw new EnrollmentError("configured relay names must be unique non-empty strings up to 120 characters", 503);
+  }
+  return out;
+}
+
+export function reconcileHostDeregistrationRelays(
+  row: HostDeregistrationRecord, relayNames: readonly string[], now = new Date(),
+): HostDeregistrationRecord {
+  if (row.infrastructure.state === "destroyed") return row;
+  const at = nowIso(now);
+  const existing = new Map(row.credentials.relays.map((relay) => [relay.name, relay]));
+  row.credentials.relays = normalizedRelayNames(relayNames).map((name) => existing.get(name) ?? ({
+    name, state: "pending", updatedAt: null, error: null,
+  }));
+  if (row.credentials.state !== "blocked") {
+    row.credentials.state = row.credentials.relays.length > 0
+      && row.credentials.relays.every((relay) => relay.state === "installed")
+      ? "ready_for_infrastructure_destroy"
+      : "replicating";
+  }
+  row.status = hostDeregistrationStatus(row);
+  row.updatedAt = at;
+  return row;
+}
+
+export function beginHostDeregistration(
+  document: EnrollmentDocument, input: HostDeregistrationRequest,
+): { row: HostDeregistrationRecord; created: boolean } {
+  const host = hostname(input.hostname);
+  const externalOperationId = normalizeExternalOperationId(input.externalOperationId);
+  const hostLifecycleId = normalizeHostLifecycleId(input.hostLifecycleId);
+  if (input.reason !== "instance-destroy") throw new EnrollmentError('reason must be exactly "instance-destroy"');
+  const requestedBy = input.requestedBy.trim();
+  if (!requestedBy || requestedBy.length > 200) throw new EnrollmentError("requestedBy must be 1-200 characters");
+  const existing = document.hostDeregistrations.find((row) =>
+    row.hostname === host && row.externalOperationId === externalOperationId);
+  if (existing) {
+    if (existing.hostLifecycleId !== hostLifecycleId || existing.reason !== input.reason || existing.requestedBy !== requestedBy) {
+      throw new EnrollmentError("host deregistration idempotency key was reused with a different request", 409);
+    }
+    if (existing.blocked?.code === "no_relays_configured" && input.relayNames.length > 0) {
+      existing.blocked = null;
+      existing.credentials.state = "replicating";
+      existing.status = "credentials_pending";
+    }
+    return {
+      row: existing.status === "completed" ? existing : reconcileHostDeregistrationRelays(existing, input.relayNames, input.now),
+      created: false,
+    };
+  }
+  const known = document.tokens.some((row) => row.hostname === host && row.hostLifecycleId === hostLifecycleId)
+    || document.requests.some((row) => row.hostname === host && row.hostLifecycleId === hostLifecycleId);
+  if (!known) throw new EnrollmentError("host lifecycle not found", 404);
+  const sameLifecycle = document.hostDeregistrations.find((row) =>
+    row.hostname === host && row.hostLifecycleId === hostLifecycleId);
+  if (sameLifecycle) throw new EnrollmentError("host lifecycle already belongs to another deregistration operation", 409);
+  const competing = document.hostDeregistrations.find((row) =>
+    row.hostname === host && row.hostLifecycleId !== hostLifecycleId && row.policy.state !== "completed");
+  if (competing) throw new EnrollmentError("hostname already has an unfinished deregistration", 409);
+
+  const at = nowIso(input.now);
+  const row: HostDeregistrationRecord = {
+    id: randomHex(16), status: "credentials_pending", hostname: host, externalOperationId, hostLifecycleId,
+    reason: input.reason, requestedBy, scope: { ...input.scope },
+    createdAt: at, updatedAt: at,
+    credentials: {
+      state: "accepted", tombstone: "persisted", tokens: { revoked: 0, alreadyRevoked: 0 },
+      requests: { closed: 0, alreadyClosed: 0 }, certificates: { revoked: 0, alreadyRevoked: 0, expired: 0 },
+      requiredRevocationFingerprints: [],
+      relays: normalizedRelayNames(input.relayNames).map((name) => ({
+        name, state: "pending", updatedAt: null, error: null,
+      })),
+    },
+    infrastructure: { state: "waiting", provider: null, providerInstanceId: null, destroyedAt: null },
+    policy: {
+      state: "waiting_for_infrastructure_destroy", queuedAt: null, completedAt: null, completedBy: null,
+      pullRequestUrl: null, commitSha: null, publishedGeneration: null, relays: [],
+    },
+    blocked: null,
+  };
+  document.hostLifecycleTombstones.push({ hostname: host, hostLifecycleId, externalOperationId, createdAt: at });
+  document.hostDeregistrations.push(row);
+  row.credentials.state = "closing";
+
+  for (const token of document.tokens) {
+    if (token.hostname !== host || token.hostLifecycleId !== hostLifecycleId) continue;
+    if (!token.revokedAt) { token.revokedAt = at; row.credentials.tokens.revoked += 1; }
+    else row.credentials.tokens.alreadyRevoked += 1;
+  }
+  const certificatesToRevoke = new Map<string, string>();
+  for (const request of document.requests) {
+    if (request.hostname !== host || request.hostLifecycleId !== hostLifecycleId) continue;
+    if (request.status === "pending" || request.status === "conflict") {
+      request.status = "host-deregistered"; request.decidedAt = at; request.decidedBy = input.actor;
+      request.decisionReason = "host-deregistered";
+      row.credentials.requests.closed += 1;
+    } else {
+      row.credentials.requests.alreadyClosed += 1;
+    }
+    if (request.status === "signed" && request.certificateNotAfter && Date.parse(request.certificateNotAfter) <= Date.parse(at)) {
+      row.credentials.certificates.expired += 1;
+    } else if (request.status === "signed") {
+      if (!request.certificatePem) {
+        row.credentials.state = "blocked";
+        row.blocked = {
+          code: "certificate_inventory_incomplete",
+          operatorAction: `attach or revoke the certificate fingerprint for request ${request.id}`,
+        };
+        continue;
+      }
+      try {
+        const certificate = new X509Certificate(request.certificatePem);
+        certificatesToRevoke.set(certificate.fingerprint256.replaceAll(":", "").toLowerCase(), request.certificatePem);
+      } catch {
+        row.credentials.state = "blocked";
+        row.blocked = {
+          code: "certificate_inventory_incomplete",
+          operatorAction: `repair the invalid stored certificate for request ${request.id}`,
+        };
+      }
+    }
+  }
+  let revocationCapacityAvailable = true;
+  {
+    const newRevocations: CertificateRevocation[] = [];
+    for (const [fingerprint, certificatePem] of certificatesToRevoke) {
+      const cert = new X509Certificate(certificatePem);
+      if (document.revocations.some((revocation) => revocation.fingerprint256 === fingerprint)) {
+        row.credentials.certificates.alreadyRevoked += 1;
+      } else {
+        newRevocations.push({
+          fingerprint256: fingerprint, subject: cert.subject || null,
+          reason: `host lifecycle deregistration ${externalOperationId}`, actor: input.actor, revokedAt: at,
+        });
+      }
+      row.credentials.requiredRevocationFingerprints.push(fingerprint);
+    }
+    row.credentials.requiredRevocationFingerprints.sort();
+    const prospective = [...document.revocations, ...newRevocations];
+    try {
+      if (prospective.length > MAX_REVOCATION_ROWS) throw new Error("row limit reached");
+      serializeRevocationSnapshot({ schemaVersion: 1, revocations: prospective });
+    } catch {
+      revocationCapacityAvailable = false;
+      row.credentials.state = "blocked";
+      row.blocked = {
+        code: "revocation_capacity_exhausted",
+        operatorAction: "compact expired revocations and have an operator repair this blocked operation",
+      };
+    }
+  }
+  if (revocationCapacityAvailable) {
+    for (const certificatePem of certificatesToRevoke.values()) {
+      const before = document.revocations.length;
+      revokeCertificate(document, {
+        certificatePem,
+        reason: `host lifecycle deregistration ${externalOperationId}`,
+        actor: input.actor,
+        now: input.now,
+      });
+      if (document.revocations.length > before) row.credentials.certificates.revoked += 1;
+    }
+  }
+  if (row.credentials.state !== "blocked") {
+    row.credentials.state = "replicating";
+    if (row.credentials.relays.length === 0) {
+      row.credentials.state = "blocked";
+      row.blocked = {
+        code: "no_relays_configured", operatorAction: "configure at least one relay and retry replication",
+      };
+    }
+  }
+  row.status = hostDeregistrationStatus(row);
+  audit(document, {
+    actor: input.actor, action: "host-deregistration.accept", target: externalOperationId, sourceIp: null,
+    detail: {
+      hostname: host, hostLifecycleId, requestedBy, appTokenId: input.scope.appTokenId,
+      hostnamePattern: input.scope.hostnamePattern, credentialsState: row.credentials.state,
+      revokedNodeTokens: row.credentials.tokens.revoked, closedRequests: row.credentials.requests.closed,
+      revokedCertificates: row.credentials.certificates.revoked,
+    },
+  }, input.now);
+  return { row, created: true };
+}
+
+function hostDeregistrationStatus(row: HostDeregistrationRecord): HostDeregistrationRecord["status"] {
+  if (row.blocked || row.credentials.state === "blocked" || row.policy.state === "blocked") return "blocked";
+  if (row.policy.state === "completed") return "completed";
+  if (row.infrastructure.state === "destroyed") return "policy_pending";
+  if (row.credentials.state === "ready_for_infrastructure_destroy") return "ready_for_infrastructure_destroy";
+  return "credentials_pending";
+}
+
+export type RevocationReplicationResult =
+  { name: string; ok: true; count: number; snapshotFingerprints: readonly string[] }
+  | { name: string; ok: false; error: string; snapshotFingerprints: readonly string[] };
+
+export function recordHostDeregistrationReplication(
+  document: EnrollmentDocument, results: readonly RevocationReplicationResult[], relayNames: readonly string[], now = new Date(),
+): HostDeregistrationRecord[] {
+  const at = nowIso(now);
+  const resultByName = new Map(results.map((result) => [result.name, result]));
+  const changed: HostDeregistrationRecord[] = [];
+  for (const row of document.hostDeregistrations) {
+    if (row.credentials.state === "blocked" || row.infrastructure.state === "destroyed") continue;
+    reconcileHostDeregistrationRelays(row, relayNames, now);
+    for (const relay of row.credentials.relays) {
+      const result = resultByName.get(relay.name);
+      if (!result) continue;
+      relay.updatedAt = at;
+      const snapshot = new Set(result.snapshotFingerprints);
+      const coversOperation = row.credentials.requiredRevocationFingerprints.every((fingerprint) => snapshot.has(fingerprint));
+      if (result.ok && coversOperation) { relay.state = "installed"; relay.error = null; }
+      else if (result.ok) { /* an older in-flight snapshot cannot prove this operation installed */ }
+      else if (relay.state !== "installed") { relay.state = "failed"; relay.error = result.error.slice(0, 500); }
+    }
+    row.credentials.state = row.credentials.relays.length > 0
+      && row.credentials.relays.every((relay) => relay.state === "installed")
+      ? "ready_for_infrastructure_destroy"
+      : "replicating";
+    row.status = hostDeregistrationStatus(row);
+    row.updatedAt = at;
+    changed.push(row);
+  }
+  return changed;
+}
+
+export function confirmHostInfrastructureDestroyed(document: EnrollmentDocument, input: {
+  hostname: string; externalOperationId: string; hostLifecycleId: string; provider: "vultr";
+  providerInstanceId: string; destroyedAt: string; actor: string; now?: Date;
+}): HostDeregistrationRecord {
+  const host = hostname(input.hostname);
+  const operationId = normalizeExternalOperationId(input.externalOperationId);
+  const lifecycle = normalizeHostLifecycleId(input.hostLifecycleId);
+  const row = document.hostDeregistrations.find((candidate) =>
+    candidate.hostname === host && candidate.externalOperationId === operationId);
+  if (!row || row.hostLifecycleId !== lifecycle) throw new EnrollmentError("host deregistration not found", 404);
+  if (input.provider !== "vultr") throw new EnrollmentError('provider must be exactly "vultr"');
+  const providerInstanceId = boundedExternalId(input.providerInstanceId, "providerInstanceId");
+  const now = input.now ?? new Date();
+  const destroyedAt = normalizePastEvidenceTimestamp(input.destroyedAt, "destroyedAt", now);
+  if (row.infrastructure.state === "destroyed") {
+    if (row.infrastructure.provider !== input.provider || row.infrastructure.providerInstanceId !== providerInstanceId
+      || row.infrastructure.destroyedAt !== destroyedAt) {
+      throw new EnrollmentError("infrastructure confirmation conflicts with the stored confirmation", 409);
+    }
+    return row;
+  }
+  if (row.credentials.state !== "ready_for_infrastructure_destroy") {
+    throw new EnrollmentError(`credentials are ${row.credentials.state}; infrastructure destroy is not allowed`, 409);
+  }
+  const at = nowIso(now);
+  row.infrastructure = {
+    state: "destroyed", provider: input.provider, providerInstanceId, destroyedAt,
+  };
+  row.policy.state = "queued"; row.policy.queuedAt = at; row.updatedAt = at;
+  row.status = hostDeregistrationStatus(row);
+  audit(document, {
+    actor: input.actor, action: "host-deregistration.infrastructure-destroyed", target: operationId, sourceIp: null,
+    detail: { hostname: host, hostLifecycleId: lifecycle, provider: input.provider, providerInstanceId, destroyedAt },
+  }, now);
+  return row;
+}
+
+export function completeHostDeregistrationPolicy(document: EnrollmentDocument, input: {
+  hostname: string; externalOperationId: string; hostLifecycleId: string; pullRequestUrl: string;
+  commitSha: string; publishedGeneration: string; relayConfirmations: Array<{ name: string; absentAt: string }>;
+  relayNames: readonly string[]; actor: string; now?: Date;
+}): HostDeregistrationRecord {
+  const host = hostname(input.hostname);
+  const operationId = normalizeExternalOperationId(input.externalOperationId);
+  const lifecycle = normalizeHostLifecycleId(input.hostLifecycleId);
+  const row = document.hostDeregistrations.find((candidate) =>
+    candidate.hostname === host && candidate.externalOperationId === operationId);
+  if (!row || row.hostLifecycleId !== lifecycle) throw new EnrollmentError("host deregistration not found", 404);
+  const pullRequestUrl = input.pullRequestUrl.trim();
+  if (!/^https:\/\//.test(pullRequestUrl) || pullRequestUrl.length > 500) throw new EnrollmentError("pullRequestUrl must be an HTTPS URL");
+  const commitSha = input.commitSha.trim().toLowerCase();
+  if (!/^[0-9a-f]{40,64}$/.test(commitSha)) throw new EnrollmentError("commitSha must be a full hexadecimal commit id");
+  const publishedGeneration = boundedExternalId(input.publishedGeneration, "publishedGeneration");
+  const expectedRelays = normalizedRelayNames(input.relayNames);
+  const now = input.now ?? new Date();
+  const confirmations = input.relayConfirmations.map((confirmation) => ({
+    name: confirmation.name,
+    absentAt: normalizePastEvidenceTimestamp(confirmation.absentAt, "relayConfirmations.absentAt", now),
+  })).sort((a, b) => a.name.localeCompare(b.name));
+  if (confirmations.length !== expectedRelays.length || confirmations.some((confirmation, index) =>
+    confirmation.name !== expectedRelays[index])) {
+    throw new EnrollmentError("relayConfirmations must prove hostname absence on every configured relay", 409);
+  }
+  if (row.policy.state === "completed") {
+    if (row.policy.pullRequestUrl !== pullRequestUrl || row.policy.commitSha !== commitSha
+      || row.policy.publishedGeneration !== publishedGeneration
+      || JSON.stringify(row.policy.relays) !== JSON.stringify(confirmations)) {
+      throw new EnrollmentError("policy completion conflicts with the stored completion", 409);
+    }
+    return row;
+  }
+  if (row.policy.state !== "queued" || row.infrastructure.state !== "destroyed") {
+    throw new EnrollmentError("policy removal is not queued", 409);
+  }
+  const at = nowIso(now);
+  row.policy = {
+    state: "completed", queuedAt: row.policy.queuedAt, completedAt: at, completedBy: input.actor,
+    pullRequestUrl, commitSha, publishedGeneration, relays: confirmations,
+  };
+  row.updatedAt = at; row.status = hostDeregistrationStatus(row);
+  audit(document, {
+    actor: input.actor, action: "host-deregistration.policy-completed", target: operationId, sourceIp: null,
+    detail: { hostname: host, hostLifecycleId: lifecycle, pullRequestUrl, commitSha, publishedGeneration, relays: confirmations.length },
+  }, now);
+  return row;
 }
 
 const csrWorkerRequest = workerData as { heliopauseCsrValidation?: unknown; csrPem?: unknown; expectedHostname?: unknown } | null;

@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { X509Certificate } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
-import { request } from "node:https";
+import { createServer as createHttpsServer, request } from "node:https";
+import { createServer as createTcpServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
@@ -26,7 +28,7 @@ const managerOptions = (storeFile: string): Parameters<typeof startManager>[0] =
   revocationFile: storeFile,
 });
 
-function call(path: string, method: "GET" | "POST", body?: unknown, mode: "operator" | "agent" = "operator", token?: string, target = port) {
+function call(path: string, method: "GET" | "POST" | "PUT", body?: unknown, mode: "operator" | "agent" = "operator", token?: string, target = port) {
   return new Promise<{ status: number; body: any; headers: Record<string, string | string[] | undefined> }>((resolve, reject) => {
     const payload = body === undefined ? "" : JSON.stringify(body);
     const req = request({ host: "127.0.0.1", port: target, path, method, ca: readFileSync(join(pki, "ca.pem")),
@@ -50,10 +52,13 @@ after(() => { close(); rmSync(root, { recursive: true, force: true }); });
 
 describe("manager standalone enrollment API", () => {
   it("refuses a non-boolean revokeExisting without revoking the existing token", async () => {
-    const created = await call("/enrollment/tokens", "POST", { hostname: "node-keep.dev" });
+    assert.equal((await call("/enrollment/tokens", "POST", { hostname: "unbound.dev" })).status, 400);
+    const created = await call("/enrollment/tokens", "POST", { hostname: "node-keep.dev", hostLifecycleId: "life-node-keep" });
     assert.equal(created.status, 201);
     const rowId = created.body.id as string;
-    const malformed = await call("/enrollment/tokens", "POST", { hostname: "node-keep.dev", revokeExisting: "false" });
+    const malformed = await call("/enrollment/tokens", "POST", {
+      hostname: "node-keep.dev", hostLifecycleId: "life-node-keep", revokeExisting: "false",
+    });
     assert.equal(malformed.status, 400);
     const row = loadEnrollmentDocument(store).tokens.find((token) => token.id === rowId);
     assert.equal(row?.revokedAt, null);
@@ -69,8 +74,31 @@ describe("manager standalone enrollment API", () => {
     await assert.rejects(startManager(managerOptions(malformed)), /unsupported fields/);
   });
 
+  it("rejects startup when the listen address is already occupied", async () => {
+    const blocker = createTcpServer();
+    await new Promise<void>((resolve, reject) => {
+      blocker.once("error", reject);
+      blocker.listen(0, "127.0.0.1", resolve);
+    });
+    const occupiedPort = (blocker.address() as { port: number }).port;
+    let timeout: NodeJS.Timeout | undefined;
+    try {
+      await assert.rejects(Promise.race([
+        startManager({ ...managerOptions(store), port: occupiedPort }),
+        new Promise<never>((_resolve, reject) => {
+          timeout = setTimeout(() => reject(new Error("startManager did not reject a listen error")), 1_000);
+        }),
+      ]), (error: unknown) => (error as NodeJS.ErrnoException).code === "EADDRINUSE");
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      blocker.close();
+    }
+  });
+
   it("completes token, CSR, offline signing, upload and token-scoped fetch", { timeout: 15_000 }, async () => {
-    const tokenAnswer = await call("/enrollment/tokens", "POST", { hostname: "node-03.dev", ttlSec: 600 });
+    const tokenAnswer = await call("/enrollment/tokens", "POST", {
+      hostname: "node-03.dev", hostLifecycleId: "life-node-03", ttlSec: 600,
+    });
     assert.equal(tokenAnswer.status, 201); const token = tokenAnswer.body.token as string;
     assert.equal(
       Date.parse(tokenAnswer.body.row.expiresAt) - Date.parse(tokenAnswer.body.row.createdAt),
@@ -123,9 +151,12 @@ describe("manager standalone enrollment API", () => {
 // so a single instance gives the whole file one shared budget of 30 — and the tests that exceeded it
 // failed as `429`, from a limit they were not testing. A second instance is a second budget. The
 // bound itself is pinned by its own group at the bottom, because a polling caller has to know it.
-const startAppTokenManager = async (storeFile: string) => {
+const startAppTokenManager = async (
+  storeFile: string, overrides: Partial<Parameters<typeof startManager>[0]> = {},
+) => {
   const started = await startManager({
     ...managerOptions(storeFile),
+    ...overrides,
     otp: {
       issuerUrl: "https://idp.example.invalid",
       serviceToken: "svc",
@@ -145,9 +176,15 @@ const startAppTokenManager = async (storeFile: string) => {
 };
 
 const appTokenCalls = (livePort: () => number) => {
-  const app = (path: string, method: "GET" | "POST", body?: unknown, token?: string) =>
-    call(path, method, body, "agent", token, livePort());
-  const operator = (path: string, method: "GET" | "POST", body?: unknown) =>
+  let lifecycleSequence = 0;
+  const app = (path: string, method: "GET" | "POST" | "PUT", body?: unknown, token?: string) => {
+    const actualBody = path === "/enrollment/tokens" && method === "POST" && body && typeof body === "object" && !Array.isArray(body)
+      && !("hostLifecycleId" in body)
+      ? { ...(body as Record<string, unknown>), hostLifecycleId: `test-lifecycle-${++lifecycleSequence}` }
+      : body;
+    return call(path, method, actualBody, "agent", token, livePort());
+  };
+  const operator = (path: string, method: "GET" | "POST" | "PUT", body?: unknown) =>
     call(path, method, body, "operator", undefined, livePort());
   return {
     app, operator,
@@ -377,7 +414,9 @@ describe("app tokens over the manager API", () => {
     assert.equal(stale.body.error, "unauthorized app token", "an expired token was told apart from an unknown one");
 
     // A node token is not an app token: the shapes are disjoint and neither gate admits the other.
-    const node = await call("/enrollment/tokens", "POST", { hostname: "shape.dev", otp: "123456" }, "operator", undefined, appPort);
+    const node = await call("/enrollment/tokens", "POST", {
+      hostname: "shape.dev", hostLifecycleId: "life-shape", otp: "123456",
+    }, "operator", undefined, appPort);
     assert.equal(node.status, 201);
     const asApp = await app("/enrollment/requests", "GET", undefined, node.body.token);
     assert.equal(asApp.status, 401, "a node token reached the app-token routes");
@@ -438,7 +477,7 @@ describe("app tokens reading the CSR queue", () => {
     withEnrollmentTransaction(appStore, (document) => {
       seeded += 1;
       document.requests.push({
-        id: `seed-${seeded}`, hostname, nodeTokenId: "seed", status,
+        id: `seed-${seeded}`, hostname, nodeTokenId: "seed", hostLifecycleId: null, status,
         csrPem: "-----BEGIN CERTIFICATE REQUEST-----\nAAAA\n-----END CERTIFICATE REQUEST-----\n",
         csrSha256: "0".repeat(64), publicKeySha256: "1".repeat(64), keyAlgorithm: "ECDSA-P256",
         createdAt: new Date().toISOString(), sourceIp: null, decidedAt: null, decidedBy: null,
@@ -596,6 +635,179 @@ describe("app tokens reading the CSR queue", () => {
     const fetched = await app("/infra/node-csrs/any-id/certificate", "GET", undefined, created.body.token);
     assert.equal(fetched.status, 401);
     assert.equal(fetched.body.error, "unauthorized node token");
+  });
+});
+
+describe("lifecycle-bound host deregistration", () => {
+  const deregStore = join(root, "dereg-enrollment.json");
+  let deregPort = 0;
+  let relayPort = 0;
+  let relayAccepts = false;
+  let closeDereg = () => {};
+  let closeRelay = () => {};
+  const { app, operator } = appTokenCalls(() => deregPort);
+
+  before(async () => {
+    initializeEnrollmentDocument(deregStore);
+    const relay = createHttpsServer({
+      cert: readFileSync(join(pki, "relay-manager.pem")), key: readFileSync(join(pki, "relay-manager.key")),
+    }, (req, res) => {
+      let encoded = "";
+      req.on("data", (chunk) => encoded += chunk);
+      req.on("end", () => {
+        if (!relayAccepts) { res.writeHead(503); return res.end(JSON.stringify({ error: "held for test" })); }
+        const snapshot = JSON.parse(encoded) as { revocations: unknown[] };
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ count: snapshot.revocations.length }));
+      });
+    });
+    await new Promise<void>((resolve) => relay.listen(0, "127.0.0.1", resolve));
+    relayPort = (relay.address() as { port: number }).port;
+    closeRelay = () => relay.close();
+    const started = await startAppTokenManager(deregStore, {
+      relays: [{ name: "dev", url: `https://127.0.0.1:${relayPort}`, pkiDir: pki }],
+    });
+    deregPort = started.port;
+    closeDereg = started.close;
+  });
+  after(() => { closeDereg(); closeRelay(); });
+
+  it("closes only the exact lifecycle, converges through relay readiness, and queues reviewed policy removal", { timeout: 30_000 }, async () => {
+    const issuedApp = withEnrollmentTransaction(deregStore, (document) => createAppToken(document, {
+      label: "destroyer", scopes: ["enrollment:token-create", "enrollment:host-deregister"],
+      hostnamePattern: "*.dev", createdBy: "ops",
+    }));
+    const appToken = issuedApp.token;
+    const lifecycle = "create-operation-100";
+    const node = await app("/enrollment/tokens", "POST", {
+      hostname: "retire-me.dev", hostLifecycleId: lifecycle,
+    }, appToken);
+    assert.equal(node.status, 201);
+    const sibling = await app("/enrollment/tokens", "POST", {
+      hostname: "retire-me.dev", hostLifecycleId: "sibling-lifecycle", revokeExisting: false,
+    }, appToken);
+    assert.equal(sibling.status, 201);
+    const certificatePem = readFileSync(join(pki, "relay-manager.pem"), "utf8");
+    const certificate = new X509Certificate(certificatePem);
+    withEnrollmentTransaction(deregStore, (document) => {
+      document.requests.push({
+        id: "pending-exact", hostname: "retire-me.dev", nodeTokenId: node.body.id,
+        hostLifecycleId: lifecycle, status: "pending", csrPem: "pending", csrSha256: "1".repeat(64),
+        publicKeySha256: "2".repeat(64), keyAlgorithm: "ECDSA-P256", createdAt: new Date().toISOString(),
+        sourceIp: null, decidedAt: null, decidedBy: null, decisionReason: null, signedAt: null, caName: null,
+        certificatePem: null, caPem: null, certificateSha256: null, certificateNotBefore: null,
+        certificateNotAfter: null, retrievedAt: null,
+      });
+      document.requests.push({
+        id: "signed-exact", hostname: "retire-me.dev", nodeTokenId: node.body.id,
+        hostLifecycleId: lifecycle, status: "signed", csrPem: "signed", csrSha256: "3".repeat(64),
+        publicKeySha256: "4".repeat(64), keyAlgorithm: "ECDSA-P256", createdAt: new Date().toISOString(),
+        sourceIp: null, decidedAt: new Date().toISOString(), decidedBy: "ops", decisionReason: null,
+        signedAt: new Date().toISOString(), caName: "dev", certificatePem, caPem: certificatePem,
+        certificateSha256: certificate.fingerprint256.replaceAll(":", "").toLowerCase(),
+        certificateNotBefore: new Date(certificate.validFrom).toISOString(),
+        certificateNotAfter: new Date(certificate.validTo).toISOString(), retrievedAt: null,
+      });
+    });
+
+    const path = "/enrollment/host-deregistrations/retire-me.dev/destroy-operation-200";
+    const body = { hostLifecycleId: lifecycle, reason: "instance-destroy", requestedBy: "stardust:henry" };
+    const destroyedAt = new Date(Date.now() - 120_000).toISOString();
+    const first = await app(path, "PUT", body, appToken);
+    assert.equal(first.status, 202);
+    assert.equal(first.body.operation.credentials.state, "replicating");
+    assert.equal(first.body.operation.credentials.tokens.revoked, 1);
+    assert.equal(first.body.operation.credentials.requests.closed, 1);
+    assert.equal(first.body.operation.credentials.certificates.revoked, 1);
+    let storedAfterFirst = loadEnrollmentDocument(deregStore);
+    assert.equal(storedAfterFirst.tokens.find((row) => row.id === sibling.body.id)?.revokedAt, null,
+      "deregistration crossed into a same-host sibling lifecycle");
+    const tombstonesAfterFirst = storedAfterFirst.hostLifecycleTombstones.length;
+    const requestedAuditsAfterFirst = storedAfterFirst.audit.filter((row) => row.action === "host-deregistration.accept").length;
+    assert.equal((await app(`${path}/infrastructure-destroyed`, "PUT", {
+      hostLifecycleId: lifecycle, provider: "vultr", providerInstanceId: "vultr-9",
+      destroyedAt,
+    }, appToken)).status, 409, "a 2xx deregistration response became permission to destroy before relay install");
+
+    relayAccepts = true;
+    const replay = await app(path, "PUT", body, appToken);
+    assert.equal(replay.status, 202);
+    assert.equal(replay.body.operation.credentials.state, "ready_for_infrastructure_destroy");
+    assert.equal(replay.body.operation.id, first.body.operation.id);
+    storedAfterFirst = loadEnrollmentDocument(deregStore);
+    assert.equal(storedAfterFirst.hostLifecycleTombstones.length, tombstonesAfterFirst);
+    assert.equal(storedAfterFirst.audit.filter((row) => row.action === "host-deregistration.accept").length, requestedAuditsAfterFirst);
+    assert.equal((await app(path, "PUT", { ...body, requestedBy: "somebody-else" }, appToken)).status, 409);
+    assert.equal((await app(path, "PUT", { ...body, hostLifecycleId: "another-lifecycle" }, appToken)).status, 409);
+    assert.equal((await app("/enrollment/host-deregistrations/retire-me.dev/unknown-op", "PUT", {
+      ...body, hostLifecycleId: "unknown-lifecycle",
+    }, appToken)).status, 404);
+
+    const rotated = withEnrollmentTransaction(deregStore, (document) => createAppToken(document, {
+      label: "destroyer-rotated", scopes: ["enrollment:host-deregister"], hostnamePattern: "*.dev", createdBy: "ops",
+    }));
+    assert.equal((await app(path, "GET", undefined, rotated.token)).status, 200);
+    const outside = withEnrollmentTransaction(deregStore, (document) => createAppToken(document, {
+      label: "prod-destroyer", scopes: ["enrollment:host-deregister"], hostnamePattern: "*.prod", createdBy: "ops",
+    }));
+    assert.equal((await app(path, "GET", undefined, outside.token)).status, 404);
+    assert.equal((await app(path, "PUT", body, outside.token)).status, 404);
+    assert.equal((await app(`${path}/infrastructure-destroyed`, "PUT", {
+      hostLifecycleId: lifecycle, provider: "vultr", providerInstanceId: "vultr-9",
+      destroyedAt,
+    }, outside.token)).status, 404);
+
+    const overlapping = withEnrollmentTransaction(deregStore, (document) => createAppToken(document, {
+      label: "exact-destroyer", scopes: ["enrollment:host-deregister"],
+      hostnamePattern: "retire-me.dev", createdBy: "ops",
+    }));
+    assert.equal((await app(path, "PUT", body, overlapping.token)).status, 404,
+      "an overlapping but differently scoped token observed another authority's replay");
+
+    const confirmation = {
+      hostLifecycleId: lifecycle, provider: "vultr", providerInstanceId: "vultr-9", destroyedAt,
+    };
+    assert.equal((await app(`${path}/infrastructure-destroyed`, "PUT", {
+      ...confirmation, destroyedAt: "08/30/2026",
+    }, rotated.token)).status, 400);
+    assert.equal((await app(`${path}/infrastructure-destroyed`, "PUT", {
+      ...confirmation, destroyedAt: new Date(Date.now() + 60_000).toISOString(),
+    }, rotated.token)).status, 400);
+    const confirmed = await app(`${path}/infrastructure-destroyed`, "PUT", confirmation, rotated.token);
+    assert.equal(confirmed.status, 202);
+    assert.equal(confirmed.body.operation.policy.state, "queued");
+    const confirmedAgain = await app(`${path}/infrastructure-destroyed`, "PUT", confirmation, rotated.token);
+    assert.equal(confirmedAgain.status, 202);
+    assert.equal((await app(`${path}/infrastructure-destroyed`, "PUT", {
+      ...confirmation, providerInstanceId: "vultr-10",
+    }, rotated.token)).status, 409);
+
+    assert.equal((await app("/enrollment/tokens", "POST", {
+      hostname: "retire-me.dev", hostLifecycleId: "create-operation-101",
+    }, appToken)).status, 409, "hostname reuse crossed an unfinished policy removal");
+    assert.equal((await operator(`${path}/policy-completed`, "PUT", {
+      otp: "123456", hostLifecycleId: lifecycle, pullRequestUrl: "https://github.com/example/policy/pull/1",
+      commitSha: "a".repeat(40), publishedGeneration: "generation-9",
+      relayConfirmations: [{ name: "dev", absentAt: new Date(Date.now() + 60_000).toISOString() }],
+    })).status, 400);
+    const completed = await operator(`${path}/policy-completed`, "PUT", {
+      otp: "123456", hostLifecycleId: lifecycle, pullRequestUrl: "https://github.com/example/policy/pull/1",
+      commitSha: "a".repeat(40), publishedGeneration: "generation-9",
+      relayConfirmations: [{ name: "dev", absentAt: new Date(Date.now() - 60_000).toISOString() }],
+    });
+    assert.equal(completed.status, 200);
+    assert.equal(completed.body.operation.status, "completed");
+    assert.equal((await app("/enrollment/tokens", "POST", {
+      hostname: "retire-me.dev", hostLifecycleId: "create-operation-101",
+    }, appToken)).status, 409, "policy attestation implicitly reopened a retired hostname");
+
+    const stored = loadEnrollmentDocument(deregStore);
+    assert.equal(stored.requests.find((row) => row.id === "pending-exact")?.status, "host-deregistered");
+    assert.ok(stored.revocations.some((row) => row.fingerprint256 === certificate.fingerprint256.replaceAll(":", "").toLowerCase()));
+    const serialized = JSON.stringify(stored.hostDeregistrations);
+    assert.equal(serialized.includes(certificatePem), false);
+    assert.equal(serialized.includes(appToken), false);
+    assert.equal(serialized.includes(stored.tokens[0]!.tokenHash), false);
   });
 });
 

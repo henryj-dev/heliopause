@@ -678,7 +678,9 @@ describe("a stale enrollment lock", () => {
     try {
       const started = Date.now();
       // A write route, so it takes the lock.
-      const blocked = call(managerPort, "/enrollment/tokens", "POST", { hostname: "gw-01.dev" }, "henry");
+      const blocked = call(managerPort, "/enrollment/tokens", "POST", {
+        hostname: "gw-01.dev", hostLifecycleId: "stale-lock-test",
+      }, "henry");
       // A read route with no lock, issued while the write is waiting. If the wait blocked the thread
       // for ten seconds this could not be answered inside it.
       const alongside = call(managerPort, "/site", "GET", undefined, "henry");
@@ -908,4 +910,3 @@ describe("listing plans", () => {
 //
 // The API assertions above are untouched: `canWrite` is what the console *offers*, and the server
 // re-checks it on every request — which is the pair this file exists to keep apart.
-

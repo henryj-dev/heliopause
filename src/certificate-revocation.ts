@@ -31,7 +31,7 @@ function parseEnrollmentRevocations(value: unknown): RevocationSnapshot {
   // field either way. The five below stay required: their absence is a truncated file, and a
   // truncated denylist is the thing that must never read as "nobody is revoked".
   const required = ["schemaVersion", "tokens", "requests", "audit", "revocations"];
-  const optional = ["appTokens"];
+  const optional = ["appTokens", "hostLifecycleTombstones", "hostDeregistrations"];
   const keys = Object.keys(document);
   if (required.some((key) => !keys.includes(key)) || keys.some((key) => !required.includes(key) && !optional.includes(key))) {
     throw new Error("enrollment revocation source contains unsupported or missing fields");
