@@ -93,6 +93,10 @@ import {
   type Fetcher,
   type ProposalTarget,
 } from "./policy-proposal.ts";
+import {
+  startHostDeregistrationPolicyWorker,
+  type PolicyWorkerPlan,
+} from "./host-deregistration-policy-worker.ts";
 import { siteView, type RelaySource, type RelayResult, type SiteView } from "./manager.ts";
 import { bundleFromPlan, planHash, validateBundle, type PlanBundle } from "./bundle.ts";
 import { diffRulesets } from "./ruleset-diff.ts";
@@ -116,11 +120,12 @@ import {
 } from "./approval.ts";
 import {
   APP_TOKEN_SCOPES, EnrollmentError, appTokenAllowsHostname, appTokenCreatedBy, beginHostDeregistration,
-  completeHostDeregistrationPolicy, confirmHostInfrastructureDestroyed, createAppToken, createNodeToken,
+  bindLegacyHostLifecycle, completeHostDeregistrationPolicy, confirmHostInfrastructureDestroyed, createAppToken, createNodeToken,
   fetchNodeCertificate, looksLikeAppToken, looksLikeNodeToken, lookupAppToken,
   normalizeEnrollmentHostname, preflightNodeCsr, rejectNodeCsr, requireEnrollmentDocument,
   recordHostDeregistrationReplication, reconcileHostDeregistrationRelays,
-  normalizeExternalOperationId,
+  normalizeExternalOperationId, repairHostDeregistrationCertificateInventory,
+  repairHostDeregistrationRevocationCapacity,
   revokeAppToken, revokeCertificate, revokeNodeToken, storeNodeCertificate,
   submitValidatedNodeCsr, touchExistingNodeCsr, validateNodeCsrAsync, withEnrollmentTransaction,
   type AppTokenRecord, type AppTokenScope, type EnrollmentDocument, type NodeCsrRecord,
@@ -226,8 +231,10 @@ export const API_ROUTE_PATTERNS: readonly RegExp[] = [
   /^\/enrollment\/app-tokens\/[^/]+\/revoke$/,
   /^\/enrollment\/requests\/[^/]+\/reject$/,
   /^\/enrollment\/requests\/[^/]+\/certificate$/,
+  /^\/enrollment\/host-lifecycle-bindings\/[^/]+\/[^/]+$/,
   /^\/enrollment\/host-deregistrations\/[^/]+\/[^/]+(?:\/infrastructure-destroyed)?$/,
   /^\/enrollment\/host-deregistrations\/[^/]+\/[^/]+\/policy-completed$/,
+  /^\/enrollment\/host-deregistrations\/[^/]+\/[^/]+\/repairs\/(?:certificate-inventory|revocation-capacity)$/,
 ];
 
 export type PendingOidcLogin = {
@@ -338,6 +345,12 @@ export interface ManagerOptions {
      */
     allowPaths: readonly string[];
     fetch?: Fetcher;
+  };
+  /** Reviewed-Git host retirement orchestration. It never approves, merges or publishes. */
+  policyWorker?: {
+    /** Machine-owned JSON file in the policy repository, also exposed by the renderer allowlist. */
+    retiredHostsPath: string;
+    intervalMs?: number;
   };
   /**
    * Where to read Cilium's policy-map counters from, if a reader is deployed.
@@ -965,6 +978,22 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     // cannot be distinguished from deletion of a populated revocation ledger after a crash.
     requireEnrollmentDocument(opts.enrollment.storeFile);
   }
+  if (opts.policyWorker) {
+    if (!opts.enrollment || !opts.policySource || !opts.policyWrite) {
+      throw new Error("policyWorker requires enrollment, policySource and policyWrite");
+    }
+    if (!opts.policyWrite.allowPaths.includes(opts.policyWorker.retiredHostsPath)) {
+      throw new Error("policyWorker retiredHostsPath must be in policyWrite.allowPaths");
+    }
+    if (opts.relays.length === 0) throw new Error("policyWorker requires at least one configured relay");
+    if (new Set(opts.relays.map((relay) => relay.name)).size !== opts.relays.length) {
+      throw new Error("policyWorker requires unique configured relay names");
+    }
+    if (opts.policyWorker.intervalMs !== undefined
+      && (!Number.isSafeInteger(opts.policyWorker.intervalMs) || opts.policyWorker.intervalMs < 1_000)) {
+      throw new Error("policyWorker intervalMs must be an integer of at least 1000");
+    }
+  }
   let revocationSourceFormat: "snapshot" | "enrollment" = opts.revocationFile ? "snapshot" : "enrollment";
   if (opts.revocationFile && opts.enrollment) {
     try {
@@ -1160,6 +1189,54 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
    * the fleet is not running is worse than no diff, because it reads as authoritative.
    */
   const lastPublished = new Map<string, { generation: string; bundle: PlanBundle }>();
+
+  /**
+   * Recreate a worker proposal after a restart without recreating approval.
+   *
+   * The worker identity is intentionally not a configured writer: it reaches this function, never
+   * the HTTP approve/publish handlers. A human writer sees the ordinary plan and must still approve
+   * and publish it with the existing OTP/two-person gate.
+   */
+  async function proposePolicyRetirement(
+    targetName: string,
+    previous?: { generation: string; proposedAt: string },
+  ): Promise<PolicyWorkerPlan> {
+    if (!opts.policySource) throw new Error("policy worker has no renderer");
+    const target = opts.relays.find((relay) => relay.name === targetName);
+    if (!target) throw new Error(`policy worker target ${targetName} is not configured`);
+    const source = await fetchPolicySource(opts.policySource, timeoutMs);
+    if (source.head.sha === null || source.head.dirty) {
+      throw new Error("policy worker cannot propose from an unnamed or dirty renderer checkout");
+    }
+    const site = screenSiteOf(source);
+    const issuedAt = previous && sameCommit(previous.generation, source.head.sha)
+      ? previous.proposedAt
+      : now().toISOString();
+    const plan = planPublish({
+      cfg: site.cfg,
+      generation: source.head.sha,
+      issuedAt,
+      hosts: site.hosts,
+      ...(site.workload ? { workload: site.workload } : {}),
+      ...(site.resolveService ? { resolveService: site.resolveService } : {}),
+    } as Parameters<typeof planPublish>[0]);
+    const bundle = bundleFromPlan(plan);
+    const hash = planHash(targetName, bundle);
+    propose(
+      approvals,
+      { hash, generation: bundle.manifest.generation, summary: summarise(bundle), by: "policy-worker", now: now() },
+      limits,
+    );
+    bundles.set(hash, bundle);
+    planTargets.set(hash, targetName);
+    for (const key of bundles.keys()) {
+      if (!approvals.plans.has(key)) {
+        bundles.delete(key);
+        planTargets.delete(key);
+      }
+    }
+    return { relay: targetName, hash, generation: bundle.manifest.generation, proposedAt: issuedAt };
+  }
 
   if (writers.size === 1) {
     // Said at startup, because the alternative is discovering it from a 403 while trying to change a
@@ -1747,6 +1824,116 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
             "request was caused by another site",
         });
       }
+    }
+
+    const lifecycleBind = /^\/enrollment\/host-lifecycle-bindings\/([^/]+)\/([^/]+)$/.exec(url.pathname);
+    if (opts.enrollment && req.method === "PUT" && lifecycleBind) {
+      if (!mayWrite) return refuseWrite(res, who, url.pathname, principal.via);
+      try {
+        const rawBody: unknown = JSON.parse(await readBody(req));
+        if (!rawBody || typeof rawBody !== "object" || Array.isArray(rawBody)) throw new EnrollmentError("request body must be an object");
+        const body = rawBody as Record<string, unknown>;
+        if ((await requireOtp(principal, body, res, url.pathname)) === "answered") return;
+        if (Object.keys(body).some((key) => !["inventoryEvidence", "otp"].includes(key))) {
+          throw new EnrollmentError("request contains unsupported fields");
+        }
+        const rawEvidence = body.inventoryEvidence;
+        if (!rawEvidence || typeof rawEvidence !== "object" || Array.isArray(rawEvidence)) {
+          throw new EnrollmentError("inventoryEvidence must be an object");
+        }
+        const evidence = rawEvidence as Record<string, unknown>;
+        const evidenceFields = ["stardustCreateOperationId", "provider", "providerInstanceId", "nodeTokenIds", "csrRequestIds", "certificateFingerprints"];
+        if (Object.keys(evidence).some((key) => !evidenceFields.includes(key))
+          || typeof evidence.stardustCreateOperationId !== "string" || evidence.provider !== "vultr"
+          || typeof evidence.providerInstanceId !== "string" || !Array.isArray(evidence.nodeTokenIds)
+          || !Array.isArray(evidence.csrRequestIds) || !Array.isArray(evidence.certificateFingerprints)
+          || [...evidence.nodeTokenIds, ...evidence.csrRequestIds, ...evidence.certificateFingerprints]
+            .some((value) => typeof value !== "string")) {
+          throw new EnrollmentError("inventoryEvidence is malformed");
+        }
+        const trustedCaPems = await Promise.all([...opts.enrollment?.trustedCaFiles?.values() ?? []]
+          .map((path) => readFile(path, "utf8")));
+        if (trustedCaPems.length === 0) throw new EnrollmentError("no trusted enrollment CA is configured", 503);
+        const result = enrollmentWrite(opts.enrollment.storeFile, (document) => bindLegacyHostLifecycle(document, {
+          hostname: decodeURIComponent(lifecycleBind[1]!), hostLifecycleId: decodeURIComponent(lifecycleBind[2]!),
+          evidence: {
+            stardustCreateOperationId: evidence.stardustCreateOperationId as string,
+            provider: "vultr", providerInstanceId: evidence.providerInstanceId as string,
+            nodeTokenIds: evidence.nodeTokenIds as string[], csrRequestIds: evidence.csrRequestIds as string[],
+            certificateFingerprints: evidence.certificateFingerprints as string[],
+          }, trustedCaPems, actor: who,
+        }));
+        return send(res, 200, { binding: result });
+      } catch (e) { return sendEnrollmentError(res, e); }
+    }
+
+    const deregistrationRepair = /^\/enrollment\/host-deregistrations\/([^/]+)\/([^/]+)\/repairs\/(certificate-inventory|revocation-capacity)$/.exec(url.pathname);
+    if (opts.enrollment && req.method === "PUT" && deregistrationRepair) {
+      if (!mayWrite) return refuseWrite(res, who, url.pathname, principal.via);
+      try {
+        const rawBody: unknown = JSON.parse(await readBody(req, 128 * 1024));
+        if (!rawBody || typeof rawBody !== "object" || Array.isArray(rawBody)) throw new EnrollmentError("request body must be an object");
+        const body = rawBody as Record<string, unknown>;
+        if ((await requireOtp(principal, body, res, url.pathname)) === "answered") return;
+        const hostname = decodeURIComponent(deregistrationRepair[1]!);
+        const externalOperationId = decodeURIComponent(deregistrationRepair[2]!);
+        let repaired;
+        if (deregistrationRepair[3] === "certificate-inventory") {
+          if (Object.keys(body).some((key) => !["hostLifecycleId", "certificates", "otp"].includes(key))
+            || typeof body.hostLifecycleId !== "string" || !Array.isArray(body.certificates)) {
+            throw new EnrollmentError("certificate inventory repair body is malformed");
+          }
+          const certificates = body.certificates.map((entry) => {
+            if (!entry || typeof entry !== "object" || Array.isArray(entry)
+              || Object.keys(entry).some((key) => !["requestId", "certificatePem"].includes(key))) {
+              throw new EnrollmentError("certificates entries must contain only requestId and certificatePem");
+            }
+            const candidate = entry as Record<string, unknown>;
+            if (typeof candidate.requestId !== "string" || typeof candidate.certificatePem !== "string") {
+              throw new EnrollmentError("certificates entries require string requestId and certificatePem");
+            }
+            return { requestId: candidate.requestId, certificatePem: candidate.certificatePem };
+          });
+          const trustedCaPems = await Promise.all([...opts.enrollment.trustedCaFiles?.values() ?? []]
+            .map((path) => readFile(path, "utf8")));
+          if (trustedCaPems.length === 0) throw new EnrollmentError("no trusted enrollment CA is configured", 503);
+          repaired = enrollmentWrite(opts.enrollment.storeFile, (document) =>
+            repairHostDeregistrationCertificateInventory(document, {
+              hostname, externalOperationId, hostLifecycleId: body.hostLifecycleId as string,
+              certificates, trustedCaPems, actor: who,
+            }));
+        } else {
+          if (Object.keys(body).some((key) => !["hostLifecycleId", "relayConfirmations", "otp"].includes(key))
+            || typeof body.hostLifecycleId !== "string" || !Array.isArray(body.relayConfirmations)) {
+            throw new EnrollmentError("revocation capacity repair body is malformed");
+          }
+          const relayConfirmations = body.relayConfirmations.map((entry) => {
+            if (!entry || typeof entry !== "object" || Array.isArray(entry)
+              || Object.keys(entry).some((key) => !["name", "compactedAt", "retainedFingerprintSha256"].includes(key))) {
+              throw new EnrollmentError("relayConfirmations entries contain unsupported fields");
+            }
+            const candidate = entry as Record<string, unknown>;
+            if (typeof candidate.name !== "string" || typeof candidate.compactedAt !== "string"
+              || typeof candidate.retainedFingerprintSha256 !== "string") {
+              throw new EnrollmentError("relayConfirmations entries require string name, compactedAt, and retainedFingerprintSha256");
+            }
+            return { name: candidate.name, compactedAt: candidate.compactedAt,
+              retainedFingerprintSha256: candidate.retainedFingerprintSha256 };
+          });
+          const trustedCaPems = await Promise.all([...opts.enrollment.trustedCaFiles?.values() ?? []]
+            .map((path) => readFile(path, "utf8")));
+          if (trustedCaPems.length === 0) throw new EnrollmentError("no trusted enrollment CA is configured", 503);
+          repaired = enrollmentWrite(opts.enrollment.storeFile, (document) =>
+            repairHostDeregistrationRevocationCapacity(document, {
+              hostname, externalOperationId, hostLifecycleId: body.hostLifecycleId as string,
+              relayConfirmations, relayNames: opts.relays.map((relay) => relay.name), trustedCaPems, actor: who,
+            }));
+        }
+        const replication = repaired.credentials.state === "replicating" ? await replicateRevocations() : [];
+        const operation = requireEnrollmentDocument(opts.enrollment.storeFile).hostDeregistrations.find((candidate) =>
+          candidate.hostname === repaired.hostname && candidate.externalOperationId === repaired.externalOperationId)!;
+        return send(res, 200, { operation, replication });
+      } catch (e) { return sendEnrollmentError(res, e); }
     }
 
     const policyComplete = /^\/enrollment\/host-deregistrations\/([^/]+)\/([^/]+)\/policy-completed$/.exec(url.pathname);
@@ -3407,6 +3594,9 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         }
         if (parsed.reason !== "instance-destroy") throw new EnrollmentError('reason must be exactly "instance-destroy"');
         if (typeof parsed.requestedBy !== "string") throw new EnrollmentError("requestedBy must be a string");
+        const trustedCaPems = await Promise.all([...opts.enrollment?.trustedCaFiles?.values() ?? []]
+          .map((path) => readFile(path, "utf8")));
+        if (trustedCaPems.length === 0) throw new EnrollmentError("no trusted enrollment CA is configured", 503);
         const result = enrollmentWrite(storeFile, (current) => {
           const authorised = authoriseAppToken(current, plaintext, scope, url.pathname);
           if (!appTokenAllowsHostname(authorised.hostnamePattern, wanted)) {
@@ -3422,7 +3612,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
             reason: "instance-destroy", requestedBy: parsed.requestedBy as string,
             actor: appTokenCreatedBy(authorised.label, authorised.id),
             scope: { appTokenId: authorised.id, label: authorised.label, hostnamePattern: authorised.hostnamePattern },
-            relayNames: opts.relays.map((relay) => relay.name),
+            relayNames: opts.relays.map((relay) => relay.name), trustedCaPems,
           });
         });
         if (result.row.credentials.state !== "blocked") await replicateRevocations();
@@ -3679,6 +3869,45 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     revocationTimer = setInterval(() => void replicateRevocations(), 60_000);
     revocationTimer.unref();
     server.once("close", () => clearInterval(revocationTimer!));
+  }
+  if (opts.policyWorker && opts.enrollment && opts.policySource && opts.policyWrite) {
+    const stopPolicyWorker = startHostDeregistrationPolicyWorker({
+      storeFile: opts.enrollment.storeFile,
+      retiredHostsPath: opts.policyWorker.retiredHostsPath,
+      creds: opts.policyWrite.creds,
+      target: opts.policyWrite.target,
+      fetcher: opts.policyWrite.fetch ?? (fetch as unknown as Fetcher),
+      relayNames: opts.relays.map((relay) => relay.name),
+      renderer: async () => {
+        const [source, head] = await Promise.all([
+          fetchPolicySource(opts.policySource!, timeoutMs),
+          currentRepoHead(),
+        ]);
+        if ("error" in head) throw new Error(`policy repository head is unavailable: ${head.error}`);
+        return {
+          headSha: source.head.sha,
+          dirty: source.head.dirty,
+          repositoryHead: head.sha,
+          hosts: screenSiteOf(source).hosts.map((host) => host.id),
+        };
+      },
+      relays: async () => (await pollRelays(opts.relays, timeoutMs)).map((result) => result.ok
+        ? {
+            name: result.name,
+            ok: true,
+            generation: result.view.generation,
+            issuedAt: result.view.issuedAt,
+            planHash: result.view.planHash,
+            hosts: result.view.hosts.map((host) => host.host),
+          }
+        : { name: result.name, ok: false, generation: null, issuedAt: null, planHash: null, hosts: [], error: result.error }),
+      propose: proposePolicyRetirement,
+      now,
+      actor: "policy-worker",
+    }, opts.policyWorker.intervalMs, (error) => {
+      log(`policy worker retry: ${error.message}`, `정책 worker 재시도: ${error.message}`);
+    });
+    server.once("close", stopPolicyWorker);
   }
 
   return { server };

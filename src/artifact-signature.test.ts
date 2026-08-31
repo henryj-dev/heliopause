@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash, generateKeyPairSync, sign as cryptoSign, verify as cryptoVerify } from "node:crypto";
 import { describe, it } from "node:test";
-import type { PlanBundle } from "./bundle.ts";
+import { planHash, type PlanBundle } from "./bundle.ts";
 import { SCHEMA_VERSION } from "./protocol.ts";
 import {
   ArtifactSignatureError,
@@ -15,6 +15,8 @@ import {
   decodeHostArtifactEnvelope,
   encodeHostArtifactEnvelope,
   signHostArtifactAuthorization,
+  signAuthorizedArtifactBundle,
+  validateAuthorizedArtifactBundle,
   verifyHostArtifactAuthorization,
   type HostArtifactEnvelope,
   privateKeyFileModeError,
@@ -92,6 +94,22 @@ function verified(e: HostArtifactEnvelope | string = envelope(), over: Partial<P
 }
 
 describe("host artifact authorization envelope", () => {
+  it("carries the exact plan receipt and derives it from legacy signed-host bundles", () => {
+    const signed = signAuthorizedArtifactBundle({
+      target: TARGET, bundle: bundle(), authorizedAt: AUTHORIZED, expiresAt: EXPIRES,
+      authorizationMode: "two-person",
+    }, signing.privateKey);
+    assert.equal(signed.planHash, planHash(TARGET, bundle()));
+    assert.throws(() => validateAuthorizedArtifactBundle({
+      ...signed, planHash: `sha256:${"0".repeat(64)}`,
+    }), /differs from its signed artifacts/);
+
+    const legacy = structuredClone(signed) as unknown as Record<string, unknown>;
+    delete legacy.planHash;
+    assert.equal(validateAuthorizedArtifactBundle(legacy).planHash, signed.planHash,
+      "a rolling upgrade failed to derive the receipt from the signed host payload");
+  });
+
   it("binds the manifest header, exact host entry, ruleset, workload, approval and destination", () => {
     const e = envelope();
     const p = verified(encodeHostArtifactEnvelope(e));

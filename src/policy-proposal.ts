@@ -438,6 +438,217 @@ export interface PullRequestInput {
   body: string;
 }
 
+export interface RepositoryFile {
+  content: string;
+  /** Git blob sha, used for compare-and-swap updates through the contents API. */
+  sha: string;
+}
+
+/** Read one repository file at an exact ref. Executable policy is never evaluated here. */
+export async function readRepositoryFile(
+  creds: AppCredentials,
+  target: ProposalTarget,
+  fetcher: Fetcher,
+  nowSec: number,
+  path: string,
+  ref: string,
+): Promise<RepositoryFile> {
+  const token = await installationToken(creds, fetcher, nowSec);
+  const out = (await gh(
+    fetcher,
+    token,
+    `/repos/${encodeURIComponent(target.owner)}/${encodeURIComponent(target.repo)}` +
+      `/contents/${encodeURIComponent(path)}?ref=${encodeURIComponent(ref)}`,
+  )) as { content?: string; encoding?: string; sha?: string };
+  if (out.encoding !== "base64" || typeof out.content !== "string" || typeof out.sha !== "string") {
+    throw new ProposalError(`repository file ${JSON.stringify(path)} did not arrive as base64 content`);
+  }
+  return { content: Buffer.from(out.content.replaceAll("\n", ""), "base64").toString("utf8"), sha: out.sha };
+}
+
+/**
+ * Put one exact file on a deterministic branch, idempotently.
+ *
+ * A retry after GitHub accepted the PUT but before the enrollment transaction committed sees the
+ * desired bytes and returns the branch head instead of manufacturing another commit. The file must
+ * already exist: the host-retirement document is an explicit policy-repository migration, and a
+ * typo in its configured path must not create a second, unused document that looks successful.
+ */
+export async function ensureRepositoryFileOnBranch(
+  creds: AppCredentials,
+  fetcher: Fetcher,
+  nowSec: number,
+  input: Omit<EditInput, "content"> & { content?: string; transform?: (current: string) => string },
+): Promise<{ branch: string; commit: string; changed: boolean }> {
+  const token = await installationToken(creds, fetcher, nowSec);
+  const { owner, repo, base } = input.target;
+  const at = (p: string) => `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}${p}`;
+  const baseRef = (await gh(fetcher, token, at(`/git/ref/heads/${encodeURIComponent(base)}`))) as {
+    object?: { sha?: string };
+  };
+  const baseSha = baseRef.object?.sha;
+  if (!baseSha) throw new ProposalError(`${base} has no commit to branch from`);
+  try {
+    await gh(fetcher, token, at("/git/refs"), "POST", { ref: `refs/heads/${input.branch}`, sha: baseSha });
+  } catch (e) {
+    if (!(e instanceof ProposalError) || e.status !== 422) throw e;
+  }
+  const branchRef = (await gh(
+    fetcher, token, at(`/git/ref/heads/${encodeURIComponent(input.branch)}`),
+  )) as { object?: { sha?: string } };
+  const currentHead = branchRef.object?.sha;
+  if (!currentHead) throw new ProposalError(`branch ${input.branch} has no head commit`);
+  const current = await readRepositoryFile(creds, input.target, fetcher, nowSec, input.path, input.branch);
+  if ((input.content === undefined) === (input.transform === undefined)) {
+    throw new ProposalError("file update requires exactly one of content or transform");
+  }
+  // Computed from the branch after it was created. Building desired bytes from an earlier base read
+  // can erase a retirement merged in between the read and branch creation.
+  const desired = input.transform ? input.transform(current.content) : input.content!;
+  if (current.content === desired) {
+    return { branch: input.branch, commit: currentHead, changed: false };
+  }
+  const put = (await gh(fetcher, token, at(`/contents/${encodeURIComponent(input.path)}`), "PUT", {
+    message: input.message,
+    content: Buffer.from(desired, "utf8").toString("base64"),
+    branch: input.branch,
+    sha: current.sha,
+  })) as { commit?: { sha?: string } };
+  const commit = put.commit?.sha;
+  if (!commit) throw new ProposalError("repository did not return the policy commit sha");
+  return { branch: input.branch, commit, changed: true };
+}
+
+/** Find the PR for a deterministic head branch, including one merged before a crash was recorded. */
+export async function findPullRequestByBranch(
+  creds: AppCredentials,
+  target: ProposalTarget,
+  fetcher: Fetcher,
+  nowSec: number,
+  branch: string,
+): Promise<PullRequestStatus | null> {
+  const token = await installationToken(creds, fetcher, nowSec);
+  const rows = (await gh(
+    fetcher,
+    token,
+    `/repos/${encodeURIComponent(target.owner)}/${encodeURIComponent(target.repo)}/pulls` +
+      `?head=${encodeURIComponent(`${target.owner}:${branch}`)}&state=all&per_page=10`,
+  )) as Array<{
+    number?: number; html_url?: string; state?: string; merged_at?: string | null;
+    merge_commit_sha?: string | null; head?: { sha?: string; ref?: string }; base?: { ref?: string };
+  }>;
+  const row = rows.find((candidate) => candidate.state === "open") ?? rows[0];
+  if (!row) return null;
+  if (!Number.isSafeInteger(row.number) || typeof row.html_url !== "string"
+    || !["open", "closed"].includes(String(row.state)) || typeof row.head?.sha !== "string"
+    || typeof row.head.ref !== "string" || typeof row.base?.ref !== "string") {
+    throw new ProposalError(`pull request lookup for ${branch} returned an invalid status`);
+  }
+  return {
+    number: row.number!,
+    url: row.html_url,
+    state: row.state as "open" | "closed",
+    merged: typeof row.merged_at === "string",
+    mergeCommitSha: typeof row.merge_commit_sha === "string" ? row.merge_commit_sha : null,
+    headSha: row.head.sha,
+    headRef: row.head.ref,
+    baseRef: row.base.ref,
+  };
+}
+
+export interface PullRequestStatus {
+  number: number;
+  url: string;
+  state: "open" | "closed";
+  merged: boolean;
+  mergeCommitSha: string | null;
+  headSha: string;
+  headRef: string;
+  baseRef: string;
+}
+
+/** Poll review/merge outcome without attempting to review or merge. */
+export async function pullRequestStatus(
+  creds: AppCredentials,
+  target: ProposalTarget,
+  fetcher: Fetcher,
+  nowSec: number,
+  number: number,
+): Promise<PullRequestStatus> {
+  if (!Number.isSafeInteger(number) || number < 1) throw new ProposalError("pull request number is invalid");
+  const token = await installationToken(creds, fetcher, nowSec);
+  const out = (await gh(
+    fetcher,
+    token,
+    `/repos/${encodeURIComponent(target.owner)}/${encodeURIComponent(target.repo)}/pulls/${number}`,
+  )) as {
+    number?: number; html_url?: string; state?: string; merged?: boolean;
+    merge_commit_sha?: string | null; head?: { sha?: string; ref?: string }; base?: { ref?: string };
+  };
+  if (out.number !== number || typeof out.html_url !== "string" || !["open", "closed"].includes(String(out.state))
+    || typeof out.merged !== "boolean" || typeof out.head?.sha !== "string"
+    || typeof out.head.ref !== "string" || typeof out.base?.ref !== "string") {
+    throw new ProposalError(`pull request #${number} returned an invalid status`);
+  }
+  return {
+    number,
+    url: out.html_url,
+    state: out.state as "open" | "closed",
+    merged: out.merged,
+    mergeCommitSha: typeof out.merge_commit_sha === "string" ? out.merge_commit_sha : null,
+    headSha: out.head.sha,
+    headRef: out.head.ref,
+    baseRef: out.base.ref,
+  };
+}
+
+/**
+ * Human approvals of the exact durable head. The latest submitted review per GitHub user wins;
+ * an older approval followed by CHANGES_REQUESTED is not approval, and bot reviews are not human.
+ */
+export async function pullRequestHumanApprovals(
+  creds: AppCredentials,
+  target: ProposalTarget,
+  fetcher: Fetcher,
+  nowSec: number,
+  number: number,
+  headSha: string,
+): Promise<string[]> {
+  if (!Number.isSafeInteger(number) || number < 1) throw new ProposalError("pull request number is invalid");
+  const token = await installationToken(creds, fetcher, nowSec);
+  const rows = (await gh(
+    fetcher,
+    token,
+    `/repos/${encodeURIComponent(target.owner)}/${encodeURIComponent(target.repo)}/pulls/${number}/reviews?per_page=100`,
+  )) as Array<{
+    id?: number; state?: string; commit_id?: string; submitted_at?: string;
+    user?: { login?: string; type?: string };
+  }>;
+  if (rows.length >= 100) {
+    throw new ProposalError(`pull request #${number} has too many reviews to prove the latest human decision`);
+  }
+  const latest = new Map<string, { id: number; state: string; commit: string; submittedAt: string; type: string }>();
+  for (const row of rows) {
+    if (!Number.isSafeInteger(row.id) || typeof row.state !== "string" || typeof row.commit_id !== "string"
+      || typeof row.submitted_at !== "string" || !Number.isFinite(Date.parse(row.submitted_at))
+      || typeof row.user?.login !== "string" || typeof row.user.type !== "string") {
+      throw new ProposalError(`pull request #${number} returned an invalid review`);
+    }
+    const previous = latest.get(row.user.login);
+    if (!previous || row.submitted_at > previous.submittedAt
+      || (row.submitted_at === previous.submittedAt && row.id! > previous.id)) {
+      latest.set(row.user.login, {
+        id: row.id!, state: row.state, commit: row.commit_id,
+        submittedAt: row.submitted_at, type: row.user.type,
+      });
+    }
+  }
+  return [...latest.entries()]
+    .filter(([, review]) => review.type === "User" && review.state === "APPROVED" && review.commit === headSha)
+    .map(([login]) => login)
+    .sort();
+}
+
 /** Open the pull request. Returns the existing one when the branch already has an open PR. */
 export async function openPullRequest(
   creds: AppCredentials,

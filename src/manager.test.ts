@@ -39,6 +39,7 @@ const host = (over: Partial<HostView> = {}): HostView => ({
 const view = (over: Partial<FleetView> = {}): FleetView => ({
   generation: "gen1",
   issuedAt: "2026-08-02T00:00:00Z",
+  planHash: null,
   hosts: [host()],
   problems: [],
   relayAgeSec: 600,

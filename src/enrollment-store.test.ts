@@ -1,26 +1,122 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
+import { createHash, X509Certificate } from "node:crypto";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
   APP_TOKEN_PREFIX, MAX_CREATED_BY_CHARS, appTokenAllowsHostname, appTokenCreatedBy,
-  beginHostDeregistration, createAppToken, createNodeToken, emptyEnrollmentDocument,
+  beginHostDeregistration, bindLegacyHostLifecycle, completeHostDeregistrationPolicy,
+  confirmHostInfrastructureDestroyed, createAppToken, createNodeToken, emptyEnrollmentDocument,
   fetchNodeCertificate, initializeEnrollmentDocument,
   loadEnrollmentDocument, looksLikeAppToken, looksLikeNodeToken, lookupAppToken, lookupNodeToken, NODE_TOKEN_PREFIX,
-  rejectNodeCsr, revokeAppToken, saveEnrollmentDocument, storeNodeCertificate, submitNodeCsr, validateNodeCsrAsync,
-  withEnrollmentTransaction,
+  recordHostDeregistrationReplication, rejectNodeCsr, repairHostDeregistrationCertificateInventory, repairHostDeregistrationRevocationCapacity,
+  revokeAppToken, saveEnrollmentDocument, storeNodeCertificate, submitNodeCsr, validateNodeCsrAsync,
+  withEnrollmentTransaction, type NodeCsrRecord,
 } from "./enrollment-store.ts";
 
 function csr(root: string, name: string, suffix: string) {
   const key = join(root, `${suffix}.key`); const path = join(root, `${suffix}.csr`);
   execFileSync("openssl", ["genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-out", key]);
   execFileSync("openssl", ["req", "-new", "-key", key, "-subj", `/CN=${name}`, "-out", path]);
-  return { path, pem: readFileSync(path, "utf8") };
+  return { key, path, pem: readFileSync(path, "utf8") };
+}
+
+function signClientCertificate(csrPath: string, outputPath: string, caPem: string, caKey: string, extPath: string): void {
+  writeFileSync(extPath, [
+    "basicConstraints=critical,CA:FALSE",
+    "keyUsage=critical,digitalSignature",
+    "extendedKeyUsage=critical,clientAuth",
+  ].join("\n"));
+  execFileSync("openssl", ["x509", "-req", "-in", csrPath, "-CA", caPem, "-CAkey", caKey,
+    "-CAcreateserial", "-days", "1", "-sha256", "-extfile", extPath, "-out", outputPath]);
+}
+
+function storedRequest(input: Partial<NodeCsrRecord> & Pick<NodeCsrRecord, "id" | "hostname" | "nodeTokenId">): NodeCsrRecord {
+  const defaults: NodeCsrRecord = {
+    id: input.id, hostname: input.hostname, nodeTokenId: input.nodeTokenId, hostLifecycleId: null,
+    status: "pending", csrPem: "fixture", csrSha256: "1".repeat(64), publicKeySha256: "2".repeat(64),
+    keyAlgorithm: "ECDSA-P256", createdAt: "2026-08-01T00:00:00.000Z", sourceIp: null,
+    decidedAt: null, decidedBy: null, decisionReason: null, signedAt: null, caName: null,
+    certificatePem: null, caPem: null, certificateSha256: null, certificateNotBefore: null,
+    certificateNotAfter: null, retrievedAt: null,
+  };
+  return { ...defaults, ...input };
 }
 
 describe("standalone enrollment store", () => {
+  it("allows exact break-glass policy evidence from every destroyed worker-pending state", () => {
+    for (const state of ["queued", "pr_open", "merged", "awaiting_publish", "published"] as const) {
+      const document = emptyEnrollmentDocument();
+      const now = new Date("2026-08-31T00:10:00.000Z");
+      createNodeToken(document, { hostname: "manual-recovery.dev", hostLifecycleId: "create-1", now });
+      beginHostDeregistration(document, {
+        hostname: "manual-recovery.dev", externalOperationId: "destroy-1", hostLifecycleId: "create-1",
+        reason: "instance-destroy", requestedBy: "stardust", actor: "app:destroyer", relayNames: ["dev"],
+        scope: { appTokenId: "app-1", label: "destroyer", hostnamePattern: "*.dev" }, trustedCaPems: [], now,
+      });
+      recordHostDeregistrationReplication(document, [
+        { name: "dev", ok: true, count: 0, snapshotFingerprints: [] },
+      ], ["dev"], now);
+      const row = confirmHostInfrastructureDestroyed(document, {
+        hostname: "manual-recovery.dev", externalOperationId: "destroy-1", hostLifecycleId: "create-1",
+        provider: "vultr", providerInstanceId: "vultr-1", destroyedAt: "2026-08-31T00:09:00.000Z",
+        actor: "app:destroyer", now,
+      });
+      row.policy.state = state;
+
+      const completed = completeHostDeregistrationPolicy(document, {
+        hostname: "manual-recovery.dev", externalOperationId: "destroy-1", hostLifecycleId: "create-1",
+        pullRequestUrl: "https://github.test/o/r/pull/1", commitSha: "a".repeat(40),
+        publishedGeneration: "generation-1",
+        relayConfirmations: [{ name: "dev", absentAt: "2026-08-31T00:09:30.000Z" }],
+        relayNames: ["dev"], actor: "ops", now,
+      });
+      assert.equal(completed.policy.state, "completed", `manual recovery was blocked from ${state}`);
+      assert.equal(completed.status, "completed");
+      assert.equal(completed.policy.completedBy, "ops");
+    }
+  });
+
+  it("fails closed on a persisted publish state whose durable automation evidence is incomplete", () => {
+    const document = emptyEnrollmentDocument();
+    const now = new Date("2026-08-31T00:10:00.000Z");
+    createNodeToken(document, { hostname: "corrupt-policy.dev", hostLifecycleId: "create-1", now });
+    beginHostDeregistration(document, {
+      hostname: "corrupt-policy.dev", externalOperationId: "destroy-1", hostLifecycleId: "create-1",
+      reason: "instance-destroy", requestedBy: "stardust", actor: "app:destroyer", relayNames: ["dev"],
+      scope: { appTokenId: "app-1", label: "destroyer", hostnamePattern: "*.dev" }, trustedCaPems: [], now,
+    });
+    recordHostDeregistrationReplication(document, [
+      { name: "dev", ok: true, count: 0, snapshotFingerprints: [] },
+    ], ["dev"], now);
+    const row = confirmHostInfrastructureDestroyed(document, {
+      hostname: "corrupt-policy.dev", externalOperationId: "destroy-1", hostLifecycleId: "create-1",
+      provider: "vultr", providerInstanceId: "vultr-1", destroyedAt: "2026-08-31T00:09:00.000Z",
+      actor: "app:destroyer", now,
+    });
+    row.policy.state = "awaiting_publish";
+    row.policy.pullRequestUrl = "https://github.test/o/r/pull/1";
+    row.policy.commitSha = "c".repeat(40);
+    row.policy.publishedGeneration = "generation-1";
+    row.policy.automation = {
+      branch: "policy/host-deregister/destroy-1", pullRequestNumber: 1,
+      patchCommitSha: "b".repeat(40), mergeCommitSha: "c".repeat(40),
+      affectedRelays: ["dev"], reviewedBy: ["human-reviewer"],
+      planGeneration: "generation-1", planProposedAt: "2026-08-31T00:09:30.000Z",
+      plans: [], lastAttemptAt: null, lastError: null,
+    };
+    const corruptRoot = mkdtempSync(join(tmpdir(), "heliopause-corrupt-policy-"));
+    const path = join(corruptRoot, "store.json");
+    try {
+      writeFileSync(path, JSON.stringify(document), { mode: 0o600 });
+      assert.throws(() => loadEnrollmentDocument(path), /lacks exact durable plans/);
+    } finally {
+      rmSync(corruptRoot, { recursive: true, force: true });
+    }
+  });
+
   it("rejects a non-boolean revokeExisting before changing existing tokens", () => {
     const document = emptyEnrollmentDocument();
     const issued = createNodeToken(document, { hostname: "node-keep.dev" });
@@ -125,7 +221,9 @@ describe("standalone enrollment store", () => {
       const legacy = structuredClone(document) as unknown as { tokens: Array<Record<string, unknown>> };
       delete legacy.tokens[0]!.hostLifecycleId;
       writeFileSync(path, JSON.stringify(legacy));
-      assert.equal(loadEnrollmentDocument(path).tokens[0]!.hostLifecycleId, null);
+      const loadedLegacy = loadEnrollmentDocument(path);
+      assert.equal(loadedLegacy.tokens[0]!.hostLifecycleId, null);
+      assert.deepEqual(loadedLegacy.hostLifecycleBindings, [], "legacy schema did not migrate missing bindings closed");
       for (const malformed of [7, {}, "", " lifecycle "]) {
         legacy.tokens[0]!.hostLifecycleId = malformed;
         writeFileSync(path, JSON.stringify(legacy));
@@ -134,6 +232,310 @@ describe("standalone enrollment store", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  it("binds only explicitly evidenced legacy inventory and audits both sides of the mutation", () => {
+    const document = emptyEnrollmentDocument();
+    const token = createNodeToken(document, { hostname: "legacy-bind.dev" }).row;
+    const otherwiseOmissible = createNodeToken(document, { hostname: "legacy-bind.dev" }).row;
+    const request = storedRequest({ id: "legacy-csr", hostname: "legacy-bind.dev", nodeTokenId: token.id });
+    document.requests.push(request);
+    const evidence = {
+      stardustCreateOperationId: "create-uuid-1", provider: "vultr" as const, providerInstanceId: "vm-77",
+      nodeTokenIds: [token.id, otherwiseOmissible.id], csrRequestIds: [request.id], certificateFingerprints: [],
+    };
+    assert.throws(() => bindLegacyHostLifecycle(document, {
+      hostname: "legacy-bind.dev", hostLifecycleId: "create-uuid-1",
+      evidence: { ...evidence, nodeTokenIds: [token.id] }, trustedCaPems: [], actor: "ops",
+    }), /complete legacy inventory/);
+    assert.equal(token.hostLifecycleId, null, "a rejected partial inventory changed the token");
+    assert.equal(otherwiseOmissible.hostLifecycleId, null, "a rejected partial inventory changed an omitted token");
+    const result = bindLegacyHostLifecycle(document, {
+      hostname: "legacy-bind.dev", hostLifecycleId: "create-uuid-1", evidence, trustedCaPems: [], actor: "ops",
+    });
+    assert.equal(result.tokensBound, 2); assert.equal(result.requestsBound, 1);
+    assert.equal(token.hostLifecycleId, "create-uuid-1"); assert.equal(request.hostLifecycleId, "create-uuid-1");
+    assert.equal(otherwiseOmissible.hostLifecycleId, "create-uuid-1");
+    assert.deepEqual(document.hostLifecycleBindings.map(({ hostname, hostLifecycleId, provider, providerInstanceId }) =>
+      ({ hostname, hostLifecycleId, provider, providerInstanceId })), [{
+      hostname: "legacy-bind.dev", hostLifecycleId: "create-uuid-1", provider: "vultr", providerInstanceId: "vm-77",
+    }]);
+    assert.deepEqual(document.audit.slice(-2).map((event) => event.action), [
+      "host-lifecycle.bind-before", "host-lifecycle.bind-after",
+    ]);
+    assert.throws(() => bindLegacyHostLifecycle(document, {
+      hostname: "legacy-bind.dev", hostLifecycleId: "create-uuid-1", evidence, trustedCaPems: [], actor: "ops",
+    }), /rebinding is refused/);
+    assert.throws(() => bindLegacyHostLifecycle(document, {
+      hostname: "some-other-name.dev", hostLifecycleId: "create-uuid-2",
+      evidence: { ...evidence, stardustCreateOperationId: "create-uuid-2" }, trustedCaPems: [], actor: "ops",
+    }), /complete legacy inventory/);
+    const operation = beginHostDeregistration(document, {
+      hostname: "legacy-bind.dev", hostLifecycleId: "create-uuid-1", externalOperationId: "destroy-uuid-1",
+      reason: "instance-destroy", requestedBy: "stardust:ops", actor: "app:destroyer", relayNames: ["dev"],
+      scope: { appTokenId: "app-1", label: "destroyer", hostnamePattern: "*.dev" }, trustedCaPems: [],
+    }).row;
+    assert.equal(operation.infrastructure.expectedProviderInstanceId, "vm-77");
+    recordHostDeregistrationReplication(document, [{ name: "dev", ok: true, count: 0, snapshotFingerprints: [] }], ["dev"]);
+    const destroyedAt = new Date(Date.now() - 1_000).toISOString();
+    assert.throws(() => confirmHostInfrastructureDestroyed(document, {
+      hostname: operation.hostname, hostLifecycleId: operation.hostLifecycleId,
+      externalOperationId: operation.externalOperationId, provider: "vultr",
+      providerInstanceId: "vm-other", destroyedAt, actor: "ops",
+    }), /conflicts with the lifecycle binding inventory/);
+    assert.equal(confirmHostInfrastructureDestroyed(document, {
+      hostname: operation.hostname, hostLifecycleId: operation.hostLifecycleId,
+      externalOperationId: operation.externalOperationId, provider: "vultr",
+      providerInstanceId: "vm-77", destroyedAt, actor: "ops",
+    }).infrastructure.providerInstanceId, "vm-77");
+  });
+
+  it("loads lifecycle bindings as strict unique immutable enforcement records", () => {
+    const root = mkdtempSync(join(tmpdir(), "heliopause-lifecycle-binding-")); const path = join(root, "store.json");
+    try {
+      const document = emptyEnrollmentDocument();
+      const token = createNodeToken(document, { hostname: "binding.dev" }).row;
+      bindLegacyHostLifecycle(document, {
+        hostname: "binding.dev", hostLifecycleId: "create-binding-1", trustedCaPems: [], actor: "ops",
+        evidence: { stardustCreateOperationId: "create-binding-1", provider: "vultr",
+          providerInstanceId: "vm-binding-1", nodeTokenIds: [token.id], csrRequestIds: [], certificateFingerprints: [] },
+      });
+      saveEnrollmentDocument(path, document);
+      const loaded = loadEnrollmentDocument(path);
+      assert.deepEqual(loaded.hostLifecycleBindings, document.hostLifecycleBindings);
+      const malformed = structuredClone(document);
+      malformed.hostLifecycleBindings.push({ ...malformed.hostLifecycleBindings[0]!, hostLifecycleId: "create-binding-2" });
+      writeFileSync(path, JSON.stringify(malformed));
+      assert.throws(() => loadEnrollmentDocument(path), /duplicate lifecycle binding/);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("binds signed legacy inventory only from trusted PEM truth, never cached certificate metadata",
+    { timeout: 15_000 }, () => {
+      const root = mkdtempSync(join(tmpdir(), "heliopause-bind-cert-truth-")); const ca = join(root, "pki");
+      try {
+        execFileSync("node", ["bin/heliopause-pki.ts", "init", ca], { cwd: process.cwd() });
+        const document = emptyEnrollmentDocument();
+        const issued = createNodeToken(document, { hostname: "legacy-cert.dev" });
+        const material = csr(root, "legacy-cert.dev", "legacy");
+        const request = submitNodeCsr(document, { token: issued.token, csrPem: material.pem }).row;
+        const certPath = join(root, "legacy.pem");
+        execFileSync("node", ["bin/heliopause-pki.ts", "sign-csr", ca, material.path, certPath,
+          "--name=legacy-cert.dev", `--expect-sha256=${request.csrSha256}`], { cwd: process.cwd() });
+        const caPem = readFileSync(join(ca, "ca.pem"), "utf8");
+        storeNodeCertificate(document, { requestId: request.id, certificatePem: readFileSync(certPath, "utf8"),
+          caPem, caName: "dev", actor: "ops" });
+        const actualFingerprint = request.certificateSha256!;
+        const evidence = { stardustCreateOperationId: "create-legacy-cert-1", provider: "vultr" as const,
+          providerInstanceId: "vm-legacy-cert", nodeTokenIds: [issued.row.id], csrRequestIds: [request.id],
+          certificateFingerprints: [actualFingerprint] };
+        assert.throws(() => bindLegacyHostLifecycle(document, {
+          hostname: "legacy-cert.dev", hostLifecycleId: "create-legacy-cert-1",
+          evidence, trustedCaPems: [], actor: "ops",
+        }), /not valid under a configured trusted CA/);
+        const actualNotAfter = request.certificateNotAfter;
+        request.certificateNotAfter = "2020-01-01T00:00:00.000Z";
+        assert.throws(() => bindLegacyHostLifecycle(document, {
+          hostname: "legacy-cert.dev", hostLifecycleId: "create-legacy-cert-1",
+          evidence, trustedCaPems: [caPem], actor: "ops",
+        }), /metadata conflicts with its trusted PEM/);
+        assert.equal(issued.row.hostLifecycleId, null); assert.equal(request.hostLifecycleId, null);
+        request.certificateNotAfter = actualNotAfter;
+        assert.equal(bindLegacyHostLifecycle(document, {
+          hostname: "legacy-cert.dev", hostLifecycleId: "create-legacy-cert-1",
+          evidence, trustedCaPems: [caPem], actor: "ops",
+        }).requestsBound, 1);
+      } finally { rmSync(root, { recursive: true, force: true }); }
+    });
+
+  it("revokes a trusted unexpired PEM even when cached metadata falsely says expired",
+    { timeout: 15_000 }, () => {
+      const root = mkdtempSync(join(tmpdir(), "heliopause-dereg-cert-truth-")); const ca = join(root, "pki");
+      try {
+        execFileSync("node", ["bin/heliopause-pki.ts", "init", ca], { cwd: process.cwd() });
+        const document = emptyEnrollmentDocument();
+        const issued = createNodeToken(document, { hostname: "metadata-lie.dev", hostLifecycleId: "create-metadata-lie" });
+        const material = csr(root, "metadata-lie.dev", "host");
+        const request = submitNodeCsr(document, { token: issued.token, csrPem: material.pem }).row;
+        const certPath = join(root, "agent.pem");
+        execFileSync("node", ["bin/heliopause-pki.ts", "sign-csr", ca, material.path, certPath,
+          "--name=metadata-lie.dev", `--expect-sha256=${request.csrSha256}`], { cwd: process.cwd() });
+        const caPem = readFileSync(join(ca, "ca.pem"), "utf8");
+        storeNodeCertificate(document, { requestId: request.id, certificatePem: readFileSync(certPath, "utf8"),
+          caPem, caName: "dev", actor: "ops" });
+        const actualFingerprint = request.certificateSha256!;
+        const untrustedDocument = structuredClone(document);
+        const untrustedOperation = beginHostDeregistration(untrustedDocument, {
+          hostname: "metadata-lie.dev", hostLifecycleId: "create-metadata-lie",
+          externalOperationId: "destroy-untrusted", reason: "instance-destroy",
+          requestedBy: "stardust:ops", actor: "app:destroyer", relayNames: ["dev"],
+          scope: { appTokenId: "app-1", label: "destroyer", hostnamePattern: "*.dev" }, trustedCaPems: [],
+        }).row;
+        assert.equal(untrustedOperation.blocked?.code, "certificate_inventory_incomplete");
+        assert.deepEqual(untrustedOperation.credentials.requiredRevocationFingerprints, []);
+        assert.equal(untrustedDocument.revocations.length, 0);
+        request.certificateNotAfter = "2020-01-01T00:00:00.000Z";
+        request.certificateSha256 = "f".repeat(64);
+        const operation = beginHostDeregistration(document, {
+          hostname: "metadata-lie.dev", hostLifecycleId: "create-metadata-lie",
+          externalOperationId: "destroy-metadata-lie", reason: "instance-destroy",
+          requestedBy: "stardust:ops", actor: "app:destroyer", relayNames: ["dev"],
+          scope: { appTokenId: "app-1", label: "destroyer", hostnamePattern: "*.dev" },
+          trustedCaPems: [caPem],
+        }).row;
+        assert.equal(operation.blocked?.code, "certificate_inventory_incomplete");
+        assert.equal(operation.credentials.certificates.expired, 0);
+        assert.deepEqual(operation.credentials.requiredRevocationFingerprints, [actualFingerprint]);
+        assert.equal(document.revocations.some((row) => row.fingerprint256 === actualFingerprint), true);
+        assert.equal(document.revocations.some((row) => row.fingerprint256 === "f".repeat(64)), false);
+      } finally { rmSync(root, { recursive: true, force: true }); }
+    });
+
+  it("repairs incomplete certificate inventory and resumes the same durable operation", { timeout: 15_000 }, () => {
+    const root = mkdtempSync(join(tmpdir(), "heliopause-dereg-cert-repair-")); const ca = join(root, "pki");
+    try {
+      execFileSync("node", ["bin/heliopause-pki.ts", "init", ca], { cwd: process.cwd() });
+      const document = emptyEnrollmentDocument();
+      const issued = createNodeToken(document, { hostname: "repair-cert.dev", hostLifecycleId: "create-repair-1" });
+      const material = csr(root, "repair-cert.dev", "host");
+      const request = submitNodeCsr(document, { token: issued.token, csrPem: material.pem }).row;
+      const certPath = join(root, "agent.pem");
+      execFileSync("node", ["bin/heliopause-pki.ts", "sign-csr", ca, material.path, certPath,
+        "--name=repair-cert.dev", `--expect-sha256=${request.csrSha256}`], { cwd: process.cwd() });
+      storeNodeCertificate(document, { requestId: request.id, certificatePem: readFileSync(certPath, "utf8"),
+        caPem: readFileSync(join(ca, "ca.pem"), "utf8"), caName: "dev", actor: "ops" });
+      const missingPem = request.certificatePem!; request.certificatePem = null; request.certificateSha256 = null;
+      const operation = beginHostDeregistration(document, {
+        hostname: "repair-cert.dev", externalOperationId: "destroy-repair-1", hostLifecycleId: "create-repair-1",
+        reason: "instance-destroy", requestedBy: "stardust:ops", actor: "app:destroyer", relayNames: ["dev"],
+        scope: { appTokenId: "app-1", label: "destroyer", hostnamePattern: "*.dev" },
+        trustedCaPems: [readFileSync(join(ca, "ca.pem"), "utf8")],
+      }).row;
+      assert.equal(operation.blocked?.code, "certificate_inventory_incomplete");
+      const selfSignedPath = join(root, "self-signed.pem");
+      const profilePath = join(root, "self-signed.ext");
+      writeFileSync(profilePath, ["basicConstraints=critical,CA:FALSE", "keyUsage=critical,digitalSignature",
+        "extendedKeyUsage=critical,clientAuth"].join("\n"));
+      execFileSync("openssl", ["x509", "-req", "-in", material.path, "-signkey", material.key,
+        "-days", "1", "-sha256", "-extfile", profilePath, "-out", selfSignedPath]);
+      const selfSignedPem = readFileSync(selfSignedPath, "utf8");
+      assert.throws(() => repairHostDeregistrationCertificateInventory(document, {
+        hostname: operation.hostname, externalOperationId: operation.externalOperationId,
+        hostLifecycleId: operation.hostLifecycleId,
+        certificates: [{ requestId: request.id, certificatePem: selfSignedPem }],
+        trustedCaPems: [readFileSync(join(ca, "ca.pem"), "utf8")], actor: "ops",
+      }), /configured trusted CA/);
+      assert.equal(request.certificatePem, null, "a rejected certificate repair mutated inventory");
+      const repaired = repairHostDeregistrationCertificateInventory(document, {
+        hostname: operation.hostname, externalOperationId: operation.externalOperationId,
+        hostLifecycleId: operation.hostLifecycleId, certificates: [{ requestId: request.id, certificatePem: missingPem }],
+        trustedCaPems: [readFileSync(join(ca, "ca.pem"), "utf8")], actor: "ops",
+      });
+      assert.equal(repaired.id, operation.id); assert.equal(repaired.credentials.state, "replicating");
+      assert.equal(repaired.blocked, null); assert.equal(repaired.credentials.certificates.revoked, 1);
+      assert.equal(JSON.stringify(repaired).includes(missingPem), false, "operation leaked repaired certificate PEM");
+      assert.equal(JSON.stringify(document.audit).includes("BEGIN CERTIFICATE"), false, "audit leaked certificate PEM");
+      assert.deepEqual(document.audit.slice(-2).map((event) => event.action), [
+        "certificate.revoke", "host-deregistration.certificate-repair-after",
+      ]);
+      assert.ok(document.audit.some((event) => event.action === "host-deregistration.certificate-repair-before"));
+      const auditRows = document.audit.length;
+      assert.equal(repairHostDeregistrationCertificateInventory(document, {
+        hostname: operation.hostname, externalOperationId: operation.externalOperationId,
+        hostLifecycleId: operation.hostLifecycleId, certificates: [{ requestId: request.id, certificatePem: missingPem }],
+        trustedCaPems: [readFileSync(join(ca, "ca.pem"), "utf8")], actor: "ops",
+      }).id, operation.id, "response-loss retry did not return the same operation");
+      assert.equal(document.audit.length, auditRows, "response-loss retry appended duplicate audit evidence");
+      assert.throws(() => repairHostDeregistrationCertificateInventory(document, {
+        hostname: operation.hostname, externalOperationId: operation.externalOperationId,
+        hostLifecycleId: operation.hostLifecycleId,
+        certificates: [{ requestId: request.id, certificatePem: selfSignedPem }],
+        trustedCaPems: [readFileSync(join(ca, "ca.pem"), "utf8")], actor: "ops",
+      }), /replay conflicts/);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("compacts only proven-expired revocations and resumes the capacity-blocked operation", { timeout: 15_000 }, () => {
+    const root = mkdtempSync(join(tmpdir(), "heliopause-dereg-capacity-repair-")); const ca = join(root, "pki");
+    try {
+      execFileSync("node", ["bin/heliopause-pki.ts", "init", ca], { cwd: process.cwd() });
+      const document = emptyEnrollmentDocument();
+      const issued = createNodeToken(document, { hostname: "repair-capacity.dev", hostLifecycleId: "create-cap-1" });
+      const material = csr(root, "repair-capacity.dev", "host");
+      const request = submitNodeCsr(document, { token: issued.token, csrPem: material.pem }).row;
+      const certPath = join(root, "agent.pem");
+      execFileSync("node", ["bin/heliopause-pki.ts", "sign-csr", ca, material.path, certPath,
+        "--name=repair-capacity.dev", `--expect-sha256=${request.csrSha256}`], { cwd: process.cwd() });
+      storeNodeCertificate(document, { requestId: request.id, certificatePem: readFileSync(certPath, "utf8"),
+        caPem: readFileSync(join(ca, "ca.pem"), "utf8"), caName: "dev", actor: "ops" });
+      const oldIssued = createNodeToken(document, { hostname: "old.dev", hostLifecycleId: "create-old-1" });
+      const oldMaterial = csr(root, "old.dev", "old");
+      const oldRequest = submitNodeCsr(document, { token: oldIssued.token, csrPem: oldMaterial.pem }).row;
+      const oldCertPath = join(root, "old.pem");
+      signClientCertificate(oldMaterial.path, oldCertPath, join(ca, "ca.pem"), join(ca, "ca.key"), join(root, "old.ext"));
+      storeNodeCertificate(document, { requestId: oldRequest.id, certificatePem: readFileSync(oldCertPath, "utf8"),
+        caPem: readFileSync(join(ca, "ca.pem"), "utf8"), caName: "dev", actor: "ops" });
+      const oldFingerprint = oldRequest.certificateSha256!;
+      const repairNow = new Date(Date.parse(oldRequest.certificateNotAfter!) + 60_000);
+      const capacityFixtureRows = 1_588;
+      document.revocations = Array.from({ length: capacityFixtureRows }, (_, index) => ({
+        fingerprint256: index === 0 ? oldFingerprint : index.toString(16).padStart(64, "0"),
+        subject: null, reason: "x", actor: "x",
+        revokedAt: "2026-08-01T00:00:00.000Z",
+      }));
+      const operation = beginHostDeregistration(document, {
+        hostname: "repair-capacity.dev", externalOperationId: "destroy-cap-1", hostLifecycleId: "create-cap-1",
+        reason: "instance-destroy", requestedBy: "stardust:ops", actor: "app:destroyer", relayNames: ["dev"],
+        scope: { appTokenId: "app-1", label: "destroyer", hostnamePattern: "*.dev" },
+        trustedCaPems: [readFileSync(join(ca, "ca.pem"), "utf8")],
+        now: repairNow,
+      }).row;
+      assert.equal(operation.blocked?.code, "revocation_capacity_exhausted");
+      const retained = document.revocations.filter((entry) => entry.fingerprint256 !== oldFingerprint)
+        .map((entry) => entry.fingerprint256).sort();
+      const digest = createHash("sha256").update(JSON.stringify(retained)).digest("hex");
+      const oldPem = oldRequest.certificatePem; oldRequest.certificatePem = null;
+      assert.throws(() => repairHostDeregistrationRevocationCapacity(document, {
+        hostname: operation.hostname, externalOperationId: operation.externalOperationId,
+        hostLifecycleId: operation.hostLifecycleId, relayNames: ["dev"], trustedCaPems: [readFileSync(join(ca, "ca.pem"), "utf8")], actor: "ops",
+        relayConfirmations: [{ name: "dev", compactedAt: new Date(repairNow.getTime() - 1_000).toISOString(), retainedFingerprintSha256: digest }],
+        now: repairNow,
+      }), /no expired revocations are safely compactable/);
+      oldRequest.certificatePem = oldPem;
+      const actualNotAfter = oldRequest.certificateNotAfter; oldRequest.certificateNotAfter = "2020-01-01T00:00:00.000Z";
+      assert.throws(() => repairHostDeregistrationRevocationCapacity(document, {
+        hostname: operation.hostname, externalOperationId: operation.externalOperationId,
+        hostLifecycleId: operation.hostLifecycleId, relayNames: ["dev"], trustedCaPems: [readFileSync(join(ca, "ca.pem"), "utf8")], actor: "ops",
+        relayConfirmations: [{ name: "dev", compactedAt: new Date(repairNow.getTime() - 1_000).toISOString(), retainedFingerprintSha256: digest }],
+        now: repairNow,
+      }), /no expired revocations are safely compactable/);
+      oldRequest.certificateNotAfter = actualNotAfter;
+      assert.throws(() => repairHostDeregistrationRevocationCapacity(document, {
+        hostname: operation.hostname, externalOperationId: operation.externalOperationId,
+        hostLifecycleId: operation.hostLifecycleId, relayNames: ["dev"], trustedCaPems: [readFileSync(join(ca, "ca.pem"), "utf8")], actor: "ops",
+        relayConfirmations: [{ name: "dev", compactedAt: new Date(repairNow.getTime() - 1_000).toISOString(), retainedFingerprintSha256: "0".repeat(64) }],
+        now: repairNow,
+      }), /exact compacted snapshot/);
+      const compactedAt = new Date(repairNow.getTime() - 1_000).toISOString();
+      const repaired = repairHostDeregistrationRevocationCapacity(document, {
+        hostname: operation.hostname, externalOperationId: operation.externalOperationId,
+        hostLifecycleId: operation.hostLifecycleId, relayNames: ["dev"], trustedCaPems: [readFileSync(join(ca, "ca.pem"), "utf8")], actor: "ops",
+        relayConfirmations: [{ name: "dev", compactedAt, retainedFingerprintSha256: digest }],
+        now: repairNow,
+      });
+      assert.equal(repaired.id, operation.id); assert.equal(repaired.credentials.state, "replicating");
+      assert.equal(document.revocations.length, capacityFixtureRows);
+      assert.equal(document.revocations.some((entry) => entry.fingerprint256 === oldFingerprint), false);
+      assert.ok(document.audit.some((event) => event.action === "host-deregistration.capacity-repair-before"));
+      assert.ok(document.audit.some((event) => event.action === "host-deregistration.capacity-repair-after"));
+      const auditRows = document.audit.length;
+      assert.equal(repairHostDeregistrationRevocationCapacity(document, {
+        hostname: operation.hostname, externalOperationId: operation.externalOperationId,
+        hostLifecycleId: operation.hostLifecycleId, relayNames: ["dev"], trustedCaPems: [readFileSync(join(ca, "ca.pem"), "utf8")], actor: "ops",
+        relayConfirmations: [{ name: "dev", compactedAt, retainedFingerprintSha256: digest }], now: repairNow,
+      }).id, operation.id);
+      assert.equal(document.audit.length, auditRows);
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
   it("fails closed when persisted policy evidence skips credential and infrastructure ordering", () => {
@@ -146,6 +548,7 @@ describe("standalone enrollment store", () => {
         hostname: "ordered.dev", externalOperationId: "destroy-1", hostLifecycleId: "life-1",
         reason: "instance-destroy", requestedBy: "stardust:ops", actor: "app:destroyer",
         scope: { appTokenId: "app-1", label: "destroyer", hostnamePattern: "*.dev" }, relayNames: ["dev"],
+        trustedCaPems: [],
       }).row;
       const ordered = structuredClone(document);
       row.policy = {
@@ -159,7 +562,8 @@ describe("standalone enrollment store", () => {
 
       const waitingWithEvidence = structuredClone(ordered);
       waitingWithEvidence.hostDeregistrations[0]!.infrastructure = {
-        state: "waiting", provider: "vultr", providerInstanceId: "vm-1", destroyedAt: ordered.hostDeregistrations[0]!.createdAt,
+        state: "waiting", provider: "vultr", providerInstanceId: "vm-1", expectedProviderInstanceId: null,
+        destroyedAt: ordered.hostDeregistrations[0]!.createdAt,
       };
       writeFileSync(path, JSON.stringify(waitingWithEvidence));
       assert.throws(() => loadEnrollmentDocument(path), /waiting infrastructure carries destruction evidence/);
