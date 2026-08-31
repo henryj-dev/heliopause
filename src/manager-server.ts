@@ -116,11 +116,12 @@ import {
 } from "./approval.ts";
 import {
   APP_TOKEN_SCOPES, EnrollmentError, appTokenAllowsHostname, appTokenCreatedBy, beginHostDeregistration,
-  completeHostDeregistrationPolicy, confirmHostInfrastructureDestroyed, createAppToken, createNodeToken,
+  bindLegacyHostLifecycle, completeHostDeregistrationPolicy, confirmHostInfrastructureDestroyed, createAppToken, createNodeToken,
   fetchNodeCertificate, looksLikeAppToken, looksLikeNodeToken, lookupAppToken,
   normalizeEnrollmentHostname, preflightNodeCsr, rejectNodeCsr, requireEnrollmentDocument,
   recordHostDeregistrationReplication, reconcileHostDeregistrationRelays,
-  normalizeExternalOperationId,
+  normalizeExternalOperationId, repairHostDeregistrationCertificateInventory,
+  repairHostDeregistrationRevocationCapacity,
   revokeAppToken, revokeCertificate, revokeNodeToken, storeNodeCertificate,
   submitValidatedNodeCsr, touchExistingNodeCsr, validateNodeCsrAsync, withEnrollmentTransaction,
   type AppTokenRecord, type AppTokenScope, type EnrollmentDocument, type NodeCsrRecord,
@@ -226,8 +227,10 @@ export const API_ROUTE_PATTERNS: readonly RegExp[] = [
   /^\/enrollment\/app-tokens\/[^/]+\/revoke$/,
   /^\/enrollment\/requests\/[^/]+\/reject$/,
   /^\/enrollment\/requests\/[^/]+\/certificate$/,
+  /^\/enrollment\/host-lifecycle-bindings\/[^/]+\/[^/]+$/,
   /^\/enrollment\/host-deregistrations\/[^/]+\/[^/]+(?:\/infrastructure-destroyed)?$/,
   /^\/enrollment\/host-deregistrations\/[^/]+\/[^/]+\/policy-completed$/,
+  /^\/enrollment\/host-deregistrations\/[^/]+\/[^/]+\/repairs\/(?:certificate-inventory|revocation-capacity)$/,
 ];
 
 export type PendingOidcLogin = {
@@ -1747,6 +1750,107 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
             "request was caused by another site",
         });
       }
+    }
+
+    const lifecycleBind = /^\/enrollment\/host-lifecycle-bindings\/([^/]+)\/([^/]+)$/.exec(url.pathname);
+    if (opts.enrollment && req.method === "PUT" && lifecycleBind) {
+      if (!mayWrite) return refuseWrite(res, who, url.pathname, principal.via);
+      try {
+        const rawBody: unknown = JSON.parse(await readBody(req));
+        if (!rawBody || typeof rawBody !== "object" || Array.isArray(rawBody)) throw new EnrollmentError("request body must be an object");
+        const body = rawBody as Record<string, unknown>;
+        if ((await requireOtp(principal, body, res, url.pathname)) === "answered") return;
+        if (Object.keys(body).some((key) => !["inventoryEvidence", "otp"].includes(key))) {
+          throw new EnrollmentError("request contains unsupported fields");
+        }
+        const rawEvidence = body.inventoryEvidence;
+        if (!rawEvidence || typeof rawEvidence !== "object" || Array.isArray(rawEvidence)) {
+          throw new EnrollmentError("inventoryEvidence must be an object");
+        }
+        const evidence = rawEvidence as Record<string, unknown>;
+        const evidenceFields = ["stardustCreateOperationId", "provider", "providerInstanceId", "nodeTokenIds", "csrRequestIds", "certificateFingerprints"];
+        if (Object.keys(evidence).some((key) => !evidenceFields.includes(key))
+          || typeof evidence.stardustCreateOperationId !== "string" || evidence.provider !== "vultr"
+          || typeof evidence.providerInstanceId !== "string" || !Array.isArray(evidence.nodeTokenIds)
+          || !Array.isArray(evidence.csrRequestIds) || !Array.isArray(evidence.certificateFingerprints)
+          || [...evidence.nodeTokenIds, ...evidence.csrRequestIds, ...evidence.certificateFingerprints]
+            .some((value) => typeof value !== "string")) {
+          throw new EnrollmentError("inventoryEvidence is malformed");
+        }
+        const result = enrollmentWrite(opts.enrollment.storeFile, (document) => bindLegacyHostLifecycle(document, {
+          hostname: decodeURIComponent(lifecycleBind[1]!), hostLifecycleId: decodeURIComponent(lifecycleBind[2]!),
+          evidence: {
+            stardustCreateOperationId: evidence.stardustCreateOperationId as string,
+            provider: "vultr", providerInstanceId: evidence.providerInstanceId as string,
+            nodeTokenIds: evidence.nodeTokenIds as string[], csrRequestIds: evidence.csrRequestIds as string[],
+            certificateFingerprints: evidence.certificateFingerprints as string[],
+          }, actor: who,
+        }));
+        return send(res, 200, { binding: result });
+      } catch (e) { return sendEnrollmentError(res, e); }
+    }
+
+    const deregistrationRepair = /^\/enrollment\/host-deregistrations\/([^/]+)\/([^/]+)\/repairs\/(certificate-inventory|revocation-capacity)$/.exec(url.pathname);
+    if (opts.enrollment && req.method === "PUT" && deregistrationRepair) {
+      if (!mayWrite) return refuseWrite(res, who, url.pathname, principal.via);
+      try {
+        const rawBody: unknown = JSON.parse(await readBody(req, 128 * 1024));
+        if (!rawBody || typeof rawBody !== "object" || Array.isArray(rawBody)) throw new EnrollmentError("request body must be an object");
+        const body = rawBody as Record<string, unknown>;
+        if ((await requireOtp(principal, body, res, url.pathname)) === "answered") return;
+        const hostname = decodeURIComponent(deregistrationRepair[1]!);
+        const externalOperationId = decodeURIComponent(deregistrationRepair[2]!);
+        let repaired;
+        if (deregistrationRepair[3] === "certificate-inventory") {
+          if (Object.keys(body).some((key) => !["hostLifecycleId", "certificates", "otp"].includes(key))
+            || typeof body.hostLifecycleId !== "string" || !Array.isArray(body.certificates)) {
+            throw new EnrollmentError("certificate inventory repair body is malformed");
+          }
+          const certificates = body.certificates.map((entry) => {
+            if (!entry || typeof entry !== "object" || Array.isArray(entry)
+              || Object.keys(entry).some((key) => !["requestId", "certificatePem"].includes(key))) {
+              throw new EnrollmentError("certificates entries must contain only requestId and certificatePem");
+            }
+            const candidate = entry as Record<string, unknown>;
+            if (typeof candidate.requestId !== "string" || typeof candidate.certificatePem !== "string") {
+              throw new EnrollmentError("certificates entries require string requestId and certificatePem");
+            }
+            return { requestId: candidate.requestId, certificatePem: candidate.certificatePem };
+          });
+          repaired = enrollmentWrite(opts.enrollment.storeFile, (document) =>
+            repairHostDeregistrationCertificateInventory(document, {
+              hostname, externalOperationId, hostLifecycleId: body.hostLifecycleId as string,
+              certificates, actor: who,
+            }));
+        } else {
+          if (Object.keys(body).some((key) => !["hostLifecycleId", "relayConfirmations", "otp"].includes(key))
+            || typeof body.hostLifecycleId !== "string" || !Array.isArray(body.relayConfirmations)) {
+            throw new EnrollmentError("revocation capacity repair body is malformed");
+          }
+          const relayConfirmations = body.relayConfirmations.map((entry) => {
+            if (!entry || typeof entry !== "object" || Array.isArray(entry)
+              || Object.keys(entry).some((key) => !["name", "compactedAt", "retainedFingerprintSha256"].includes(key))) {
+              throw new EnrollmentError("relayConfirmations entries contain unsupported fields");
+            }
+            const candidate = entry as Record<string, unknown>;
+            if (typeof candidate.name !== "string" || typeof candidate.compactedAt !== "string"
+              || typeof candidate.retainedFingerprintSha256 !== "string") {
+              throw new EnrollmentError("relayConfirmations entries require string name, compactedAt, and retainedFingerprintSha256");
+            }
+            return { name: candidate.name, compactedAt: candidate.compactedAt,
+              retainedFingerprintSha256: candidate.retainedFingerprintSha256 };
+          });
+          repaired = enrollmentWrite(opts.enrollment.storeFile, (document) =>
+            repairHostDeregistrationRevocationCapacity(document, {
+              hostname, externalOperationId, hostLifecycleId: body.hostLifecycleId as string,
+              relayConfirmations, relayNames: opts.relays.map((relay) => relay.name), actor: who,
+            }));
+        }
+        const replication = repaired.credentials.state === "replicating" ? await replicateRevocations() : [];
+        const operation = requireEnrollmentDocument(opts.enrollment.storeFile).hostDeregistrations.find((candidate) =>
+          candidate.hostname === repaired.hostname && candidate.externalOperationId === repaired.externalOperationId)!;
+        return send(res, 200, { operation, replication });
+      } catch (e) { return sendEnrollmentError(res, e); }
     }
 
     const policyComplete = /^\/enrollment\/host-deregistrations\/([^/]+)\/([^/]+)\/policy-completed$/.exec(url.pathname);

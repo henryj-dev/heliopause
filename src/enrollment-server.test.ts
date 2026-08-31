@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import {
-  createAppToken, initializeEnrollmentDocument, loadEnrollmentDocument, withEnrollmentTransaction,
+  createAppToken, createNodeToken, initializeEnrollmentDocument, loadEnrollmentDocument, withEnrollmentTransaction,
   type NodeCsrRecord,
 } from "./enrollment-store.ts";
 import { startManager } from "./manager-server.ts";
@@ -671,6 +671,36 @@ describe("lifecycle-bound host deregistration", () => {
     closeDereg = started.close;
   });
   after(() => { closeDereg(); closeRelay(); });
+
+  it("requires an operator writer and OTP to bind exact legacy inventory", async () => {
+    const seeded = withEnrollmentTransaction(deregStore, (document) => {
+      const token = createNodeToken(document, { hostname: "legacy-bind-api.dev" }).row;
+      const request: NodeCsrRecord = {
+        id: "legacy-bind-api-csr", hostname: "legacy-bind-api.dev", nodeTokenId: token.id,
+        hostLifecycleId: null, status: "pending", csrPem: "fixture", csrSha256: "1".repeat(64),
+        publicKeySha256: "2".repeat(64), keyAlgorithm: "ECDSA-P256", createdAt: new Date().toISOString(),
+        sourceIp: null, decidedAt: null, decidedBy: null, decisionReason: null, signedAt: null, caName: null,
+        certificatePem: null, caPem: null, certificateSha256: null, certificateNotBefore: null,
+        certificateNotAfter: null, retrievedAt: null,
+      };
+      document.requests.push(request);
+      return { tokenId: token.id, requestId: request.id };
+    });
+    const path = "/enrollment/host-lifecycle-bindings/legacy-bind-api.dev/create-api-uuid-1";
+    const inventoryEvidence = {
+      stardustCreateOperationId: "create-api-uuid-1", provider: "vultr", providerInstanceId: "vm-api-1",
+      nodeTokenIds: [seeded.tokenId], csrRequestIds: [seeded.requestId], certificateFingerprints: [],
+    };
+    assert.equal((await operator(path, "PUT", { inventoryEvidence })).status, 401);
+    assert.equal(loadEnrollmentDocument(deregStore).tokens.find((row) => row.id === seeded.tokenId)?.hostLifecycleId, null);
+    const malformed = await operator(path, "PUT", { otp: "123456", inventoryEvidence: { ...inventoryEvidence, hostname: "guess.dev" } });
+    assert.equal(malformed.status, 400);
+    const bound = await operator(path, "PUT", { otp: "123456", inventoryEvidence });
+    assert.equal(bound.status, 200); assert.equal(bound.body.binding.tokensBound, 1);
+    assert.equal(bound.body.binding.requestsBound, 1); assert.match(bound.body.binding.evidenceSha256, /^[0-9a-f]{64}$/);
+    assert.equal(JSON.stringify(bound.body).includes("tokenHash"), false);
+    assert.equal((await operator(path, "PUT", { otp: "123456", inventoryEvidence })).status, 409);
+  });
 
   it("closes only the exact lifecycle, converges through relay readiness, and queues reviewed policy removal", { timeout: 30_000 }, async () => {
     const issuedApp = withEnrollmentTransaction(deregStore, (document) => createAppToken(document, {
