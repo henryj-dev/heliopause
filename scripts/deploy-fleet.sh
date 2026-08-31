@@ -114,24 +114,30 @@ deploy() {
   scp -q -o ConnectTimeout=10 "$tgz" "${SSH_USER}@${addr}:/tmp/hp-code.tgz"
   rm -f "$tgz"
 
-  ssh -o ConnectTimeout=10 -o BatchMode=yes "${SSH_USER}@${addr}" "bash -s" <<EOS
+  local remote_env
+  printf -v remote_env 'HELIOPAUSE_DEPLOY_PATHS=%q HELIOPAUSE_DEPLOY_STAMP=%q HELIOPAUSE_DEPLOY_UNIT=%q' \
+    "$paths" "$stamp" "$unit"
+  ssh -o ConnectTimeout=10 -o BatchMode=yes "${SSH_USER}@${addr}" "$remote_env bash -s" <<'EOS'
 set -euo pipefail
+paths="$HELIOPAUSE_DEPLOY_PATHS"
+stamp="$HELIOPAUSE_DEPLOY_STAMP"
+unit="$HELIOPAUSE_DEPLOY_UNIT"
 # A path may be shipped here for the first time — `packages/i18n` was, when the relay grew a shared
 # package it had never needed before. Backing it up would `cp` a source that is not there yet and
 # `set -e` would abort the whole deploy; a path with no prior version simply has no backup to make.
-# And rsync writes into `/opt/heliopause/\$p/` but does not create a missing *parent* (`packages/`),
+# And rsync writes into `/opt/heliopause/$p/` but does not create a missing *parent* (`packages/`),
 # so a new nested path needs the tree made first. Both were measured on gw-01.util 2026-08-27.
 for p in $paths; do
-  if [ -e "/opt/heliopause/\$p" ]; then sudo cp -a "/opt/heliopause/\$p" "/opt/heliopause/\$p.bak-$stamp"; else echo "  \$p: new path, no backup"; fi
+  if [ -e "/opt/heliopause/$p" ]; then sudo cp -a "/opt/heliopause/$p" "/opt/heliopause/$p.bak-$stamp"; else echo "  $p: new path, no backup"; fi
 done
-T=\$(mktemp -d)
-tar xzf /tmp/hp-code.tgz -C "\$T"
-for p in $paths; do sudo mkdir -p "/opt/heliopause/\$p"; sudo rsync -a --delete "\$T/\$p/" "/opt/heliopause/\$p/"; done
-rm -rf "\$T" /tmp/hp-code.tgz
-sudo systemctl restart $unit
+T=$(mktemp -d)
+tar xzf /tmp/hp-code.tgz -C "$T"
+for p in $paths; do sudo mkdir -p "/opt/heliopause/$p"; sudo rsync -a --delete "$T/$p/" "/opt/heliopause/$p/"; done
+rm -rf "$T" /tmp/hp-code.tgz
+sudo systemctl restart "$unit"
 sleep 5
-systemctl is-active $unit
-sudo journalctl -u $unit -n 6 --no-pager | tail -6
+systemctl is-active "$unit"
+sudo journalctl -u "$unit" -n 6 --no-pager | tail -6
 EOS
   echo "── $name: done. Roll back with the .bak-$stamp directories if the journal above is wrong."
 }
