@@ -78,10 +78,11 @@ describe("deploy-fleet.sh ships every source the relay imports", () => {
 
   it("does not expand the remote script in the operator's shell", () => {
     const script = read("../scripts/deploy-fleet.sh");
-    assert.match(script, /<<'EOS'/,
-      "the remote heredoc must be quoted so comments and commands are not evaluated locally");
-    assert.match(script, /HELIOPAUSE_DEPLOY_PATHS=%q HELIOPAUSE_DEPLOY_STAMP=%q HELIOPAUSE_DEPLOY_UNIT=%q/,
-      "values needed remotely must be passed explicitly when the heredoc is quoted");
+    assert.match(
+      script,
+      /printf -v remote_env 'HELIOPAUSE_DEPLOY_PATHS=%q HELIOPAUSE_DEPLOY_STAMP=%q HELIOPAUSE_DEPLOY_UNIT=%q' \\\n\s+"\$paths" "\$stamp" "\$unit"\n\s+ssh [^\n]+ "\$remote_env bash -s" <<'EOS'\nset -euo pipefail\npaths="\$HELIOPAUSE_DEPLOY_PATHS"\nstamp="\$HELIOPAUSE_DEPLOY_STAMP"\nunit="\$HELIOPAUSE_DEPLOY_UNIT"/,
+      "the active SSH heredoc must receive and consume all three explicitly quoted values",
+    );
   });
 
   it("still ships the repo's own bin and src", () => {
