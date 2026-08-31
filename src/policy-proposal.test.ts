@@ -10,6 +10,8 @@ import {
   appJwt,
   branchName,
   commitToBranch,
+  ensureRepositoryFileOnBranch,
+  findPullRequestByBranch,
   forgetInstallationTokens,
   installationToken,
   isUsableBranchName,
@@ -164,6 +166,43 @@ describe("commitToBranch", () => {
       { match: /git\/ref\/heads\/main$/, status: 404, body: { message: "Branch not found" } },
     ]);
     await assert.rejects(() => commitToBranch(creds, fetch, 0, edit), /Branch not found/);
+  });
+});
+
+describe("idempotent machine-owned branch updates", () => {
+  it("derives desired bytes from the branch after creation, not from a stale base read", async () => {
+    const current = '{"schemaVersion":1,"retiredHosts":[{"hostname":"already.dev"}]}\n';
+    const { fetch, seen } = fetcherFor([
+      tokenRoute, baseRefRoute,
+      { match: /git\/refs$/, method: "POST", body: {} },
+      { match: /git\/ref\/heads\/policy%2Fa%2Fb$/, body: { object: { sha: "branch-head" } } },
+      { match: /contents\/retired-hosts\.json\?ref=/, body: {
+        encoding: "base64", content: Buffer.from(current).toString("base64"), sha: "blob-sha",
+      } },
+      { match: /contents\/retired-hosts\.json$/, method: "PUT", body: { commit: { sha: "new-head" } } },
+    ]);
+    const out = await ensureRepositoryFileOnBranch(creds, fetch, 0, {
+      target, path: "retired-hosts.json", message: "m", branch: "policy/a/b",
+      transform: (content) => content.replace("]}", ',{"hostname":"next.dev"}]}'),
+    });
+    assert.equal(out.commit, "new-head");
+    const put = seen.find((call) => call.method === "PUT")!;
+    const written = Buffer.from(String((put.body as { content: string }).content), "base64").toString("utf8");
+    assert.match(written, /already\.dev/);
+    assert.match(written, /next\.dev/);
+  });
+
+  it("recovers a pull request that merged before its number was durably recorded", async () => {
+    const { fetch } = fetcherFor([
+      tokenRoute,
+      { match: /\/pulls\?head=.*state=all/, body: [{
+        number: 9, html_url: "https://example.test/pull/9", state: "closed",
+        merged_at: "2026-08-31T00:00:00Z", merge_commit_sha: "c".repeat(40), head: { sha: "b".repeat(40) },
+      }] },
+    ]);
+    const found = await findPullRequestByBranch(creds, target, fetch, 0, "policy/a/b");
+    assert.equal(found?.number, 9);
+    assert.equal(found?.merged, true);
   });
 });
 

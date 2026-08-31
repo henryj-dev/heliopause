@@ -269,6 +269,16 @@ const { server } = await startManager({
         },
       }
     : {}),
+  ...(process.env.HELIOPAUSE_POLICY_RETIREMENTS_PATH
+    ? {
+        policyWorker: {
+          retiredHostsPath: env("HELIOPAUSE_POLICY_RETIREMENTS_PATH"),
+          ...(process.env.HELIOPAUSE_POLICY_WORKER_INTERVAL_MS
+            ? { intervalMs: Number(process.env.HELIOPAUSE_POLICY_WORKER_INTERVAL_MS) }
+            : {}),
+        },
+      }
+    : {}),
   ...(process.env.HELIOPAUSE_ENROLLMENT_STORE
     ? {
         enrollment: {

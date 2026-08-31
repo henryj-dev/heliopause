@@ -93,6 +93,10 @@ import {
   type Fetcher,
   type ProposalTarget,
 } from "./policy-proposal.ts";
+import {
+  startHostDeregistrationPolicyWorker,
+  type PolicyWorkerPlan,
+} from "./host-deregistration-policy-worker.ts";
 import { siteView, type RelaySource, type RelayResult, type SiteView } from "./manager.ts";
 import { bundleFromPlan, planHash, validateBundle, type PlanBundle } from "./bundle.ts";
 import { diffRulesets } from "./ruleset-diff.ts";
@@ -341,6 +345,12 @@ export interface ManagerOptions {
      */
     allowPaths: readonly string[];
     fetch?: Fetcher;
+  };
+  /** Reviewed-Git host retirement orchestration. It never approves, merges or publishes. */
+  policyWorker?: {
+    /** Machine-owned JSON file in the policy repository, also exposed by the renderer allowlist. */
+    retiredHostsPath: string;
+    intervalMs?: number;
   };
   /**
    * Where to read Cilium's policy-map counters from, if a reader is deployed.
@@ -968,6 +978,19 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     // cannot be distinguished from deletion of a populated revocation ledger after a crash.
     requireEnrollmentDocument(opts.enrollment.storeFile);
   }
+  if (opts.policyWorker) {
+    if (!opts.enrollment || !opts.policySource || !opts.policyWrite) {
+      throw new Error("policyWorker requires enrollment, policySource and policyWrite");
+    }
+    if (!opts.policyWrite.allowPaths.includes(opts.policyWorker.retiredHostsPath)) {
+      throw new Error("policyWorker retiredHostsPath must be in policyWrite.allowPaths");
+    }
+    if (opts.relays.length === 0) throw new Error("policyWorker requires at least one configured relay");
+    if (opts.policyWorker.intervalMs !== undefined
+      && (!Number.isSafeInteger(opts.policyWorker.intervalMs) || opts.policyWorker.intervalMs < 1_000)) {
+      throw new Error("policyWorker intervalMs must be an integer of at least 1000");
+    }
+  }
   let revocationSourceFormat: "snapshot" | "enrollment" = opts.revocationFile ? "snapshot" : "enrollment";
   if (opts.revocationFile && opts.enrollment) {
     try {
@@ -1163,6 +1186,54 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
    * the fleet is not running is worse than no diff, because it reads as authoritative.
    */
   const lastPublished = new Map<string, { generation: string; bundle: PlanBundle }>();
+
+  /**
+   * Recreate a worker proposal after a restart without recreating approval.
+   *
+   * The worker identity is intentionally not a configured writer: it reaches this function, never
+   * the HTTP approve/publish handlers. A human writer sees the ordinary plan and must still approve
+   * and publish it with the existing OTP/two-person gate.
+   */
+  async function proposePolicyRetirement(
+    targetName: string,
+    previous?: { generation: string; proposedAt: string },
+  ): Promise<PolicyWorkerPlan> {
+    if (!opts.policySource) throw new Error("policy worker has no renderer");
+    const target = opts.relays.find((relay) => relay.name === targetName);
+    if (!target) throw new Error(`policy worker target ${targetName} is not configured`);
+    const source = await fetchPolicySource(opts.policySource, timeoutMs);
+    if (source.head.sha === null || source.head.dirty) {
+      throw new Error("policy worker cannot propose from an unnamed or dirty renderer checkout");
+    }
+    const site = screenSiteOf(source);
+    const issuedAt = previous && sameCommit(previous.generation, source.head.sha)
+      ? previous.proposedAt
+      : now().toISOString();
+    const plan = planPublish({
+      cfg: site.cfg,
+      generation: source.head.sha,
+      issuedAt,
+      hosts: site.hosts,
+      ...(site.workload ? { workload: site.workload } : {}),
+      ...(site.resolveService ? { resolveService: site.resolveService } : {}),
+    } as Parameters<typeof planPublish>[0]);
+    const bundle = bundleFromPlan(plan);
+    const hash = planHash(targetName, bundle);
+    propose(
+      approvals,
+      { hash, generation: bundle.manifest.generation, summary: summarise(bundle), by: "policy-worker", now: now() },
+      limits,
+    );
+    bundles.set(hash, bundle);
+    planTargets.set(hash, targetName);
+    for (const key of bundles.keys()) {
+      if (!approvals.plans.has(key)) {
+        bundles.delete(key);
+        planTargets.delete(key);
+      }
+    }
+    return { relay: targetName, hash, generation: bundle.manifest.generation, proposedAt: issuedAt };
+  }
 
   if (writers.size === 1) {
     // Said at startup, because the alternative is discovering it from a 403 while trying to change a
@@ -3783,6 +3854,43 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     revocationTimer = setInterval(() => void replicateRevocations(), 60_000);
     revocationTimer.unref();
     server.once("close", () => clearInterval(revocationTimer!));
+  }
+  if (opts.policyWorker && opts.enrollment && opts.policySource && opts.policyWrite) {
+    const stopPolicyWorker = startHostDeregistrationPolicyWorker({
+      storeFile: opts.enrollment.storeFile,
+      retiredHostsPath: opts.policyWorker.retiredHostsPath,
+      creds: opts.policyWrite.creds,
+      target: opts.policyWrite.target,
+      fetcher: opts.policyWrite.fetch ?? (fetch as unknown as Fetcher),
+      relayNames: opts.relays.map((relay) => relay.name),
+      renderer: async () => {
+        const [source, head] = await Promise.all([
+          fetchPolicySource(opts.policySource!, timeoutMs),
+          currentRepoHead(),
+        ]);
+        if ("error" in head) throw new Error(`policy repository head is unavailable: ${head.error}`);
+        return {
+          headSha: source.head.sha,
+          dirty: source.head.dirty,
+          repositoryHead: head.sha,
+          hosts: screenSiteOf(source).hosts.map((host) => host.id),
+        };
+      },
+      relays: async () => (await pollRelays(opts.relays, timeoutMs)).map((result) => result.ok
+        ? {
+            name: result.name,
+            ok: true,
+            generation: result.view.generation,
+            hosts: result.view.hosts.map((host) => host.host),
+          }
+        : { name: result.name, ok: false, generation: null, hosts: [], error: result.error }),
+      propose: proposePolicyRetirement,
+      now,
+      actor: "policy-worker",
+    }, opts.policyWorker.intervalMs, (error) => {
+      log(`policy worker retry: ${error.message}`, `정책 worker 재시도: ${error.message}`);
+    });
+    server.once("close", stopPolicyWorker);
   }
 
   return { server };
