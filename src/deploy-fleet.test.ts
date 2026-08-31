@@ -67,13 +67,21 @@ describe("deploy-fleet.sh ships every source the relay imports", () => {
     // schema-4 deploy. The deploy must not `cp` a backup source that is not there (`set -e` aborts),
     // and rsync into `.../packages/i18n/` needs the parent `packages/` made first — it creates the
     // leaf, not the tree. Both were measured on gw-01.util 2026-08-27; this pins the guards.
-    // `[^"]*` rather than the exact `\$p`: the loop variable is written inside a heredoc, so on disk
-    // it is the escaped `\$p`, and pinning that escaping would test the quoting more than the guard.
+    // `[^"]*` rather than the exact `$p`: this test owns the filesystem guard; the separate heredoc
+    // test below owns which shell expands that variable.
     const script = read("../scripts/deploy-fleet.sh");
     assert.match(script, /if \[ -e "\/opt\/heliopause\/[^"]*" \]; then sudo cp -a/,
       "the backup must skip a path that does not exist yet, or the first deploy of a new path aborts");
     assert.match(script, /sudo mkdir -p "\/opt\/heliopause\/[^"]*"; sudo rsync/,
       "rsync must have its parent directory made first, or a new nested path fails");
+  });
+
+  it("does not expand the remote script in the operator's shell", () => {
+    const script = read("../scripts/deploy-fleet.sh");
+    assert.match(script, /<<'EOS'/,
+      "the remote heredoc must be quoted so comments and commands are not evaluated locally");
+    assert.match(script, /HELIOPAUSE_DEPLOY_PATHS=%q HELIOPAUSE_DEPLOY_STAMP=%q HELIOPAUSE_DEPLOY_UNIT=%q/,
+      "values needed remotely must be passed explicitly when the heredoc is quoted");
   });
 
   it("still ships the repo's own bin and src", () => {
