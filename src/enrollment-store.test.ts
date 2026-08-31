@@ -54,7 +54,7 @@ describe("standalone enrollment store", () => {
       beginHostDeregistration(document, {
         hostname: "manual-recovery.dev", externalOperationId: "destroy-1", hostLifecycleId: "create-1",
         reason: "instance-destroy", requestedBy: "stardust", actor: "app:destroyer", relayNames: ["dev"],
-        scope: { appTokenId: "app-1", label: "destroyer", hostnamePattern: "*.dev" }, now,
+        scope: { appTokenId: "app-1", label: "destroyer", hostnamePattern: "*.dev" }, trustedCaPems: [], now,
       });
       recordHostDeregistrationReplication(document, [
         { name: "dev", ok: true, count: 0, snapshotFingerprints: [] },
@@ -86,7 +86,7 @@ describe("standalone enrollment store", () => {
     beginHostDeregistration(document, {
       hostname: "corrupt-policy.dev", externalOperationId: "destroy-1", hostLifecycleId: "create-1",
       reason: "instance-destroy", requestedBy: "stardust", actor: "app:destroyer", relayNames: ["dev"],
-      scope: { appTokenId: "app-1", label: "destroyer", hostnamePattern: "*.dev" }, now,
+      scope: { appTokenId: "app-1", label: "destroyer", hostnamePattern: "*.dev" }, trustedCaPems: [], now,
     });
     recordHostDeregistrationReplication(document, [
       { name: "dev", ok: true, count: 0, snapshotFingerprints: [] },

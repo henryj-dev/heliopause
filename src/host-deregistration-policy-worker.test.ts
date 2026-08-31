@@ -28,7 +28,7 @@ function queuedStore(): string {
     beginHostDeregistration(document, {
       hostname: "web-01.dev", externalOperationId: "destroy-1", hostLifecycleId: "create-1",
       reason: "instance-destroy", requestedBy: "stardust", actor: "app:destroyer", relayNames: ["dev"],
-      scope: { appTokenId: "app-1", label: "destroyer", hostnamePattern: "*.dev" }, now: at,
+      scope: { appTokenId: "app-1", label: "destroyer", hostnamePattern: "*.dev" }, trustedCaPems: [], now: at,
     });
     recordHostDeregistrationReplication(document, [
       { name: "dev", ok: true, count: 0, snapshotFingerprints: [] },
@@ -88,7 +88,7 @@ describe("reviewed-Git host deregistration worker", () => {
       beginHostDeregistration(document, {
         hostname: "web-02.dev", externalOperationId: "destroy-2", hostLifecycleId: "create-2",
         reason: "instance-destroy", requestedBy: "stardust", actor: "app:destroyer", relayNames: ["dev"],
-        scope: { appTokenId: "app-1", label: "destroyer", hostnamePattern: "*.dev" }, now: at,
+        scope: { appTokenId: "app-1", label: "destroyer", hostnamePattern: "*.dev" }, trustedCaPems: [], now: at,
       });
       recordHostDeregistrationReplication(document, [
         { name: "dev", ok: true, count: 0, snapshotFingerprints: [] },

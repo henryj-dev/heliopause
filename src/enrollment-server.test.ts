@@ -1021,7 +1021,7 @@ describe("host deregistration policy break-glass recovery", () => {
         beginHostDeregistration(document, {
           hostname, externalOperationId, hostLifecycleId,
           reason: "instance-destroy", requestedBy: "stardust", actor: "app:destroyer", relayNames: ["dev"],
-          scope: { appTokenId: "app-1", label: "destroyer", hostnamePattern: "*.dev" }, now,
+          scope: { appTokenId: "app-1", label: "destroyer", hostnamePattern: "*.dev" }, trustedCaPems: [], now,
         });
         recordHostDeregistrationReplication(document, [
           { name: "dev", ok: true, count: 0, snapshotFingerprints: [] },
