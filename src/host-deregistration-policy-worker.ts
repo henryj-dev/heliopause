@@ -14,12 +14,13 @@ import {
   openPullRequest,
   pullRequestHumanApprovals,
   pullRequestStatus,
+  readRepositoryFile,
   sameCommit,
   type AppCredentials,
   type Fetcher,
   type ProposalTarget,
 } from "./policy-proposal.ts";
-import { retireHost } from "./retired-hosts.ts";
+import { parseRetiredHostsDocument, retireHost } from "./retired-hosts.ts";
 export { parseRetiredHostsDocument, retireHost, withoutRetiredHosts } from "./retired-hosts.ts";
 export type { RetiredHostsDocument } from "./retired-hosts.ts";
 
@@ -106,6 +107,20 @@ const configuredRelays = (options: HostDeregistrationPolicyWorkerOptions): strin
 const sameStrings = (a: readonly string[], b: readonly string[]): boolean =>
   a.length === b.length && a.every((value, index) => value === b[index]);
 
+function verifyRecoveredRetirement(content: string, row: HostDeregistrationRecord, source: string): void {
+  const document = parseRetiredHostsDocument(content, source);
+  if (content !== JSON.stringify(document, null, 2) + "\n") {
+    throw new Error(`${source}: retirement document is not canonical`);
+  }
+  const retirement = document.retiredHosts.find((entry) => entry.hostname === row.hostname);
+  if (!retirement
+    || retirement.hostLifecycleId !== row.hostLifecycleId
+    || retirement.externalOperationId !== row.externalOperationId
+    || retirement.retiredAt !== row.infrastructure.destroyedAt) {
+    throw new Error(`${source}: exact host retirement evidence is missing`);
+  }
+}
+
 function resetForRelaySet(
   options: HostDeregistrationPolicyWorkerOptions,
   row: HostDeregistrationRecord,
@@ -179,20 +194,37 @@ export async function runHostDeregistrationPolicyWorkerOnce(
     // Look for a PR before touching the branch. A crash can happen after GitHub accepted the PR but
     // before our CAS recorded its number; an auto-deleted merged branch must not be recreated merely
     // to recover that durable evidence.
-    const commit = recovered ? { commit: recovered.headSha } : await ensureRepositoryFileOnBranch(
-      options.creds, options.fetcher, nowSec, {
-        target: options.target,
-        path: options.retiredHostsPath,
-        transform: (current) => retireHost(current, {
-          hostname: row.hostname,
-          hostLifecycleId: row.hostLifecycleId,
-          externalOperationId: row.externalOperationId,
-          retiredAt: row.infrastructure.destroyedAt!,
-        }).content,
-        branch,
-        message: `policy: retire ${row.hostname} after infrastructure destroy`,
-      },
-    );
+    let commit: { commit: string };
+    if (recovered) {
+      if (recovered.headRef !== branch || recovered.baseRef !== options.target.base) {
+        throw new Error("recovered policy pull request does not match the deterministic branch and base");
+      }
+      const recoveredFile = await readRepositoryFile(
+        options.creds, options.target, options.fetcher, nowSec,
+        options.retiredHostsPath, recovered.headSha,
+      );
+      verifyRecoveredRetirement(
+        recoveredFile.content,
+        row,
+        `recovered policy pull request head ${recovered.headSha}`,
+      );
+      commit = { commit: recovered.headSha };
+    } else {
+      commit = await ensureRepositoryFileOnBranch(
+        options.creds, options.fetcher, nowSec, {
+          target: options.target,
+          path: options.retiredHostsPath,
+          transform: (current) => retireHost(current, {
+            hostname: row.hostname,
+            hostLifecycleId: row.hostLifecycleId,
+            externalOperationId: row.externalOperationId,
+            retiredAt: row.infrastructure.destroyedAt!,
+          }).content,
+          branch,
+          message: `policy: retire ${row.hostname} after infrastructure destroy`,
+        },
+      );
+    }
     const pr = recovered ?? await openPullRequest(options.creds, options.fetcher, nowSec, {
       target: options.target,
       branch,

@@ -222,6 +222,15 @@ describe("reviewed-Git host deregistration worker", () => {
     });
     const patch = "b".repeat(40);
     const merge = "c".repeat(40);
+    const policyAtRecoveredHead = JSON.stringify({
+      schemaVersion: 1,
+      retiredHosts: [{
+        hostname: "web-01.dev",
+        hostLifecycleId: "create-1",
+        externalOperationId: "destroy-1",
+        retiredAt: "2026-08-31T00:00:00.000Z",
+      }],
+    }, null, 2) + "\n";
     const seen: string[] = [];
     const fetcher: Fetcher = async (raw, init) => {
       const url = new URL(raw);
@@ -229,6 +238,10 @@ describe("reviewed-Git host deregistration worker", () => {
       seen.push(`${method} ${url.pathname}${url.search}`);
       let body: unknown;
       if (url.pathname.endsWith("/access_tokens")) body = { token: "installation" };
+      else if (method === "GET" && url.pathname.endsWith("/contents/retired-hosts.json")
+        && url.searchParams.get("ref") === patch) {
+        body = { encoding: "base64", content: Buffer.from(policyAtRecoveredHead).toString("base64"), sha: "blob" };
+      }
       else if (url.pathname.endsWith("/pulls") && url.searchParams.get("state") === "all") {
         body = [{
           number: 9, html_url: "https://github.test/o/r/pull/9", state: "closed",
@@ -270,11 +283,93 @@ describe("reviewed-Git host deregistration worker", () => {
     assert.equal(row.policy.pullRequestUrl, "https://github.test/o/r/pull/9");
     assert.equal(row.policy.automation?.pullRequestNumber, 9);
     assert.equal(row.policy.automation?.patchCommitSha, patch);
-    assert.equal(seen.some((call) => call.includes("/git/refs") || call.includes("/contents/")), false,
-      "recovering a PR must not recreate an auto-deleted branch");
+    assert.equal(seen.filter((call) => call.includes(`/contents/retired-hosts.json?ref=${patch}`)).length, 1,
+      "recovery must inspect policy bytes at the immutable PR head");
+    assert.equal(seen.some((call) => call.startsWith("POST /repos/") || call.startsWith("PUT /repos/")), false,
+      "recovering a PR must not recreate or mutate its branch");
 
     const merged = await runHostDeregistrationPolicyWorkerOnce(options);
     assert.deepEqual(merged, { state: "advanced", operationId: "destroy-1", policyState: "merged" });
+  });
+
+  it("fails closed when a recovered PR head lacks the exact canonical retirement tuple", async () => {
+    const exact = {
+      hostname: "web-01.dev",
+      hostLifecycleId: "create-1",
+      externalOperationId: "destroy-1",
+      retiredAt: "2026-08-31T00:00:00.000Z",
+    };
+    const candidates = [
+      {
+        name: "wrong tuple",
+        content: JSON.stringify({
+          schemaVersion: 1,
+          retiredHosts: [{ ...exact, externalOperationId: "destroy-other" }],
+        }, null, 2) + "\n",
+      },
+      {
+        name: "missing tuple",
+        content: JSON.stringify({ schemaVersion: 1, retiredHosts: [] }, null, 2) + "\n",
+      },
+      {
+        name: "alternate host retirement",
+        content: JSON.stringify({
+          schemaVersion: 1,
+          retiredHosts: [{ ...exact, hostname: "web-02.dev" }],
+        }, null, 2) + "\n",
+      },
+      {
+        name: "non-canonical exact tuple",
+        content: JSON.stringify({ schemaVersion: 1, retiredHosts: [exact] }),
+      },
+    ];
+
+    for (const candidate of candidates) {
+      const storeFile = queuedStore();
+      const { privateKey } = generateKeyPairSync("rsa", {
+        modulusLength: 2048,
+        privateKeyEncoding: { type: "pkcs1", format: "pem" },
+        publicKeyEncoding: { type: "pkcs1", format: "pem" },
+      });
+      const patch = "d".repeat(40);
+      const seen: string[] = [];
+      const fetcher: Fetcher = async (raw, init) => {
+        const url = new URL(raw);
+        const method = init?.method ?? "GET";
+        seen.push(`${method} ${url.pathname}${url.search}`);
+        let body: unknown;
+        if (url.pathname.endsWith("/access_tokens")) body = { token: "installation" };
+        else if (method === "GET" && url.pathname.endsWith("/pulls") && url.searchParams.get("state") === "all") {
+          body = [{
+            number: 10, html_url: "https://github.test/o/r/pull/10", state: "open",
+            merged_at: null, merge_commit_sha: null,
+            head: { sha: patch, ref: "policy/host-deregister/destroy-1-ca761d98b2" }, base: { ref: "main" },
+          }];
+        } else if (method === "GET" && url.pathname.endsWith("/contents/retired-hosts.json")
+          && url.searchParams.get("ref") === patch) {
+          body = { encoding: "base64", content: Buffer.from(candidate.content).toString("base64"), sha: "blob" };
+        } else {
+          return { ok: false, status: 500, text: async () => JSON.stringify({ error: "unexpected route" }) };
+        }
+        return { ok: true, status: 200, text: async () => JSON.stringify(body) };
+      };
+
+      await assert.rejects(runHostDeregistrationPolicyWorkerOnce({
+        storeFile,
+        retiredHostsPath: "retired-hosts.json",
+        creds: { appId: "1", installationId: "2", privateKey },
+        target: { owner: "o", repo: "r", base: "main" },
+        fetcher,
+        relayNames: ["dev"],
+        renderer: async () => { throw new Error("renderer must not be called"); },
+        relays: async () => [{ name: "dev", ok: true, generation: "old", issuedAt: null, planHash: null, hosts: [] }],
+        propose: async () => { throw new Error("propose must not be called"); },
+        now: () => new Date("2026-08-31T00:00:01.000Z"),
+      }), /exact host retirement evidence is missing|retirement document is not canonical/, candidate.name);
+      assert.equal(loadEnrollmentDocument(storeFile).hostDeregistrations[0]!.policy.state, "queued", candidate.name);
+      assert.equal(seen.some((call) => call.startsWith("POST /repos/") || call.startsWith("PUT /repos/")), false,
+        `${candidate.name}: recovery must remain read-only`);
+    }
   });
 
   it("persists retry diagnostics without advancing when a relay observation is unavailable", async () => {
