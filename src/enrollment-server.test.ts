@@ -730,6 +730,7 @@ describe("lifecycle-bound host deregistration", () => {
             hostname: host, hostLifecycleId: lifecycle, externalOperationId: "destroy-repair-api-1",
             reason: "instance-destroy", requestedBy: "stardust:ops", actor: "app:destroyer",
             relayNames: ["dev"], scope: { appTokenId: "app-repair", label: "destroyer", hostnamePattern: "*.dev" },
+            trustedCaPems: [readFileSync(join(pki, "ca.pem"), "utf8")],
           });
         });
         const path = `/enrollment/host-deregistrations/${host}/destroy-repair-api-1/repairs/certificate-inventory`;
@@ -829,6 +830,7 @@ describe("lifecycle-bound host deregistration", () => {
             hostname: targetHost, hostLifecycleId: targetLifecycle, externalOperationId: "destroy-capacity-api-1",
             reason: "instance-destroy", requestedBy: "stardust:ops", actor: "app:destroyer",
             relayNames: ["dev"], scope: { appTokenId: "app-capacity", label: "destroyer", hostnamePattern: "*.dev" },
+            trustedCaPems: [readFileSync(join(pki, "ca.pem"), "utf8")],
           });
         });
         const path = `/enrollment/host-deregistrations/${targetHost}/destroy-capacity-api-1/repairs/revocation-capacity`;
@@ -876,9 +878,22 @@ describe("lifecycle-bound host deregistration", () => {
       hostname: "retire-me.dev", hostLifecycleId: "sibling-lifecycle", revokeExisting: false,
     }, appToken);
     assert.equal(sibling.status, 201);
-    const certificatePem = readFileSync(join(pki, "relay-manager.pem"), "utf8");
+    const signedKeyPath = join(root, "retire-exact.key"); const signedCsrPath = join(root, "retire-exact.csr");
+    const signedCertPath = join(root, "retire-exact.pem");
+    execFileSync("openssl", ["genpkey", "-algorithm", "EC", "-pkeyopt",
+      "ec_paramgen_curve:prime256v1", "-out", signedKeyPath]);
+    execFileSync("openssl", ["req", "-new", "-key", signedKeyPath, "-subj",
+      "/CN=retire-me.dev", "-out", signedCsrPath]);
+    const submitted = withEnrollmentTransaction(deregStore, (document) => submitNodeCsr(document, {
+      token: node.body.token as string, csrPem: readFileSync(signedCsrPath, "utf8"),
+    }).row);
+    execFileSync("node", ["bin/heliopause-pki.ts", "sign-csr", pki, signedCsrPath, signedCertPath,
+      "--name=retire-me.dev", `--expect-sha256=${submitted.csrSha256}`], { cwd: process.cwd() });
+    const certificatePem = readFileSync(signedCertPath, "utf8");
     const certificate = new X509Certificate(certificatePem);
     withEnrollmentTransaction(deregStore, (document) => {
+      storeNodeCertificate(document, { requestId: submitted.id, certificatePem,
+        caPem: readFileSync(join(pki, "ca.pem"), "utf8"), caName: "dev", actor: "ops" });
       document.requests.push({
         id: "pending-exact", hostname: "retire-me.dev", nodeTokenId: node.body.id,
         hostLifecycleId: lifecycle, status: "pending", csrPem: "pending", csrSha256: "1".repeat(64),
@@ -886,16 +901,6 @@ describe("lifecycle-bound host deregistration", () => {
         sourceIp: null, decidedAt: null, decidedBy: null, decisionReason: null, signedAt: null, caName: null,
         certificatePem: null, caPem: null, certificateSha256: null, certificateNotBefore: null,
         certificateNotAfter: null, retrievedAt: null,
-      });
-      document.requests.push({
-        id: "signed-exact", hostname: "retire-me.dev", nodeTokenId: node.body.id,
-        hostLifecycleId: lifecycle, status: "signed", csrPem: "signed", csrSha256: "3".repeat(64),
-        publicKeySha256: "4".repeat(64), keyAlgorithm: "ECDSA-P256", createdAt: new Date().toISOString(),
-        sourceIp: null, decidedAt: new Date().toISOString(), decidedBy: "ops", decisionReason: null,
-        signedAt: new Date().toISOString(), caName: "dev", certificatePem, caPem: certificatePem,
-        certificateSha256: certificate.fingerprint256.replaceAll(":", "").toLowerCase(),
-        certificateNotBefore: new Date(certificate.validFrom).toISOString(),
-        certificateNotAfter: new Date(certificate.validTo).toISOString(), retrievedAt: null,
       });
     });
 

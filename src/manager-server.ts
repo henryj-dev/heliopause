@@ -1851,6 +1851,9 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
             .some((value) => typeof value !== "string")) {
           throw new EnrollmentError("inventoryEvidence is malformed");
         }
+        const trustedCaPems = await Promise.all([...opts.enrollment?.trustedCaFiles?.values() ?? []]
+          .map((path) => readFile(path, "utf8")));
+        if (trustedCaPems.length === 0) throw new EnrollmentError("no trusted enrollment CA is configured", 503);
         const result = enrollmentWrite(opts.enrollment.storeFile, (document) => bindLegacyHostLifecycle(document, {
           hostname: decodeURIComponent(lifecycleBind[1]!), hostLifecycleId: decodeURIComponent(lifecycleBind[2]!),
           evidence: {
@@ -1858,7 +1861,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
             provider: "vultr", providerInstanceId: evidence.providerInstanceId as string,
             nodeTokenIds: evidence.nodeTokenIds as string[], csrRequestIds: evidence.csrRequestIds as string[],
             certificateFingerprints: evidence.certificateFingerprints as string[],
-          }, actor: who,
+          }, trustedCaPems, actor: who,
         }));
         return send(res, 200, { binding: result });
       } catch (e) { return sendEnrollmentError(res, e); }
@@ -3591,6 +3594,9 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         }
         if (parsed.reason !== "instance-destroy") throw new EnrollmentError('reason must be exactly "instance-destroy"');
         if (typeof parsed.requestedBy !== "string") throw new EnrollmentError("requestedBy must be a string");
+        const trustedCaPems = await Promise.all([...opts.enrollment?.trustedCaFiles?.values() ?? []]
+          .map((path) => readFile(path, "utf8")));
+        if (trustedCaPems.length === 0) throw new EnrollmentError("no trusted enrollment CA is configured", 503);
         const result = enrollmentWrite(storeFile, (current) => {
           const authorised = authoriseAppToken(current, plaintext, scope, url.pathname);
           if (!appTokenAllowsHostname(authorised.hostnamePattern, wanted)) {
@@ -3606,7 +3612,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
             reason: "instance-destroy", requestedBy: parsed.requestedBy as string,
             actor: appTokenCreatedBy(authorised.label, authorised.id),
             scope: { appTokenId: authorised.id, label: authorised.label, hostnamePattern: authorised.hostnamePattern },
-            relayNames: opts.relays.map((relay) => relay.name),
+            relayNames: opts.relays.map((relay) => relay.name), trustedCaPems,
           });
         });
         if (result.row.credentials.state !== "blocked") await replicateRevocations();

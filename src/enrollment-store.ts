@@ -1172,6 +1172,31 @@ export function validateNodeCertificate(certificatePem: string, caPem: string, r
   if (notAfter.getTime() - notBefore.getTime() > 90 * 86_400_000 + 5 * 60_000) throw new EnrollmentError("certificate validity exceeds 90 days");
   return { certificatePem: leaf.toString(), caPem: ca.toString(), certificateSha256: leaf.fingerprint256.replaceAll(":", "").toLowerCase(), notBefore: notBefore.toISOString(), notAfter: notAfter.toISOString() };
 }
+
+type VerifiedStoredCertificate = ReturnType<typeof validateNodeCertificate> & { certificate: X509Certificate };
+
+/** Validate stored certificate truth independently of its mutable cached metadata. */
+function verifyStoredCertificate(request: NodeCsrRecord, trustedCaPems: readonly string[]): VerifiedStoredCertificate {
+  if (!request.certificatePem) throw new EnrollmentError(`signed CSR request ${request.id} lacks certificate PEM inventory`, 409);
+  let certificate: X509Certificate;
+  try { certificate = new X509Certificate(request.certificatePem); }
+  catch { throw new EnrollmentError(`signed CSR request ${request.id} has invalid certificate PEM inventory`, 409); }
+  const validFrom = Date.parse(certificate.validFrom);
+  const validTo = Date.parse(certificate.validTo);
+  const historicalNow = new Date(Math.max(validFrom, validTo - 1));
+  for (const caPem of trustedCaPems) {
+    try {
+      return { ...validateNodeCertificate(certificate.toString(), caPem, request, historicalNow), certificate };
+    } catch { /* try the next configured trust anchor */ }
+  }
+  throw new EnrollmentError(`signed CSR request ${request.id} certificate is not valid under a configured trusted CA`, 409);
+}
+
+function storedCertificateMetadataMatches(request: NodeCsrRecord, verified: VerifiedStoredCertificate): boolean {
+  return request.certificateSha256 === verified.certificateSha256
+    && request.certificateNotBefore === verified.notBefore
+    && request.certificateNotAfter === verified.notAfter;
+}
 export function storeNodeCertificate(document: EnrollmentDocument, input: { requestId: string; certificatePem: string; caPem: string; caName: string; actor: string; now?: Date }): NodeCsrRecord {
   const row = document.requests.find((request) => request.id === input.requestId); if (!row || !["pending", "conflict"].includes(row.status)) throw new EnrollmentError("CSR not found or already decided", 404);
   assertLifecycleMayProvision(document, row.hostname, row.hostLifecycleId);
@@ -1252,7 +1277,8 @@ function exactEvidenceIds(values: readonly string[], field: string): string[] {
  * token and CSR id is named, cross-checked, and bound in the same transaction.
  */
 export function bindLegacyHostLifecycle(document: EnrollmentDocument, input: {
-  hostname: string; hostLifecycleId: string; evidence: LegacyLifecycleInventoryEvidence; actor: string; now?: Date;
+  hostname: string; hostLifecycleId: string; evidence: LegacyLifecycleInventoryEvidence;
+  trustedCaPems: readonly string[]; actor: string; now?: Date;
 }): { hostname: string; hostLifecycleId: string; tokensBound: number; requestsBound: number; evidenceSha256: string } {
   const host = hostname(input.hostname);
   const lifecycle = normalizeHostLifecycleId(input.hostLifecycleId);
@@ -1314,10 +1340,11 @@ export function bindLegacyHostLifecycle(document: EnrollmentDocument, input: {
   const observedFingerprints = requests
     .filter((row) => row.status === "signed")
     .map((row) => {
-      if (!row.certificateSha256 || !SHA256.test(row.certificateSha256)) {
-        throw new EnrollmentError(`signed CSR request ${row.id} lacks certificate fingerprint inventory`, 409);
+      const verified = verifyStoredCertificate(row, input.trustedCaPems);
+      if (!storedCertificateMetadataMatches(row, verified)) {
+        throw new EnrollmentError(`signed CSR request ${row.id} certificate metadata conflicts with its trusted PEM`, 409);
       }
-      return row.certificateSha256;
+      return verified.certificateSha256;
     }).sort();
   if (JSON.stringify(observedFingerprints) !== JSON.stringify(certificateFingerprints)) {
     throw new EnrollmentError("certificateFingerprints do not exactly match the selected signed CSR inventory", 409);
@@ -1350,7 +1377,8 @@ export function bindLegacyHostLifecycle(document: EnrollmentDocument, input: {
 export type HostDeregistrationRequest = {
   hostname: string; externalOperationId: string; hostLifecycleId: string;
   reason: "instance-destroy"; requestedBy: string; actor: string; relayNames: readonly string[];
-  scope: { appTokenId: string; label: string; hostnamePattern: string }; now?: Date;
+  scope: { appTokenId: string; label: string; hostnamePattern: string };
+  trustedCaPems: readonly string[]; now?: Date;
 };
 
 function normalizedRelayNames(names: readonly string[]): string[] {
@@ -1466,27 +1494,27 @@ export function beginHostDeregistration(
     } else {
       row.credentials.requests.alreadyClosed += 1;
     }
-    if (request.status === "signed" && request.certificateNotAfter && Date.parse(request.certificateNotAfter) <= Date.parse(at)) {
-      row.credentials.certificates.expired += 1;
-    } else if (request.status === "signed") {
-      if (!request.certificatePem) {
-        row.credentials.state = "blocked";
-        row.blocked = {
-          code: "certificate_inventory_incomplete",
-          operatorAction: `attach or revoke the certificate fingerprint for request ${request.id}`,
-        };
-        continue;
-      }
+    if (request.status === "signed") {
+      let verified: VerifiedStoredCertificate;
       try {
-        const certificate = new X509Certificate(request.certificatePem);
-        certificatesToRevoke.set(certificate.fingerprint256.replaceAll(":", "").toLowerCase(), request.certificatePem);
+        verified = verifyStoredCertificate(request, input.trustedCaPems);
       } catch {
         row.credentials.state = "blocked";
         row.blocked = {
           code: "certificate_inventory_incomplete",
-          operatorAction: `repair the invalid stored certificate for request ${request.id}`,
+          operatorAction: `attach a trusted certificate PEM for request ${request.id}`,
+        };
+        continue;
+      }
+      if (!storedCertificateMetadataMatches(request, verified)) {
+        row.credentials.state = "blocked";
+        row.blocked = {
+          code: "certificate_inventory_incomplete",
+          operatorAction: `repair certificate metadata from trusted PEM for request ${request.id}`,
         };
       }
+      if (Date.parse(verified.notAfter) <= Date.parse(at)) row.credentials.certificates.expired += 1;
+      else certificatesToRevoke.set(verified.certificateSha256, verified.certificatePem);
     }
   }
   let revocationCapacityAvailable = true;
@@ -1578,22 +1606,19 @@ function requireRepairableDeregistration(row: HostDeregistrationRecord, blockedC
   }
 }
 
-function candidateCertificates(document: EnrollmentDocument, row: HostDeregistrationRecord, now: Date): Array<{
+function candidateCertificates(document: EnrollmentDocument, row: HostDeregistrationRecord, now: Date,
+  trustedCaPems: readonly string[]): Array<{
   request: NodeCsrRecord; certificate: X509Certificate; fingerprint: string;
 }> {
   const out: Array<{ request: NodeCsrRecord; certificate: X509Certificate; fingerprint: string }> = [];
   for (const request of document.requests) {
     if (request.hostname !== row.hostname || request.hostLifecycleId !== row.hostLifecycleId || request.status !== "signed") continue;
-    if (request.certificateNotAfter && Date.parse(request.certificateNotAfter) <= now.getTime()) continue;
-    if (!request.certificatePem) throw new EnrollmentError(`signed CSR request ${request.id} still lacks certificate inventory`, 409);
-    let certificate: X509Certificate;
-    try { certificate = new X509Certificate(request.certificatePem); }
-    catch { throw new EnrollmentError(`signed CSR request ${request.id} still has invalid certificate inventory`, 409); }
-    const fingerprint = certificate.fingerprint256.replaceAll(":", "").toLowerCase();
-    if (request.certificateSha256 && request.certificateSha256 !== fingerprint) {
-      throw new EnrollmentError(`certificate inventory fingerprint conflicts for request ${request.id}`, 409);
+    const verified = verifyStoredCertificate(request, trustedCaPems);
+    if (!storedCertificateMetadataMatches(request, verified)) {
+      throw new EnrollmentError(`certificate inventory metadata conflicts for request ${request.id}`, 409);
     }
-    out.push({ request, certificate, fingerprint });
+    if (Date.parse(verified.notAfter) <= now.getTime()) continue;
+    out.push({ request, certificate: verified.certificate, fingerprint: verified.certificateSha256 });
   }
   return out;
 }
@@ -1684,9 +1709,8 @@ export function repairHostDeregistrationCertificateInventory(document: Enrollmen
   requireRepairableDeregistration(row, "certificate_inventory_incomplete");
   const incomplete = document.requests.filter((request) => {
     if (request.hostname !== row.hostname || request.hostLifecycleId !== row.hostLifecycleId || request.status !== "signed") return false;
-    if (request.certificateNotAfter && Date.parse(request.certificateNotAfter) <= now.getTime()) return false;
-    if (!request.certificatePem) return true;
-    try { new X509Certificate(request.certificatePem); return false; } catch { return true; }
+    try { return !storedCertificateMetadataMatches(request, verifyStoredCertificate(request, input.trustedCaPems)); }
+    catch { return true; }
   }).map((request) => request.id).sort();
   if (JSON.stringify(ids) !== JSON.stringify(incomplete)) {
     throw new EnrollmentError("certificates must exactly match every incomplete request in this lifecycle", 409);
@@ -1695,27 +1719,33 @@ export function repairHostDeregistrationCertificateInventory(document: Enrollmen
     if (certificate.subject !== `CN=${row.hostname}`) {
       throw new EnrollmentError(`certificate subject for request ${request.id} must be exactly CN=${row.hostname}`, 409);
     }
-    if (!input.trustedCaPems.some((caPem) => {
-      try { validateNodeCertificate(certificate.toString(), caPem, request, now); return true; }
-      catch { return false; }
-    })) throw new EnrollmentError(`certificate for request ${request.id} is not valid under a configured trusted CA`, 409);
+    const historicalNow = new Date(Math.max(Date.parse(certificate.validFrom), Date.parse(certificate.validTo) - 1));
+    let validated: ReturnType<typeof validateNodeCertificate> | null = null;
+    for (const caPem of input.trustedCaPems) {
+      try { validated = validateNodeCertificate(certificate.toString(), caPem, request, historicalNow); break; }
+      catch { /* try the next configured trust anchor */ }
+    }
+    if (!validated) throw new EnrollmentError(`certificate for request ${request.id} is not valid under a configured trusted CA`, 409);
     const certificatePublicKey = openssl(["x509", "-pubkey", "-noout"], certificate.toString());
     const certificatePublicKeyDer = openssl(["pkey", "-pubin", "-outform", "DER"], certificatePublicKey);
     if (sha256(certificatePublicKeyDer) !== request.publicKeySha256) {
       throw new EnrollmentError(`certificate public key conflicts with CSR request ${request.id}`, 409);
     }
-    if (request.certificateSha256 && request.certificateSha256 !== fingerprint) {
-      throw new EnrollmentError(`certificate fingerprint conflicts for request ${request.id}`, 409);
-    }
-    return { request, certificate, fingerprint, pem };
+    return { request, certificate, fingerprint, pem, validated };
   });
   audit(document, {
     actor: input.actor, action: "host-deregistration.certificate-repair-before", target: row.externalOperationId,
     sourceIp: null, detail: { hostname: row.hostname, hostLifecycleId: row.hostLifecycleId,
       certificates: repaired.length, evidenceSha256 },
   }, now);
-  for (const item of repaired) item.request.certificatePem = item.pem;
-  const resumed = installDeregistrationRevocations(document, row, candidateCertificates(document, row, now), input.actor, now);
+  for (const item of repaired) {
+    item.request.certificatePem = item.pem;
+    item.request.certificateSha256 = item.validated.certificateSha256;
+    item.request.certificateNotBefore = item.validated.notBefore;
+    item.request.certificateNotAfter = item.validated.notAfter;
+  }
+  const resumed = installDeregistrationRevocations(document, row,
+    candidateCertificates(document, row, now, input.trustedCaPems), input.actor, now);
   audit(document, {
     actor: input.actor, action: "host-deregistration.certificate-repair-after", target: row.externalOperationId,
     sourceIp: null, detail: { hostname: row.hostname, hostLifecycleId: row.hostLifecycleId,
@@ -1754,18 +1784,11 @@ export function repairHostDeregistrationRevocationCapacity(document: EnrollmentD
   requireRepairableDeregistration(row, "revocation_capacity_exhausted");
   const expiry = new Map<string, string>();
   for (const request of document.requests) {
-    if (!request.certificatePem || request.status !== "signed") continue;
+    if (request.status !== "signed") continue;
     try {
-      const certificate = new X509Certificate(request.certificatePem);
-      const fingerprint = certificate.fingerprint256.replaceAll(":", "").toLowerCase();
-      const notAfter = new Date(certificate.validTo).toISOString();
-      if (request.certificateSha256 !== fingerprint || request.certificateNotAfter !== notAfter) continue;
-      const historicalNow = new Date(Math.max(Date.parse(certificate.validFrom), Date.parse(certificate.validTo) - 1));
-      if (!input.trustedCaPems.some((caPem) => {
-        try { validateNodeCertificate(certificate.toString(), caPem, request, historicalNow); return true; }
-        catch { return false; }
-      })) continue;
-      expiry.set(fingerprint, notAfter);
+      const verified = verifyStoredCertificate(request, input.trustedCaPems);
+      if (!storedCertificateMetadataMatches(request, verified)) continue;
+      expiry.set(verified.certificateSha256, verified.notAfter);
     } catch { /* unverifiable inventory is never compaction proof */ }
   }
   const plan = planRevocationCompaction({ schemaVersion: 1, revocations: document.revocations }, expiry, now);
@@ -1781,7 +1804,8 @@ export function repairHostDeregistrationRevocationCapacity(document: EnrollmentD
       retainedFingerprintSha256, confirmationEvidenceSha256 },
   }, now);
   document.revocations = plan.keep;
-  const resumed = installDeregistrationRevocations(document, row, candidateCertificates(document, row, now), input.actor, now);
+  const resumed = installDeregistrationRevocations(document, row,
+    candidateCertificates(document, row, now, input.trustedCaPems), input.actor, now);
   if (!resumed) throw new EnrollmentError("compaction did not create enough revocation capacity", 409);
   audit(document, {
     actor: input.actor, action: "host-deregistration.capacity-repair-after", target: row.externalOperationId,
