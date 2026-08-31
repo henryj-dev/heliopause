@@ -1888,10 +1888,13 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
             }
             return { requestId: candidate.requestId, certificatePem: candidate.certificatePem };
           });
+          const trustedCaPems = await Promise.all([...opts.enrollment.trustedCaFiles?.values() ?? []]
+            .map((path) => readFile(path, "utf8")));
+          if (trustedCaPems.length === 0) throw new EnrollmentError("no trusted enrollment CA is configured", 503);
           repaired = enrollmentWrite(opts.enrollment.storeFile, (document) =>
             repairHostDeregistrationCertificateInventory(document, {
               hostname, externalOperationId, hostLifecycleId: body.hostLifecycleId as string,
-              certificates, actor: who,
+              certificates, trustedCaPems, actor: who,
             }));
         } else {
           if (Object.keys(body).some((key) => !["hostLifecycleId", "relayConfirmations", "otp"].includes(key))
@@ -1911,10 +1914,13 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
             return { name: candidate.name, compactedAt: candidate.compactedAt,
               retainedFingerprintSha256: candidate.retainedFingerprintSha256 };
           });
+          const trustedCaPems = await Promise.all([...opts.enrollment.trustedCaFiles?.values() ?? []]
+            .map((path) => readFile(path, "utf8")));
+          if (trustedCaPems.length === 0) throw new EnrollmentError("no trusted enrollment CA is configured", 503);
           repaired = enrollmentWrite(opts.enrollment.storeFile, (document) =>
             repairHostDeregistrationRevocationCapacity(document, {
               hostname, externalOperationId, hostLifecycleId: body.hostLifecycleId as string,
-              relayConfirmations, relayNames: opts.relays.map((relay) => relay.name), actor: who,
+              relayConfirmations, relayNames: opts.relays.map((relay) => relay.name), trustedCaPems, actor: who,
             }));
         }
         const replication = repaired.credentials.state === "replicating" ? await replicateRevocations() : [];
