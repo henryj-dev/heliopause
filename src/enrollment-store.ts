@@ -1143,6 +1143,24 @@ export function bindLegacyHostLifecycle(document: EnrollmentDocument, input: {
     throw new EnrollmentError("host lifecycle is already bound; rebinding is refused", 409);
   }
 
+  // "Exact inventory" means the complete legacy-null inventory for this host, not merely that every
+  // submitted id exists. Otherwise an operator could omit an unreferenced live token, bind the rest,
+  // and the later deregistration would truthfully close every lifecycle-bound credential while the
+  // omitted legacy credential remained usable.
+  const legacyTokenIds = document.tokens
+    .filter((row) => row.hostname === host && row.hostLifecycleId === null)
+    .map((row) => row.id).sort();
+  const legacyRequestIds = document.requests
+    .filter((row) => row.hostname === host && row.hostLifecycleId === null)
+    .map((row) => row.id).sort();
+  if (JSON.stringify(nodeTokenIds) !== JSON.stringify(legacyTokenIds)
+    || JSON.stringify(csrRequestIds) !== JSON.stringify(legacyRequestIds)) {
+    throw new EnrollmentError(
+      "nodeTokenIds and csrRequestIds must exactly match the complete legacy inventory for this host",
+      409,
+    );
+  }
+
   const tokens = nodeTokenIds.map((id) => {
     const row = document.tokens.find((candidate) => candidate.id === id);
     if (!row || row.hostname !== host) throw new EnrollmentError(`node token ${id} is not in the exact host inventory`, 409);

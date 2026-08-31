@@ -153,22 +153,25 @@ describe("standalone enrollment store", () => {
   it("binds only explicitly evidenced legacy inventory and audits both sides of the mutation", () => {
     const document = emptyEnrollmentDocument();
     const token = createNodeToken(document, { hostname: "legacy-bind.dev" }).row;
+    const otherwiseOmissible = createNodeToken(document, { hostname: "legacy-bind.dev" }).row;
     const request = storedRequest({ id: "legacy-csr", hostname: "legacy-bind.dev", nodeTokenId: token.id });
     document.requests.push(request);
     const evidence = {
       stardustCreateOperationId: "create-uuid-1", provider: "vultr" as const, providerInstanceId: "vm-77",
-      nodeTokenIds: [token.id], csrRequestIds: [request.id], certificateFingerprints: [],
+      nodeTokenIds: [token.id, otherwiseOmissible.id], csrRequestIds: [request.id], certificateFingerprints: [],
     };
     assert.throws(() => bindLegacyHostLifecycle(document, {
       hostname: "legacy-bind.dev", hostLifecycleId: "create-uuid-1",
-      evidence: { ...evidence, nodeTokenIds: [] }, actor: "ops",
-    }), /absent from the evidence/);
+      evidence: { ...evidence, nodeTokenIds: [token.id] }, actor: "ops",
+    }), /complete legacy inventory/);
     assert.equal(token.hostLifecycleId, null, "a rejected partial inventory changed the token");
+    assert.equal(otherwiseOmissible.hostLifecycleId, null, "a rejected partial inventory changed an omitted token");
     const result = bindLegacyHostLifecycle(document, {
       hostname: "legacy-bind.dev", hostLifecycleId: "create-uuid-1", evidence, actor: "ops",
     });
-    assert.equal(result.tokensBound, 1); assert.equal(result.requestsBound, 1);
+    assert.equal(result.tokensBound, 2); assert.equal(result.requestsBound, 1);
     assert.equal(token.hostLifecycleId, "create-uuid-1"); assert.equal(request.hostLifecycleId, "create-uuid-1");
+    assert.equal(otherwiseOmissible.hostLifecycleId, "create-uuid-1");
     assert.deepEqual(document.audit.slice(-2).map((event) => event.action), [
       "host-lifecycle.bind-before", "host-lifecycle.bind-after",
     ]);
@@ -178,7 +181,7 @@ describe("standalone enrollment store", () => {
     assert.throws(() => bindLegacyHostLifecycle(document, {
       hostname: "some-other-name.dev", hostLifecycleId: "create-uuid-2",
       evidence: { ...evidence, stardustCreateOperationId: "create-uuid-2" }, actor: "ops",
-    }), /not in the exact host inventory/);
+    }), /complete legacy inventory/);
   });
 
   it("repairs incomplete certificate inventory and resumes the same durable operation", { timeout: 15_000 }, () => {
