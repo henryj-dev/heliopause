@@ -7,7 +7,8 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
   APP_TOKEN_PREFIX, MAX_CREATED_BY_CHARS, appTokenAllowsHostname, appTokenCreatedBy,
-  beginHostDeregistration, bindLegacyHostLifecycle, confirmHostInfrastructureDestroyed, createAppToken, createNodeToken, emptyEnrollmentDocument,
+  beginHostDeregistration, bindLegacyHostLifecycle, completeHostDeregistrationPolicy,
+  confirmHostInfrastructureDestroyed, createAppToken, createNodeToken, emptyEnrollmentDocument,
   fetchNodeCertificate, initializeEnrollmentDocument,
   loadEnrollmentDocument, looksLikeAppToken, looksLikeNodeToken, lookupAppToken, lookupNodeToken, NODE_TOKEN_PREFIX,
   recordHostDeregistrationReplication, rejectNodeCsr, repairHostDeregistrationCertificateInventory, repairHostDeregistrationRevocationCapacity,
@@ -45,6 +46,77 @@ function storedRequest(input: Partial<NodeCsrRecord> & Pick<NodeCsrRecord, "id" 
 }
 
 describe("standalone enrollment store", () => {
+  it("allows exact break-glass policy evidence from every destroyed worker-pending state", () => {
+    for (const state of ["queued", "pr_open", "merged", "awaiting_publish", "published"] as const) {
+      const document = emptyEnrollmentDocument();
+      const now = new Date("2026-08-31T00:10:00.000Z");
+      createNodeToken(document, { hostname: "manual-recovery.dev", hostLifecycleId: "create-1", now });
+      beginHostDeregistration(document, {
+        hostname: "manual-recovery.dev", externalOperationId: "destroy-1", hostLifecycleId: "create-1",
+        reason: "instance-destroy", requestedBy: "stardust", actor: "app:destroyer", relayNames: ["dev"],
+        scope: { appTokenId: "app-1", label: "destroyer", hostnamePattern: "*.dev" }, now,
+      });
+      recordHostDeregistrationReplication(document, [
+        { name: "dev", ok: true, count: 0, snapshotFingerprints: [] },
+      ], ["dev"], now);
+      const row = confirmHostInfrastructureDestroyed(document, {
+        hostname: "manual-recovery.dev", externalOperationId: "destroy-1", hostLifecycleId: "create-1",
+        provider: "vultr", providerInstanceId: "vultr-1", destroyedAt: "2026-08-31T00:09:00.000Z",
+        actor: "app:destroyer", now,
+      });
+      row.policy.state = state;
+
+      const completed = completeHostDeregistrationPolicy(document, {
+        hostname: "manual-recovery.dev", externalOperationId: "destroy-1", hostLifecycleId: "create-1",
+        pullRequestUrl: "https://github.test/o/r/pull/1", commitSha: "a".repeat(40),
+        publishedGeneration: "generation-1",
+        relayConfirmations: [{ name: "dev", absentAt: "2026-08-31T00:09:30.000Z" }],
+        relayNames: ["dev"], actor: "ops", now,
+      });
+      assert.equal(completed.policy.state, "completed", `manual recovery was blocked from ${state}`);
+      assert.equal(completed.status, "completed");
+      assert.equal(completed.policy.completedBy, "ops");
+    }
+  });
+
+  it("fails closed on a persisted publish state whose durable automation evidence is incomplete", () => {
+    const document = emptyEnrollmentDocument();
+    const now = new Date("2026-08-31T00:10:00.000Z");
+    createNodeToken(document, { hostname: "corrupt-policy.dev", hostLifecycleId: "create-1", now });
+    beginHostDeregistration(document, {
+      hostname: "corrupt-policy.dev", externalOperationId: "destroy-1", hostLifecycleId: "create-1",
+      reason: "instance-destroy", requestedBy: "stardust", actor: "app:destroyer", relayNames: ["dev"],
+      scope: { appTokenId: "app-1", label: "destroyer", hostnamePattern: "*.dev" }, now,
+    });
+    recordHostDeregistrationReplication(document, [
+      { name: "dev", ok: true, count: 0, snapshotFingerprints: [] },
+    ], ["dev"], now);
+    const row = confirmHostInfrastructureDestroyed(document, {
+      hostname: "corrupt-policy.dev", externalOperationId: "destroy-1", hostLifecycleId: "create-1",
+      provider: "vultr", providerInstanceId: "vultr-1", destroyedAt: "2026-08-31T00:09:00.000Z",
+      actor: "app:destroyer", now,
+    });
+    row.policy.state = "awaiting_publish";
+    row.policy.pullRequestUrl = "https://github.test/o/r/pull/1";
+    row.policy.commitSha = "c".repeat(40);
+    row.policy.publishedGeneration = "generation-1";
+    row.policy.automation = {
+      branch: "policy/host-deregister/destroy-1", pullRequestNumber: 1,
+      patchCommitSha: "b".repeat(40), mergeCommitSha: "c".repeat(40),
+      affectedRelays: ["dev"], reviewedBy: ["human-reviewer"],
+      planGeneration: "generation-1", planProposedAt: "2026-08-31T00:09:30.000Z",
+      plans: [], lastAttemptAt: null, lastError: null,
+    };
+    const corruptRoot = mkdtempSync(join(tmpdir(), "heliopause-corrupt-policy-"));
+    const path = join(corruptRoot, "store.json");
+    try {
+      writeFileSync(path, JSON.stringify(document), { mode: 0o600 });
+      assert.throws(() => loadEnrollmentDocument(path), /lacks exact durable plans/);
+    } finally {
+      rmSync(corruptRoot, { recursive: true, force: true });
+    }
+  });
+
   it("rejects a non-boolean revokeExisting before changing existing tokens", () => {
     const document = emptyEnrollmentDocument();
     const issued = createNodeToken(document, { hostname: "node-keep.dev" });

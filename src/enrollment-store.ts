@@ -133,6 +133,8 @@ export interface HostDeregistrationRecord {
     automation?: {
       branch: string | null; pullRequestNumber: number | null; patchCommitSha: string | null;
       mergeCommitSha: string | null; affectedRelays: string[];
+      /** Optional only while reading the first worker revision written before these fields existed. */
+      reviewedBy?: string[]; planGeneration?: string | null; planProposedAt?: string | null;
       plans: Array<{
         relay: string; hash: string; generation: string; proposedAt: string;
         publishedAt: string | null;
@@ -494,10 +496,10 @@ function parse(raw: unknown, source: string): EnrollmentDocument {
     }
     if (row.policy.automation !== undefined) {
       const automation = row.policy.automation;
-      exactObject(automation, [
+      exactObjectOptional(automation, [
         "branch", "pullRequestNumber", "patchCommitSha", "mergeCommitSha", "affectedRelays", "plans",
         "lastAttemptAt", "lastError",
-      ], `${source}: host deregistration policy automation`);
+      ], ["reviewedBy", "planGeneration", "planProposedAt"], `${source}: host deregistration policy automation`);
       for (const field of ["branch", "patchCommitSha", "mergeCommitSha", "lastAttemptAt", "lastError"] as const) {
         if (automation[field] !== null && typeof automation[field] !== "string") {
           throw new EnrollmentError(`${source}: invalid host deregistration policy automation ${field}`);
@@ -505,6 +507,23 @@ function parse(raw: unknown, source: string): EnrollmentDocument {
       }
       if (automation.lastAttemptAt !== null && !Number.isFinite(Date.parse(automation.lastAttemptAt))) {
         throw new EnrollmentError(`${source}: invalid host deregistration policy automation lastAttemptAt`);
+      }
+      if (automation.reviewedBy !== undefined && (!Array.isArray(automation.reviewedBy)
+        || automation.reviewedBy.some((reviewer) => typeof reviewer !== "string" || !reviewer)
+        || new Set(automation.reviewedBy).size !== automation.reviewedBy.length)) {
+        throw new EnrollmentError(`${source}: invalid host deregistration policy reviewers`);
+      }
+      if (automation.planGeneration !== undefined && automation.planGeneration !== null
+        && (typeof automation.planGeneration !== "string" || !automation.planGeneration)) {
+        throw new EnrollmentError(`${source}: invalid host deregistration reserved generation`);
+      }
+      if (automation.planProposedAt !== undefined && automation.planProposedAt !== null
+        && (typeof automation.planProposedAt !== "string" || !isCanonicalRfc3339(automation.planProposedAt))) {
+        throw new EnrollmentError(`${source}: invalid host deregistration reserved proposal time`);
+      }
+      if (((automation.planGeneration ?? null) === null)
+        !== ((automation.planProposedAt ?? null) === null)) {
+        throw new EnrollmentError(`${source}: incomplete host deregistration plan reservation`);
       }
       if (automation.pullRequestNumber !== null
         && (!Number.isSafeInteger(automation.pullRequestNumber) || automation.pullRequestNumber < 1)) {
@@ -526,6 +545,27 @@ function parse(raw: unknown, source: string): EnrollmentDocument {
           throw new EnrollmentError(`${source}: invalid host deregistration policy plan`);
         }
         planRelays.add(plan.relay);
+      }
+      const needsPr = ["pr_open", "merged", "awaiting_publish", "published"].includes(row.policy.state);
+      if (needsPr && (!automation.branch || automation.pullRequestNumber === null || !automation.patchCommitSha
+        || automation.affectedRelays.length === 0 || !row.policy.pullRequestUrl)) {
+        throw new EnrollmentError(`${source}: advanced host deregistration lacks pull request automation evidence`);
+      }
+      const needsMerge = ["merged", "awaiting_publish", "published"].includes(row.policy.state);
+      if (needsMerge && (!automation.mergeCommitSha || (automation.reviewedBy?.length ?? 0) === 0
+        || row.policy.commitSha !== automation.mergeCommitSha)) {
+        throw new EnrollmentError(`${source}: merged host deregistration lacks reviewed merge evidence`);
+      }
+      if (["awaiting_publish", "published"].includes(row.policy.state)) {
+        const affected = [...automation.affectedRelays].sort();
+        const planned = [...planRelays].sort();
+        if (!automation.planGeneration || !automation.planProposedAt
+          || JSON.stringify(affected) !== JSON.stringify(planned)
+          || automation.plans.some((plan) => plan.generation !== automation.planGeneration
+            || plan.proposedAt !== automation.planProposedAt)
+          || (row.policy.state === "published" && automation.plans.some((plan) => plan.publishedAt === null))) {
+          throw new EnrollmentError(`${source}: publish-pending host deregistration lacks exact durable plans`);
+        }
       }
     }
     if (row.blocked !== null) {
@@ -1833,7 +1873,8 @@ export type HostDeregistrationPolicyAutomation = NonNullable<HostDeregistrationR
 export function emptyHostDeregistrationPolicyAutomation(): HostDeregistrationPolicyAutomation {
   return {
     branch: null, pullRequestNumber: null, patchCommitSha: null, mergeCommitSha: null,
-    affectedRelays: [], plans: [], lastAttemptAt: null, lastError: null,
+    affectedRelays: [], reviewedBy: [], planGeneration: null, planProposedAt: null,
+    plans: [], lastAttemptAt: null, lastError: null,
   };
 }
 
@@ -1847,6 +1888,7 @@ export function emptyHostDeregistrationPolicyAutomation(): HostDeregistrationPol
 export function recordHostDeregistrationPolicyWorkerStep(document: EnrollmentDocument, input: {
   hostname: string; externalOperationId: string; hostLifecycleId: string;
   expectedState: HostDeregistrationRecord["policy"]["state"];
+  expectedPolicy: HostDeregistrationRecord["policy"];
   nextState: HostDeregistrationRecord["policy"]["state"];
   automation: HostDeregistrationPolicyAutomation;
   pullRequestUrl?: string | null; commitSha?: string | null; publishedGeneration?: string | null;
@@ -1859,13 +1901,14 @@ export function recordHostDeregistrationPolicyWorkerStep(document: EnrollmentDoc
   const row = document.hostDeregistrations.find((candidate) =>
     candidate.hostname === host && candidate.externalOperationId === operationId);
   if (!row || row.hostLifecycleId !== lifecycle) throw new EnrollmentError("host deregistration not found", 404);
-  if (row.policy.state !== input.expectedState) return { row, applied: false };
+  if (row.policy.state !== input.expectedState
+    || JSON.stringify(row.policy) !== JSON.stringify(input.expectedPolicy)) return { row, applied: false };
   const allowed: Record<string, readonly string[]> = {
     queued: ["queued", "pr_open"],
     pr_open: ["pr_open", "merged"],
     merged: ["merged", "awaiting_publish"],
-    awaiting_publish: ["awaiting_publish", "published"],
-    published: ["published", "completed"],
+    awaiting_publish: ["merged", "awaiting_publish", "published"],
+    published: ["merged", "published", "completed"],
   };
   if (!(allowed[input.expectedState] ?? []).includes(input.nextState)) {
     throw new EnrollmentError(`invalid policy worker transition ${input.expectedState} -> ${input.nextState}`);
@@ -1933,8 +1976,9 @@ export function completeHostDeregistrationPolicy(document: EnrollmentDocument, i
     }
     return row;
   }
-  if (!["queued", "published"].includes(row.policy.state) || row.infrastructure.state !== "destroyed") {
-    throw new EnrollmentError("policy removal is not queued", 409);
+  if (!["queued", "pr_open", "merged", "awaiting_publish", "published"].includes(row.policy.state)
+    || row.infrastructure.state !== "destroyed") {
+    throw new EnrollmentError("policy removal is not pending after infrastructure destruction", 409);
   }
   const at = nowIso(now);
   row.policy = {

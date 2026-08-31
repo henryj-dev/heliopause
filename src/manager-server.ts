@@ -986,6 +986,9 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       throw new Error("policyWorker retiredHostsPath must be in policyWrite.allowPaths");
     }
     if (opts.relays.length === 0) throw new Error("policyWorker requires at least one configured relay");
+    if (new Set(opts.relays.map((relay) => relay.name)).size !== opts.relays.length) {
+      throw new Error("policyWorker requires unique configured relay names");
+    }
     if (opts.policyWorker.intervalMs !== undefined
       && (!Number.isSafeInteger(opts.policyWorker.intervalMs) || opts.policyWorker.intervalMs < 1_000)) {
       throw new Error("policyWorker intervalMs must be an integer of at least 1000");
@@ -3887,9 +3890,11 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
             name: result.name,
             ok: true,
             generation: result.view.generation,
+            issuedAt: result.view.issuedAt,
+            planHash: result.view.planHash,
             hosts: result.view.hosts.map((host) => host.host),
           }
-        : { name: result.name, ok: false, generation: null, hosts: [], error: result.error }),
+        : { name: result.name, ok: false, generation: null, issuedAt: null, planHash: null, hosts: [], error: result.error }),
       propose: proposePolicyRetirement,
       now,
       actor: "policy-worker",

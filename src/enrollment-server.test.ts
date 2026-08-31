@@ -8,7 +8,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import {
-  beginHostDeregistration, createAppToken, createNodeToken, initializeEnrollmentDocument, loadEnrollmentDocument,
+  beginHostDeregistration, confirmHostInfrastructureDestroyed, createAppToken, createNodeToken,
+  initializeEnrollmentDocument, loadEnrollmentDocument, recordHostDeregistrationReplication,
   storeNodeCertificate, submitNodeCsr, withEnrollmentTransaction,
   type NodeCsrRecord,
 } from "./enrollment-store.ts";
@@ -996,6 +997,103 @@ describe("lifecycle-bound host deregistration", () => {
     assert.equal(serialized.includes(certificatePem), false);
     assert.equal(serialized.includes(appToken), false);
     assert.equal(serialized.includes(stored.tokens[0]!.tokenHash), false);
+  });
+});
+
+describe("host deregistration policy break-glass recovery", () => {
+  it("accepts the existing OTP-and-evidence endpoint from every destroyed worker-pending state", async () => {
+    const recoveryStore = join(root, "policy-recovery-enrollment.json");
+    initializeEnrollmentDocument(recoveryStore);
+    const states = ["queued", "pr_open", "merged", "awaiting_publish", "published"] as const;
+    withEnrollmentTransaction(recoveryStore, (document) => {
+      const now = new Date("2026-08-31T00:10:00.000Z");
+      for (const state of states) {
+        const suffix = state.replaceAll("_", "-");
+        const hostname = `manual-${suffix}.dev`;
+        const hostLifecycleId = `create-${suffix}`;
+        const externalOperationId = `destroy-${suffix}`;
+        createNodeToken(document, { hostname, hostLifecycleId, now });
+        beginHostDeregistration(document, {
+          hostname, externalOperationId, hostLifecycleId,
+          reason: "instance-destroy", requestedBy: "stardust", actor: "app:destroyer", relayNames: ["dev"],
+          scope: { appTokenId: "app-1", label: "destroyer", hostnamePattern: "*.dev" }, now,
+        });
+        recordHostDeregistrationReplication(document, [
+          { name: "dev", ok: true, count: 0, snapshotFingerprints: [] },
+        ], ["dev"], now);
+        const row = confirmHostInfrastructureDestroyed(document, {
+          hostname, externalOperationId, hostLifecycleId,
+          provider: "vultr", providerInstanceId: `vultr-${suffix}`,
+          destroyedAt: "2026-08-31T00:09:00.000Z", actor: "app:destroyer", now,
+        });
+        row.policy.state = state;
+        if (state !== "queued") {
+          row.policy.pullRequestUrl = "https://github.test/o/r/pull/1";
+          row.policy.commitSha = "b".repeat(40);
+          row.policy.automation = {
+            branch: `policy/host-deregister/${suffix}`, pullRequestNumber: 1,
+            patchCommitSha: "b".repeat(40), mergeCommitSha: null,
+            affectedRelays: ["dev"], reviewedBy: [], planGeneration: null, planProposedAt: null,
+            plans: [], lastAttemptAt: null, lastError: null,
+          };
+        }
+        if (["merged", "awaiting_publish", "published"].includes(state)) {
+          row.policy.commitSha = "c".repeat(40);
+          row.policy.automation!.mergeCommitSha = "c".repeat(40);
+          row.policy.automation!.reviewedBy = ["human-reviewer"];
+        }
+        if (["awaiting_publish", "published"].includes(state)) {
+          row.policy.publishedGeneration = "generation-1";
+          row.policy.automation!.planGeneration = "generation-1";
+          row.policy.automation!.planProposedAt = "2026-08-31T00:09:30.000Z";
+          row.policy.automation!.plans = [{
+            relay: "dev", hash: `sha256:${"d".repeat(64)}`, generation: "generation-1",
+            proposedAt: "2026-08-31T00:09:30.000Z",
+            publishedAt: state === "published" ? "2026-08-31T00:09:45.000Z" : null,
+          }];
+        }
+      }
+    });
+    const started = await startAppTokenManager(recoveryStore);
+    const recoveryPort = started.port;
+    try {
+      const withoutOtp = await call(
+        "/enrollment/host-deregistrations/manual-queued.dev/destroy-queued/policy-completed",
+        "PUT",
+        {
+          hostLifecycleId: "create-queued", pullRequestUrl: "https://github.test/o/r/pull/1",
+          commitSha: "a".repeat(40), publishedGeneration: "generation-queued",
+          relayConfirmations: [{ name: "dev", absentAt: "2026-08-31T00:09:30.000Z" }],
+        },
+        "operator",
+        undefined,
+        recoveryPort,
+      );
+      assert.equal(withoutOtp.status, 401, "manual recovery bypassed the existing OTP gate");
+      assert.equal(loadEnrollmentDocument(recoveryStore).hostDeregistrations
+        .find((row) => row.externalOperationId === "destroy-queued")?.policy.state, "queued");
+      for (const state of states) {
+        const suffix = state.replaceAll("_", "-");
+        const answer = await call(
+          `/enrollment/host-deregistrations/manual-${suffix}.dev/destroy-${suffix}/policy-completed`,
+          "PUT",
+          {
+            otp: "123456", hostLifecycleId: `create-${suffix}`,
+            pullRequestUrl: `https://github.test/o/r/pull/${states.indexOf(state) + 1}`,
+            commitSha: "a".repeat(40), publishedGeneration: `generation-${suffix}`,
+            relayConfirmations: [{ name: "dev", absentAt: "2026-08-31T00:09:30.000Z" }],
+          },
+          "operator",
+          undefined,
+          recoveryPort,
+        );
+        assert.equal(answer.status, 200, `${state}: ${JSON.stringify(answer.body)}`);
+        assert.equal(answer.body.operation.policy.state, "completed");
+        assert.equal(answer.body.operation.policy.completedBy, "ops");
+      }
+    } finally {
+      started.close();
+    }
   });
 });
 

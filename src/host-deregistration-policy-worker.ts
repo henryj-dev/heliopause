@@ -12,6 +12,7 @@ import {
   ensureRepositoryFileOnBranch,
   findPullRequestByBranch,
   openPullRequest,
+  pullRequestHumanApprovals,
   pullRequestStatus,
   sameCommit,
   type AppCredentials,
@@ -26,6 +27,10 @@ export interface PolicyWorkerRelayView {
   name: string;
   ok: boolean;
   generation: string | null;
+  /** Exact bundle manifest timestamp; generation alone does not bind a unique rendered bundle. */
+  issuedAt: string | null;
+  /** Exact plan digest reported from the relay's loaded authorized bundle. */
+  planHash: string | null;
   /** Exact manifest keys, obtained independently from relay GET /status. */
   hosts: string[];
   error?: string;
@@ -66,7 +71,7 @@ export type PolicyWorkerResult =
   | { state: "waiting"; operationId: string; reason: string };
 
 const automationOf = (row: HostDeregistrationRecord): HostDeregistrationPolicyAutomation =>
-  structuredClone(row.policy.automation ?? emptyHostDeregistrationPolicyAutomation());
+  ({ ...emptyHostDeregistrationPolicyAutomation(), ...structuredClone(row.policy.automation ?? {}) });
 
 function operationKey(row: HostDeregistrationRecord): string {
   return `${row.hostname}\0${row.externalOperationId}\0${row.hostLifecycleId}`;
@@ -95,6 +100,31 @@ function relayMap(views: readonly PolicyWorkerRelayView[], expected: readonly st
   return map;
 }
 
+const configuredRelays = (options: HostDeregistrationPolicyWorkerOptions): string[] =>
+  [...new Set(options.relayNames)].sort();
+
+const sameStrings = (a: readonly string[], b: readonly string[]): boolean =>
+  a.length === b.length && a.every((value, index) => value === b[index]);
+
+function resetForRelaySet(
+  options: HostDeregistrationPolicyWorkerOptions,
+  row: HostDeregistrationRecord,
+  automation: HostDeregistrationPolicyAutomation,
+): PolicyWorkerResult | null {
+  const current = configuredRelays(options);
+  if (sameStrings([...automation.affectedRelays].sort(), current)) return null;
+  automation.affectedRelays = current;
+  automation.planGeneration = null;
+  automation.planProposedAt = null;
+  automation.plans = [];
+  automation.lastAttemptAt = (options.now ?? (() => new Date()))().toISOString();
+  automation.lastError = null;
+  const applied = cas(options, row, row.policy.state, "merged", automation);
+  return applied
+    ? { state: "advanced", operationId: row.externalOperationId, policyState: "merged" }
+    : { state: "waiting", operationId: row.externalOperationId, reason: "relay set changed during recovery" };
+}
+
 function cas(
   options: HostDeregistrationPolicyWorkerOptions,
   row: HostDeregistrationRecord,
@@ -112,6 +142,7 @@ function cas(
       externalOperationId: row.externalOperationId,
       hostLifecycleId: row.hostLifecycleId,
       expectedState,
+      expectedPolicy: structuredClone(row.policy),
       nextState,
       automation,
       actor: options.actor ?? "policy-worker",
@@ -179,7 +210,7 @@ export async function runHostDeregistrationPolicyWorkerOnce(
     // Every configured relay receives and proves the reviewed generation. Selecting only relays
     // whose current manifest contains the host makes an already-absent host a vacuous success with
     // no rendered plan, approval or publish evidence at all.
-    automation.affectedRelays = [...relays.keys()].sort();
+    automation.affectedRelays = configuredRelays(options);
     automation.lastAttemptAt = now().toISOString();
     automation.lastError = null;
     const applied = cas(options, row, "queued", "pr_open", automation, {
@@ -196,6 +227,13 @@ export async function runHostDeregistrationPolicyWorkerOnce(
     const pr = await pullRequestStatus(
       options.creds, options.target, options.fetcher, nowSec, automation.pullRequestNumber,
     );
+    if (pr.headRef !== automation.branch || pr.baseRef !== options.target.base
+      || pr.headSha !== automation.patchCommitSha) {
+      automation.lastAttemptAt = now().toISOString();
+      automation.lastError = "policy pull request no longer matches the durable branch, base and patch commit";
+      cas(options, row, "pr_open", "pr_open", automation);
+      return { state: "waiting", operationId, reason: automation.lastError };
+    }
     if (!pr.merged) {
       if (pr.state === "closed") {
         automation.lastAttemptAt = now().toISOString();
@@ -209,16 +247,31 @@ export async function runHostDeregistrationPolicyWorkerOnce(
       };
     }
     if (!pr.mergeCommitSha) throw new Error("merged pull request has no merge commit sha");
+    const reviewers = await pullRequestHumanApprovals(
+      options.creds, options.target, options.fetcher, nowSec, automation.pullRequestNumber, automation.patchCommitSha!,
+    );
+    if (reviewers.length === 0) {
+      automation.lastAttemptAt = now().toISOString();
+      automation.lastError = "merged policy pull request has no human approval of the durable patch commit";
+      cas(options, row, "pr_open", "pr_open", automation);
+      return { state: "waiting", operationId, reason: automation.lastError };
+    }
     automation.mergeCommitSha = pr.mergeCommitSha;
+    automation.reviewedBy = reviewers;
     automation.lastAttemptAt = now().toISOString();
     automation.lastError = null;
-    const applied = cas(options, row, "pr_open", "merged", automation, { pullRequestUrl: pr.url });
+    const applied = cas(options, row, "pr_open", "merged", automation, {
+      pullRequestUrl: pr.url,
+      commitSha: pr.mergeCommitSha,
+    });
     return applied
       ? { state: "advanced", operationId, policyState: "merged" }
       : { state: "waiting", operationId, reason: "operation changed while merge evidence was recorded" };
   }
 
   if (row.policy.state === "merged") {
+    const relayReset = resetForRelaySet(options, row, automation);
+    if (relayReset) return relayReset;
     const renderer = await options.renderer();
     if (renderer.dirty || !sameCommit(renderer.headSha, renderer.repositoryHead)) {
       return { state: "waiting", operationId, reason: "waiting for a clean renderer at repository HEAD" };
@@ -226,14 +279,30 @@ export async function runHostDeregistrationPolicyWorkerOnce(
     if (renderer.hosts.includes(row.hostname)) {
       return { state: "waiting", operationId, reason: "merged renderer still contains the retired hostname" };
     }
-    automation.plans = (await Promise.all(automation.affectedRelays.map((relay) => options.propose(relay))))
-      .map((plan) => ({ ...plan, publishedAt: null }))
+    if (automation.planGeneration !== renderer.headSha || automation.planProposedAt === null) {
+      automation.planGeneration = renderer.headSha!;
+      automation.planProposedAt = now().toISOString();
+      automation.plans = [];
+      automation.lastAttemptAt = now().toISOString();
+      automation.lastError = null;
+      const reserved = cas(options, row, "merged", "merged", automation);
+      return reserved
+        ? { state: "advanced", operationId, policyState: "merged" }
+        : { state: "waiting", operationId, reason: "another worker reserved the rendered plan" };
+    }
+    const reservation = { generation: automation.planGeneration!, proposedAt: automation.planProposedAt! };
+    const proposed = await Promise.all(automation.affectedRelays.map((relay) => options.propose(relay, reservation)));
+    if (proposed.some((plan) => plan.generation !== reservation.generation
+      || plan.proposedAt !== reservation.proposedAt)
+      || !sameStrings(proposed.map((plan) => plan.relay).sort(), [...automation.affectedRelays].sort())) {
+      throw new Error("renderer proposal did not match the durable plan reservation");
+    }
+    automation.plans = proposed.map((plan) => ({ ...plan, publishedAt: null }))
       .sort((a, b) => a.relay.localeCompare(b.relay));
     automation.lastAttemptAt = now().toISOString();
     automation.lastError = null;
-    const generation = automation.plans[0]?.generation ?? renderer.headSha;
     const applied = cas(options, row, "merged", "awaiting_publish", automation, {
-      publishedGeneration: generation,
+      publishedGeneration: reservation.generation,
     });
     return applied
       ? { state: "advanced", operationId, policyState: "awaiting_publish" }
@@ -241,36 +310,61 @@ export async function runHostDeregistrationPolicyWorkerOnce(
   }
 
   if (row.policy.state === "awaiting_publish") {
-    // Plans are memory-only by design. Re-proposing reconstructs them after a crash, but does not
-    // reconstruct or bypass an approval: a human must approve and publish again.
-    const previousByRelay = new Map(automation.plans.map((plan) => [plan.relay, plan]));
-    const ensured = await Promise.all(automation.affectedRelays.map((relay) => {
-      const previous = previousByRelay.get(relay);
-      return options.propose(relay, previous
-        ? { generation: previous.generation, proposedAt: previous.proposedAt }
-        : undefined);
-    }));
+    const relayReset = resetForRelaySet(options, row, automation);
+    if (relayReset) return relayReset;
+    const renderer = await options.renderer();
+    if (renderer.dirty || !sameCommit(renderer.headSha, renderer.repositoryHead)) {
+      return { state: "waiting", operationId, reason: "waiting for a clean renderer at repository HEAD" };
+    }
+    if (renderer.hosts.includes(row.hostname)) {
+      return { state: "waiting", operationId, reason: "current renderer again contains the retired hostname" };
+    }
+    if (automation.planGeneration !== renderer.headSha || automation.planProposedAt === null) {
+      automation.planGeneration = renderer.headSha!;
+      automation.planProposedAt = now().toISOString();
+      automation.plans = [];
+      automation.lastAttemptAt = now().toISOString();
+      automation.lastError = null;
+      const reset = cas(options, row, "awaiting_publish", "merged", automation, {
+        publishedGeneration: renderer.headSha,
+      });
+      return reset
+        ? { state: "advanced", operationId, policyState: "merged" }
+        : { state: "waiting", operationId, reason: "renderer advanced during plan replacement" };
+    }
+    // The plan identity is durable; the manager's publishable bundle and approval are memory-only.
+    // Re-proposing reconstructs the exact durable hash after a crash, never the approval: a human
+    // must approve and publish again.
+    const reservation = { generation: automation.planGeneration!, proposedAt: automation.planProposedAt! };
+    const ensured = await Promise.all(automation.affectedRelays.map((relay) => options.propose(relay, reservation)));
     const ensuredByRelay = new Map(ensured.map((plan) => [plan.relay, plan]));
     for (const plan of automation.plans) {
       const current = ensuredByRelay.get(plan.relay);
-      if (current && (current.hash !== plan.hash || current.generation !== plan.generation)) {
-        plan.hash = current.hash;
-        plan.generation = current.generation;
-        plan.proposedAt = current.proposedAt;
-        plan.publishedAt = null;
+      if (!current || current.hash !== plan.hash || current.generation !== plan.generation
+        || current.proposedAt !== plan.proposedAt) {
+        throw new Error(`reconstructed plan for ${plan.relay} does not match durable hash and manifest`);
       }
     }
     const observations = await options.relays();
     const relays = relayMap(observations, options.relayNames);
+    let publicationChanged = false;
     for (const plan of automation.plans) {
       const view = relays.get(plan.relay)!;
-      if (view.ok && view.generation === plan.generation && !view.hosts.includes(row.hostname) && plan.publishedAt === null) {
+      if (view.ok && view.generation === plan.generation && view.issuedAt === plan.proposedAt
+        && view.planHash === plan.hash
+        && !view.hosts.includes(row.hostname) && plan.publishedAt === null) {
         plan.publishedAt = now().toISOString();
+        publicationChanged = true;
       }
     }
     const published = automation.plans.every((plan) => plan.publishedAt !== null);
     const absentEverywhere = [...relays.values()].every((view) => view.ok && !view.hosts.includes(row.hostname));
     if (!published || !absentEverywhere) {
+      if (publicationChanged) {
+        automation.lastAttemptAt = now().toISOString();
+        automation.lastError = null;
+        cas(options, row, "awaiting_publish", "awaiting_publish", automation);
+      }
       return { state: "waiting", operationId, reason: "waiting for human approval/publish and relay manifest absence" };
     }
     automation.lastAttemptAt = now().toISOString();
@@ -282,9 +376,16 @@ export async function runHostDeregistrationPolicyWorkerOnce(
   }
 
   if (row.policy.state === "published") {
+    const relayReset = resetForRelaySet(options, row, automation);
+    if (relayReset) return relayReset;
     const observations = await options.relays();
     const relays = relayMap(observations, options.relayNames);
-    if ([...relays.values()].some((view) => !view.ok || view.hosts.includes(row.hostname))) {
+    const planByRelay = new Map(automation.plans.map((plan) => [plan.relay, plan]));
+    if ([...relays.values()].some((view) => {
+      const plan = planByRelay.get(view.name);
+      return !view.ok || !plan || view.generation !== plan.generation
+        || view.issuedAt !== plan.proposedAt || view.planHash !== plan.hash || view.hosts.includes(row.hostname);
+    })) {
       return { state: "waiting", operationId, reason: "relay manifest absence could not be independently reconfirmed" };
     }
     const at = now().toISOString();
@@ -321,6 +422,9 @@ export function startHostDeregistrationPolicyWorker(
 ): () => void {
   if (!Number.isSafeInteger(intervalMs) || intervalMs < 1_000) throw new Error("policy worker interval must be at least one second");
   if (options.relayNames.length === 0) throw new Error("policy worker requires at least one configured relay");
+  if (new Set(options.relayNames).size !== options.relayNames.length) {
+    throw new Error("policy worker requires unique configured relay names");
+  }
   let stopped = false;
   let running = false;
   const run = async (): Promise<void> => {

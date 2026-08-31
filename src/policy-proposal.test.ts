@@ -16,6 +16,7 @@ import {
   installationToken,
   isUsableBranchName,
   openPullRequest,
+  pullRequestHumanApprovals,
   proposalBody,
   sameCommit,
   ProposalError,
@@ -197,12 +198,45 @@ describe("idempotent machine-owned branch updates", () => {
       tokenRoute,
       { match: /\/pulls\?head=.*state=all/, body: [{
         number: 9, html_url: "https://example.test/pull/9", state: "closed",
-        merged_at: "2026-08-31T00:00:00Z", merge_commit_sha: "c".repeat(40), head: { sha: "b".repeat(40) },
+        merged_at: "2026-08-31T00:00:00Z", merge_commit_sha: "c".repeat(40),
+        head: { sha: "b".repeat(40), ref: "policy/a/b" }, base: { ref: "main" },
       }] },
     ]);
     const found = await findPullRequestByBranch(creds, target, fetch, 0, "policy/a/b");
     assert.equal(found?.number, 9);
     assert.equal(found?.merged, true);
+  });
+
+  it("accepts only each human reviewer's latest approval of the exact durable head", async () => {
+    const head = "b".repeat(40);
+    const { fetch } = fetcherFor([
+      tokenRoute,
+      { match: /\/pulls\/9\/reviews\?per_page=100$/, body: [
+        { id: 1, state: "APPROVED", commit_id: head, submitted_at: "2026-08-31T00:00:00Z", user: { login: "alice", type: "User" } },
+        { id: 2, state: "CHANGES_REQUESTED", commit_id: head, submitted_at: "2026-08-31T00:01:00Z", user: { login: "alice", type: "User" } },
+        { id: 3, state: "APPROVED", commit_id: "a".repeat(40), submitted_at: "2026-08-31T00:02:00Z", user: { login: "bob", type: "User" } },
+        { id: 4, state: "APPROVED", commit_id: head, submitted_at: "2026-08-31T00:03:00Z", user: { login: "policy-bot", type: "Bot" } },
+        { id: 5, state: "APPROVED", commit_id: head, submitted_at: "2026-08-31T00:04:00Z", user: { login: "carol", type: "User" } },
+      ] },
+    ]);
+    assert.deepEqual(await pullRequestHumanApprovals(creds, target, fetch, 0, 9, head), ["carol"]);
+  });
+
+  it("fails closed when one review page cannot prove there is no later decision", async () => {
+    const head = "b".repeat(40);
+    const reviews = Array.from({ length: 100 }, (_, id) => ({
+      id: id + 1, state: "APPROVED", commit_id: head,
+      submitted_at: `2026-08-31T00:${String(id % 60).padStart(2, "0")}:00Z`,
+      user: { login: `reviewer-${id}`, type: "User" },
+    }));
+    const { fetch } = fetcherFor([
+      tokenRoute,
+      { match: /\/pulls\/9\/reviews\?per_page=100$/, body: reviews },
+    ]);
+    await assert.rejects(
+      () => pullRequestHumanApprovals(creds, target, fetch, 0, 9, head),
+      /too many reviews/,
+    );
   });
 });
 

@@ -116,6 +116,8 @@ export interface AuthorizedArtifactBundle {
   version: 1;
   manifest: Manifest;
   artifacts: Record<string, HostArtifactEnvelope>;
+  /** Exact publish receipt, also carried at top level for relay status. */
+  planHash: string;
 }
 
 export interface BuildHostAuthorizationInput {
@@ -396,16 +398,23 @@ export function signAuthorizedArtifactBundle(
     const payload = encodeCanonicalPayload(buildPayloadFromValidated(common, host));
     artifacts[host] = signPreparedPayload(payload, privateKey, keyId);
   }
-  return validateAuthorizedArtifactBundle({ version: 1, manifest: common.bundle.manifest, artifacts });
+  return validateAuthorizedArtifactBundle({
+    version: 1, manifest: common.bundle.manifest, artifacts, planHash: common.planHash,
+  });
 }
 
 /**
- * Strict outer validation for relay storage. This deliberately does not trust or interpret the
- * signed payload: only an agent holding a pinned public key can turn an envelope into applyable data.
+ * Strict validation for relay storage. The relay decodes only enough of the signed payload to prove
+ * every artifact names one plan receipt and the same outer manifest. It still cannot turn those
+ * bytes into applyable policy: signature trust and authorization remain agent-side checks.
  */
 export function validateAuthorizedArtifactBundle(input: unknown): AuthorizedArtifactBundle {
   if (!isRecord(input)) throw new ArtifactSignatureError("authorized artifact bundle is not an object");
-  exactKeys(input, ["artifacts", "manifest", "version"], "authorized artifact bundle");
+  const outerKeys = Object.keys(input);
+  if (outerKeys.some((key) => !["artifacts", "manifest", "planHash", "version"].includes(key))
+    || ["artifacts", "manifest", "version"].some((key) => !outerKeys.includes(key))) {
+    throw new ArtifactSignatureError("authorized artifact bundle contains unsupported or missing fields");
+  }
   if (input.version !== 1) throw new ArtifactSignatureError("unsupported authorized artifact bundle version");
   const manifest = validateManifest(input.manifest);
   if (!isRecord(input.artifacts)) throw new ArtifactSignatureError("authorized artifact bundle has no artifacts map");
@@ -415,8 +424,35 @@ export function validateAuthorizedArtifactBundle(input: unknown): AuthorizedArti
     throw new ArtifactSignatureError("authorized artifact bundle hosts do not exactly match its manifest");
   }
   const artifacts: Record<string, HostArtifactEnvelope> = {};
-  for (const host of named) artifacts[host] = decodeHostArtifactEnvelope(input.artifacts[host]);
-  return { version: 1, manifest, artifacts };
+  const signedPlanHashes = new Set<string>();
+  for (const host of named) {
+    const envelope = decodeHostArtifactEnvelope(input.artifacts[host]);
+    artifacts[host] = envelope;
+    const payloadBytes = decodeBase64Url(envelope.payload, "payload", MAX_HOST_ARTIFACT_PAYLOAD_BYTES, false);
+    let parsed: unknown;
+    try { parsed = JSON.parse(decodeUtf8(payloadBytes)) as unknown; }
+    catch { throw new ArtifactSignatureError(`artifact ${host} signed payload is not JSON`); }
+    if (canonicalJson(parsed) !== decodeUtf8(payloadBytes)) {
+      throw new ArtifactSignatureError(`artifact ${host} signed payload is not canonical JSON`);
+    }
+    const payload = validatePayload(parsed);
+    if (payload.host !== host || payload.manifest.generation !== manifest.generation
+      || payload.manifest.issuedAt !== manifest.issuedAt) {
+      throw new ArtifactSignatureError(`artifact ${host} does not bind the outer manifest`);
+    }
+    signedPlanHashes.add(payload.planHash);
+  }
+  if (signedPlanHashes.size > 1) throw new ArtifactSignatureError("artifacts do not agree on one signed planHash");
+  const carriedPlanHash = input.planHash;
+  if (carriedPlanHash !== undefined && (typeof carriedPlanHash !== "string" || !DIGEST.test(carriedPlanHash))) {
+    throw new ArtifactSignatureError("authorized artifact bundle planHash is not a sha256 digest");
+  }
+  const signedPlanHash = signedPlanHashes.values().next().value as string | undefined;
+  if (signedPlanHash && carriedPlanHash !== undefined && carriedPlanHash !== signedPlanHash) {
+    throw new ArtifactSignatureError("authorized artifact bundle planHash differs from its signed artifacts");
+  }
+  if (!signedPlanHash) throw new ArtifactSignatureError("authorized artifact bundle has no signed planHash");
+  return { version: 1, manifest, artifacts, planHash: carriedPlanHash ?? signedPlanHash };
 }
 
 export function encodeAuthorizedArtifactBundle(input: unknown): string {

@@ -39,6 +39,15 @@ repository served by that manager:
 4. Deploy with `HELIOPAUSE_POLICY_RETIREMENTS_PATH=retired-hosts.json`. Optionally set
    `HELIOPAUSE_POLICY_WORKER_INTERVAL_MS` (minimum 1000; default 30000).
 
+The GitHub App must be able to read pull-request reviews. The worker accepts a merge only when the
+PR still targets the configured base from the durable machine branch, its head is the exact durable
+patch commit, and the latest review from at least one GitHub `User` approves that head. Bot approval
+does not satisfy this gate.
+
+Deploy the matching relay build before enabling the worker. Relay `/status` now exposes the exact
+`planHash` loaded from the authorized artifact bundle; a relay on the older shape safely leaves the
+worker waiting, because generation and timestamp alone do not prove which approved bundle landed.
+
 Each JSON row binds the exact hostname to its lifecycle id, external destroy operation id and
 infrastructure destruction timestamp. Replay accepts only the same tuple; a second lifecycle trying
 to retire the same hostname is refused. The list suppresses only an exact `PublishHost.id`. Address tables, measurement history and

@@ -360,6 +360,12 @@ describe("re-applying after the kernel loses the table", () => {
 // worse than no fleet view, because it is consulted instead of the hosts.
 
 describe("fleetView", () => {
+  it("reports the exact plan receipt loaded with the manifest", () => {
+    const s = state();
+    s.planHash = `sha256:${"a".repeat(64)}`;
+    assert.equal(fleetView(s, new Date(AT)).planHash, s.planHash);
+  });
+
   const NOW = new Date("2026-07-30T00:01:00Z");
   // `host` is a parameter because identity binding compares it against the CN — passing the
   // default "h-canary" while claiming to be another host is a 403, which is the mechanism working.

@@ -535,12 +535,13 @@ export async function findPullRequestByBranch(
       `?head=${encodeURIComponent(`${target.owner}:${branch}`)}&state=all&per_page=10`,
   )) as Array<{
     number?: number; html_url?: string; state?: string; merged_at?: string | null;
-    merge_commit_sha?: string | null; head?: { sha?: string };
+    merge_commit_sha?: string | null; head?: { sha?: string; ref?: string }; base?: { ref?: string };
   }>;
   const row = rows.find((candidate) => candidate.state === "open") ?? rows[0];
   if (!row) return null;
   if (!Number.isSafeInteger(row.number) || typeof row.html_url !== "string"
-    || !["open", "closed"].includes(String(row.state)) || typeof row.head?.sha !== "string") {
+    || !["open", "closed"].includes(String(row.state)) || typeof row.head?.sha !== "string"
+    || typeof row.head.ref !== "string" || typeof row.base?.ref !== "string") {
     throw new ProposalError(`pull request lookup for ${branch} returned an invalid status`);
   }
   return {
@@ -550,6 +551,8 @@ export async function findPullRequestByBranch(
     merged: typeof row.merged_at === "string",
     mergeCommitSha: typeof row.merge_commit_sha === "string" ? row.merge_commit_sha : null,
     headSha: row.head.sha,
+    headRef: row.head.ref,
+    baseRef: row.base.ref,
   };
 }
 
@@ -560,6 +563,8 @@ export interface PullRequestStatus {
   merged: boolean;
   mergeCommitSha: string | null;
   headSha: string;
+  headRef: string;
+  baseRef: string;
 }
 
 /** Poll review/merge outcome without attempting to review or merge. */
@@ -578,10 +583,11 @@ export async function pullRequestStatus(
     `/repos/${encodeURIComponent(target.owner)}/${encodeURIComponent(target.repo)}/pulls/${number}`,
   )) as {
     number?: number; html_url?: string; state?: string; merged?: boolean;
-    merge_commit_sha?: string | null; head?: { sha?: string };
+    merge_commit_sha?: string | null; head?: { sha?: string; ref?: string }; base?: { ref?: string };
   };
   if (out.number !== number || typeof out.html_url !== "string" || !["open", "closed"].includes(String(out.state))
-    || typeof out.merged !== "boolean" || typeof out.head?.sha !== "string") {
+    || typeof out.merged !== "boolean" || typeof out.head?.sha !== "string"
+    || typeof out.head.ref !== "string" || typeof out.base?.ref !== "string") {
     throw new ProposalError(`pull request #${number} returned an invalid status`);
   }
   return {
@@ -591,7 +597,56 @@ export async function pullRequestStatus(
     merged: out.merged,
     mergeCommitSha: typeof out.merge_commit_sha === "string" ? out.merge_commit_sha : null,
     headSha: out.head.sha,
+    headRef: out.head.ref,
+    baseRef: out.base.ref,
   };
+}
+
+/**
+ * Human approvals of the exact durable head. The latest submitted review per GitHub user wins;
+ * an older approval followed by CHANGES_REQUESTED is not approval, and bot reviews are not human.
+ */
+export async function pullRequestHumanApprovals(
+  creds: AppCredentials,
+  target: ProposalTarget,
+  fetcher: Fetcher,
+  nowSec: number,
+  number: number,
+  headSha: string,
+): Promise<string[]> {
+  if (!Number.isSafeInteger(number) || number < 1) throw new ProposalError("pull request number is invalid");
+  const token = await installationToken(creds, fetcher, nowSec);
+  const rows = (await gh(
+    fetcher,
+    token,
+    `/repos/${encodeURIComponent(target.owner)}/${encodeURIComponent(target.repo)}/pulls/${number}/reviews?per_page=100`,
+  )) as Array<{
+    id?: number; state?: string; commit_id?: string; submitted_at?: string;
+    user?: { login?: string; type?: string };
+  }>;
+  if (rows.length >= 100) {
+    throw new ProposalError(`pull request #${number} has too many reviews to prove the latest human decision`);
+  }
+  const latest = new Map<string, { id: number; state: string; commit: string; submittedAt: string; type: string }>();
+  for (const row of rows) {
+    if (!Number.isSafeInteger(row.id) || typeof row.state !== "string" || typeof row.commit_id !== "string"
+      || typeof row.submitted_at !== "string" || !Number.isFinite(Date.parse(row.submitted_at))
+      || typeof row.user?.login !== "string" || typeof row.user.type !== "string") {
+      throw new ProposalError(`pull request #${number} returned an invalid review`);
+    }
+    const previous = latest.get(row.user.login);
+    if (!previous || row.submitted_at > previous.submittedAt
+      || (row.submitted_at === previous.submittedAt && row.id! > previous.id)) {
+      latest.set(row.user.login, {
+        id: row.id!, state: row.state, commit: row.commit_id,
+        submittedAt: row.submitted_at, type: row.user.type,
+      });
+    }
+  }
+  return [...latest.entries()]
+    .filter(([, review]) => review.type === "User" && review.state === "APPROVED" && review.commit === headSha)
+    .map(([login]) => login)
+    .sort();
 }
 
 /** Open the pull request. Returns the existing one when the branch already has an open PR. */

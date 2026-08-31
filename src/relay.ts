@@ -76,6 +76,8 @@ const MAX_BUNDLE_BYTES = MAX_AUTHORIZED_ARTIFACT_BUNDLE_BYTES;
 export interface RelayState {
   /** Null until the first successful load. Agents are told to wait rather than given nothing. */
   manifest: Manifest | null;
+  /** Exact approved plan receipt, derived from signed artifacts or the zero-host publish metadata. */
+  planHash: string | null;
   /** Signed per-host envelopes from the same atomic snapshot as `manifest`. Never interpreted here. */
   artifacts: Record<string, HostArtifactEnvelope>;
   statuses: Record<string, HostStatus>;
@@ -120,6 +122,7 @@ export interface RelayState {
 export function emptyState(): RelayState {
   return {
     manifest: null,
+    planHash: null,
     artifacts: {},
     statuses: {},
     references: {},
@@ -253,6 +256,7 @@ export interface HostView {
 export interface FleetView {
   generation: string | null;
   issuedAt: string | null;
+  planHash: string | null;
   hosts: HostView[];
   /** Hosts that must be looked at: rolled back, drifted, or silent. */
   problems: string[];
@@ -545,6 +549,7 @@ export function fleetView(
   return {
     generation: m?.generation ?? null,
     issuedAt: m?.issuedAt ?? null,
+    planHash: state.planHash,
     hosts,
     problems,
     relayAgeSec: startedAt ? Math.round((now.getTime() - startedAt.getTime()) / 1000) : null,
@@ -947,6 +952,7 @@ export async function startRelay(
       // different on-disk snapshot than the manifest the rollout gate is using.
       state.manifest = loaded.manifest;
       state.artifacts = loaded.artifacts;
+      state.planHash = loaded.planHash;
     } catch (e) {
       // Keep serving the manifest already in memory. A bad publish should stall the rollout, not
       // strand every agent behind this gateway with no answer at all.
@@ -1083,6 +1089,7 @@ export async function startRelay(
         log(`published generation ${bundle.manifest.generation} by ${cn} (${Object.keys(bundle.manifest.hosts).length} hosts)`, `${cn}이(가) 세대 ${bundle.manifest.generation}을(를) 발행함 (${Object.keys(bundle.manifest.hosts).length}개 호스트)`);
         return send(res, 200, {
           generation: bundle.manifest.generation,
+          planHash: bundle.planHash,
           hosts: Object.keys(bundle.manifest.hosts).sort(),
           serving: state.manifest?.generation ?? null,
         });
