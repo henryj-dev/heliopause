@@ -938,6 +938,21 @@ def validate_wl(text):
     return hp.validate_workload(text, cluster="dev", applier=hp.HOST_ID, generation="g1")
 
 
+def baseline(namespace="util"):
+    return {
+        "apiVersion": "cilium.io/v2", "kind": "CiliumNetworkPolicy",
+        "metadata": {
+            "name": "hp-dev-posture-baseline", "namespace": namespace,
+            "labels": {"managed-by": "heliopause", "heliopause.io/cluster": "dev"},
+            "annotations": {"heliopause.io/policy-id": "posture", "heliopause.io/applier": hp.HOST_ID,
+                            "heliopause.io/generation": "g1", "heliopause.io/policy-kind": "namespace-ingress-default-deny"},
+        },
+        "spec": {"description": "namespace default deny", "endpointSelector": {"matchLabels": {hp.NS_LABEL: namespace}},
+                 "enableDefaultDeny": {"ingress": True},
+                 "ingress": [{"fromEndpoints": [{"matchLabels": {hp.NS_LABEL: hp.BASELINE_NEVER_NAMESPACE}}]}]},
+    }
+
+
 class TestCrossLayerOrdering(unittest.TestCase):
     def setUp(self):
         hp.save_state(dict(hp._EMPTY_STATE))
@@ -1067,6 +1082,17 @@ class TestCrossLayerOrdering(unittest.TestCase):
 
 
 class TestWorkloadValidation(unittest.TestCase):
+    def test_accepts_an_exact_namespace_ingress_default_deny_baseline(self):
+        objects, reason = validate_wl(wl(baseline()))
+        self.assertEqual(reason, "")
+        self.assertEqual(objects[0]["metadata"]["name"], "hp-dev-posture-baseline")
+
+    def test_refuses_a_baseline_with_an_allow_rule(self):
+        obj = baseline()
+        obj["spec"]["ingress"] = [{"fromEntities": ["all"]}]
+        objects, reason = validate_wl(wl(obj))
+        self.assertIsNone(objects)
+        self.assertIn("exact unmatchable source rule", reason)
     """The workload document reaches Kubernetes mutation commands, which accept privileged kinds too.
 
     So the allowlist here is doing the same job as the nftables one: an artifact that got this far
@@ -1331,6 +1357,22 @@ class TestWorkloadApply(unittest.TestCase):
         create = next(c for c in self.calls if c[0] == "create")
         self.assertIn("--validate=strict", create)
         self.assertNotIn("apply", create)
+
+    def test_baseline_applies_reads_back_and_rolls_back_by_identity(self):
+        obj = baseline()
+        ok, state, detail = hp.apply_workload(self.artifact([obj]))
+        self.assertTrue(ok, detail)
+        self.assertEqual(state, "pending")
+        ref = "util/hp-dev-posture-baseline"
+        self.assertIn(ref, self.cluster)
+        # The enforcement gate intentionally observes only the selected target namespace; its
+        # unmatchable peer is not a Kubernetes namespace and must never be queried.
+        pod_queries = [c for c in self.calls if "pods" in c]
+        self.assertEqual(len(pod_queries), 1)
+        self.assertIn("util", pod_queries[0])
+        hp.rollback_workload("test baseline rollback", "g1")
+        self.assertNotIn(ref, self.cluster)
+        self.assertEqual(self.deleted[0][0], ref)
 
     def test_refuses_a_half_addressed_to_another_node(self):
         # Should be impossible — the relay serves per-host artifacts keyed by certificate CN. Checked

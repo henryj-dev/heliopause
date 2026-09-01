@@ -132,7 +132,7 @@ import urllib.parse
 # nftables ruleset — enforcing half a generation while confirming cleanly, which is exactly what this
 # number exists to prevent. So it was a bump rather than an additive change, and an agent below 2
 # receives nothing until it is upgraded.
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 AGENT_VERSION = "0.6.0-pull-signed-routes"
 
 TABLE_FAMILY = "inet"
@@ -221,6 +221,7 @@ KUBE_CACHE_DIR = os.environ.get(
 # label rather than a Kubernetes one — so it scopes a `kubectl` query instead of being passed to
 # `-l`. Must match `NS_LABEL` in src/cilium.ts.
 NS_LABEL = "k8s:io.kubernetes.pod.namespace"
+BASELINE_NEVER_NAMESPACE = "HELI0PAUSE-NEVER"
 
 HTTP_TIMEOUT_SEC = 10
 NFT_TIMEOUT_SEC = 20
@@ -1019,7 +1020,12 @@ def validate_workload(text, *, cluster, applier, generation):
         annotations = meta.get("annotations")
         if not isinstance(annotations, dict):
             return None, f"{where} has no annotations"
-        if set(annotations) != {"heliopause.io/policy-id", "heliopause.io/applier", "heliopause.io/generation"}:
+        baseline_kind = annotations.get("heliopause.io/policy-kind")
+        baseline = baseline_kind == "namespace-ingress-default-deny"
+        expected_annotations = {"heliopause.io/policy-id", "heliopause.io/applier", "heliopause.io/generation"}
+        if baseline:
+            expected_annotations.add("heliopause.io/policy-kind")
+        if set(annotations) != expected_annotations:
             return None, f"{where} annotations have unsupported or missing fields"
         if annotations.get("heliopause.io/applier") != applier:
             return None, f"{where} names a different applier"
@@ -1029,7 +1035,7 @@ def validate_workload(text, *, cluster, applier, generation):
         if not isinstance(policy_id, str) or not _slug(policy_id):
             return None, f"{where} has an invalid policy-id annotation"
         base_name = f"hp-{_slug(cluster)}-{_slug(policy_id)}"
-        if name not in {base_name, f"{base_name}-ingress"}:
+        if name not in ({f"{base_name}-baseline"} if baseline else {base_name, f"{base_name}-ingress"}):
             return None, f"{where} name {name!r} is not derived from cluster and policy-id"
 
         spec = obj.get("spec")
@@ -1052,6 +1058,16 @@ def validate_workload(text, *, cluster, applier, generation):
         if selected.get(NS_LABEL) != namespace:
             return None, f"{where} endpoint selector namespace does not match metadata.namespace"
 
+        if baseline:
+            if selected != {NS_LABEL: namespace}:
+                return None, f"{where} baseline endpoint selector must select exactly its namespace"
+            if spec.get("enableDefaultDeny") != {"ingress": True}:
+                return None, f"{where} baseline enableDefaultDeny must be ingress true"
+            if any(key in spec for key in ("egress", "ingressDeny", "egressDeny")):
+                return None, f"{where} baseline carries an unsupported traffic direction"
+            if spec.get("ingress") != [{"fromEndpoints": [{"matchLabels": {NS_LABEL: BASELINE_NEVER_NAMESPACE}}]}]:
+                return None, f"{where} baseline ingress must be its exact unmatchable source rule"
+            continue
         directions = [key for key in ("ingress", "egress", "ingressDeny", "egressDeny") if key in spec]
         if len(directions) != 1:
             return None, f"{where} must carry exactly one renderer-produced policy direction"
@@ -2331,6 +2347,9 @@ def _owned_object_error(obj, ref, cluster, generation=None):
     expected_annotation_keys = {
         "heliopause.io/policy-id", "heliopause.io/applier", "heliopause.io/generation",
     }
+    baseline = annotations.get("heliopause.io/policy-kind") == "namespace-ingress-default-deny" if isinstance(annotations, dict) else False
+    if baseline:
+        expected_annotation_keys.add("heliopause.io/policy-kind")
     if not isinstance(annotations, dict) or set(annotations) != expected_annotation_keys:
         return f"{ref} has unsupported or missing ownership annotations; refusing external object"
     if annotations.get("heliopause.io/applier") != HOST_ID:
@@ -2339,10 +2358,12 @@ def _owned_object_error(obj, ref, cluster, generation=None):
             f"{annotations.get('heliopause.io/applier') if isinstance(annotations, dict) else None!r}, "
             f"expected {HOST_ID!r}; refusing another applier's object"
         )
-    if not isinstance(policy_id, str) or name not in {
-        f"hp-{_slug(cluster)}-{_slug(policy_id)}",
-        f"hp-{_slug(cluster)}-{_slug(policy_id)}-ingress",
-    }:
+    if not isinstance(policy_id, str) or name not in (
+        {f"hp-{_slug(cluster)}-{_slug(policy_id)}-baseline"} if baseline else {
+            f"hp-{_slug(cluster)}-{_slug(policy_id)}",
+            f"hp-{_slug(cluster)}-{_slug(policy_id)}-ingress",
+        }
+    ):
         return f"{ref} name does not match its heliopause policy-id annotation"
     observed_generation = annotations.get("heliopause.io/generation")
     if (
@@ -2519,14 +2540,22 @@ def _selector_enforcement_gate(doc, deadline=None):
         ns = obj["metadata"]["namespace"]
         ref = f"{ns}/{obj['metadata']['name']}"
         spec = obj["spec"]
+        annotations = obj["metadata"].get("annotations", {})
+        if annotations.get("heliopause.io/policy-kind") == "namespace-ingress-default-deny":
+            # Its sole peer selector intentionally cannot resolve to a Kubernetes namespace. The
+            # destination namespace must still be observed before we claim enforcement.
+            selectors = [("endpointSelector", spec["endpointSelector"]["matchLabels"])]
+        else:
+            selectors = None
         direction = next(
             key for key in ("ingress", "egress", "ingressDeny", "egressDeny") if key in spec
         )
         rule = spec[direction][0]
-        selectors = [("endpointSelector", spec["endpointSelector"]["matchLabels"])]
-        for peer_field in ("fromEndpoints", "toEndpoints"):
-            for peer in rule.get(peer_field, []):
-                selectors.append((peer_field, peer["matchLabels"]))
+        if selectors is None:
+            selectors = [("endpointSelector", spec["endpointSelector"]["matchLabels"])]
+            for peer_field in ("fromEndpoints", "toEndpoints"):
+                for peer in rule.get(peer_field, []):
+                    selectors.append((peer_field, peer["matchLabels"]))
 
         for role, labels in selectors:
             selector_ns = labels.get(NS_LABEL)
@@ -3737,7 +3766,7 @@ def _validate_signed_entry(entry):
             workload,
             ["policiesHash", "cluster", "mustExist", "confirmTimeoutSec", "policyCount"],
             "signed workload entry",
-            ["ingressProtectedSelectors", "watchSelectors"],
+            ["ingressDefaultDenyNamespaces", "ingressProtectedSelectors", "watchSelectors"],
         )
         if not _digest(workload.get("policiesHash")) or not isinstance(workload.get("cluster"), str):
             raise ValueError("signed workload entry has invalid digest or cluster")
@@ -3747,6 +3776,12 @@ def _validate_signed_entry(entry):
             raise ValueError("signed workload mustExist is not a string array")
         if not isinstance(workload.get("confirmTimeoutSec"), int) or isinstance(workload.get("confirmTimeoutSec"), bool):
             raise ValueError("signed workload confirmTimeoutSec is not an integer")
+        baseline_namespaces = workload.get("ingressDefaultDenyNamespaces", [])
+        if not isinstance(baseline_namespaces, list) or not all(
+            isinstance(ns, str) and _DNS_LABEL.fullmatch(ns) and ns in WORKLOAD_NAMESPACES
+            for ns in baseline_namespaces
+        ) or len(set(baseline_namespaces)) != len(baseline_namespaces):
+            raise ValueError("signed workload ingressDefaultDenyNamespaces is not a unique authorised namespace array")
     return workload
 
 
@@ -3823,6 +3858,17 @@ def verify_artifact_envelope(envelope, now=None):
         watch, watch_error = validate_watch_selectors(workload_entry.get("watchSelectors"))
         if watch_error:
             raise ValueError(f"signed workload selector watch is invalid: {watch_error}")
+        checked_doc, reason = validate_workload(
+            workload_text, cluster=workload_entry["cluster"], applier=HOST_ID, generation=generation
+        )
+        if checked_doc is None:
+            raise ValueError(f"signed workload document refused: {reason}")
+        rendered_baselines = sorted({
+            obj["metadata"]["namespace"] for obj in checked_doc
+            if obj["metadata"]["annotations"].get("heliopause.io/policy-kind") == "namespace-ingress-default-deny"
+        })
+        if rendered_baselines != sorted(workload_entry.get("ingressDefaultDenyNamespaces", [])):
+            raise ValueError("signed workload baseline namespace list does not match its CNP document")
         workload = {
             "policies": workload_text,
             "policiesHash": workload_entry["policiesHash"],

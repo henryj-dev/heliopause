@@ -44,6 +44,7 @@ import {
   type CiliumItem,
   type CiliumSkipped,
   type CiliumWarning,
+  type WorkloadBaseline,
   type ResolvePods,
   type ResolveService,
 } from "./cilium.ts";
@@ -108,6 +109,8 @@ export interface PublishInput {
    * `workload.applier` already answers.
    */
   workload?: CiliumItem[];
+  /** Namespace posture rules; unlike workload flows these have no source or destination. */
+  workloadBaselines?: WorkloadBaseline[];
   /** Service → selector resolution, injected the same way `ResolveCidrs` is. */
   resolveService?: ResolveService;
   /**
@@ -329,13 +332,14 @@ function planWorkload(
 ): PublishedWorkload | undefined {
   const items = input.workload ?? [];
   const needing = items.filter((i) => assignsToWorkloadLayer(i.policy).workload);
+  const baselines = input.workloadBaselines ?? [];
 
   const w = cfg.workload;
   if (!w) {
     // Refused, not skipped. A policy naming a pod destination has no host-layer rule behind it
     // (evaluation rule 8), so publishing the host half alone would hand out a generation that
     // confirms cleanly over traffic nobody is governing.
-    if (needing.length) {
+    if (needing.length || baselines.length) {
       throw new PublishError(
         `${needing.length} policy/policies need the workload layer ` +
           `(${needing.map((i) => i.policy.id).join(", ")}) but cfg.workload is null. A pod or ` +
@@ -355,7 +359,7 @@ function planWorkload(
     );
   }
 
-  if (needing.length === 0) return undefined;
+  if (needing.length === 0 && baselines.length === 0) return undefined;
 
   let rendered;
   try {
@@ -368,7 +372,7 @@ function planWorkload(
         ...(input.resolveService ? { resolveService: input.resolveService } : {}),
         ...(input.resolvePods ? { resolvePods: input.resolvePods } : {}),
       },
-      needing,
+      needing, baselines,
     );
   } catch (e) {
     // Same all-or-nothing rule as the host half: a generation is one thing or it is not published.
@@ -386,10 +390,14 @@ function planWorkload(
     ingressProtectedSelectors: rendered.plan.policies
       .filter((p) => p.spec.ingress?.length)
       .map((p) => p.spec.endpointSelector.matchLabels),
+    ...(baselines.length ? { ingressDefaultDenyNamespaces: [...new Set(baselines.map((b) => b.namespace))].sort() } : {}),
     // Derived from the policies being published, not restated — so what the applier is asked about
     // cannot drift from what was actually rendered. `needing` rather than every item: a policy the
     // workload layer does not own has no selector this cluster should be queried for.
-    watchSelectors: selectorsToWatch(needing),
+    watchSelectors: {
+      ...selectorsToWatch(needing),
+      namespaces: [...new Set([...selectorsToWatch(needing).namespaces, ...baselines.map((b) => b.namespace)])].sort(),
+    },
   };
   hosts[w.applier] = { ...hosts[w.applier]!, workload: entry };
 

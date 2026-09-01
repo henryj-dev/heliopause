@@ -125,6 +125,8 @@ export interface CiliumRenderInput {
 }
 
 export const DEFAULT_MANAGED_BY = "heliopause";
+/** Not a Kubernetes-valid namespace: the baseline ingress rule can never whitelist a pod. */
+export const BASELINE_NEVER_NAMESPACE = "HELI0PAUSE-NEVER";
 /** Independent matching bound in the agent; crossing it refuses publish before a host sees it. */
 export const MAX_WATCH_SELECTORS = 32;
 
@@ -671,6 +673,14 @@ export interface CiliumItem {
   srcCidrs?: string[];
   /** Resolved CIDRs for `dst`, when `dst` is an address kind. Ignored when `dst` is a workload. */
   dstCidrs?: string[];
+}
+
+/** A namespace-wide ingress posture, deliberately separate from an allow/deny traffic flow. */
+export interface WorkloadBaseline {
+  kind: "namespace-ingress-default-deny";
+  id: string;
+  namespace: string;
+  description: string;
 }
 
 /**
@@ -1295,11 +1305,44 @@ export function assignsToWorkloadLayer(p: Policy): { workload: boolean; host: bo
  * out to kubectl. So the one consumer that cares about the wrapper — `kubectl apply` on the applier
  * node — was the only thing never exercised until a real generation was published.
  */
-export function renderCiliumPolicies(input: CiliumRenderInput, items: CiliumItem[]): {
+export function renderCiliumPolicies(input: CiliumRenderInput, items: CiliumItem[], baselines: WorkloadBaseline[] = []): {
   json: string;
   plan: CiliumPlan;
 } {
   const plan = planCiliumPolicies(input, items);
+  const names = new Set(plan.policies.map((p) => `${p.metadata.namespace}/${p.metadata.name}`));
+  for (const baseline of baselines) {
+    if (baseline.kind !== "namespace-ingress-default-deny" || !baseline.id || !baseline.description) {
+      throw new CiliumRenderError("workload baseline has an invalid kind, id, or description");
+    }
+    assertNamespace(baseline.namespace, `baseline ${baseline.id}`);
+    const name = crdName(input.cluster, baseline.id, "-baseline");
+    const ref = `${baseline.namespace}/${name}`;
+    if (names.has(ref)) throw new CiliumRenderError(`workload baseline ${baseline.id} collides with ${ref}`);
+    names.add(ref);
+    plan.policies.push({
+      apiVersion: "cilium.io/v2", kind: "CiliumNetworkPolicy",
+      metadata: {
+        name, namespace: baseline.namespace,
+        labels: { "managed-by": input.managedByLabel ?? DEFAULT_MANAGED_BY, "heliopause.io/cluster": input.cluster },
+        annotations: {
+          "heliopause.io/policy-id": baseline.id,
+          "heliopause.io/applier": input.k8sApplier,
+          "heliopause.io/generation": input.generation,
+          "heliopause.io/policy-kind": baseline.kind,
+        },
+      },
+      spec: {
+        description: baseline.description,
+        endpointSelector: { matchLabels: { [NS_LABEL]: baseline.namespace } },
+        enableDefaultDeny: { ingress: true },
+        // Cilium enters ingress default-deny only when an ingress section exists. An empty rule
+        // would allow all peers, so this is an intentionally unmatchable source instead.
+        ingress: [{ fromEndpoints: [{ matchLabels: { [NS_LABEL]: BASELINE_NEVER_NAMESPACE } }] }],
+      },
+    } as CiliumNetworkPolicy);
+    plan.affectedPods[baseline.id] = input.resolvePods?.("k8s-namespace", baseline.namespace) ?? null;
+  }
   const doc = { apiVersion: "v1", kind: "List", items: plan.policies };
   return { json: JSON.stringify(doc, null, 2) + "\n", plan };
 }

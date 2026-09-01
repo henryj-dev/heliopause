@@ -25,7 +25,7 @@ import type { FirewallObject } from "../src/objects.ts";
 // direct publish path must not need it. A `type` specifier inside a destructuring `await import` is
 // not valid syntax, and `tsc` accepts it: only running the file catches that.
 import type { PlanView } from "../src/api-client.ts";
-import { podsFromMembership, membershipJumps, type CiliumItem, type ResolveService } from "../src/cilium.ts";
+import { podsFromMembership, membershipJumps, type CiliumItem, type ResolveService, type WorkloadBaseline } from "../src/cilium.ts";
 import {
   asPodLists,
   countsFrom,
@@ -47,6 +47,8 @@ export interface Site {
    * whole set renders once and lands on `cfg.workload.applier`.
    */
   workload?: CiliumItem[];
+  /** Namespace posture declarations, rendered alongside workload flows. */
+  workloadBaselines?: WorkloadBaseline[];
   resolveService?: ResolveService;
   /**
    * Named ranges and how far this deployment trusts each (`zones.ts`).
