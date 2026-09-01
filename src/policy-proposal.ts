@@ -603,6 +603,36 @@ export async function pullRequestStatus(
 }
 
 /**
+ * Files GitHub attributes to one pull request, with a closed-world page bound.
+ *
+ * The host-retirement recovery path uses this as a scope proof. Silently accepting the first page
+ * would let an additional policy edit hide on page two, so a full page is ambiguous and refused.
+ */
+export async function pullRequestChangedFiles(
+  creds: AppCredentials,
+  target: ProposalTarget,
+  fetcher: Fetcher,
+  nowSec: number,
+  number: number,
+): Promise<string[]> {
+  if (!Number.isSafeInteger(number) || number < 1) throw new ProposalError("pull request number is invalid");
+  const token = await installationToken(creds, fetcher, nowSec);
+  const rows = (await gh(
+    fetcher,
+    token,
+    `/repos/${encodeURIComponent(target.owner)}/${encodeURIComponent(target.repo)}` +
+      `/pulls/${number}/files?per_page=100`,
+  )) as Array<{ filename?: string }>;
+  if (rows.length >= 100) {
+    throw new ProposalError(`pull request #${number} has too many changed files to prove its exact scope`);
+  }
+  if (rows.some((row) => typeof row.filename !== "string" || row.filename.length === 0)) {
+    throw new ProposalError(`pull request #${number} returned an invalid changed file`);
+  }
+  return rows.map((row) => row.filename!);
+}
+
+/**
  * Human approvals of the exact durable head. The latest submitted review per GitHub user wins;
  * an older approval followed by CHANGES_REQUESTED is not approval, and bot reviews are not human.
  */

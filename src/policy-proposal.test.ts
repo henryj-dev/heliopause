@@ -17,6 +17,7 @@ import {
   isUsableBranchName,
   openPullRequest,
   pullRequestHumanApprovals,
+  pullRequestChangedFiles,
   proposalBody,
   sameCommit,
   ProposalError,
@@ -236,6 +237,23 @@ describe("idempotent machine-owned branch updates", () => {
     await assert.rejects(
       () => pullRequestHumanApprovals(creds, target, fetch, 0, 9, head),
       /too many reviews/,
+    );
+  });
+
+  it("lists the exact changed-file scope and refuses an ambiguous full page", async () => {
+    const { fetch } = fetcherFor([
+      tokenRoute,
+      { match: /\/pulls\/9\/files\?per_page=100$/, body: [{ filename: "retired-hosts.json" }] },
+    ]);
+    assert.deepEqual(await pullRequestChangedFiles(creds, target, fetch, 0, 9), ["retired-hosts.json"]);
+
+    const { fetch: crowded } = fetcherFor([
+      tokenRoute,
+      { match: /\/pulls\/9\/files\?per_page=100$/, body: Array.from({ length: 100 }, (_, i) => ({ filename: `f-${i}` })) },
+    ]);
+    await assert.rejects(
+      () => pullRequestChangedFiles(creds, target, crowded, 0, 9),
+      /too many changed files/,
     );
   });
 });

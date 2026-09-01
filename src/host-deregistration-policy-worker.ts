@@ -12,6 +12,7 @@ import {
   ensureRepositoryFileOnBranch,
   findPullRequestByBranch,
   openPullRequest,
+  pullRequestChangedFiles,
   pullRequestHumanApprovals,
   pullRequestStatus,
   readRepositoryFile,
@@ -259,14 +260,20 @@ export async function runHostDeregistrationPolicyWorkerOnce(
     const pr = await pullRequestStatus(
       options.creds, options.target, options.fetcher, nowSec, automation.pullRequestNumber,
     );
-    if (pr.headRef !== automation.branch || pr.baseRef !== options.target.base
-      || pr.headSha !== automation.patchCommitSha) {
+    if (pr.headRef !== automation.branch || pr.baseRef !== options.target.base) {
       automation.lastAttemptAt = now().toISOString();
-      automation.lastError = "policy pull request no longer matches the durable branch, base and patch commit";
+      automation.lastError = "policy pull request no longer matches the durable branch and base";
       cas(options, row, "pr_open", "pr_open", automation);
       return { state: "waiting", operationId, reason: automation.lastError };
     }
+    const finalHeadChanged = pr.headSha !== automation.patchCommitSha;
     if (!pr.merged) {
+      if (finalHeadChanged) {
+        automation.lastAttemptAt = now().toISOString();
+        automation.lastError = "policy pull request head changed before merge; waiting for final human review and merge";
+        cas(options, row, "pr_open", "pr_open", automation);
+        return { state: "waiting", operationId, reason: automation.lastError };
+      }
       if (pr.state === "closed") {
         automation.lastAttemptAt = now().toISOString();
         automation.lastError = "policy pull request closed without merge";
@@ -279,15 +286,60 @@ export async function runHostDeregistrationPolicyWorkerOnce(
       };
     }
     if (!pr.mergeCommitSha) throw new Error("merged pull request has no merge commit sha");
+    if (finalHeadChanged) {
+      // A machine-created branch can legitimately move when GitHub rebases or updates it onto the
+      // current base. The original commit is no longer sufficient evidence in that case: prove both
+      // what the human reviewed and what the merge actually adopted before replacing the durable
+      // head. This path is deliberately unavailable while the PR is still mutable.
+      const [durablePatchFile, finalHeadFile, mergedFile, changedFiles] = await Promise.all([
+        readRepositoryFile(
+          options.creds, options.target, options.fetcher, nowSec,
+          options.retiredHostsPath, automation.patchCommitSha!,
+        ),
+        readRepositoryFile(
+          options.creds, options.target, options.fetcher, nowSec,
+          options.retiredHostsPath, pr.headSha,
+        ),
+        readRepositoryFile(
+          options.creds, options.target, options.fetcher, nowSec,
+          options.retiredHostsPath, pr.mergeCommitSha,
+        ),
+        pullRequestChangedFiles(
+          options.creds, options.target, options.fetcher, nowSec, automation.pullRequestNumber,
+        ),
+      ]);
+      verifyRecoveredRetirement(
+        durablePatchFile.content,
+        row,
+        `durable policy patch ${automation.patchCommitSha}`,
+      );
+      verifyRecoveredRetirement(
+        finalHeadFile.content,
+        row,
+        `updated policy pull request head ${pr.headSha}`,
+      );
+      verifyRecoveredRetirement(
+        mergedFile.content,
+        row,
+        `merged policy commit ${pr.mergeCommitSha}`,
+      );
+      if (durablePatchFile.content !== finalHeadFile.content || finalHeadFile.content !== mergedFile.content) {
+        throw new Error("updated policy pull request does not preserve the exact durable retirement document");
+      }
+      if (changedFiles.length !== 1 || changedFiles[0] !== options.retiredHostsPath) {
+        throw new Error("updated policy pull request changes files outside the exact retirement document");
+      }
+    }
     const reviewers = await pullRequestHumanApprovals(
-      options.creds, options.target, options.fetcher, nowSec, automation.pullRequestNumber, automation.patchCommitSha!,
+      options.creds, options.target, options.fetcher, nowSec, automation.pullRequestNumber, pr.headSha,
     );
     if (reviewers.length === 0) {
       automation.lastAttemptAt = now().toISOString();
-      automation.lastError = "merged policy pull request has no human approval of the durable patch commit";
+      automation.lastError = "merged policy pull request has no human approval of the final pull request head";
       cas(options, row, "pr_open", "pr_open", automation);
       return { state: "waiting", operationId, reason: automation.lastError };
     }
+    automation.patchCommitSha = pr.headSha;
     automation.mergeCommitSha = pr.mergeCommitSha;
     automation.reviewedBy = reviewers;
     automation.lastAttemptAt = now().toISOString();

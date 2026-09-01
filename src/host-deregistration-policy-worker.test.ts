@@ -78,6 +78,16 @@ function workerStateStore(
   return path;
 }
 
+const exactRetirementContent = JSON.stringify({
+  schemaVersion: 1,
+  retiredHosts: [{
+    hostname: "web-01.dev",
+    hostLifecycleId: "create-1",
+    externalOperationId: "destroy-1",
+    retiredAt: "2026-08-31T00:00:00.000Z",
+  }],
+}, null, 2) + "\n";
+
 describe("reviewed-Git host deregistration worker", () => {
   it("waits for human merge and publish, then independently proves relay manifest absence", async () => {
     const storeFile = queuedStore();
@@ -521,33 +531,105 @@ describe("reviewed-Git host deregistration worker", () => {
     assert.equal(plan?.publishedAt, null);
   });
 
-  it("refuses a merged PR whose durable head, base, or human approval does not match", async () => {
+  it("recovers a merged PR whose machine branch was rebased only after proving final content and approval", async () => {
     const { privateKey } = generateKeyPairSync("rsa", {
       modulusLength: 2048,
       privateKeyEncoding: { type: "pkcs1", format: "pem" },
       publicKeyEncoding: { type: "pkcs1", format: "pem" },
     });
-    for (const mismatch of ["head", "base", "review"] as const) {
+    const storeFile = workerStateStore("pr_open");
+    const original = "b".repeat(40);
+    const finalHead = "d".repeat(40);
+    const merge = "c".repeat(40);
+    const seen: string[] = [];
+    const fetcher: Fetcher = async (raw) => {
+      const url = new URL(raw);
+      seen.push(`${url.pathname}${url.search}`);
+      let body: unknown;
+      if (url.pathname.endsWith("/access_tokens")) body = { token: "installation" };
+      else if (url.pathname.endsWith("/pulls/7")) body = {
+        number: 7, html_url: "https://github.test/o/r/pull/7", state: "closed", merged: true,
+        merge_commit_sha: merge,
+        head: { sha: finalHead, ref: "policy/host-deregister/destroy-1-ca761d98b2" },
+        base: { ref: "main" },
+      };
+      else if (url.pathname.endsWith("/contents/retired-hosts.json")
+        && [original, finalHead, merge].includes(url.searchParams.get("ref") ?? "")) {
+        body = { encoding: "base64", content: Buffer.from(exactRetirementContent).toString("base64"), sha: "blob" };
+      }
+      else if (url.pathname.endsWith("/pulls/7/files")) body = [{ filename: "retired-hosts.json" }];
+      else if (url.pathname.endsWith("/pulls/7/reviews")) body = [{
+        id: 1, state: "APPROVED", commit_id: finalHead, submitted_at: "2026-08-31T00:07:00.000Z",
+        user: { login: "human-reviewer", type: "User" },
+      }];
+      else return { ok: false, status: 500, text: async () => "unexpected" };
+      return { ok: true, status: 200, text: async () => JSON.stringify(body) };
+    };
+    const result = await runHostDeregistrationPolicyWorkerOnce({
+      storeFile, retiredHostsPath: "retired-hosts.json",
+      creds: { appId: "1", installationId: "2", privateKey },
+      target: { owner: "o", repo: "r", base: "main" }, fetcher, relayNames: ["dev"],
+      renderer: async () => { throw new Error("renderer must not be called"); },
+      relays: async () => { throw new Error("relays must not be called"); },
+      propose: async () => { throw new Error("propose must not be called"); },
+      now: () => new Date("2026-08-31T00:08:00.000Z"),
+    });
+    assert.deepEqual(result, { state: "advanced", operationId: "destroy-1", policyState: "merged" });
+    const automation = loadEnrollmentDocument(storeFile).hostDeregistrations[0]!.policy.automation!;
+    assert.notEqual(original, finalHead);
+    assert.equal(automation.patchCommitSha, finalHead, "the durable reviewed head follows the legitimate rebase");
+    assert.equal(automation.mergeCommitSha, merge);
+    assert.deepEqual(automation.reviewedBy, ["human-reviewer"]);
+    assert.equal(seen.some((call) => call.endsWith(`?ref=${finalHead}`)), true);
+    assert.equal(seen.some((call) => call.endsWith(`?ref=${merge}`)), true);
+    assert.equal(seen.some((call) => call.endsWith("/pulls/7/files?per_page=100")), true);
+  });
+
+  it("keeps an updated PR closed on wrong branch, base, content, or final-head approval", async () => {
+    const { privateKey } = generateKeyPairSync("rsa", {
+      modulusLength: 2048,
+      privateKeyEncoding: { type: "pkcs1", format: "pem" },
+      publicKeyEncoding: { type: "pkcs1", format: "pem" },
+    });
+    for (const mismatch of ["branch", "base", "head-content", "merge-content", "scope", "review"] as const) {
       const storeFile = workerStateStore("pr_open");
-      const patch = "b".repeat(40);
+      const finalHead = "d".repeat(40);
+      const merge = "c".repeat(40);
       const fetcher: Fetcher = async (raw) => {
         const url = new URL(raw);
         let body: unknown;
         if (url.pathname.endsWith("/access_tokens")) body = { token: "installation" };
         else if (url.pathname.endsWith("/pulls/7")) body = {
           number: 7, html_url: "https://github.test/o/r/pull/7", state: "closed", merged: true,
-          merge_commit_sha: "c".repeat(40),
+          merge_commit_sha: merge,
           head: {
-            sha: mismatch === "head" ? "d".repeat(40) : patch,
-            ref: "policy/host-deregister/destroy-1-ca761d98b2",
+            sha: finalHead,
+            ref: mismatch === "branch" ? "policy/other" : "policy/host-deregister/destroy-1-ca761d98b2",
           },
           base: { ref: mismatch === "base" ? "other" : "main" },
         };
-        else if (url.pathname.endsWith("/pulls/7/reviews")) body = [];
+        else if (url.pathname.endsWith("/contents/retired-hosts.json")) {
+          const ref = url.searchParams.get("ref");
+          const wrong = (mismatch === "head-content" && ref === finalHead)
+            || (mismatch === "merge-content" && ref === merge);
+          const content = wrong
+            ? JSON.stringify({ schemaVersion: 1, retiredHosts: [] }, null, 2) + "\n"
+            : exactRetirementContent;
+          body = { encoding: "base64", content: Buffer.from(content).toString("base64"), sha: "blob" };
+        }
+        else if (url.pathname.endsWith("/pulls/7/files")) {
+          body = mismatch === "scope"
+            ? [{ filename: "retired-hosts.json" }, { filename: "rules.ts" }]
+            : [{ filename: "retired-hosts.json" }];
+        }
+        else if (url.pathname.endsWith("/pulls/7/reviews")) body = [{
+          id: 1, state: "APPROVED", commit_id: mismatch === "review" ? "b".repeat(40) : finalHead,
+          submitted_at: "2026-08-31T00:07:00.000Z", user: { login: "human-reviewer", type: "User" },
+        }];
         else return { ok: false, status: 500, text: async () => "unexpected" };
         return { ok: true, status: 200, text: async () => JSON.stringify(body) };
       };
-      const result = await runHostDeregistrationPolicyWorkerOnce({
+      const run = () => runHostDeregistrationPolicyWorkerOnce({
         storeFile, retiredHostsPath: "retired-hosts.json",
         creds: { appId: "1", installationId: "2", privateKey },
         target: { owner: "o", repo: "r", base: "main" }, fetcher, relayNames: ["dev"],
@@ -556,10 +638,57 @@ describe("reviewed-Git host deregistration worker", () => {
         propose: async () => { throw new Error("propose must not be called"); },
         now: () => new Date("2026-08-31T00:08:00.000Z"),
       });
-      assert.equal(result.state, "waiting");
+      if (mismatch.endsWith("content") || mismatch === "scope") {
+        await assert.rejects(
+          run,
+          mismatch === "scope" ? /outside the exact retirement document/ : /exact host retirement evidence is missing/,
+          mismatch,
+        );
+      } else {
+        const result = await run();
+        assert.equal(result.state, "waiting", mismatch);
+      }
       assert.equal(loadEnrollmentDocument(storeFile).hostDeregistrations[0]!.policy.state, "pr_open");
-      assert.match(loadEnrollmentDocument(storeFile).hostDeregistrations[0]!.policy.automation?.lastError ?? "",
-        mismatch === "review" ? /no human approval/ : /match/);
+      if (!mismatch.endsWith("content") && mismatch !== "scope") {
+        assert.match(loadEnrollmentDocument(storeFile).hostDeregistrations[0]!.policy.automation?.lastError ?? "",
+          mismatch === "review" ? /no human approval.*final pull request head/ : /match/);
+      }
     }
+  });
+
+  it("does not recover an updated head while the pull request is still mutable", async () => {
+    const { privateKey } = generateKeyPairSync("rsa", {
+      modulusLength: 2048,
+      privateKeyEncoding: { type: "pkcs1", format: "pem" },
+      publicKeyEncoding: { type: "pkcs1", format: "pem" },
+    });
+    const storeFile = workerStateStore("pr_open");
+    const fetcher: Fetcher = async (raw) => {
+      const url = new URL(raw);
+      if (url.pathname.endsWith("/access_tokens")) {
+        return { ok: true, status: 200, text: async () => JSON.stringify({ token: "installation" }) };
+      }
+      if (url.pathname.endsWith("/pulls/7")) {
+        return { ok: true, status: 200, text: async () => JSON.stringify({
+          number: 7, html_url: "https://github.test/o/r/pull/7", state: "open", merged: false,
+          merge_commit_sha: null,
+          head: { sha: "d".repeat(40), ref: "policy/host-deregister/destroy-1-ca761d98b2" },
+          base: { ref: "main" },
+        }) };
+      }
+      throw new Error("mutable updated PR must not read content or reviews");
+    };
+    const result = await runHostDeregistrationPolicyWorkerOnce({
+      storeFile, retiredHostsPath: "retired-hosts.json",
+      creds: { appId: "1", installationId: "2", privateKey },
+      target: { owner: "o", repo: "r", base: "main" }, fetcher, relayNames: ["dev"],
+      renderer: async () => { throw new Error("renderer must not be called"); },
+      relays: async () => { throw new Error("relays must not be called"); },
+      propose: async () => { throw new Error("propose must not be called"); },
+      now: () => new Date("2026-08-31T00:08:00.000Z"),
+    });
+    assert.equal(result.state, "waiting");
+    assert.match((result as { reason: string }).reason, /head changed before merge/);
+    assert.equal(loadEnrollmentDocument(storeFile).hostDeregistrations[0]!.policy.automation?.patchCommitSha, "b".repeat(40));
   });
 });
