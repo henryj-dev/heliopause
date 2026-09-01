@@ -535,7 +535,8 @@ export async function findPullRequestByBranch(
       `?head=${encodeURIComponent(`${target.owner}:${branch}`)}&state=all&per_page=10`,
   )) as Array<{
     number?: number; html_url?: string; state?: string; merged_at?: string | null;
-    merge_commit_sha?: string | null; head?: { sha?: string; ref?: string }; base?: { ref?: string };
+    merge_commit_sha?: string | null; head?: { sha?: string; ref?: string };
+    base?: { sha?: string; ref?: string };
   }>;
   const row = rows.find((candidate) => candidate.state === "open") ?? rows[0];
   if (!row) return null;
@@ -552,6 +553,7 @@ export async function findPullRequestByBranch(
     mergeCommitSha: typeof row.merge_commit_sha === "string" ? row.merge_commit_sha : null,
     headSha: row.head.sha,
     headRef: row.head.ref,
+    baseSha: typeof row.base.sha === "string" ? row.base.sha : null,
     baseRef: row.base.ref,
   };
 }
@@ -564,6 +566,8 @@ export interface PullRequestStatus {
   mergeCommitSha: string | null;
   headSha: string;
   headRef: string;
+  /** Exact base commit GitHub records for the PR; required by crash recovery before local CAS. */
+  baseSha: string | null;
   baseRef: string;
 }
 
@@ -583,7 +587,8 @@ export async function pullRequestStatus(
     `/repos/${encodeURIComponent(target.owner)}/${encodeURIComponent(target.repo)}/pulls/${number}`,
   )) as {
     number?: number; html_url?: string; state?: string; merged?: boolean;
-    merge_commit_sha?: string | null; head?: { sha?: string; ref?: string }; base?: { ref?: string };
+    merge_commit_sha?: string | null; head?: { sha?: string; ref?: string };
+    base?: { sha?: string; ref?: string };
   };
   if (out.number !== number || typeof out.html_url !== "string" || !["open", "closed"].includes(String(out.state))
     || typeof out.merged !== "boolean" || typeof out.head?.sha !== "string"
@@ -598,6 +603,7 @@ export async function pullRequestStatus(
     mergeCommitSha: typeof out.merge_commit_sha === "string" ? out.merge_commit_sha : null,
     headSha: out.head.sha,
     headRef: out.head.ref,
+    baseSha: typeof out.base.sha === "string" ? out.base.sha : null,
     baseRef: out.base.ref,
   };
 }

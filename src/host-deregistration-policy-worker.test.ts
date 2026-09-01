@@ -232,6 +232,7 @@ describe("reviewed-Git host deregistration worker", () => {
     });
     const patch = "b".repeat(40);
     const merge = "c".repeat(40);
+    const base = "a".repeat(40);
     const policyAtRecoveredHead = JSON.stringify({
       schemaVersion: 1,
       retiredHosts: [{
@@ -248,21 +249,24 @@ describe("reviewed-Git host deregistration worker", () => {
       seen.push(`${method} ${url.pathname}${url.search}`);
       let body: unknown;
       if (url.pathname.endsWith("/access_tokens")) body = { token: "installation" };
-      else if (method === "GET" && url.pathname.endsWith("/contents/retired-hosts.json")
-        && url.searchParams.get("ref") === patch) {
-        body = { encoding: "base64", content: Buffer.from(policyAtRecoveredHead).toString("base64"), sha: "blob" };
+      else if (method === "GET" && url.pathname.endsWith("/contents/retired-hosts.json")) {
+        const content = url.searchParams.get("ref") === base
+          ? '{"schemaVersion":1,"retiredHosts":[]}\n'
+          : policyAtRecoveredHead;
+        body = { encoding: "base64", content: Buffer.from(content).toString("base64"), sha: "blob" };
       }
+      else if (url.pathname.endsWith("/pulls/9/files")) body = [{ filename: "retired-hosts.json" }];
       else if (url.pathname.endsWith("/pulls") && url.searchParams.get("state") === "all") {
         body = [{
           number: 9, html_url: "https://github.test/o/r/pull/9", state: "closed",
           merged_at: "2026-08-31T00:00:00Z", merge_commit_sha: merge,
-          head: { sha: patch, ref: "policy/host-deregister/destroy-1-ca761d98b2" }, base: { ref: "main" },
+          head: { sha: patch, ref: "policy/host-deregister/destroy-1-ca761d98b2" }, base: { sha: base, ref: "main" },
         }];
       } else if (url.pathname.endsWith("/pulls/9")) {
         body = {
           number: 9, html_url: "https://github.test/o/r/pull/9", state: "closed",
           merged: true, merge_commit_sha: merge,
-          head: { sha: patch, ref: "policy/host-deregister/destroy-1-ca761d98b2" }, base: { ref: "main" },
+          head: { sha: patch, ref: "policy/host-deregister/destroy-1-ca761d98b2" }, base: { sha: base, ref: "main" },
         };
       } else if (url.pathname.endsWith("/pulls/9/reviews")) {
         body = [{
@@ -295,11 +299,85 @@ describe("reviewed-Git host deregistration worker", () => {
     assert.equal(row.policy.automation?.patchCommitSha, patch);
     assert.equal(seen.filter((call) => call.includes(`/contents/retired-hosts.json?ref=${patch}`)).length, 1,
       "recovery must inspect policy bytes at the immutable PR head");
+    assert.equal(seen.filter((call) => call.includes(`/contents/retired-hosts.json?ref=${base}`)).length, 1,
+      "recovery must reconstruct the exact machine delta from GitHub's PR base commit");
+    assert.equal(seen.filter((call) => call.includes(`/contents/retired-hosts.json?ref=${merge}`)).length, 1,
+      "recovery must prove the merge adopted the reviewed bytes");
+    assert.equal(seen.some((call) => call.endsWith("/pulls/9/files?per_page=100")), true,
+      "recovery must prove the PR changed only the machine-owned inventory");
     assert.equal(seen.some((call) => call.startsWith("POST /repos/") || call.startsWith("PUT /repos/")), false,
       "recovering a PR must not recreate or mutate its branch");
 
     const merged = await runHostDeregistrationPolicyWorkerOnce(options);
     assert.deepEqual(merged, { state: "advanced", operationId: "destroy-1", policyState: "merged" });
+  });
+
+  it("fails closed during pre-CAS recovery on an extra file, altered retirement delta, or altered merge result", async () => {
+    const { privateKey } = generateKeyPairSync("rsa", {
+      modulusLength: 2048,
+      privateKeyEncoding: { type: "pkcs1", format: "pem" },
+      publicKeyEncoding: { type: "pkcs1", format: "pem" },
+    });
+    const base = "a".repeat(40);
+    const head = "b".repeat(40);
+    const merge = "c".repeat(40);
+    const extraRetirement = JSON.stringify({
+      schemaVersion: 1,
+      retiredHosts: [
+        {
+          hostname: "other.dev", hostLifecycleId: "create-other", externalOperationId: "destroy-other",
+          retiredAt: "2026-08-31T00:00:00.000Z",
+        },
+        ...JSON.parse(exactRetirementContent).retiredHosts,
+      ],
+    }, null, 2) + "\n";
+    for (const mismatch of ["scope", "head-delta", "merge-content"] as const) {
+      const storeFile = queuedStore();
+      const fetcher: Fetcher = async (raw) => {
+        const url = new URL(raw);
+        let body: unknown;
+        if (url.pathname.endsWith("/access_tokens")) body = { token: "installation" };
+        else if (url.pathname.endsWith("/pulls") && url.searchParams.get("state") === "all") body = [{
+          number: 9, html_url: "https://github.test/o/r/pull/9", state: "closed",
+          merged_at: "2026-08-31T00:00:00Z", merge_commit_sha: merge,
+          head: { sha: head, ref: "policy/host-deregister/destroy-1-ca761d98b2" },
+          base: { sha: base, ref: "main" },
+        }];
+        else if (url.pathname.endsWith("/pulls/9/files")) body = mismatch === "scope"
+          ? [{ filename: "retired-hosts.json" }, { filename: "rules.ts" }]
+          : [{ filename: "retired-hosts.json" }];
+        else if (url.pathname.endsWith("/contents/retired-hosts.json")) {
+          const ref = url.searchParams.get("ref");
+          const content = ref === base
+            ? '{"schemaVersion":1,"retiredHosts":[]}\n'
+            : mismatch === "head-delta" && ref === head
+              ? extraRetirement
+              : mismatch === "merge-content" && ref === merge
+                ? extraRetirement
+                : exactRetirementContent;
+          body = { encoding: "base64", content: Buffer.from(content).toString("base64"), sha: "blob" };
+        } else return { ok: false, status: 500, text: async () => "unexpected" };
+        return { ok: true, status: 200, text: async () => JSON.stringify(body) };
+      };
+      await assert.rejects(
+        () => runHostDeregistrationPolicyWorkerOnce({
+          storeFile, retiredHostsPath: "retired-hosts.json",
+          creds: { appId: "1", installationId: "2", privateKey },
+          target: { owner: "o", repo: "r", base: "main" }, fetcher, relayNames: ["dev"],
+          renderer: async () => { throw new Error("renderer must not be called"); },
+          relays: async () => [{ name: "dev", ok: true, generation: "old", issuedAt: null, planHash: null, hosts: [] }],
+          propose: async () => { throw new Error("propose must not be called"); },
+          now: () => new Date("2026-08-31T00:00:01.000Z"),
+        }),
+        mismatch === "scope"
+          ? /outside the exact retirement document/
+          : mismatch === "head-delta"
+            ? /exact retirement delta from its base/
+            : /did not adopt the exact reviewed retirement document/,
+        mismatch,
+      );
+      assert.equal(loadEnrollmentDocument(storeFile).hostDeregistrations[0]!.policy.state, "queued", mismatch);
+    }
   });
 
   it("fails closed when a recovered PR head lacks the exact canonical retirement tuple", async () => {
@@ -342,6 +420,7 @@ describe("reviewed-Git host deregistration worker", () => {
         publicKeyEncoding: { type: "pkcs1", format: "pem" },
       });
       const patch = "d".repeat(40);
+      const base = "a".repeat(40);
       const seen: string[] = [];
       const fetcher: Fetcher = async (raw, init) => {
         const url = new URL(raw);
@@ -353,11 +432,16 @@ describe("reviewed-Git host deregistration worker", () => {
           body = [{
             number: 10, html_url: "https://github.test/o/r/pull/10", state: "open",
             merged_at: null, merge_commit_sha: null,
-            head: { sha: patch, ref: "policy/host-deregister/destroy-1-ca761d98b2" }, base: { ref: "main" },
+            head: { sha: patch, ref: "policy/host-deregister/destroy-1-ca761d98b2" }, base: { sha: base, ref: "main" },
           }];
         } else if (method === "GET" && url.pathname.endsWith("/contents/retired-hosts.json")
-          && url.searchParams.get("ref") === patch) {
-          body = { encoding: "base64", content: Buffer.from(candidate.content).toString("base64"), sha: "blob" };
+          && [patch, base].includes(url.searchParams.get("ref") ?? "")) {
+          const content = url.searchParams.get("ref") === base
+            ? '{"schemaVersion":1,"retiredHosts":[]}\n'
+            : candidate.content;
+          body = { encoding: "base64", content: Buffer.from(content).toString("base64"), sha: "blob" };
+        } else if (url.pathname.endsWith("/pulls/10/files")) {
+          body = [{ filename: "retired-hosts.json" }];
         } else {
           return { ok: false, status: 500, text: async () => JSON.stringify({ error: "unexpected route" }) };
         }

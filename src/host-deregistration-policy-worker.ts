@@ -200,15 +200,52 @@ export async function runHostDeregistrationPolicyWorkerOnce(
       if (recovered.headRef !== branch || recovered.baseRef !== options.target.base) {
         throw new Error("recovered policy pull request does not match the deterministic branch and base");
       }
-      const recoveredFile = await readRepositoryFile(
-        options.creds, options.target, options.fetcher, nowSec,
-        options.retiredHostsPath, recovered.headSha,
-      );
+      if (!recovered.baseSha) throw new Error("recovered policy pull request has no exact base commit sha");
+      const [recoveredFile, baseFile, changedFiles] = await Promise.all([
+        readRepositoryFile(
+          options.creds, options.target, options.fetcher, nowSec,
+          options.retiredHostsPath, recovered.headSha,
+        ),
+        readRepositoryFile(
+          options.creds, options.target, options.fetcher, nowSec,
+          options.retiredHostsPath, recovered.baseSha,
+        ),
+        pullRequestChangedFiles(
+          options.creds, options.target, options.fetcher, nowSec, recovered.number,
+        ),
+      ]);
       verifyRecoveredRetirement(
         recoveredFile.content,
         row,
         `recovered policy pull request head ${recovered.headSha}`,
       );
+      const intended = retireHost(baseFile.content, {
+        hostname: row.hostname,
+        hostLifecycleId: row.hostLifecycleId,
+        externalOperationId: row.externalOperationId,
+        retiredAt: row.infrastructure.destroyedAt!,
+      }).content;
+      if (recoveredFile.content !== intended) {
+        throw new Error("recovered policy pull request does not contain the exact retirement delta from its base");
+      }
+      if (changedFiles.length !== 1 || changedFiles[0] !== options.retiredHostsPath) {
+        throw new Error("recovered policy pull request changes files outside the exact retirement document");
+      }
+      if (recovered.merged) {
+        if (!recovered.mergeCommitSha) throw new Error("recovered merged pull request has no merge commit sha");
+        const mergedFile = await readRepositoryFile(
+          options.creds, options.target, options.fetcher, nowSec,
+          options.retiredHostsPath, recovered.mergeCommitSha,
+        );
+        verifyRecoveredRetirement(
+          mergedFile.content,
+          row,
+          `recovered merged policy commit ${recovered.mergeCommitSha}`,
+        );
+        if (mergedFile.content !== recoveredFile.content) {
+          throw new Error("recovered merged pull request did not adopt the exact reviewed retirement document");
+        }
+      }
       commit = { commit: recovered.headSha };
     } else {
       commit = await ensureRepositoryFileOnBranch(
