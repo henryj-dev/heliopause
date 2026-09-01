@@ -1218,6 +1218,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       issuedAt,
       hosts: site.hosts,
       ...(site.workload ? { workload: site.workload } : {}),
+      ...(site.workloadBaselines ? { workloadBaselines: site.workloadBaselines } : {}),
       ...(site.resolveService ? { resolveService: site.resolveService } : {}),
     } as Parameters<typeof planPublish>[0]);
     const bundle = bundleFromPlan(plan);
@@ -2920,6 +2921,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
           issuedAt: now().toISOString(),
           hosts: site.hosts,
           ...(site.workload ? { workload: site.workload } : {}),
+          ...(site.workloadBaselines ? { workloadBaselines: site.workloadBaselines } : {}),
           ...(site.resolveService ? { resolveService: site.resolveService } : {}),
         } as Parameters<typeof planPublish>[0]);
         bundle = bundleFromPlan(plan);

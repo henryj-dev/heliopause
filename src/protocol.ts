@@ -40,7 +40,7 @@
  * reporting a clean confirm is the failure this version number exists to make loud: a schema-1 agent
  * now reports `unsupported` and the rollout stops at it.
  */
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 /**
  * Lowest schema an agent may report and still be given work.
@@ -56,7 +56,7 @@ export const SCHEMA_VERSION = 4;
  * layer behind them (evaluation rule 8) — so the traffic would be ungoverned while the host
  * confirmed.
  */
-export const MIN_AGENT_SCHEMA = 4;
+export const MIN_AGENT_SCHEMA = 5;
 
 export type ArtifactAuthorizationMode = "two-person" | "solo-otp" | "break-glass";
 
@@ -336,6 +336,8 @@ export interface WorkloadEntry {
    * an observed Cilium HostPort/NodePort is protected rather than merely bypassing nftables.
    */
   ingressProtectedSelectors?: Array<Record<string, string>>;
+  /** Namespaces protected by an owned ingress-default-deny baseline. */
+  ingressDefaultDenyNamespaces?: string[];
   /**
    * Selectors the applier should report membership for (H14a).
    *

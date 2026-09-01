@@ -847,7 +847,7 @@ function validateWorkloadEntry(value: unknown, where: string): WorkloadEntry {
   if (!isRecord(value)) throw new ArtifactSignatureError(`${where} is not an object`);
   exactAllowedKeys(
     value,
-    ["cluster", "confirmTimeoutSec", "ingressProtectedSelectors", "mustExist", "policiesHash", "policyCount", "watchSelectors"],
+    ["cluster", "confirmTimeoutSec", "ingressDefaultDenyNamespaces", "ingressProtectedSelectors", "mustExist", "policiesHash", "policyCount", "watchSelectors"],
     ["cluster", "confirmTimeoutSec", "mustExist", "policiesHash", "policyCount"],
     where,
   );
@@ -869,6 +869,9 @@ function validateWorkloadEntry(value: unknown, where: string): WorkloadEntry {
     for (const [index, selector] of value.ingressProtectedSelectors.entries()) {
       validateStringMap(selector, `${where}.ingressProtectedSelectors[${index}]`, 32, 256);
     }
+  }
+  if (value.ingressDefaultDenyNamespaces !== undefined) {
+    validateStringArray(value.ingressDefaultDenyNamespaces, `${where}.ingressDefaultDenyNamespaces`, 32, 256);
   }
   if (value.watchSelectors !== undefined) {
     if (!isRecord(value.watchSelectors)) throw new ArtifactSignatureError(`${where}.watchSelectors is not an object`);

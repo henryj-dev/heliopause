@@ -1,10 +1,11 @@
-import type { CiliumItem } from "./cilium.ts";
+import type { CiliumItem, WorkloadBaseline } from "./cilium.ts";
 import type { PolicyDocument, PolicyPlacement } from "./policy-store.ts";
 import type { PublishHost } from "./publish.ts";
 
 export interface PolicyBearingSite {
   hosts: PublishHost[];
   workload?: CiliumItem[];
+  workloadBaselines?: WorkloadBaseline[];
 }
 
 export class SitePolicyError extends Error {

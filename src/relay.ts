@@ -372,11 +372,15 @@ export function fleetView(
       st.workloadPoliciesHash === entry.workload?.policiesHash
         ? (entry.workload?.ingressProtectedSelectors ?? [])
         : [];
+    const protectedNamespaces = current && st?.workloadState === "confirmed" &&
+      st.workloadPoliciesHash === entry.workload?.policiesHash
+      ? (entry.workload?.ingressDefaultDenyNamespaces ?? []) : [];
     const unprotectedCilium = cilium?.services.filter((service) => {
       const peer = /\s([a-z0-9-]+)\/([a-z0-9-]+)$/.exec(service);
       if (!peer) return true;
       const namespace = peer[1]!;
       const name = peer[2]!;
+      if (protectedNamespaces.includes(namespace)) return false;
       return !protectedSelectors.some((selector) => {
         if (selector["k8s:io.kubernetes.pod.namespace"] !== namespace) return false;
         const app = selector.app;

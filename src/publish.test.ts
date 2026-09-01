@@ -494,6 +494,25 @@ const wlInput = (hosts: PublishHost[], workload: Policy[] = [wlPolicy()]) => ({
 });
 
 describe("planPublish — the workload half", () => {
+  it("ships a namespace ingress-default-deny baseline even without a flow policy", () => {
+    const plan = planPublish({
+      ...wlInput([host("h-k3s-01", "canary")], []),
+      workloadBaselines: [{
+        kind: "namespace-ingress-default-deny", id: "STARDUST-DATABASES", namespace: "stardust-databases",
+        description: "Default deny ingress for Stardust-managed database workloads.",
+      }],
+    });
+    const baseline = (JSON.parse(plan.workload!.json) as { items: Array<{ metadata: { name: string; annotations: Record<string, string> }; spec: Record<string, unknown> }> }).items[0]!;
+    assert.equal(baseline.metadata.name, "hp-dev-stardust-databases-baseline");
+    assert.equal(baseline.metadata.annotations["heliopause.io/policy-kind"], "namespace-ingress-default-deny");
+    assert.deepEqual(baseline.spec, {
+      description: "Default deny ingress for Stardust-managed database workloads.",
+      endpointSelector: { matchLabels: { [NS]: "stardust-databases" } },
+      enableDefaultDeny: { ingress: true },
+      ingress: [{ fromEndpoints: [{ matchLabels: { [NS]: "HELI0PAUSE-NEVER" } }] }],
+    });
+    assert.deepEqual(plan.manifest.hosts["h-k3s-01"]!.workload!.ingressDefaultDenyNamespaces, ["stardust-databases"]);
+  });
   it("renders it once and addresses it to the applier, not to every host", () => {
     // CiliumNetworkPolicy is cluster-scoped. Three nodes writing one object is API contention with
     // flapping, so exactly one manifest entry carries the assignment.

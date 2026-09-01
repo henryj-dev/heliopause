@@ -34,6 +34,7 @@ export interface ScreenSite {
   cfg: Parameters<typeof baselineRows>[0];
   hosts: Parameters<typeof hostRows>[0]["hosts"];
   workload?: unknown[];
+  workloadBaselines?: unknown[];
   resolveService?: unknown;
   zones?: Parameters<typeof zoneRows>[0];
   devices?: Parameters<typeof deviceRows>[0];
@@ -221,6 +222,7 @@ export function skippedByHost(site: ScreenSite): ReadonlyMap<string, ReadonlySet
       issuedAt: new Date().toISOString(),
       hosts: site.hosts,
       ...(site.workload ? { workload: site.workload } : {}),
+      ...(site.workloadBaselines ? { workloadBaselines: site.workloadBaselines } : {}),
       ...(site.resolveService ? { resolveService: site.resolveService } : {}),
     } as Parameters<typeof planPublish>[0]);
     return new Map(plan.artifacts.map((a) => [a.host, new Set(a.skipped.map((s) => s.policyId))] as const));
