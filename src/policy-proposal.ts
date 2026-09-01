@@ -535,7 +535,8 @@ export async function findPullRequestByBranch(
       `?head=${encodeURIComponent(`${target.owner}:${branch}`)}&state=all&per_page=10`,
   )) as Array<{
     number?: number; html_url?: string; state?: string; merged_at?: string | null;
-    merge_commit_sha?: string | null; head?: { sha?: string; ref?: string }; base?: { ref?: string };
+    merge_commit_sha?: string | null; head?: { sha?: string; ref?: string };
+    base?: { sha?: string; ref?: string };
   }>;
   const row = rows.find((candidate) => candidate.state === "open") ?? rows[0];
   if (!row) return null;
@@ -552,6 +553,7 @@ export async function findPullRequestByBranch(
     mergeCommitSha: typeof row.merge_commit_sha === "string" ? row.merge_commit_sha : null,
     headSha: row.head.sha,
     headRef: row.head.ref,
+    baseSha: typeof row.base.sha === "string" ? row.base.sha : null,
     baseRef: row.base.ref,
   };
 }
@@ -564,6 +566,8 @@ export interface PullRequestStatus {
   mergeCommitSha: string | null;
   headSha: string;
   headRef: string;
+  /** Exact base commit GitHub records for the PR; required by crash recovery before local CAS. */
+  baseSha: string | null;
   baseRef: string;
 }
 
@@ -583,7 +587,8 @@ export async function pullRequestStatus(
     `/repos/${encodeURIComponent(target.owner)}/${encodeURIComponent(target.repo)}/pulls/${number}`,
   )) as {
     number?: number; html_url?: string; state?: string; merged?: boolean;
-    merge_commit_sha?: string | null; head?: { sha?: string; ref?: string }; base?: { ref?: string };
+    merge_commit_sha?: string | null; head?: { sha?: string; ref?: string };
+    base?: { sha?: string; ref?: string };
   };
   if (out.number !== number || typeof out.html_url !== "string" || !["open", "closed"].includes(String(out.state))
     || typeof out.merged !== "boolean" || typeof out.head?.sha !== "string"
@@ -598,8 +603,39 @@ export async function pullRequestStatus(
     mergeCommitSha: typeof out.merge_commit_sha === "string" ? out.merge_commit_sha : null,
     headSha: out.head.sha,
     headRef: out.head.ref,
+    baseSha: typeof out.base.sha === "string" ? out.base.sha : null,
     baseRef: out.base.ref,
   };
+}
+
+/**
+ * Files GitHub attributes to one pull request, with a closed-world page bound.
+ *
+ * The host-retirement recovery path uses this as a scope proof. Silently accepting the first page
+ * would let an additional policy edit hide on page two, so a full page is ambiguous and refused.
+ */
+export async function pullRequestChangedFiles(
+  creds: AppCredentials,
+  target: ProposalTarget,
+  fetcher: Fetcher,
+  nowSec: number,
+  number: number,
+): Promise<string[]> {
+  if (!Number.isSafeInteger(number) || number < 1) throw new ProposalError("pull request number is invalid");
+  const token = await installationToken(creds, fetcher, nowSec);
+  const rows = (await gh(
+    fetcher,
+    token,
+    `/repos/${encodeURIComponent(target.owner)}/${encodeURIComponent(target.repo)}` +
+      `/pulls/${number}/files?per_page=100`,
+  )) as Array<{ filename?: string }>;
+  if (rows.length >= 100) {
+    throw new ProposalError(`pull request #${number} has too many changed files to prove its exact scope`);
+  }
+  if (rows.some((row) => typeof row.filename !== "string" || row.filename.length === 0)) {
+    throw new ProposalError(`pull request #${number} returned an invalid changed file`);
+  }
+  return rows.map((row) => row.filename!);
 }
 
 /**
