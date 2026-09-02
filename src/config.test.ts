@@ -144,4 +144,30 @@ describe("workload", () => {
       /needs longer/,
     );
   });
+
+  it("accepts the applier's namespace list, and refuses one that cannot name a namespace", () => {
+    assert.deepEqual(
+      defineConfig({ workload: { ...workload, applierNamespaces: ["dispatcher", "build-jobs"] } }).workload?.applierNamespaces,
+      ["dispatcher", "build-jobs"],
+    );
+    // A label value may hold uppercase; a namespace may not. Left in, every check against the list
+    // would refuse an object that is in fact fine.
+    assert.throws(
+      () => defineConfig({ workload: { ...workload, applierNamespaces: ["Dispatcher"] } }),
+      /not a lowercase/,
+    );
+    assert.throws(
+      () => defineConfig({ workload: { ...workload, applierNamespaces: ["util", "util"] } }),
+      /twice/,
+    );
+  });
+
+  it("refuses an empty list rather than reading it as no restriction", () => {
+    // `[]` and an absent field mean opposite things — one refuses every workload object, the other
+    // refuses none — and the two are one keystroke apart.
+    assert.throws(
+      () => defineConfig({ workload: { ...workload, applierNamespaces: [] } }),
+      /would refuse every workload object/,
+    );
+  });
 });

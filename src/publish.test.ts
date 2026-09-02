@@ -513,6 +513,30 @@ describe("planPublish — the workload half", () => {
     });
     assert.deepEqual(plan.manifest.hosts["h-k3s-01"]!.workload!.ingressDefaultDenyNamespaces, ["stardust-databases"]);
   });
+  it("ships a selector-scoped egress baseline and watches the pods it closes", () => {
+    // The egress posture the deny-list form could never express: reach nothing except what is
+    // named. What is asserted here beyond the object itself is the watch — the agent will not call
+    // a generation confirmed until it has seen a pod under every selector published, and an egress
+    // baseline that selects nobody closes nobody while reading as containment.
+    const plan = planPublish({
+      ...wlInput([host("h-k3s-01", "canary")], []),
+      workloadBaselines: [{
+        kind: "selector-egress-default-deny", id: "VULTR-BROKER-EGRESS", namespace: "dispatcher",
+        selector: `${NS}=dispatcher,app=vultr-broker`,
+        description: "Default deny egress for the Vultr root-key broker.",
+      }],
+    });
+    const obj = (JSON.parse(plan.workload!.json) as { items: Array<{ metadata: { name: string; annotations: Record<string, string> }; spec: Record<string, unknown> }> }).items[0]!;
+    assert.equal(obj.metadata.name, "hp-dev-vultr-broker-egress-egress-baseline");
+    assert.equal(obj.metadata.annotations["heliopause.io/policy-kind"], "selector-egress-default-deny");
+    assert.deepEqual(obj.spec.enableDefaultDeny, { egress: true });
+    const entry = plan.manifest.hosts["h-k3s-01"]!.workload!;
+    // An ingress-only field. An egress baseline protects nothing the relay's exposure check is
+    // about, so it must not appear here — a HostPort is not made safe by a closed *egress* posture.
+    assert.equal(entry.ingressDefaultDenyNamespaces, undefined);
+    assert.deepEqual(entry.watchSelectors, { namespaces: [], labels: [`${NS}=dispatcher,app=vultr-broker`] });
+  });
+
   it("renders it once and addresses it to the applier, not to every host", () => {
     // CiliumNetworkPolicy is cluster-scoped. Three nodes writing one object is API contention with
     // flapping, so exactly one manifest entry carries the assignment.

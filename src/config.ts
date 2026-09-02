@@ -256,6 +256,21 @@ export interface WorkloadConfig {
    */
   ciliumVersion: readonly [number, number];
   /**
+   * Namespaces the applier holds a RoleBinding in — `HELIOPAUSE_K8S_NAMESPACES` on that node.
+   *
+   * Optional, and its absence changes nothing about what renders. Given, it moves two refusals from
+   * the applier to the publisher: an object addressed outside the list is refused while the policy
+   * id is still in hand, and a workload-to-workload allow whose destination lives outside it renders
+   * the sender's half alone instead of a document the agent throws away whole. See
+   * `CiliumRenderInput.applierNamespaces` for why the second one is what makes a closed egress
+   * posture expressible at all.
+   *
+   * It is a *copy* of the node's environment, not the source of it, so it can be wrong in the
+   * harmless direction (listing fewer namespaces than the node allows) and in the loud one (listing
+   * more — the agent still refuses, exactly as before this field existed).
+   */
+  applierNamespaces?: readonly string[];
+  /**
    * Seconds before the workload half rolls back (H20). Longer than `confirmTimeoutSec` by design.
    *
    * The two layers fail differently. A bad nftables ruleset takes SSH and the relay with it, so that
@@ -435,6 +450,28 @@ export function defineConfig(partial: Partial<Config> = {}): Config {
           "it with: kubectl -n kube-system get ds cilium " +
           "-o jsonpath='{.spec.template.spec.containers[0].image}'",
       );
+    }
+    if (w.applierNamespaces) {
+      const seen = new Set<string>();
+      for (const ns of w.applierNamespaces) {
+        if (!/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(ns)) {
+          throw new Error(
+            `workload.applierNamespaces contains ${JSON.stringify(ns)}, which is not a lowercase ` +
+              "DNS-1123 label — it cannot name a Kubernetes namespace, so every check against it " +
+              "would refuse an object that is in fact fine",
+          );
+        }
+        if (seen.has(ns)) throw new Error(`workload.applierNamespaces lists ${JSON.stringify(ns)} twice`);
+        seen.add(ns);
+      }
+      if (seen.size === 0) {
+        // An empty array is not "no restriction" — it would refuse every workload object, which is
+        // the opposite of what omitting the field means. Say so rather than render nothing.
+        throw new Error(
+          "workload.applierNamespaces is empty — that would refuse every workload object. Omit the " +
+            "field to render without the check, or list the namespaces the applier can write to",
+        );
+      }
     }
     // The workload timer has to clear the host timer, not merely be positive. Cilium converges after
     // the API server returns, so a window at or below the nftables figure rolls back policy that was
