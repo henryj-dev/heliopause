@@ -534,7 +534,7 @@ describe("planPublish — the workload half", () => {
     // An ingress-only field. An egress baseline protects nothing the relay's exposure check is
     // about, so it must not appear here — a HostPort is not made safe by a closed *egress* posture.
     assert.equal(entry.ingressDefaultDenyNamespaces, undefined);
-    assert.deepEqual(entry.watchSelectors, { namespaces: [], labels: [`${NS}=dispatcher,app=vultr-broker`] });
+    assert.deepEqual(entry.watchSelectors, { namespaces: [], labels: [`app=vultr-broker,${NS}=dispatcher`] });
   });
 
   it("renders it once and addresses it to the applier, not to every host", () => {

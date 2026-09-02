@@ -162,6 +162,25 @@ describe("workload", () => {
     );
   });
 
+  it("keeps the peer list separate from the writable one, and refuses it alone", () => {
+    // Two different privileges. Writing an object into a namespace lets heliopause close the pods
+    // there; naming one as a peer only lets it look — and an egress allow-list cannot avoid naming
+    // `kube-system`, because DNS is CoreDNS.
+    assert.deepEqual(
+      defineConfig({ workload: { ...workload, applierNamespaces: ["dispatcher"], peerNamespaces: ["kube-system"] } })
+        .workload?.peerNamespaces,
+      ["kube-system"],
+    );
+    assert.throws(
+      () => defineConfig({ workload: { ...workload, peerNamespaces: ["kube-system"] } }),
+      /would be read and never enforced/,
+    );
+    assert.throws(
+      () => defineConfig({ workload: { ...workload, applierNamespaces: ["util"], peerNamespaces: ["util"] } }),
+      /already one we may point at/,
+    );
+  });
+
   it("refuses an empty list rather than reading it as no restriction", () => {
     // `[]` and an absent field mean opposite things — one refuses every workload object, the other
     // refuses none — and the two are one keystroke apart.

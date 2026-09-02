@@ -210,6 +210,21 @@ KUBECONFIG = os.environ.get("HELIOPAUSE_KUBECONFIG", "")
 WORKLOAD_NAMESPACES = frozenset(
     x.strip() for x in os.environ.get("HELIOPAUSE_K8S_NAMESPACES", "").split(",") if x.strip()
 )
+# Namespaces a *selector* may point at, beyond the ones we write objects in.
+#
+# The two are not the same privilege and were one list for as long as this file has existed. Writing
+# a CiliumNetworkPolicy into a namespace lets heliopause **close** the pods there; naming one as a
+# peer only requires that the enforcement gate can run `kubectl -n <ns> get pods` before it calls a
+# generation confirmed. Conflating them made a closed egress posture impossible to express: every
+# such posture needs DNS, DNS is CoreDNS in `kube-system`, and `toCIDR` can never reach a pod-backed
+# destination — so the allow has to name `kube-system` as a peer. Granting write there to get it
+# would hand this agent the ability to put CoreDNS into ingress default-deny, which is the outage the
+# renderer's `applierNamespaces` exists to avoid.
+#
+# Empty by default, so a node that sets nothing behaves exactly as before.
+WORKLOAD_PEER_NAMESPACES = WORKLOAD_NAMESPACES | frozenset(
+    x.strip() for x in os.environ.get("HELIOPAUSE_K8S_PEER_NAMESPACES", "").split(",") if x.strip()
+)
 WORKLOAD_MANAGED_BY = os.environ.get("HELIOPAUSE_K8S_MANAGED_BY", "heliopause")
 # Derived from STATE_FILE rather than configured separately: it has to land somewhere the unit can
 # write, and the state directory is the one path that is guaranteed to be. See `kubectl`.
@@ -841,8 +856,16 @@ def _string_map(value, where, *, require_namespace=False):
     ns = out.get(NS_LABEL)
     if require_namespace and not ns:
         return None, f"{where} does not pin {NS_LABEL}; an empty/unscoped selector is forbidden"
-    if ns is not None and ns not in WORKLOAD_NAMESPACES:
-        return None, f"{where} reaches namespace {ns!r}, outside HELIOPAUSE_K8S_NAMESPACES"
+    # The peer set, not the writable one. This function checks selectors — an object's own
+    # `endpointSelector` and a rule's peers alike — and a selector is a reference, not a write. Where
+    # the object actually *lands* is checked separately against `WORKLOAD_NAMESPACES`
+    # (`metadata.namespace`), and the endpoint selector is pinned to that namespace, so nothing here
+    # widens where an object may be created.
+    if ns is not None and ns not in WORKLOAD_PEER_NAMESPACES:
+        return None, (
+            f"{where} reaches namespace {ns!r}, outside HELIOPAUSE_K8S_NAMESPACES and "
+            f"HELIOPAUSE_K8S_PEER_NAMESPACES"
+        )
     return out, ""
 
 
@@ -940,8 +963,9 @@ def _validate_workload_rule(rule, direction, where):
                     reason = f"{where}.toServices[0] is not a renderer-produced k8sService"
                 elif not isinstance(k8s.get("serviceName"), str) or not _DNS_LABEL.fullmatch(k8s["serviceName"]):
                     reason = f"{where}.toServices[0] has an invalid serviceName"
-                elif k8s.get("namespace") not in WORKLOAD_NAMESPACES:
-                    reason = f"{where}.toServices[0] reaches a namespace outside HELIOPAUSE_K8S_NAMESPACES"
+                elif k8s.get("namespace") not in WORKLOAD_PEER_NAMESPACES:
+                    # A Service reference is a peer like any other — see `_string_map`.
+                    reason = f"{where}.toServices[0] reaches a namespace this applier may not point at"
         if reason:
             return reason
     return ""
@@ -1143,8 +1167,10 @@ def validate_watch_selectors(watch):
     for ns in namespaces:
         if not isinstance(ns, str) or not _DNS_LABEL.fullmatch(ns):
             return None, f"watchSelectors contains invalid namespace {ns!r}"
-        if ns not in WORKLOAD_NAMESPACES:
-            return None, f"watchSelectors namespace {ns!r} is outside HELIOPAUSE_K8S_NAMESPACES"
+        if ns not in WORKLOAD_PEER_NAMESPACES:
+            # A membership query is a read. It is bounded by what we may look at, not by where we may
+            # write — the same split as `_string_map`.
+            return None, f"watchSelectors namespace {ns!r} is outside the namespaces this applier may query"
     for selector in labels:
         if not isinstance(selector, str) or not selector or len(selector.encode()) > MAX_SELECTOR_BYTES:
             return None, "watchSelectors contains an empty, non-text or overlong selector"
@@ -1164,7 +1190,7 @@ def validate_watch_selectors(watch):
         # removes the expensive `--all-namespaces` fallback from the heartbeat boundary.
         if not ns:
             return None, f"watch selector {selector!r} does not pin {NS_LABEL}"
-        if ns not in WORKLOAD_NAMESPACES:
+        if ns not in WORKLOAD_PEER_NAMESPACES:
             return None, f"watch selector {selector!r} reaches an unauthorised namespace"
     if len(set(namespaces)) != len(namespaces) or len(set(labels)) != len(labels):
         return None, "watchSelectors contains duplicate queries"

@@ -1113,6 +1113,37 @@ class TestWorkloadValidation(unittest.TestCase):
         self.assertIsNone(objects)
         self.assertIn("exact unmatchable source rule", reason)
 
+    def test_accepts_a_peer_in_a_namespace_it_may_look_at_but_not_write_to(self):
+        # The egress allow every closed posture needs. The object lands in a writable namespace; the
+        # peer it names is CoreDNS, where this applier holds no CiliumNetworkPolicy verbs — and must
+        # not, because an object there could close CoreDNS. Only the pod list is required, and only
+        # so the enforcement gate can see the pods before confirming.
+        obj = cnp()
+        obj["spec"] = {
+            "description": "p700 test",
+            "endpointSelector": {"matchLabels": {hp.NS_LABEL: "util", "app": "zot"}},
+            "enableDefaultDeny": {"egress": False},
+            "egress": [{
+                "toEndpoints": [{"matchLabels": {hp.NS_LABEL: "kube-system", "k8s-app": "kube-dns"}}],
+                "toPorts": [{"ports": [{"port": "53", "protocol": "ANY"}]}],
+            }],
+        }
+        doc, reason = validate_wl(wl(obj))
+        self.assertIsNone(doc)
+        self.assertIn("HELIOPAUSE_K8S_PEER_NAMESPACES", reason)
+
+        real = hp.WORKLOAD_PEER_NAMESPACES
+        hp.WORKLOAD_PEER_NAMESPACES = real | {"kube-system"}
+        try:
+            doc, reason = validate_wl(wl(obj))
+            self.assertIsNotNone(doc, reason)
+            # Widening the peer set must not widen where objects may land.
+            refused, why = validate_wl(wl(cnp(namespace="kube-system")))
+            self.assertIsNone(refused)
+            self.assertIn("HELIOPAUSE_K8S_NAMESPACES", why)
+        finally:
+            hp.WORKLOAD_PEER_NAMESPACES = real
+
     def test_accepts_an_exact_selector_egress_default_deny_baseline(self):
         objects, reason = validate_wl(wl(egress_baseline()))
         self.assertEqual(reason, "")
@@ -2944,7 +2975,27 @@ class TestWatchSelectorBounds(unittest.TestCase):
         # one this agent's RBAC may still answer, and the answer goes back over the heartbeat.
         result, reason = hp.validate_watch_selectors({"namespaces": ["kube-system"], "labels": []})
         self.assertIsNone(result)
-        self.assertIn("outside HELIOPAUSE_K8S_NAMESPACES", reason)
+        self.assertIn("may query", reason)
+
+    def test_a_peer_namespace_may_be_queried_without_being_writable(self):
+        # The split this bound now respects: a membership query is a read. A namespace we may look at
+        # is not a namespace we may create a CiliumNetworkPolicy in — and an egress allow-list has to
+        # name `kube-system`, because DNS is CoreDNS and no CIDR reaches a pod-backed destination.
+        real = hp.WORKLOAD_PEER_NAMESPACES
+        hp.WORKLOAD_PEER_NAMESPACES = real | {"kube-system"}
+        try:
+            result, reason = hp.validate_watch_selectors(
+                {"namespaces": ["kube-system"], "labels": [f"{hp.NS_LABEL}=kube-system,k8s-app=kube-dns"]}
+            )
+            self.assertEqual(reason, "")
+            self.assertEqual(result["namespaces"], ["kube-system"])
+        finally:
+            hp.WORKLOAD_PEER_NAMESPACES = real
+        # And writing there is still refused: the object's own namespace is checked against the
+        # writable list, which this did not widen.
+        doc, reason = validate_wl(wl(cnp(namespace="kube-system")))
+        self.assertIsNone(doc)
+        self.assertIn("HELIOPAUSE_K8S_NAMESPACES", reason)
 
     def test_an_unpinned_selector_is_refused(self):
         # Without the namespace label the query would fall back to every namespace — the expensive

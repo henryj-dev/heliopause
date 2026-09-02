@@ -371,6 +371,7 @@ function planWorkload(
         generation: input.generation,
         ciliumVersion: w.ciliumVersion,
         ...(w.applierNamespaces ? { applierNamespaces: w.applierNamespaces } : {}),
+        ...(w.peerNamespaces ? { peerNamespaces: w.peerNamespaces } : {}),
         ...(input.resolveService ? { resolveService: input.resolveService } : {}),
         ...(input.resolvePods ? { resolvePods: input.resolvePods } : {}),
       },

@@ -35,6 +35,7 @@ import {
   K8S_KINDS,
   isWorkload,
   isPortsRef,
+  normalizeLabelSelector,
   type Endpoint,
   type Policy,
   type PolicyAction,
@@ -139,6 +140,22 @@ export interface CiliumRenderInput {
    * renderable DNS allow is one that takes the generation with it.
    */
   applierNamespaces?: readonly string[];
+  /**
+   * Namespaces a selector may *point at*, beyond the ones we write objects in.
+   *
+   * A peer reference is not a write. Naming CoreDNS as the destination of an egress allow puts no
+   * object in `kube-system` — but the agent still has to look those pods up (the enforcement gate
+   * runs `kubectl -n <ns> get pods`) before it will call the generation confirmed, so the two
+   * capabilities are different and only one of them is dangerous. Kept as a second list for exactly
+   * that reason: `applierNamespaces` is where heliopause may *close* pods, and this is where it may
+   * merely *look*.
+   *
+   * The applier's own namespaces are always allowed as peers, so this holds only the additions.
+   * Given, a peer outside both is refused at the render rather than at the node — the same move
+   * `applierNamespaces` makes for the object's own namespace, and for the same reason: the agent
+   * refuses the whole document, and by then the policy id is gone.
+   */
+  peerNamespaces?: readonly string[];
   /**
    * Label put on every rendered object so flux can be told to leave them alone.
    *
@@ -684,6 +701,19 @@ function assertNamespace(ns: string, at: string): void {
   }
 }
 
+/**
+ * A baseline's selector in the one canonical spelling, so it matches a policy that writes the same
+ * one.
+ *
+ * `normalizePolicy` sorts and deduplicates a `k8s-label` endpoint's terms; a baseline's selector
+ * arrives raw. The string is watched **verbatim** and `resolvePods` is keyed by it, so two spellings
+ * of one selector are two queries against the `MAX_WATCH_SELECTORS` budget — measured, before this
+ * existed, on exactly the pair this feature was written for.
+ */
+function baselineSelector(b: SelectorEgressBaseline, at: string): string {
+  return normalizeLabelSelector(b.selector, at, (m) => new CiliumRenderError(m));
+}
+
 /** The `heliopause.io/policy-kind` values a baseline may carry. The agent's allowlist mirrors this. */
 const BASELINE_KINDS: ReadonlySet<WorkloadBaseline["kind"]> = new Set<WorkloadBaseline["kind"]>([
   "namespace-ingress-default-deny",
@@ -719,6 +749,18 @@ function senderOnlyWarning(what: string, ns: string): string {
   );
 }
 
+function assertPeerNamespace(input: CiliumRenderInput, ns: string, at: string): void {
+  const write = input.applierNamespaces;
+  if (!write) return;
+  if (write.includes(ns) || (input.peerNamespaces ?? []).includes(ns)) return;
+  throw new CiliumRenderError(
+    `${at}: namespace ${JSON.stringify(ns)} is named as a peer but is in neither the applier's ` +
+      `namespaces nor peerNamespaces. Pointing a selector there is not a write — but the agent has ` +
+      `to list those pods before it will confirm the generation, and it refuses the whole document ` +
+      `for a namespace it was not told about. Add it to peerNamespaces (and bind pod list there).`,
+  );
+}
+
 function assertApplierNamespace(input: CiliumRenderInput, ns: string, at: string): void {
   const allowed = input.applierNamespaces;
   if (!allowed || allowed.includes(ns)) return;
@@ -740,7 +782,7 @@ function assertApplierNamespace(input: CiliumRenderInput, ns: string, at: string
  * rather than a narrower rule.
  */
 function egressBaselineLabels(baseline: SelectorEgressBaseline, at: string): MatchLabels {
-  const labels = labelsFromSelector(baseline.selector, at);
+  const labels = labelsFromSelector(baselineSelector(baseline, at), at);
   const named = labels[NS_LABEL];
   if (named === undefined) {
     // The same string is handed to `resolvePods` and watched through `selectorsToWatch`, and the
@@ -985,6 +1027,9 @@ export function planCiliumPolicies(input: CiliumRenderInput, items: CiliumItem[]
         }
         // Built from the resolved Service, not from splitting `p.dst.value` — see `resolveServiceRef`.
         rule.toServices = [{ k8sService: { serviceName: svc.name, namespace: svc.namespace } }];
+        // Before the allow/deny split below: a deny names this Service as a peer too, and the agent
+        // checks `toServices[0].namespace` against its own list either way.
+        assertPeerNamespace(input, svc.namespace, `${at} destination`);
         // ## The receiver's half, which this branch used to skip
         //
         // `peerIngress` is built in the `else if (dstWorkload)` branch below. `k8s-service` is a
@@ -1053,6 +1098,7 @@ export function planCiliumPolicies(input: CiliumRenderInput, items: CiliumItem[]
           );
         }
         assertNamespace(peerNs, `${at} destination`);
+        assertPeerNamespace(input, peerNs, `${at} destination`);
         rule.toEndpoints = [{ matchLabels: to.labels }];
         if (p.action === "allow") {
           // ## Both halves, because one half is not a policy — it is a broken flow
@@ -1362,8 +1408,9 @@ export function selectorsToWatch(items: CiliumItem[], baselines: WorkloadBaselin
   // agent enforces independently, and the refusal would then have arrived on the node.
   for (const b of baselines) {
     if (b.kind === "selector-egress-default-deny") {
-      validateWatchLabelSelector(b.selector);
-      labels.add(b.selector);
+      const selector = baselineSelector(b, `baseline ${b.id}`);
+      validateWatchLabelSelector(selector);
+      labels.add(selector);
     } else {
       namespaces.add(b.namespace);
     }
@@ -1564,7 +1611,7 @@ export function renderCiliumPolicies(input: CiliumRenderInput, items: CiliumItem
           },
     } as CiliumNetworkPolicy);
     plan.affectedPods[baseline.id] = egress
-      ? (input.resolvePods?.("k8s-label", baseline.selector) ?? null)
+      ? (input.resolvePods?.("k8s-label", baselineSelector(baseline, at)) ?? null)
       : (input.resolvePods?.("k8s-namespace", baseline.namespace) ?? null);
   }
   const doc = { apiVersion: "v1", kind: "List", items: plan.policies };

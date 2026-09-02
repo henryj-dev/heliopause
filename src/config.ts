@@ -271,6 +271,19 @@ export interface WorkloadConfig {
    */
   applierNamespaces?: readonly string[];
   /**
+   * Namespaces a selector may point at, beyond the ones above — `HELIOPAUSE_K8S_PEER_NAMESPACES`.
+   *
+   * The split matters because the two capabilities are not the same size. Writing an object into a
+   * namespace lets heliopause **close** the pods there; naming one as a peer only lets it look. An
+   * egress allow-list needs DNS, and DNS is CoreDNS in `kube-system` — so the peer reference is
+   * unavoidable, while an object there is both unnecessary and, if it were the receiver's half of an
+   * allow, a cluster-wide DNS outage.
+   *
+   * Only meaningful alongside `applierNamespaces`, and only holds the additions: a namespace we may
+   * write to is a namespace we may point at.
+   */
+  peerNamespaces?: readonly string[];
+  /**
    * Seconds before the workload half rolls back (H20). Longer than `confirmTimeoutSec` by design.
    *
    * The two layers fail differently. A bad nftables ruleset takes SSH and the relay with it, so that
@@ -451,6 +464,15 @@ export function defineConfig(partial: Partial<Config> = {}): Config {
           "-o jsonpath='{.spec.template.spec.containers[0].image}'",
       );
     }
+    if (!w.applierNamespaces && w.peerNamespaces) {
+      // On its own it would look like a restriction and be none: the renderer checks a peer only
+      // when it also knows which namespaces are writable.
+      throw new Error(
+        "workload.peerNamespaces is set without workload.applierNamespaces — the peer check only " +
+          "runs when the renderer also knows which namespaces objects may land in, so this list " +
+          "would be read and never enforced",
+      );
+    }
     if (w.applierNamespaces) {
       const seen = new Set<string>();
       for (const ns of w.applierNamespaces) {
@@ -463,6 +485,22 @@ export function defineConfig(partial: Partial<Config> = {}): Config {
         }
         if (seen.has(ns)) throw new Error(`workload.applierNamespaces lists ${JSON.stringify(ns)} twice`);
         seen.add(ns);
+      }
+      for (const ns of w.peerNamespaces ?? []) {
+        if (!/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(ns)) {
+          throw new Error(
+            `workload.peerNamespaces contains ${JSON.stringify(ns)}, which is not a lowercase ` +
+              "DNS-1123 label and cannot name a Kubernetes namespace",
+          );
+        }
+        if (seen.has(ns)) {
+          // Not merely redundant. The two lists mean different privileges, and a name in both reads
+          // as though the narrower one had been considered and granted separately when it had not.
+          throw new Error(
+            `workload.peerNamespaces repeats ${JSON.stringify(ns)}, which applierNamespaces already ` +
+              "grants — a namespace we may write to is already one we may point at",
+          );
+        }
       }
       if (seen.size === 0) {
         // An empty array is not "no restriction" — it would refuse every workload object, which is

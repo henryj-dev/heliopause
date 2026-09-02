@@ -1408,7 +1408,7 @@ describe("selector-egress-default-deny baseline", () => {
       () => renderCiliumPolicies(input(), [], [baseline({ selector: `${NS}=dispatcher` })]),
       /names no label besides the namespace/,
     );
-    assert.throws(() => renderCiliumPolicies(input(), [], [baseline({ selector: "" })]), /does not pin/);
+    assert.throws(() => renderCiliumPolicies(input(), [], [baseline({ selector: "" })]), /empty label selector/);
   });
 
   it("refuses a selector pinned to a different namespace than the object lands in", () => {
@@ -1430,7 +1430,9 @@ describe("selector-egress-default-deny baseline", () => {
       input({ resolvePods: (kind, value) => (asked.push([kind, value]), ["dispatcher/vultr-broker-0"]) }),
       [], [baseline()],
     );
-    assert.deepEqual(asked, [["k8s-label", `${NS}=dispatcher,app=vultr-broker`]]);
+    // Canonical spelling — sorted, exactly as `normalizePolicy` writes a `k8s-label` endpoint, so a
+    // policy naming the same pods asks the identical question.
+    assert.deepEqual(asked, [["k8s-label", `app=vultr-broker,${NS}=dispatcher`]]);
     assert.deepEqual(p.affectedPods["VULTR-BROKER-EGRESS"], ["dispatcher/vultr-broker-0"]);
   });
 
@@ -1451,9 +1453,22 @@ describe("selector-egress-default-deny baseline", () => {
     assert.deepEqual(p.policies.map((o) => o.metadata.name), ["hp-dev-broker-baseline", "hp-dev-broker-egress-baseline"]);
   });
 
+  it("spells its selector the way a policy does, so one set of pods is one question", () => {
+    // Measured on exactly the pair this feature was written for: the baseline written
+    // `namespace=…,app=…` and a policy written `app=…,namespace=…` produced **two** watch entries
+    // for one set of pods — two of the 32 the agent allows, and two answers the manager then has to
+    // reconcile. `normalizePolicy` sorts a `k8s-label` endpoint; the baseline now uses the same
+    // function rather than a second spelling of the same rule.
+    const w = selectorsToWatch(
+      [{ policy: policy({ id: "P9", src: { kind: "k8s-label", value: `app=vultr-broker,${NS}=dispatcher` }, dst: { kind: "k8s-namespace", value: "util" } }) }],
+      [baseline()],
+    );
+    assert.deepEqual(w.labels, [`app=vultr-broker,${NS}=dispatcher`]);
+  });
+
   it("is watched by its selector, and counts against the same query budget", () => {
     const w = selectorsToWatch([], [baseline()]);
-    assert.deepEqual(w, { namespaces: [], labels: [`${NS}=dispatcher,app=vultr-broker`] });
+    assert.deepEqual(w, { namespaces: [], labels: [`app=vultr-broker,${NS}=dispatcher`] });
     // Merged in *here* rather than at the call site: the bound is the agent's, enforced
     // independently, so a set of baselines that pushed the request past it used to be discovered on
     // the node instead of at the render.
@@ -1493,7 +1508,7 @@ describe("applierNamespaces", () => {
           ports: "53",
         }),
       }],
-      { applierNamespaces: ns },
+      { applierNamespaces: ns, peerNamespaces: ["kube-system"] },
     );
     assert.deepEqual(p.policies.map((o) => `${o.metadata.namespace}/${o.metadata.name}`), ["dispatcher/hp-dev-broker-dns"]);
     assert.equal(p.policies[0]!.spec.enableDefaultDeny?.egress, false);
@@ -1520,10 +1535,27 @@ describe("applierNamespaces", () => {
   it("withholds a Service destination's half too, and says which pods it withheld it for", () => {
     const p = plan(
       [{ policy: policy({ id: "P3", src: { kind: "k8s-namespace", value: "arc-runners" }, dst: { kind: "k8s-service", value: "util/zot" } }) }],
-      { applierNamespaces: ["arc-runners"] },
+      { applierNamespaces: ["arc-runners"], peerNamespaces: ["util"] },
     );
     assert.deepEqual(p.policies.map((o) => o.metadata.namespace), ["arc-runners"]);
     contains(p.warnings.map((w) => w.warning).join("\n"), 'the pods behind Service "util/zot"');
+  });
+
+  it("refuses a peer in neither list — pointing there is cheap, but the agent still has to look", () => {
+    // The distinction this pair of lists exists for: a peer reference writes nothing, so it does not
+    // need `applierNamespaces`. It does need *somebody* to have granted pod list there, because the
+    // agent will not confirm a generation until it has seen the selected pods — and it refuses the
+    // whole document for a namespace it was not told about.
+    assert.throws(
+      () => plan([{
+        policy: policy({
+          id: "P5",
+          src: { kind: "k8s-namespace", value: "arc-runners" },
+          dst: { kind: "k8s-label", value: `${NS}=kube-system,k8s-app=kube-dns` },
+        }),
+      }], { applierNamespaces: ns }),
+      /named as a peer but is in neither/,
+    );
   });
 
   it("changes nothing when the caller does not say what the applier can write to", () => {
