@@ -1360,3 +1360,217 @@ describe("an egress allow must not close the sender", () => {
     assert.equal(denied[0]!.spec.enableDefaultDeny?.egress, false);
   });
 });
+
+// ── The egress baseline, and the allow-list it makes expressible ──────────────
+//
+// Until this object existed, egress containment on this layer could only be written as a deny list
+// — `BUILD-JOBS-DENY-*`, fifteen policies naming every namespace the build pods must not reach. That
+// is exact and absolute, and it is an *enumeration*: a namespace created tomorrow is reachable until
+// somebody adds a line. The opposite polarity could not be assembled out of allows, because an
+// egress allow deliberately renders `{ egress: false }` — it must not close its sender (2026-08-10,
+// where the first one that did took DNS down three seconds later).
+//
+// So the closing is its own named object and the allows beside it are unchanged.
+describe("selector-egress-default-deny baseline", () => {
+  const baseline = (over: Record<string, unknown> = {}) => ({
+    kind: "selector-egress-default-deny" as const,
+    id: "VULTR-BROKER-EGRESS",
+    namespace: "dispatcher",
+    selector: `${NS}=dispatcher,app=vultr-broker`,
+    description: "Default deny egress for the Vultr root-key broker.",
+    ...over,
+  });
+
+  it("closes exactly the selected pods, with a destination no pod can be in", () => {
+    const { plan: p } = renderCiliumPolicies(input(), [], [baseline()]);
+    const obj = p.policies[0]!;
+    assert.equal(obj.metadata.name, "hp-dev-vultr-broker-egress-egress-baseline");
+    assert.equal(obj.metadata.namespace, "dispatcher");
+    assert.equal(obj.metadata.annotations["heliopause.io/policy-kind"], "selector-egress-default-deny");
+    assert.deepEqual(obj.spec, {
+      description: "Default deny egress for the Vultr root-key broker.",
+      endpointSelector: { matchLabels: { "app": "vultr-broker", [NS]: "dispatcher" } },
+      enableDefaultDeny: { egress: true },
+      // Not `egress: [{}]`. Cilium's `Sanitize()` decides enforcement with
+      // `len(r.Egress) > 0 || len(r.EgressDeny) > 0`, so a spec with no egress section leaves the
+      // endpoint exactly where it was — and an empty rule goes the other way and allows every peer,
+      // which reads as containment while removing it.
+      egress: [{ toEndpoints: [{ matchLabels: { [NS]: "HELI0PAUSE-NEVER" } }] }],
+    });
+  });
+
+  it("refuses a selector that names nothing but the namespace", () => {
+    // An empty `EndpointSelector` is a *wildcard* in Cilium and `getEndpointSelector` fills the
+    // policy's own namespace in. The object that meant "close the broker" would mean "close every
+    // pod in dispatcher" — which also holds `dispatcher`, `cron-runner` and `vworld-proxy`. Both
+    // requests for this feature ruled that out by name, so it is refused rather than defaulted.
+    assert.throws(
+      () => renderCiliumPolicies(input(), [], [baseline({ selector: `${NS}=dispatcher` })]),
+      /names no label besides the namespace/,
+    );
+    assert.throws(() => renderCiliumPolicies(input(), [], [baseline({ selector: "" })]), /empty label selector/);
+  });
+
+  it("refuses a selector pinned to a different namespace than the object lands in", () => {
+    // A CiliumNetworkPolicy only governs pods in its own namespace, so the two names cannot disagree
+    // — one of them describes pods this object can never reach, and it applies cleanly either way.
+    assert.throws(
+      () => renderCiliumPolicies(input(), [], [baseline({ selector: `${NS}=build-jobs,app=vultr-broker` })]),
+      /but the baseline declares namespace/,
+    );
+  });
+
+  it("asks about the pods it selects, by the selector rather than by the namespace", () => {
+    // The ingress baseline is namespace-wide, so `k8s-namespace` is the right question for it. This
+    // one closes a label, and asking about the namespace would report pods it does not select — the
+    // agent's enforcement gate would then confirm a generation on the strength of somebody else's
+    // pod.
+    const asked: Array<[string, string]> = [];
+    const { plan: p } = renderCiliumPolicies(
+      input({ resolvePods: (kind, value) => (asked.push([kind, value]), ["dispatcher/vultr-broker-0"]) }),
+      [], [baseline()],
+    );
+    // Canonical spelling — sorted, exactly as `normalizePolicy` writes a `k8s-label` endpoint, so a
+    // policy naming the same pods asks the identical question.
+    assert.deepEqual(asked, [["k8s-label", `app=vultr-broker,${NS}=dispatcher`]]);
+    assert.deepEqual(p.affectedPods["VULTR-BROKER-EGRESS"], ["dispatcher/vultr-broker-0"]);
+  });
+
+  it("still refuses an unknown baseline kind", () => {
+    assert.throws(
+      () => renderCiliumPolicies(input(), [], [baseline({ kind: "selector-egress-allow" }) as never]),
+      /invalid kind, id, or description/,
+    );
+  });
+
+  it("does not collide with the ingress baseline for the same policy id", () => {
+    // The two carry different suffixes precisely so one workload can have both postures without the
+    // second silently overwriting the first at apply.
+    const { plan: p } = renderCiliumPolicies(input(), [], [
+      { kind: "namespace-ingress-default-deny", id: "BROKER", namespace: "dispatcher", description: "in" },
+      baseline({ id: "BROKER" }),
+    ]);
+    assert.deepEqual(p.policies.map((o) => o.metadata.name), ["hp-dev-broker-baseline", "hp-dev-broker-egress-baseline"]);
+  });
+
+  it("spells its selector the way a policy does, so one set of pods is one question", () => {
+    // Measured on exactly the pair this feature was written for: the baseline written
+    // `namespace=…,app=…` and a policy written `app=…,namespace=…` produced **two** watch entries
+    // for one set of pods — two of the 32 the agent allows, and two answers the manager then has to
+    // reconcile. `normalizePolicy` sorts a `k8s-label` endpoint; the baseline now uses the same
+    // function rather than a second spelling of the same rule.
+    const w = selectorsToWatch(
+      [{ policy: policy({ id: "P9", src: { kind: "k8s-label", value: `app=vultr-broker,${NS}=dispatcher` }, dst: { kind: "k8s-namespace", value: "util" } }) }],
+      [baseline()],
+    );
+    assert.deepEqual(w.labels, [`app=vultr-broker,${NS}=dispatcher`]);
+  });
+
+  it("is watched by its selector, and counts against the same query budget", () => {
+    const w = selectorsToWatch([], [baseline()]);
+    assert.deepEqual(w, { namespaces: [], labels: [`app=vultr-broker,${NS}=dispatcher`] });
+    // Merged in *here* rather than at the call site: the bound is the agent's, enforced
+    // independently, so a set of baselines that pushed the request past it used to be discovered on
+    // the node instead of at the render.
+    const many = Array.from({ length: 33 }, (_, i) => baseline({ id: `B${i}`, selector: `${NS}=dispatcher,app=b${i}` }));
+    assert.throws(() => selectorsToWatch([], many), /limit is 32/);
+  });
+});
+
+// ── applierNamespaces: the half heliopause was never able to apply ────────────
+describe("applierNamespaces", () => {
+  const ns = ["arc-runners", "util", "dispatcher"];
+
+  it("refuses an object addressed outside the applier's RoleBindings", () => {
+    // Not a narrower policy — the agent refuses the whole document over one such object, so the
+    // generation never applies at all. Caught here, where the policy id is still in hand.
+    assert.throws(
+      () => plan([{ policy: policy({ id: "P1", dst: { kind: "k8s-namespace", value: "kube-system" } }) }],
+        { applierNamespaces: ns }),
+      /outside the applier's namespaces/,
+    );
+  });
+
+  it("renders the sender's half alone when the destination is one we cannot write to", () => {
+    // Every closed egress posture needs DNS, and DNS is CoreDNS in `kube-system` — a pod-backed
+    // destination, so `toCIDR` can never match it. Emitting the receiver's half too is what made
+    // that allow unpublishable: the agent throws the document away, taking the sender's half with
+    // it. The half we keep is enough here for a reason specific to this case — heliopause holds no
+    // RoleBinding in `kube-system`, so nothing we publish could put CoreDNS into ingress
+    // default-deny either.
+    const p = plan(
+      [{
+        policy: policy({
+          id: "BROKER-DNS",
+          src: { kind: "k8s-label", value: `${NS}=dispatcher,app=vultr-broker` },
+          dst: { kind: "k8s-label", value: `${NS}=kube-system,k8s-app=kube-dns` },
+          proto: "any",
+          ports: "53",
+        }),
+      }],
+      { applierNamespaces: ns, peerNamespaces: ["kube-system"] },
+    );
+    assert.deepEqual(p.policies.map((o) => `${o.metadata.namespace}/${o.metadata.name}`), ["dispatcher/hp-dev-broker-dns"]);
+    assert.equal(p.policies[0]!.spec.enableDefaultDeny?.egress, false);
+    const warned = p.warnings.map((w) => w.warning).join("\n");
+    contains(warned, "sender's egress half only");
+    contains(warned, "no RoleBinding there");
+  });
+
+  it("still renders both halves for a destination inside the list", () => {
+    const p = plan(
+      [{
+        policy: policy({
+          id: "P2",
+          src: { kind: "k8s-namespace", value: "arc-runners" },
+          dst: { kind: "k8s-label", value: `${NS}=util,app=idp` },
+        }),
+      }],
+      { applierNamespaces: ns },
+    );
+    assert.deepEqual(p.policies.map((o) => `${o.metadata.namespace}/${o.metadata.name}`),
+      ["arc-runners/hp-dev-p2", "util/hp-dev-p2-ingress"]);
+  });
+
+  it("withholds a Service destination's half too, and says which pods it withheld it for", () => {
+    const p = plan(
+      [{ policy: policy({ id: "P3", src: { kind: "k8s-namespace", value: "arc-runners" }, dst: { kind: "k8s-service", value: "util/zot" } }) }],
+      { applierNamespaces: ["arc-runners"], peerNamespaces: ["util"] },
+    );
+    assert.deepEqual(p.policies.map((o) => o.metadata.namespace), ["arc-runners"]);
+    contains(p.warnings.map((w) => w.warning).join("\n"), 'the pods behind Service "util/zot"');
+  });
+
+  it("refuses a peer in neither list — pointing there is cheap, but the agent still has to look", () => {
+    // The distinction this pair of lists exists for: a peer reference writes nothing, so it does not
+    // need `applierNamespaces`. It does need *somebody* to have granted pod list there, because the
+    // agent will not confirm a generation until it has seen the selected pods — and it refuses the
+    // whole document for a namespace it was not told about.
+    assert.throws(
+      () => plan([{
+        policy: policy({
+          id: "P5",
+          src: { kind: "k8s-namespace", value: "arc-runners" },
+          dst: { kind: "k8s-label", value: `${NS}=kube-system,k8s-app=kube-dns` },
+        }),
+      }], { applierNamespaces: ns }),
+      /named as a peer but is in neither/,
+    );
+  });
+
+  it("changes nothing when the caller does not say what the applier can write to", () => {
+    // Most callers of this exported renderer have no reason to know the applier's RBAC, and the
+    // absent field must not quietly mean "nothing is writable".
+    const p = plan([{ policy: policy({ id: "P4", dst: { kind: "k8s-namespace", value: "kube-system" } }) }]);
+    assert.equal(p.policies.length, 1);
+  });
+
+  it("applies to baselines as well as to flows", () => {
+    assert.throws(
+      () => renderCiliumPolicies(input({ applierNamespaces: ns }), [], [
+        { kind: "namespace-ingress-default-deny", id: "X", namespace: "kube-system", description: "d" },
+      ]),
+      /outside the applier's namespaces/,
+    );
+  });
+});

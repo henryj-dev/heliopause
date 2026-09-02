@@ -144,4 +144,49 @@ describe("workload", () => {
       /needs longer/,
     );
   });
+
+  it("accepts the applier's namespace list, and refuses one that cannot name a namespace", () => {
+    assert.deepEqual(
+      defineConfig({ workload: { ...workload, applierNamespaces: ["dispatcher", "build-jobs"] } }).workload?.applierNamespaces,
+      ["dispatcher", "build-jobs"],
+    );
+    // A label value may hold uppercase; a namespace may not. Left in, every check against the list
+    // would refuse an object that is in fact fine.
+    assert.throws(
+      () => defineConfig({ workload: { ...workload, applierNamespaces: ["Dispatcher"] } }),
+      /not a lowercase/,
+    );
+    assert.throws(
+      () => defineConfig({ workload: { ...workload, applierNamespaces: ["util", "util"] } }),
+      /twice/,
+    );
+  });
+
+  it("keeps the peer list separate from the writable one, and refuses it alone", () => {
+    // Two different privileges. Writing an object into a namespace lets heliopause close the pods
+    // there; naming one as a peer only lets it look — and an egress allow-list cannot avoid naming
+    // `kube-system`, because DNS is CoreDNS.
+    assert.deepEqual(
+      defineConfig({ workload: { ...workload, applierNamespaces: ["dispatcher"], peerNamespaces: ["kube-system"] } })
+        .workload?.peerNamespaces,
+      ["kube-system"],
+    );
+    assert.throws(
+      () => defineConfig({ workload: { ...workload, peerNamespaces: ["kube-system"] } }),
+      /would be read and never enforced/,
+    );
+    assert.throws(
+      () => defineConfig({ workload: { ...workload, applierNamespaces: ["util"], peerNamespaces: ["util"] } }),
+      /already one we may point at/,
+    );
+  });
+
+  it("refuses an empty list rather than reading it as no restriction", () => {
+    // `[]` and an absent field mean opposite things — one refuses every workload object, the other
+    // refuses none — and the two are one keystroke apart.
+    assert.throws(
+      () => defineConfig({ workload: { ...workload, applierNamespaces: [] } }),
+      /would refuse every workload object/,
+    );
+  });
 });

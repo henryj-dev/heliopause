@@ -157,7 +157,10 @@ export {
   type ResolveService,
   type MembershipJump,
   type JumpLimits,
+  type NamespaceIngressBaseline,
+  type SelectorEgressBaseline,
   type ServiceSelector,
+  type WorkloadBaseline,
 } from "./cilium.ts";
 
 export {

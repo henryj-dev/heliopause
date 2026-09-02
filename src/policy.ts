@@ -390,26 +390,42 @@ function normalizeEndpoint(e: unknown, label: "src" | "dst"): Endpoint {
     throw bad(`${label}.value must be a namespace name, e.g. arc-runners`);
   }
   if (kind === "k8s-label") {
-    const parts = value.split(",").map((x) => x.trim()).filter(Boolean);
-    if (parts.length === 0) {
-      // An empty selector matches *every* pod in the cluster. Same hazard as an empty address
-      // group, and the same answer: refuse rather than render the widest possible rule.
-      throw bad(`${label}.value is an empty label selector — it would match every pod`);
-    }
-    for (const part of parts) {
-      if (!LABEL_SELECTOR.test(part)) {
-        throw bad(
-          `${label}.value has an unusable selector term ${JSON.stringify(part)} — ` +
-            `expected key=value pairs separated by commas (equality only)`,
-        );
-      }
-    }
-    // Sorted and deduplicated: `a=1,b=2` and `b=2,a=1` select the same pods, and leaving them
-    // distinct makes `policyFingerprint` report an edit that did not happen.
-    value = [...new Set(parts)].sort().join(",");
+    value = normalizeLabelSelector(value, `${label}.value`, bad);
   }
 
   return { kind, value };
+}
+
+/**
+ * The one canonical form of an equality label selector, shared by every place that writes one.
+ *
+ * Exported because a `k8s-label` endpoint is not the only thing that carries one: an egress baseline
+ * selects by labels too, and the string is watched **verbatim** — the agent answers the question it
+ * was asked, keyed by the exact text. Two spellings of one selector are therefore two queries
+ * against a budget of `MAX_WATCH_SELECTORS`, and they compare unequal everywhere a fingerprint is
+ * taken. Measured: a baseline written `namespace=…,app=…` and a policy written `app=…,namespace=…`
+ * produced two watch entries for one set of pods.
+ *
+ * `fail` builds the error, so the caller decides which of its own error types this becomes.
+ */
+export function normalizeLabelSelector(value: string, label: string, fail: (m: string) => Error): string {
+  const parts = value.split(",").map((x) => x.trim()).filter(Boolean);
+  if (parts.length === 0) {
+    // An empty selector matches *every* pod in the cluster. Same hazard as an empty address
+    // group, and the same answer: refuse rather than render the widest possible rule.
+    throw fail(`${label} is an empty label selector — it would match every pod`);
+  }
+  for (const part of parts) {
+    if (!LABEL_SELECTOR.test(part)) {
+      throw fail(
+        `${label} has an unusable selector term ${JSON.stringify(part)} — ` +
+          `expected key=value pairs separated by commas (equality only)`,
+      );
+    }
+  }
+  // Sorted and deduplicated: `a=1,b=2` and `b=2,a=1` select the same pods, and leaving them
+  // distinct makes `policyFingerprint` report an edit that did not happen.
+  return [...new Set(parts)].sort().join(",");
 }
 
 /**

@@ -333,6 +333,7 @@ function planWorkload(
   const items = input.workload ?? [];
   const needing = items.filter((i) => assignsToWorkloadLayer(i.policy).workload);
   const baselines = input.workloadBaselines ?? [];
+  const ingressBaselines = baselines.filter((b) => b.kind === "namespace-ingress-default-deny");
 
   const w = cfg.workload;
   if (!w) {
@@ -369,6 +370,8 @@ function planWorkload(
         cluster: w.cluster,
         generation: input.generation,
         ciliumVersion: w.ciliumVersion,
+        ...(w.applierNamespaces ? { applierNamespaces: w.applierNamespaces } : {}),
+        ...(w.peerNamespaces ? { peerNamespaces: w.peerNamespaces } : {}),
         ...(input.resolveService ? { resolveService: input.resolveService } : {}),
         ...(input.resolvePods ? { resolvePods: input.resolvePods } : {}),
       },
@@ -390,14 +393,18 @@ function planWorkload(
     ingressProtectedSelectors: rendered.plan.policies
       .filter((p) => p.spec.ingress?.length)
       .map((p) => p.spec.endpointSelector.matchLabels),
-    ...(baselines.length ? { ingressDefaultDenyNamespaces: [...new Set(baselines.map((b) => b.namespace))].sort() } : {}),
+    // Ingress baselines only, and the filter is load-bearing twice over. The relay uses this list to
+    // decide that an observed Cilium HostPort is *protected* rather than merely bypassing nftables —
+    // and a closed egress posture protects nothing about an inbound port. The agent also recomputes
+    // the list from the CNP document and refuses the generation when the two disagree, so listing an
+    // egress baseline here would fail closed on the node instead of quietly over-reporting.
+    ...(ingressBaselines.length
+      ? { ingressDefaultDenyNamespaces: [...new Set(ingressBaselines.map((b) => b.namespace))].sort() }
+      : {}),
     // Derived from the policies being published, not restated — so what the applier is asked about
     // cannot drift from what was actually rendered. `needing` rather than every item: a policy the
     // workload layer does not own has no selector this cluster should be queried for.
-    watchSelectors: {
-      ...selectorsToWatch(needing),
-      namespaces: [...new Set([...selectorsToWatch(needing).namespaces, ...baselines.map((b) => b.namespace)])].sort(),
-    },
+    watchSelectors: selectorsToWatch(needing, baselines),
   };
   hosts[w.applier] = { ...hosts[w.applier]!, workload: entry };
 

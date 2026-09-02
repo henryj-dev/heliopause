@@ -953,6 +953,25 @@ def baseline(namespace="util"):
     }
 
 
+def egress_baseline(namespace="util", selector=None, policy_id="broker"):
+    """The posture object that closes one label selector's egress, as the renderer emits it."""
+    labels = selector if selector is not None else {hp.NS_LABEL: namespace, "app": "vultr-broker"}
+    return {
+        "apiVersion": "cilium.io/v2", "kind": "CiliumNetworkPolicy",
+        "metadata": {
+            "name": f"hp-dev-{policy_id}-egress-baseline", "namespace": namespace,
+            "labels": {"managed-by": "heliopause", "heliopause.io/cluster": "dev"},
+            "annotations": {"heliopause.io/policy-id": policy_id, "heliopause.io/applier": hp.HOST_ID,
+                            "heliopause.io/generation": "g1",
+                            "heliopause.io/policy-kind": "selector-egress-default-deny"},
+        },
+        "spec": {"description": "broker default deny egress",
+                 "endpointSelector": {"matchLabels": labels},
+                 "enableDefaultDeny": {"egress": True},
+                 "egress": [{"toEndpoints": [{"matchLabels": {hp.NS_LABEL: hp.BASELINE_NEVER_NAMESPACE}}]}]},
+    }
+
+
 class TestCrossLayerOrdering(unittest.TestCase):
     def setUp(self):
         hp.save_state(dict(hp._EMPTY_STATE))
@@ -1093,6 +1112,95 @@ class TestWorkloadValidation(unittest.TestCase):
         objects, reason = validate_wl(wl(obj))
         self.assertIsNone(objects)
         self.assertIn("exact unmatchable source rule", reason)
+
+    def test_accepts_a_peer_in_a_namespace_it_may_look_at_but_not_write_to(self):
+        # The egress allow every closed posture needs. The object lands in a writable namespace; the
+        # peer it names is CoreDNS, where this applier holds no CiliumNetworkPolicy verbs — and must
+        # not, because an object there could close CoreDNS. Only the pod list is required, and only
+        # so the enforcement gate can see the pods before confirming.
+        obj = cnp()
+        obj["spec"] = {
+            "description": "p700 test",
+            "endpointSelector": {"matchLabels": {hp.NS_LABEL: "util", "app": "zot"}},
+            "enableDefaultDeny": {"egress": False},
+            "egress": [{
+                "toEndpoints": [{"matchLabels": {hp.NS_LABEL: "kube-system", "k8s-app": "kube-dns"}}],
+                "toPorts": [{"ports": [{"port": "53", "protocol": "ANY"}]}],
+            }],
+        }
+        doc, reason = validate_wl(wl(obj))
+        self.assertIsNone(doc)
+        self.assertIn("HELIOPAUSE_K8S_PEER_NAMESPACES", reason)
+
+        real = hp.WORKLOAD_PEER_NAMESPACES
+        hp.WORKLOAD_PEER_NAMESPACES = real | {"kube-system"}
+        try:
+            doc, reason = validate_wl(wl(obj))
+            self.assertIsNotNone(doc, reason)
+            # Widening the peer set must not widen where objects may land.
+            refused, why = validate_wl(wl(cnp(namespace="kube-system")))
+            self.assertIsNone(refused)
+            self.assertIn("HELIOPAUSE_K8S_NAMESPACES", why)
+        finally:
+            hp.WORKLOAD_PEER_NAMESPACES = real
+
+    def test_accepts_an_exact_selector_egress_default_deny_baseline(self):
+        objects, reason = validate_wl(wl(egress_baseline()))
+        self.assertEqual(reason, "")
+        self.assertEqual(objects[0]["metadata"]["name"], "hp-dev-broker-egress-baseline")
+
+    def test_refuses_an_egress_baseline_that_closes_a_whole_namespace(self):
+        # An `endpointSelector` holding nothing but the namespace closes every pod in it. Both
+        # workloads this object exists for share a namespace with pods nobody asked to contain, so
+        # the difference between "the broker" and "everything beside the broker" is an outage — and
+        # the object applies cleanly either way.
+        objects, reason = validate_wl(wl(egress_baseline(selector={hp.NS_LABEL: "util"})))
+        self.assertIsNone(objects)
+        self.assertIn("names no label besides its namespace", reason)
+
+    def test_refuses_an_egress_baseline_that_does_not_close_anything(self):
+        # `enableDefaultDeny: {egress: false}` on this object would leave the endpoint's posture
+        # exactly where it was while the object still reads, in a diff, as containment.
+        obj = egress_baseline()
+        obj["spec"]["enableDefaultDeny"] = {"egress": False}
+        objects, reason = validate_wl(wl(obj))
+        self.assertIsNone(objects)
+        self.assertIn("enableDefaultDeny must be egress true", reason)
+
+    def test_refuses_an_egress_baseline_whose_rule_lets_anything_out(self):
+        # The rule has to exist — Cilium's `Sanitize()` enters egress default-deny only when an
+        # egress section is present — and it has to be unmatchable. `[{}]` satisfies the first and
+        # inverts the second: every peer allowed, under an object named for closing.
+        obj = egress_baseline()
+        obj["spec"]["egress"] = [{}]
+        objects, reason = validate_wl(wl(obj))
+        self.assertIsNone(objects)
+        self.assertIn("exact unmatchable destination rule", reason)
+
+    def test_refuses_an_egress_baseline_carrying_another_direction(self):
+        obj = egress_baseline()
+        obj["spec"]["ingress"] = [{"fromEntities": ["all"]}]
+        objects, reason = validate_wl(wl(obj))
+        self.assertIsNone(objects)
+        self.assertIn("unsupported traffic direction", reason)
+
+    def test_refuses_an_egress_baseline_under_the_ingress_baseline_name(self):
+        # The two suffixes are what let one workload carry both postures without the second
+        # overwriting the first at apply, so the name has to follow the kind.
+        obj = egress_baseline()
+        obj["metadata"]["name"] = "hp-dev-broker-baseline"
+        objects, reason = validate_wl(wl(obj))
+        self.assertIsNone(objects)
+        self.assertIn("is not derived from cluster and policy-id", reason)
+
+    def test_refuses_an_unknown_policy_kind_instead_of_reading_it_as_a_flow(self):
+        # Falling through to the traffic-flow rules would check the wrong template against it, and a
+        # posture object shaped like an allow could pass.
+        obj = egress_baseline()
+        obj["metadata"]["annotations"]["heliopause.io/policy-kind"] = "selector-egress-allow"
+        objects, reason = validate_wl(wl(obj))
+        self.assertIsNone(objects)
+        self.assertIn("unsupported heliopause.io/policy-kind", reason)
     """The workload document reaches Kubernetes mutation commands, which accept privileged kinds too.
 
     So the allowlist here is doing the same job as the nftables one: an artifact that got this far
@@ -1357,6 +1465,23 @@ class TestWorkloadApply(unittest.TestCase):
         create = next(c for c in self.calls if c[0] == "create")
         self.assertIn("--validate=strict", create)
         self.assertNotIn("apply", create)
+
+    def test_egress_baseline_applies_and_is_gated_on_the_pods_it_closes(self):
+        # The gate asks about the *selected* pods, by their labels. Asking about the namespace would
+        # confirm this generation on the strength of a pod the object does not select — and an egress
+        # baseline that selects nobody closes nobody while reading as containment.
+        obj = egress_baseline()
+        ok, state, detail = hp.apply_workload(self.artifact([obj]))
+        self.assertTrue(ok, detail)
+        self.assertEqual(state, "pending")
+        ref = "util/hp-dev-broker-egress-baseline"
+        self.assertIn(ref, self.cluster)
+        pod_queries = [c for c in self.calls if "pods" in c]
+        self.assertEqual(len(pod_queries), 1)
+        self.assertIn("app=vultr-broker", pod_queries[0])
+        hp.rollback_workload("test egress baseline rollback", "g1")
+        self.assertNotIn(ref, self.cluster)
+        self.assertEqual(self.deleted[0][0], ref)
 
     def test_baseline_applies_reads_back_and_rolls_back_by_identity(self):
         obj = baseline()
@@ -2850,7 +2975,27 @@ class TestWatchSelectorBounds(unittest.TestCase):
         # one this agent's RBAC may still answer, and the answer goes back over the heartbeat.
         result, reason = hp.validate_watch_selectors({"namespaces": ["kube-system"], "labels": []})
         self.assertIsNone(result)
-        self.assertIn("outside HELIOPAUSE_K8S_NAMESPACES", reason)
+        self.assertIn("may query", reason)
+
+    def test_a_peer_namespace_may_be_queried_without_being_writable(self):
+        # The split this bound now respects: a membership query is a read. A namespace we may look at
+        # is not a namespace we may create a CiliumNetworkPolicy in — and an egress allow-list has to
+        # name `kube-system`, because DNS is CoreDNS and no CIDR reaches a pod-backed destination.
+        real = hp.WORKLOAD_PEER_NAMESPACES
+        hp.WORKLOAD_PEER_NAMESPACES = real | {"kube-system"}
+        try:
+            result, reason = hp.validate_watch_selectors(
+                {"namespaces": ["kube-system"], "labels": [f"{hp.NS_LABEL}=kube-system,k8s-app=kube-dns"]}
+            )
+            self.assertEqual(reason, "")
+            self.assertEqual(result["namespaces"], ["kube-system"])
+        finally:
+            hp.WORKLOAD_PEER_NAMESPACES = real
+        # And writing there is still refused: the object's own namespace is checked against the
+        # writable list, which this did not widen.
+        doc, reason = validate_wl(wl(cnp(namespace="kube-system")))
+        self.assertIsNone(doc)
+        self.assertIn("HELIOPAUSE_K8S_NAMESPACES", reason)
 
     def test_an_unpinned_selector_is_refused(self):
         # Without the namespace label the query would fall back to every namespace — the expensive

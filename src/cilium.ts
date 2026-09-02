@@ -35,6 +35,7 @@ import {
   K8S_KINDS,
   isWorkload,
   isPortsRef,
+  normalizeLabelSelector,
   type Endpoint,
   type Policy,
   type PolicyAction,
@@ -114,6 +115,47 @@ export interface CiliumRenderInput {
    * condition. Neither is a default worth having, so the caller states the version.
    */
   ciliumVersion: readonly [number, number];
+  /**
+   * Namespaces the applier holds a RoleBinding in — the same list as `HELIOPAUSE_K8S_NAMESPACES` on
+   * that node.
+   *
+   * Two things change when it is given, and the second is the reason it exists.
+   *
+   * An object addressed to a namespace outside the list is refused at the render (see
+   * `assertApplierNamespace`) instead of taking the whole generation down at the agent.
+   *
+   * And a workload-to-workload **allow** whose destination lives outside the list renders the
+   * sender's half **alone**. That half is normally not enough — Cilium enforces the two directions
+   * independently, so the receiver's ingress half travels with it (measured 2026-08-10, see where
+   * `peerIngress` is set). But the ingress half is only needed to re-open a destination that
+   * something has closed, and heliopause cannot close what it cannot write to: no policy of ours
+   * will ever put `kube-system` or `zot` into ingress default-deny, because the applier has no
+   * RoleBinding there. Emitting it anyway is not caution — the agent refuses any document naming
+   * such a namespace, so the *whole* generation fails, including the sender's half that would have
+   * worked.
+   *
+   * This is what makes an egress allow-list expressible at all. Every closed egress posture needs
+   * DNS, and DNS is CoreDNS in `kube-system` — a pod-backed destination, so `toCIDR` cannot reach it
+   * (Cilium resolves a pod-backed peer to its identity, never to its address). Without this the only
+   * renderable DNS allow is one that takes the generation with it.
+   */
+  applierNamespaces?: readonly string[];
+  /**
+   * Namespaces a selector may *point at*, beyond the ones we write objects in.
+   *
+   * A peer reference is not a write. Naming CoreDNS as the destination of an egress allow puts no
+   * object in `kube-system` — but the agent still has to look those pods up (the enforcement gate
+   * runs `kubectl -n <ns> get pods`) before it will call the generation confirmed, so the two
+   * capabilities are different and only one of them is dangerous. Kept as a second list for exactly
+   * that reason: `applierNamespaces` is where heliopause may *close* pods, and this is where it may
+   * merely *look*.
+   *
+   * The applier's own namespaces are always allowed as peers, so this holds only the additions.
+   * Given, a peer outside both is refused at the render rather than at the node — the same move
+   * `applierNamespaces` makes for the object's own namespace, and for the same reason: the agent
+   * refuses the whole document, and by then the policy id is gone.
+   */
+  peerNamespaces?: readonly string[];
   /**
    * Label put on every rendered object so flux can be told to leave them alone.
    *
@@ -659,6 +701,118 @@ function assertNamespace(ns: string, at: string): void {
   }
 }
 
+/**
+ * A baseline's selector in the one canonical spelling, so it matches a policy that writes the same
+ * one.
+ *
+ * `normalizePolicy` sorts and deduplicates a `k8s-label` endpoint's terms; a baseline's selector
+ * arrives raw. The string is watched **verbatim** and `resolvePods` is keyed by it, so two spellings
+ * of one selector are two queries against the `MAX_WATCH_SELECTORS` budget — measured, before this
+ * existed, on exactly the pair this feature was written for.
+ */
+function baselineSelector(b: SelectorEgressBaseline, at: string): string {
+  return normalizeLabelSelector(b.selector, at, (m) => new CiliumRenderError(m));
+}
+
+/** The `heliopause.io/policy-kind` values a baseline may carry. The agent's allowlist mirrors this. */
+const BASELINE_KINDS: ReadonlySet<WorkloadBaseline["kind"]> = new Set<WorkloadBaseline["kind"]>([
+  "namespace-ingress-default-deny",
+  "selector-egress-default-deny",
+]);
+
+/**
+ * Refuse a namespace this applier holds no RoleBinding in — **when the caller said which those are**.
+ *
+ * heliopause writes CiliumNetworkPolicy with a least-privilege credential: a ServiceAccount in
+ * `heliopause-system` plus one RoleBinding per namespace it is allowed to manage (audit M4/M5), and
+ * the agent independently refuses any object outside `HELIOPAUSE_K8S_NAMESPACES`. So an object
+ * addressed elsewhere is not a narrower policy, it is a **refused generation** — the whole document
+ * is rejected before anything is applied, and the error surfaces on the applier node rather than at
+ * the desk of whoever wrote the policy.
+ *
+ * Optional, because the renderer is exported and most callers have no reason to know the applier's
+ * RBAC. Given, it moves that refusal from the node to the render, which is the only place the policy
+ * id is still in hand.
+ */
+function applierCanWrite(input: CiliumRenderInput, ns: string): boolean {
+  return !input.applierNamespaces || input.applierNamespaces.includes(ns);
+}
+
+/** The sentence an allow carries when its receiver's half was withheld. See `applierNamespaces`. */
+function senderOnlyWarning(what: string, ns: string): string {
+  return (
+    `this allow renders the sender's egress half only: ${what} lives in ${JSON.stringify(ns)}, which ` +
+    `is outside the applier's namespaces, so the receiver's ingress half could not be written there. ` +
+    `The flow works because nothing heliopause publishes can put those pods into ingress ` +
+    `default-deny either — we hold no RoleBinding there. It stops working the moment something ` +
+    `outside heliopause closes them, and this layer will not be able to re-open it.`
+  );
+}
+
+function assertPeerNamespace(input: CiliumRenderInput, ns: string, at: string): void {
+  const write = input.applierNamespaces;
+  if (!write) return;
+  if (write.includes(ns) || (input.peerNamespaces ?? []).includes(ns)) return;
+  throw new CiliumRenderError(
+    `${at}: namespace ${JSON.stringify(ns)} is named as a peer but is in neither the applier's ` +
+      `namespaces nor peerNamespaces. Pointing a selector there is not a write — but the agent has ` +
+      `to list those pods before it will confirm the generation, and it refuses the whole document ` +
+      `for a namespace it was not told about. Add it to peerNamespaces (and bind pod list there).`,
+  );
+}
+
+function assertApplierNamespace(input: CiliumRenderInput, ns: string, at: string): void {
+  const allowed = input.applierNamespaces;
+  if (!allowed || allowed.includes(ns)) return;
+  throw new CiliumRenderError(
+    `${at}: namespace ${JSON.stringify(ns)} is outside the applier's namespaces ` +
+      `(${[...allowed].sort().join(", ")}). heliopause holds one RoleBinding per managed namespace, ` +
+      `and the agent refuses the entire workload document when an object names another — so this ` +
+      `would not be a narrower policy, it would be a generation that never applies at all.`,
+  );
+}
+
+/**
+ * `endpointSelector.matchLabels` for an egress baseline, with the namespace pinned onto it.
+ *
+ * An empty selector is refused rather than defaulted: in Cilium an empty `EndpointSelector` is a
+ * **wildcard**, and `getEndpointSelector` fills the policy's own namespace in — so the object that
+ * meant "close these pods" would silently mean "close every pod in this namespace". That is the one
+ * outcome both requests for this feature explicitly ruled out, and it is a cluster-visible outage
+ * rather than a narrower rule.
+ */
+function egressBaselineLabels(baseline: SelectorEgressBaseline, at: string): MatchLabels {
+  const labels = labelsFromSelector(baselineSelector(baseline, at), at);
+  const named = labels[NS_LABEL];
+  if (named === undefined) {
+    // The same string is handed to `resolvePods` and watched through `selectorsToWatch`, and the
+    // agent refuses a membership query that is not scoped to a namespace — a cluster-wide pod list
+    // is a different and much larger question than the one this object asks. Adding the label here
+    // instead would make the watched selector differ from the written one, so the agent's answer
+    // would no longer key to the question the manager asked.
+    throw new CiliumRenderError(
+      `${at}: the selector does not pin ${NS_LABEL}. It is watched verbatim, and the agent refuses a ` +
+        `cluster-wide pod query — write it as ${NS_LABEL}=${baseline.namespace},<your labels>.`,
+    );
+  }
+  if (named !== baseline.namespace) {
+    throw new CiliumRenderError(
+      `${at}: the selector pins ${NS_LABEL}=${JSON.stringify(named)} but the baseline declares ` +
+        `namespace ${JSON.stringify(baseline.namespace)}. A CiliumNetworkPolicy only governs pods in ` +
+        `its own namespace, so one of the two names pods this object can never reach.`,
+    );
+  }
+  const rest = Object.keys(labels).filter((k) => k !== NS_LABEL);
+  if (rest.length === 0) {
+    throw new CiliumRenderError(
+      `${at}: the selector names no label besides the namespace. An egress baseline closes what it ` +
+        `selects, and an empty selector is a wildcard in Cilium — this would close every pod in ` +
+        `${JSON.stringify(baseline.namespace)} rather than the ones you meant.`,
+    );
+  }
+  return { ...labels, [NS_LABEL]: baseline.namespace };
+}
+
 // ── The plan ──────────────────────────────────────────────────────────────────
 
 /**
@@ -675,11 +829,69 @@ export interface CiliumItem {
   dstCidrs?: string[];
 }
 
+/**
+ * A posture object: it closes a set of endpoints in one direction and carries no traffic of its own.
+ *
+ * Deliberately separate from an allow/deny flow, and the separation is the whole point. Cilium
+ * enables default-deny on an endpoint if **any** policy selecting it asks for one, so a closure that
+ * arrives as a side effect of an unrelated allow is invisible in the catalogue and irreversible from
+ * any other policy — the trap documented at `defaultDenyFor`, and the shape of the 2026-08-10 DNS
+ * outage. A baseline is that same aggregation rule used on purpose: one named object whose entire
+ * job is the closing, with the openings written as ordinary allow policies beside it.
+ */
+export type WorkloadBaseline = NamespaceIngressBaseline | SelectorEgressBaseline;
+
 /** A namespace-wide ingress posture, deliberately separate from an allow/deny traffic flow. */
-export interface WorkloadBaseline {
+export interface NamespaceIngressBaseline {
   kind: "namespace-ingress-default-deny";
   id: string;
   namespace: string;
+  description: string;
+}
+
+/**
+ * An egress posture for the pods one label selector names.
+ *
+ * ## Why this exists, when an egress allow renders `{ egress: false }`
+ *
+ * Egress containment on this layer has until now been expressible only as a deny list — see
+ * `BUILD-JOBS-DENY-*`, fifteen policies naming every namespace the build pods must not reach. A deny
+ * list is exact and it is absolute (Cilium evaluates deny before every allow), but it is an
+ * *enumeration*: a namespace created tomorrow is reachable until somebody remembers to add a line.
+ * The request that produced this object asked for the other polarity — reach nothing except what is
+ * named — and that cannot be assembled out of allows, because an allow here deliberately refuses to
+ * close its sender.
+ *
+ * So the closing is its own object. The egress allows beside it keep rendering `{ egress: false }`,
+ * unchanged: the 2026-08-10 rule that an allow must not close the sender is not weakened, it is
+ * simply no longer the only way to arrive at a closed sender.
+ *
+ * ## Why a selector and not a namespace
+ *
+ * Both live requests forbid the namespace form, and independently. `build-jobs` holds the trusted
+ * registry deployer in the same namespace as the untrusted artifact lane; `dispatcher` holds
+ * `dispatcher`, `cron-runner` and `vworld-proxy` beside the broker. Closing either namespace whole
+ * is an outage for pods nobody was asked to contain — so the selector is required, and an empty one
+ * is refused rather than read as "the whole namespace".
+ *
+ * `selector` takes the same `key=value,key=value` form as a `k8s-label` endpoint, so that the same
+ * string can be handed to `resolvePods` and watched through `selectorsToWatch`.
+ */
+export interface SelectorEgressBaseline {
+  kind: "selector-egress-default-deny";
+  id: string;
+  namespace: string;
+  /**
+   * `k8s-label` form, **including** the `k8s:io.kubernetes.pod.namespace` pin.
+   *
+   * Redundant with `namespace` on purpose, and checked against it. The string is watched and
+   * resolved verbatim — normalising it would mean the agent's membership answer no longer keys to
+   * the question the manager asked — and the agent refuses an unscoped query, so the pin has to be
+   * in the string the author wrote rather than added on the way past.
+   *
+   * Must name at least one label besides the namespace; see above for why that is not a default.
+   */
+  selector: string;
   description: string;
 }
 
@@ -815,6 +1027,9 @@ export function planCiliumPolicies(input: CiliumRenderInput, items: CiliumItem[]
         }
         // Built from the resolved Service, not from splitting `p.dst.value` — see `resolveServiceRef`.
         rule.toServices = [{ k8sService: { serviceName: svc.name, namespace: svc.namespace } }];
+        // Before the allow/deny split below: a deny names this Service as a peer too, and the agent
+        // checks `toServices[0].namespace` against its own list either way.
+        assertPeerNamespace(input, svc.namespace, `${at} destination`);
         // ## The receiver's half, which this branch used to skip
         //
         // `peerIngress` is built in the `else if (dstWorkload)` branch below. `k8s-service` is a
@@ -840,23 +1055,31 @@ export function planCiliumPolicies(input: CiliumRenderInput, items: CiliumItem[]
           assertServiceUsable(svc, p.dst.value, `${at} destination`);
           const backends: MatchLabels = { ...svc.selector, [NS_LABEL]: svc.namespace };
           assertNamespace(svc.namespace, `${at} destination`);
-          peerIngress = {
-            from: { matchLabels: backends },
-            allow: { fromEndpoints: [{ matchLabels: target.labels }], ...(toPorts.length ? { toPorts } : {}) },
-          };
-          // Same sentence the `k8s-label` branch carries, and for the same reason: the object below
-          // closes the pods behind this Service to everything a heliopause policy does not name, and
-          // the author asked for one flow rather than for that.
-          warnings.push({
-            policyId: p.id,
-            name: p.name,
-            warning:
-              `this allow also renders the receiver's half, which puts the pods behind Service ` +
-              `${JSON.stringify(p.dst.value)} into ingress default-deny — Cilium enforces the two ` +
-              `directions independently, so the sender's egress rule alone leaves the flow dropped ` +
-              `at the destination. Anything else that reaches those pods and is not named by a ` +
-              `heliopause policy stops working.`,
-          });
+          if (applierCanWrite(input, svc.namespace)) {
+            peerIngress = {
+              from: { matchLabels: backends },
+              allow: { fromEndpoints: [{ matchLabels: target.labels }], ...(toPorts.length ? { toPorts } : {}) },
+            };
+            // Same sentence the `k8s-label` branch carries, and for the same reason: the object below
+            // closes the pods behind this Service to everything a heliopause policy does not name, and
+            // the author asked for one flow rather than for that.
+            warnings.push({
+              policyId: p.id,
+              name: p.name,
+              warning:
+                `this allow also renders the receiver's half, which puts the pods behind Service ` +
+                `${JSON.stringify(p.dst.value)} into ingress default-deny — Cilium enforces the two ` +
+                `directions independently, so the sender's egress rule alone leaves the flow dropped ` +
+                `at the destination. Anything else that reaches those pods and is not named by a ` +
+                `heliopause policy stops working.`,
+            });
+          } else {
+            warnings.push({
+              policyId: p.id,
+              name: p.name,
+              warning: senderOnlyWarning(`the pods behind Service ${JSON.stringify(p.dst.value)}`, svc.namespace),
+            });
+          }
         }
       } else if (dstWorkload) {
         const to = endpointSelectorFor(p.dst, "destination", input, `${at} destination`);
@@ -875,6 +1098,7 @@ export function planCiliumPolicies(input: CiliumRenderInput, items: CiliumItem[]
           );
         }
         assertNamespace(peerNs, `${at} destination`);
+        assertPeerNamespace(input, peerNs, `${at} destination`);
         rule.toEndpoints = [{ matchLabels: to.labels }];
         if (p.action === "allow") {
           // ## Both halves, because one half is not a policy — it is a broken flow
@@ -894,35 +1118,48 @@ export function planCiliumPolicies(input: CiliumRenderInput, items: CiliumItem[]
           // Deny is deliberately excluded: a deny needs only the sender's side to be effective, and
           // mirroring it would place an `ingressDeny` on pods the author never named, where Cilium's
           // deny-beats-every-allow rule makes an accidental blast radius expensive.
-          peerIngress = {
-            from: { matchLabels: to.labels },
-            allow: { fromEndpoints: [{ matchLabels: target.labels }], ...(toPorts.length ? { toPorts } : {}) },
-          };
-          // ## The half this renderer adds also **closes** the pods it was added for
           //
-          // The object below carries `enableDefaultDeny: { ingress: true }`, which is right for an
-          // ingress allow the author wrote about that destination — it admits the named caller and
-          // refuses the rest. Here the author named those pods as a *peer* of a rule about somebody
-          // else, and the closing arrives as a side effect.
-          //
-          // That is the same argument this file already accepted in the other direction: an egress
-          // allow renders `{ egress: false }` precisely because "these pods may also reach that" is
-          // not "these pods may reach nothing else". The asymmetry is deliberate — an ingress allow
-          // that did not close its destination would admit everyone — but it is not obvious from the
-          // policy text, and Cilium's aggregation rule makes it irreversible from any other policy.
-          //
-          // Said rather than changed. Flipping it to `false` would make every ingress allow on this
-          // layer non-enforcing, which is a larger decision than this warning; and the deny path
-          // already warns about the same aggregation rule from the other side.
-          warnings.push({
-            policyId: p.id,
-            name: p.name,
-            warning:
-              `this allow also renders the receiver's half, which puts ${p.dst.value} into ingress ` +
-              `default-deny — Cilium enforces the two directions independently, so the sender's ` +
-              `egress rule alone leaves the flow dropped at the destination. Anything else that ` +
-              `reaches those pods and is not named by a heliopause policy stops working.`,
-          });
+          // The one exception is a destination heliopause cannot write to at all. There the ingress
+          // half is not merely unnecessary — the agent refuses the whole document over it, taking the
+          // sender's half with it, and nothing we publish could have closed those pods anyway. See
+          // `applierNamespaces`.
+          if (applierCanWrite(input, peerNs)) {
+            peerIngress = {
+              from: { matchLabels: to.labels },
+              allow: { fromEndpoints: [{ matchLabels: target.labels }], ...(toPorts.length ? { toPorts } : {}) },
+            };
+            // ## The half this renderer adds also **closes** the pods it was added for
+            //
+            // The object below carries `enableDefaultDeny: { ingress: true }`, which is right for an
+            // ingress allow the author wrote about that destination — it admits the named caller and
+            // refuses the rest. Here the author named those pods as a *peer* of a rule about somebody
+            // else, and the closing arrives as a side effect.
+            //
+            // That is the same argument this file already accepted in the other direction: an egress
+            // allow renders `{ egress: false }` precisely because "these pods may also reach that" is
+            // not "these pods may reach nothing else". The asymmetry is deliberate — an ingress allow
+            // that did not close its destination would admit everyone — but it is not obvious from the
+            // policy text, and Cilium's aggregation rule makes it irreversible from any other policy.
+            //
+            // Said rather than changed. Flipping it to `false` would make every ingress allow on this
+            // layer non-enforcing, which is a larger decision than this warning; and the deny path
+            // already warns about the same aggregation rule from the other side.
+            warnings.push({
+              policyId: p.id,
+              name: p.name,
+              warning:
+                `this allow also renders the receiver's half, which puts ${p.dst.value} into ingress ` +
+                `default-deny — Cilium enforces the two directions independently, so the sender's ` +
+                `egress rule alone leaves the flow dropped at the destination. Anything else that ` +
+                `reaches those pods and is not named by a heliopause policy stops working.`,
+            });
+          } else {
+            warnings.push({
+              policyId: p.id,
+              name: p.name,
+              warning: senderOnlyWarning(p.dst.value, peerNs),
+            });
+          }
         }
       } else {
         // Destination is an address. The host layer sees this traffic too — pod source addresses are
@@ -1052,6 +1289,7 @@ export function planCiliumPolicies(input: CiliumRenderInput, items: CiliumItem[]
       );
     }
     assertNamespace(ns, at);
+    assertApplierNamespace(input, ns, at);
 
     const meta = (objectName: string, objectNs: string) => ({
       name: objectName,
@@ -1149,7 +1387,7 @@ function validateWatchLabelSelector(selector: string): void {
   }
 }
 
-export function selectorsToWatch(items: CiliumItem[]): WatchSelectors {
+export function selectorsToWatch(items: CiliumItem[], baselines: WorkloadBaseline[] = []): WatchSelectors {
   const namespaces = new Set<string>();
   const labels = new Set<string>();
   for (const it of items) {
@@ -1161,6 +1399,20 @@ export function selectorsToWatch(items: CiliumItem[]): WatchSelectors {
         validateWatchLabelSelector(e.value);
         labels.add(e.value);
       }
+    }
+  }
+  // Baselines select pods too, and the agent's enforcement gate refuses to call a generation
+  // confirmed until every selector it published has been observed holding at least one pod. Adding
+  // them here rather than at the call site keeps them inside the `MAX_WATCH_SELECTORS` bound — they
+  // used to be merged in afterwards, which let a set of baselines carry the request past a limit the
+  // agent enforces independently, and the refusal would then have arrived on the node.
+  for (const b of baselines) {
+    if (b.kind === "selector-egress-default-deny") {
+      const selector = baselineSelector(b, `baseline ${b.id}`);
+      validateWatchLabelSelector(selector);
+      labels.add(selector);
+    } else {
+      namespaces.add(b.namespace);
     }
   }
   const out = { namespaces: [...namespaces].sort(), labels: [...labels].sort() };
@@ -1312,11 +1564,14 @@ export function renderCiliumPolicies(input: CiliumRenderInput, items: CiliumItem
   const plan = planCiliumPolicies(input, items);
   const names = new Set(plan.policies.map((p) => `${p.metadata.namespace}/${p.metadata.name}`));
   for (const baseline of baselines) {
-    if (baseline.kind !== "namespace-ingress-default-deny" || !baseline.id || !baseline.description) {
+    if (!BASELINE_KINDS.has(baseline.kind) || !baseline.id || !baseline.description) {
       throw new CiliumRenderError("workload baseline has an invalid kind, id, or description");
     }
-    assertNamespace(baseline.namespace, `baseline ${baseline.id}`);
-    const name = crdName(input.cluster, baseline.id, "-baseline");
+    const at = `baseline ${baseline.id}`;
+    assertNamespace(baseline.namespace, at);
+    assertApplierNamespace(input, baseline.namespace, at);
+    const egress = baseline.kind === "selector-egress-default-deny";
+    const name = crdName(input.cluster, baseline.id, egress ? "-egress-baseline" : "-baseline");
     const ref = `${baseline.namespace}/${name}`;
     if (names.has(ref)) throw new CiliumRenderError(`workload baseline ${baseline.id} collides with ${ref}`);
     names.add(ref);
@@ -1332,16 +1587,32 @@ export function renderCiliumPolicies(input: CiliumRenderInput, items: CiliumItem
           "heliopause.io/policy-kind": baseline.kind,
         },
       },
-      spec: {
-        description: baseline.description,
-        endpointSelector: { matchLabels: { [NS_LABEL]: baseline.namespace } },
-        enableDefaultDeny: { ingress: true },
-        // Cilium enters ingress default-deny only when an ingress section exists. An empty rule
-        // would allow all peers, so this is an intentionally unmatchable source instead.
-        ingress: [{ fromEndpoints: [{ matchLabels: { [NS_LABEL]: BASELINE_NEVER_NAMESPACE } }] }],
-      },
+      spec: egress
+        ? {
+            description: baseline.description,
+            endpointSelector: { matchLabels: egressBaselineLabels(baseline, at) },
+            enableDefaultDeny: { egress: true },
+            // The mirror of the ingress baseline's unmatchable source, and needed for the same
+            // reason: `Sanitize()` decides enforcement with `len(r.Egress) > 0 ||
+            // len(r.EgressDeny) > 0`, so a spec carrying `enableDefaultDeny` and no egress section
+            // at all leaves the endpoint where it was. An empty rule (`egress: [{}]`) would go the
+            // other way and allow every peer, which is worse than doing nothing — it would read as
+            // containment while removing it. So the section exists and names a namespace no pod can
+            // be in.
+            egress: [{ toEndpoints: [{ matchLabels: { [NS_LABEL]: BASELINE_NEVER_NAMESPACE } }] }],
+          }
+        : {
+            description: baseline.description,
+            endpointSelector: { matchLabels: { [NS_LABEL]: baseline.namespace } },
+            enableDefaultDeny: { ingress: true },
+            // Cilium enters ingress default-deny only when an ingress section exists. An empty rule
+            // would allow all peers, so this is an intentionally unmatchable source instead.
+            ingress: [{ fromEndpoints: [{ matchLabels: { [NS_LABEL]: BASELINE_NEVER_NAMESPACE } }] }],
+          },
     } as CiliumNetworkPolicy);
-    plan.affectedPods[baseline.id] = input.resolvePods?.("k8s-namespace", baseline.namespace) ?? null;
+    plan.affectedPods[baseline.id] = egress
+      ? (input.resolvePods?.("k8s-label", baselineSelector(baseline, at)) ?? null)
+      : (input.resolvePods?.("k8s-namespace", baseline.namespace) ?? null);
   }
   const doc = { apiVersion: "v1", kind: "List", items: plan.policies };
   return { json: JSON.stringify(doc, null, 2) + "\n", plan };

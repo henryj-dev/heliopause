@@ -210,6 +210,21 @@ KUBECONFIG = os.environ.get("HELIOPAUSE_KUBECONFIG", "")
 WORKLOAD_NAMESPACES = frozenset(
     x.strip() for x in os.environ.get("HELIOPAUSE_K8S_NAMESPACES", "").split(",") if x.strip()
 )
+# Namespaces a *selector* may point at, beyond the ones we write objects in.
+#
+# The two are not the same privilege and were one list for as long as this file has existed. Writing
+# a CiliumNetworkPolicy into a namespace lets heliopause **close** the pods there; naming one as a
+# peer only requires that the enforcement gate can run `kubectl -n <ns> get pods` before it calls a
+# generation confirmed. Conflating them made a closed egress posture impossible to express: every
+# such posture needs DNS, DNS is CoreDNS in `kube-system`, and `toCIDR` can never reach a pod-backed
+# destination — so the allow has to name `kube-system` as a peer. Granting write there to get it
+# would hand this agent the ability to put CoreDNS into ingress default-deny, which is the outage the
+# renderer's `applierNamespaces` exists to avoid.
+#
+# Empty by default, so a node that sets nothing behaves exactly as before.
+WORKLOAD_PEER_NAMESPACES = WORKLOAD_NAMESPACES | frozenset(
+    x.strip() for x in os.environ.get("HELIOPAUSE_K8S_PEER_NAMESPACES", "").split(",") if x.strip()
+)
 WORKLOAD_MANAGED_BY = os.environ.get("HELIOPAUSE_K8S_MANAGED_BY", "heliopause")
 # Derived from STATE_FILE rather than configured separately: it has to land somewhere the unit can
 # write, and the state directory is the one path that is guaranteed to be. See `kubectl`.
@@ -222,6 +237,15 @@ KUBE_CACHE_DIR = os.environ.get(
 # `-l`. Must match `NS_LABEL` in src/cilium.ts.
 NS_LABEL = "k8s:io.kubernetes.pod.namespace"
 BASELINE_NEVER_NAMESPACE = "HELI0PAUSE-NEVER"
+# The posture objects the renderer may emit, mapped to the object-name suffix each one carries.
+# A baseline is the one shape whose spec is not a traffic flow, so it is checked against its own
+# exact template rather than the direction rules below — and the template is stated here, on the
+# agent, so a renderer that starts emitting a different one is refused instead of applied.
+# Must match `BASELINE_KINDS` in src/cilium.ts.
+BASELINE_SUFFIXES = {
+    "namespace-ingress-default-deny": "-baseline",
+    "selector-egress-default-deny": "-egress-baseline",
+}
 
 HTTP_TIMEOUT_SEC = 10
 NFT_TIMEOUT_SEC = 20
@@ -832,8 +856,16 @@ def _string_map(value, where, *, require_namespace=False):
     ns = out.get(NS_LABEL)
     if require_namespace and not ns:
         return None, f"{where} does not pin {NS_LABEL}; an empty/unscoped selector is forbidden"
-    if ns is not None and ns not in WORKLOAD_NAMESPACES:
-        return None, f"{where} reaches namespace {ns!r}, outside HELIOPAUSE_K8S_NAMESPACES"
+    # The peer set, not the writable one. This function checks selectors — an object's own
+    # `endpointSelector` and a rule's peers alike — and a selector is a reference, not a write. Where
+    # the object actually *lands* is checked separately against `WORKLOAD_NAMESPACES`
+    # (`metadata.namespace`), and the endpoint selector is pinned to that namespace, so nothing here
+    # widens where an object may be created.
+    if ns is not None and ns not in WORKLOAD_PEER_NAMESPACES:
+        return None, (
+            f"{where} reaches namespace {ns!r}, outside HELIOPAUSE_K8S_NAMESPACES and "
+            f"HELIOPAUSE_K8S_PEER_NAMESPACES"
+        )
     return out, ""
 
 
@@ -931,8 +963,9 @@ def _validate_workload_rule(rule, direction, where):
                     reason = f"{where}.toServices[0] is not a renderer-produced k8sService"
                 elif not isinstance(k8s.get("serviceName"), str) or not _DNS_LABEL.fullmatch(k8s["serviceName"]):
                     reason = f"{where}.toServices[0] has an invalid serviceName"
-                elif k8s.get("namespace") not in WORKLOAD_NAMESPACES:
-                    reason = f"{where}.toServices[0] reaches a namespace outside HELIOPAUSE_K8S_NAMESPACES"
+                elif k8s.get("namespace") not in WORKLOAD_PEER_NAMESPACES:
+                    # A Service reference is a peer like any other — see `_string_map`.
+                    reason = f"{where}.toServices[0] reaches a namespace this applier may not point at"
         if reason:
             return reason
     return ""
@@ -1021,7 +1054,12 @@ def validate_workload(text, *, cluster, applier, generation):
         if not isinstance(annotations, dict):
             return None, f"{where} has no annotations"
         baseline_kind = annotations.get("heliopause.io/policy-kind")
-        baseline = baseline_kind == "namespace-ingress-default-deny"
+        baseline_suffix = BASELINE_SUFFIXES.get(baseline_kind) if isinstance(baseline_kind, str) else None
+        baseline = baseline_suffix is not None
+        if baseline_kind is not None and not baseline:
+            # An unknown posture kind is refused rather than falling through to the traffic-flow
+            # rules, which would check the wrong template against it and could pass.
+            return None, f"{where} carries an unsupported heliopause.io/policy-kind"
         expected_annotations = {"heliopause.io/policy-id", "heliopause.io/applier", "heliopause.io/generation"}
         if baseline:
             expected_annotations.add("heliopause.io/policy-kind")
@@ -1035,7 +1073,7 @@ def validate_workload(text, *, cluster, applier, generation):
         if not isinstance(policy_id, str) or not _slug(policy_id):
             return None, f"{where} has an invalid policy-id annotation"
         base_name = f"hp-{_slug(cluster)}-{_slug(policy_id)}"
-        if name not in ({f"{base_name}-baseline"} if baseline else {base_name, f"{base_name}-ingress"}):
+        if name not in ({f"{base_name}{baseline_suffix}"} if baseline else {base_name, f"{base_name}-ingress"}):
             return None, f"{where} name {name!r} is not derived from cluster and policy-id"
 
         spec = obj.get("spec")
@@ -1058,7 +1096,7 @@ def validate_workload(text, *, cluster, applier, generation):
         if selected.get(NS_LABEL) != namespace:
             return None, f"{where} endpoint selector namespace does not match metadata.namespace"
 
-        if baseline:
+        if baseline_kind == "namespace-ingress-default-deny":
             if selected != {NS_LABEL: namespace}:
                 return None, f"{where} baseline endpoint selector must select exactly its namespace"
             if spec.get("enableDefaultDeny") != {"ingress": True}:
@@ -1067,6 +1105,21 @@ def validate_workload(text, *, cluster, applier, generation):
                 return None, f"{where} baseline carries an unsupported traffic direction"
             if spec.get("ingress") != [{"fromEndpoints": [{"matchLabels": {NS_LABEL: BASELINE_NEVER_NAMESPACE}}]}]:
                 return None, f"{where} baseline ingress must be its exact unmatchable source rule"
+            continue
+        if baseline_kind == "selector-egress-default-deny":
+            # The namespace-wide form is refused here as well as in the renderer, and for the reason
+            # the renderer states: an egress baseline *closes* what it selects, and a selector holding
+            # nothing but the namespace label closes every pod in that namespace. Both workloads this
+            # object was built for share a namespace with pods nobody asked to contain, so the
+            # difference between "the broker" and "everything beside the broker" is an outage.
+            if len(selected) < 2:
+                return None, f"{where} egress baseline selector names no label besides its namespace"
+            if spec.get("enableDefaultDeny") != {"egress": True}:
+                return None, f"{where} egress baseline enableDefaultDeny must be egress true"
+            if any(key in spec for key in ("ingress", "ingressDeny", "egressDeny")):
+                return None, f"{where} egress baseline carries an unsupported traffic direction"
+            if spec.get("egress") != [{"toEndpoints": [{"matchLabels": {NS_LABEL: BASELINE_NEVER_NAMESPACE}}]}]:
+                return None, f"{where} egress baseline egress must be its exact unmatchable destination rule"
             continue
         directions = [key for key in ("ingress", "egress", "ingressDeny", "egressDeny") if key in spec]
         if len(directions) != 1:
@@ -1114,8 +1167,10 @@ def validate_watch_selectors(watch):
     for ns in namespaces:
         if not isinstance(ns, str) or not _DNS_LABEL.fullmatch(ns):
             return None, f"watchSelectors contains invalid namespace {ns!r}"
-        if ns not in WORKLOAD_NAMESPACES:
-            return None, f"watchSelectors namespace {ns!r} is outside HELIOPAUSE_K8S_NAMESPACES"
+        if ns not in WORKLOAD_PEER_NAMESPACES:
+            # A membership query is a read. It is bounded by what we may look at, not by where we may
+            # write — the same split as `_string_map`.
+            return None, f"watchSelectors namespace {ns!r} is outside the namespaces this applier may query"
     for selector in labels:
         if not isinstance(selector, str) or not selector or len(selector.encode()) > MAX_SELECTOR_BYTES:
             return None, "watchSelectors contains an empty, non-text or overlong selector"
@@ -1135,7 +1190,7 @@ def validate_watch_selectors(watch):
         # removes the expensive `--all-namespaces` fallback from the heartbeat boundary.
         if not ns:
             return None, f"watch selector {selector!r} does not pin {NS_LABEL}"
-        if ns not in WORKLOAD_NAMESPACES:
+        if ns not in WORKLOAD_PEER_NAMESPACES:
             return None, f"watch selector {selector!r} reaches an unauthorised namespace"
     if len(set(namespaces)) != len(namespaces) or len(set(labels)) != len(labels):
         return None, "watchSelectors contains duplicate queries"
@@ -2347,7 +2402,11 @@ def _owned_object_error(obj, ref, cluster, generation=None):
     expected_annotation_keys = {
         "heliopause.io/policy-id", "heliopause.io/applier", "heliopause.io/generation",
     }
-    baseline = annotations.get("heliopause.io/policy-kind") == "namespace-ingress-default-deny" if isinstance(annotations, dict) else False
+    baseline_suffix = (
+        BASELINE_SUFFIXES.get(annotations.get("heliopause.io/policy-kind"))
+        if isinstance(annotations, dict) else None
+    )
+    baseline = baseline_suffix is not None
     if baseline:
         expected_annotation_keys.add("heliopause.io/policy-kind")
     if not isinstance(annotations, dict) or set(annotations) != expected_annotation_keys:
@@ -2359,7 +2418,7 @@ def _owned_object_error(obj, ref, cluster, generation=None):
             f"expected {HOST_ID!r}; refusing another applier's object"
         )
     if not isinstance(policy_id, str) or name not in (
-        {f"hp-{_slug(cluster)}-{_slug(policy_id)}-baseline"} if baseline else {
+        {f"hp-{_slug(cluster)}-{_slug(policy_id)}{baseline_suffix}"} if baseline else {
             f"hp-{_slug(cluster)}-{_slug(policy_id)}",
             f"hp-{_slug(cluster)}-{_slug(policy_id)}-ingress",
         }
@@ -2541,9 +2600,11 @@ def _selector_enforcement_gate(doc, deadline=None):
         ref = f"{ns}/{obj['metadata']['name']}"
         spec = obj["spec"]
         annotations = obj["metadata"].get("annotations", {})
-        if annotations.get("heliopause.io/policy-kind") == "namespace-ingress-default-deny":
+        if annotations.get("heliopause.io/policy-kind") in BASELINE_SUFFIXES:
             # Its sole peer selector intentionally cannot resolve to a Kubernetes namespace. The
-            # destination namespace must still be observed before we claim enforcement.
+            # selected pods must still be observed before we claim enforcement — for the egress form
+            # that is the whole check, since an egress baseline that selects nothing is a policy
+            # closing nobody while reading as containment.
             selectors = [("endpointSelector", spec["endpointSelector"]["matchLabels"])]
         else:
             selectors = None

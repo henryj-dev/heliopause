@@ -117,8 +117,24 @@ python3 scripts/git-hooks/test-pre-commit.py              # 실패 0 (사람 통
 `if __name__ == "__main__"` 이 파일 중간에 있어서 그 아래 다섯 클래스(라우트 안전 검사
 39개)가 정의조차 되지 않은 채 몇 달을 지났고, 초록불은 그동안 한 번도 흔들리지 않았다
 — 수가 줄어든 게 아니라 센 적이 없어 비교할 기준선이 없었다. 현재 기대값(정책 심링크 연결):
-`npm test` 1,807 + 8 (`@heliopause/manager`) + 206 (`@heliopause/web`) ·
-`test_validate.py` 244 (실행 232 · skip 12) · `test_enroll.py` 16.
+`npm test` 1,874 + 8 (`@heliopause/manager`) + 206 (`@heliopause/web`) ·
+`test_validate.py` 257 (실행 245 · skip 12) · `test_enroll.py` 16.
+그 1,874 는 **이 저장소 1,788(`src` + `examples`) + `policy` 86** 이다. 둘로 나눠 적는 이유는
+바로 아래에 있다 — 뒤의 86 은 이 저장소의 코드를 안 읽는다.
+
+⚠️ **`policy/*.test.ts` 는 이 저장소의 `src/` 를 검사하지 않는다.** `policy/` 는 심링크이고
+그 실체는 **빌드 포크 클론 안**(`mack-erel/heliopause/policy`)에 있다. 정책 테스트의
+`import ... from "../src/cilium.ts"` 는 링크가 아니라 **파일이 실제로 놓인 자리**에서 위로
+올라가므로, 그 `../src` 는 이 워크트리도 이 저장소의 메인 트리도 아닌 **그 포크 클론의 `src`**
+다. 그 클론은 2026-09-02 실측 `fork/main` 기준 280 커밋 뒤였고, 그래서 정책 저장소를 최신화하자
+`gen-workload-rbac.test.ts` 가 `does not provide an export named 'BASELINE_NEVER_NAMESPACE'` 로
+죽었다 — 이 저장소에는 그 export 가 몇 달째 있다.
+
+읽는 방향이 중요하다. 이 실패는 **이 저장소의 결함이 아니고**, 반대로 그 초록불도 이 저장소에
+대한 것이 **아니었다**. 렌더러를 고치고 `policy` 스위트가 초록인 것을 보고 「정책까지 통과했다」
+고 읽으면 안 된다 — 그 86개는 다른 클론의 렌더러를 검사한 것이다. 위의 「`policy/` 가 없으면
+조용히 좁아진다」와 같은 함정의 한 겹 아래다. 고치려면 그 포크 클론을 최신화해야 하고, 그것은
+이 저장소에서 할 일이 아니다.
 
 ⚠️ 훅 검사 7종은 `refs/remotes/origin/HEAD` 를 필요로 한다. `git clone` 은 그것을 쓰지만
 `actions/checkout` 은 안 쓴다 — 그래서 CI 쪽 job 이 먼저 `git symbolic-ref` 로 세운다.
