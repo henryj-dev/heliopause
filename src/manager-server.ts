@@ -125,6 +125,7 @@ import {
   normalizeEnrollmentHostname, preflightNodeCsr, rejectNodeCsr, requireEnrollmentDocument,
   recordHostDeregistrationReplication, reconcileHostDeregistrationRelays,
   normalizeExternalOperationId, repairHostDeregistrationCertificateInventory,
+  reopenRetiredHostname,
   repairHostDeregistrationRevocationCapacity,
   revokeAppToken, revokeCertificate, revokeNodeToken, storeNodeCertificate,
   submitValidatedNodeCsr, touchExistingNodeCsr, validateNodeCsrAsync, withEnrollmentTransaction,
@@ -234,6 +235,7 @@ export const API_ROUTE_PATTERNS: readonly RegExp[] = [
   /^\/enrollment\/host-lifecycle-bindings\/[^/]+\/[^/]+$/,
   /^\/enrollment\/host-deregistrations\/[^/]+\/[^/]+(?:\/infrastructure-destroyed)?$/,
   /^\/enrollment\/host-deregistrations\/[^/]+\/[^/]+\/policy-completed$/,
+  /^\/enrollment\/host-deregistrations\/[^/]+\/[^/]+\/reopen$/,
   /^\/enrollment\/host-deregistrations\/[^/]+\/[^/]+\/repairs\/(?:certificate-inventory|revocation-capacity)$/,
 ];
 
@@ -2102,6 +2104,37 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         const replication = await replicateRevocations();
         return send(res, 201, { ok: true, revocation: row, replication }); }
       catch (e) { return sendEnrollmentError(res, e); }
+    }
+
+    // ## Reopening a retired hostname is an operator action, and lands here on purpose
+    //
+    // The `/enrollment/host-deregistrations/...` family below is app-token scoped — that is the
+    // surface stardust drives to *retire* a host. This route deliberately sits up here in the
+    // operator block instead: a program must not be able to lift its own retirement. An app token is
+    // diverted to `handleAppToken` long before this point, so the only caller that can reach it is a
+    // certificate- or session-authenticated operator, with a one-time code.
+    //
+    // The path is outside the app-token regex's shape (it has no optional third segment matching
+    // `reopen`), so the two cannot collide.
+    const hostReopen = /^\/enrollment\/host-deregistrations\/([^/]+)\/([^/]+)\/reopen$/.exec(url.pathname);
+    if (opts.enrollment && req.method === "POST" && hostReopen) {
+      if (!mayWrite) return refuseWrite(res, who, url.pathname, principal.via);
+      try {
+        const body = JSON.parse(await readBody(req)) as { reason?: unknown; otp?: unknown };
+        if ((await requireOtp(principal, body, res, url.pathname)) === "answered") return;
+        if (Object.keys(body).some((key) => !["reason", "otp"].includes(key))) {
+          throw new EnrollmentError("request contains unsupported fields");
+        }
+        if (typeof body.reason !== "string") throw new EnrollmentError("reason required");
+        const reason = body.reason;
+        const result = enrollmentWrite(opts.enrollment.storeFile, (document) =>
+          reopenRetiredHostname(document, {
+            hostname: decodeURIComponent(hostReopen[1]!),
+            externalOperationId: decodeURIComponent(hostReopen[2]!),
+            reason, actor: who,
+          }));
+        return send(res, 200, { ok: true, reopened: result.changed, operation: result.row });
+      } catch (e) { return sendEnrollmentError(res, e); }
     }
 
     // `/ui` was an alias for `/` from the first read-only console and nothing in this repository ever
