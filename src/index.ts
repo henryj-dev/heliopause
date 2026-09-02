@@ -46,6 +46,7 @@ export {
   submitValidatedNodeCsr,
   submitNodeCsr,
   rejectNodeCsr,
+  reopenRetiredHostname,
   validateNodeCertificate,
   storeNodeCertificate,
   fetchNodeCertificate,

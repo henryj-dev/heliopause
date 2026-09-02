@@ -143,6 +143,25 @@ export interface HostDeregistrationRecord {
     };
   };
   blocked: { code: string; operatorAction: string } | null;
+  /**
+   * Set when an operator lifts this retirement's hold on the **hostname**, so it can be provisioned
+   * again under a new lifecycle.
+   *
+   * The row is kept rather than deleted, and that is the whole design. A deregistration is evidence —
+   * `#201` closed `web-01.dev-icn-vtr` with a lifecycle id, a provider instance id, three relay
+   * confirmations and a reviewed policy commit — and reuse of the name does not make any of that
+   * untrue. Deleting the row to unblock a re-create would erase the only durable record that the
+   * teardown happened, and the next question anyone asks about that hostname ("was it ever actually
+   * destroyed?") would have no answer.
+   *
+   * **The lifecycle tombstone is deliberately untouched.** Reopening says the *name* may be used
+   * again; it never says the retired lifecycle may provision again. `assertLifecycleMayProvision`
+   * checks the two separately, so an old lifecycle id stays dead permanently — which is what makes
+   * "reuse the hostname" safe to grant at all.
+   *
+   * Optional only for stores written before this existed; the parser fills it with `null`.
+   */
+  reopened: { at: string; by: string; reason: string } | null;
 }
 /**
  * Everything an app token is allowed to ask for.
@@ -246,7 +265,10 @@ function lifecycleTombstone(document: EnrollmentDocument, host: string, lifecycl
 function assertLifecycleMayProvision(document: EnrollmentDocument, host: string, lifecycle: string | null): void {
   const exact = lifecycleTombstone(document, host, lifecycle);
   if (exact) throw new EnrollmentError(`host lifecycle ${exact.hostLifecycleId} is deregistered`, 409);
-  const retired = document.hostDeregistrations.find((row) => row.hostname === host);
+  // Reopened rows are skipped here and **only** here. The lifecycle tombstone check above is
+  // untouched by a reopen, so the retired lifecycle stays refused forever while the hostname becomes
+  // available to a new one.
+  const retired = document.hostDeregistrations.find((row) => row.hostname === host && !row.reopened);
   if (retired) {
     throw new EnrollmentError(
       `hostname ${host} is retired by deregistration ${retired.externalOperationId}; an operator must explicitly reopen it before reuse`,
@@ -394,10 +416,23 @@ function parse(raw: unknown, source: string): EnrollmentDocument {
     if ((row.infrastructure as { expectedProviderInstanceId?: unknown }).expectedProviderInstanceId === undefined) {
       row.infrastructure.expectedProviderInstanceId = null;
     }
+    // Filled in rather than made optional in `exactObject`, so every row this process writes back
+    // carries the field and a store cannot end up with two shapes of the same record.
+    if ((row as { reopened?: unknown }).reopened === undefined) row.reopened = null;
     exactObject(row, [
       "id", "status", "hostname", "externalOperationId", "hostLifecycleId", "reason", "requestedBy", "scope",
-      "credentials", "infrastructure", "policy", "blocked", "createdAt", "updatedAt",
+      "credentials", "infrastructure", "policy", "blocked", "reopened", "createdAt", "updatedAt",
     ], `${source}: host deregistration`);
+    if (row.reopened !== null) {
+      const reopened = row.reopened as Record<string, unknown>;
+      if (typeof reopened !== "object" || Array.isArray(reopened)
+        || Object.keys(reopened).length !== 3
+        || typeof reopened.at !== "string" || !Number.isFinite(Date.parse(reopened.at))
+        || typeof reopened.by !== "string" || !reopened.by || reopened.by.length > 200
+        || typeof reopened.reason !== "string" || !reopened.reason || reopened.reason.length > 500) {
+        throw new EnrollmentError(`${source}: invalid host deregistration reopen record`);
+      }
+    }
     normalizeExternalOperationId(row.id);
     if (hostname(row.hostname) !== row.hostname || normalizeExternalOperationId(row.externalOperationId) !== row.externalOperationId
       || normalizeHostLifecycleId(row.hostLifecycleId) !== row.hostLifecycleId || row.reason !== "instance-destroy"
@@ -1474,6 +1509,7 @@ export function beginHostDeregistration(
       },
     },
     blocked: null,
+    reopened: null,
   };
   document.hostLifecycleTombstones.push({ hostname: host, hostLifecycleId, externalOperationId, createdAt: at });
   document.hostDeregistrations.push(row);
@@ -2016,6 +2052,80 @@ export function completeHostDeregistrationPolicy(document: EnrollmentDocument, i
     detail: { hostname: host, hostLifecycleId: lifecycle, pullRequestUrl, commitSha, publishedGeneration, relays: confirmations.length },
   }, now);
   return row;
+}
+
+/**
+ * Lift a completed retirement's hold on the **hostname**, so it can be provisioned again.
+ *
+ * ## The gate this opens, and the one it does not
+ *
+ * `assertLifecycleMayProvision` refuses a hostname with a live deregistration, and the 409 it raises
+ * has always said "an operator must explicitly reopen it before reuse". Nothing implemented that
+ * sentence. It was found on 2026-09-02, when stardust submitted a re-create of `web-01.dev-icn-vtr`
+ * and the create saga stopped at token issue with exactly that message — the gate worked, and the
+ * door behind it had never been built. The saga's fail-closed behaviour was correct: no VM was
+ * leased, no half-host appeared.
+ *
+ * The row is **kept**. A deregistration is evidence — for `web-01` that is a lifecycle id, a provider
+ * instance id, three relay confirmations of hostname absence and a reviewed policy commit — and
+ * reusing the name makes none of it untrue. Deleting the row to unblock a re-create would erase the
+ * only durable answer to the question anyone asks next about that hostname.
+ *
+ * The **lifecycle tombstone is untouched**, and that is what makes this safe to grant. Reopening says
+ * the *name* is free; it never says the retired lifecycle may provision again. The two are separate
+ * checks, so `f358c3d1-…` stays refused forever while a new lifecycle may take the name.
+ *
+ * ## Why `completed` is required
+ *
+ * A retirement that is still `credentials_pending`, `ready_for_infrastructure_destroy`,
+ * `policy_pending` or `blocked` has work outstanding — a VM that may still exist, a policy PR that
+ * may still be open. Reopening the hostname then would let a second host enrol under a name whose
+ * first teardown is unfinished, and the two would race over the same policy entry and the same
+ * certificates. Refused, with the state named, rather than reopened into that.
+ *
+ * ## What this does **not** do
+ *
+ * It does not touch `policy/retired-hosts.json` in the policy repository. That document is a second,
+ * independent hold: `withoutRetiredHosts` drops a retired id from the rendered host set, so a
+ * hostname reopened here and left listed there would enrol successfully and then receive **no
+ * ruleset** — a host that reads as configured and has no firewall. Removing that entry is a reviewed
+ * pull request, the same path the retirement took, and the caller is told so.
+ */
+export function reopenRetiredHostname(document: EnrollmentDocument, input: {
+  hostname: string; externalOperationId: string; reason: string; actor: string; now?: Date;
+}): { row: HostDeregistrationRecord; changed: boolean } {
+  const host = hostname(input.hostname);
+  const operationId = normalizeExternalOperationId(input.externalOperationId);
+  const actor = input.actor.trim();
+  if (!actor || actor.length > 200) throw new EnrollmentError("actor must be 1-200 characters");
+  const reason = input.reason.trim();
+  // Required, and not defaulted to something like "reopened". The hostname gate exists because a
+  // reused name is the one thing a deregistration cannot prove is safe, and the audit row is the
+  // only place the operator's argument for reusing it survives.
+  if (!reason || reason.length > 500) throw new EnrollmentError("reason must be 1-500 characters");
+  const row = document.hostDeregistrations.find((candidate) =>
+    candidate.hostname === host && candidate.externalOperationId === operationId);
+  // The operation id is required rather than reopening "whatever retired this name", so an operator
+  // who has the wrong retirement in mind is refused instead of silently opening a different one.
+  if (!row) throw new EnrollmentError("host deregistration not found", 404);
+  if (row.reopened) return { row, changed: false };
+  if (row.status !== "completed") {
+    throw new EnrollmentError(
+      `host deregistration ${operationId} is ${row.status}, not completed — reopening a hostname ` +
+        `whose teardown is unfinished would let a new host take a name whose VM, certificates or ` +
+        `policy removal are still outstanding`,
+      409,
+    );
+  }
+  const now = input.now ?? new Date();
+  const at = nowIso(now);
+  row.reopened = { at, by: actor, reason };
+  row.updatedAt = at;
+  audit(document, {
+    actor, action: "host-deregistration.hostname-reopened", target: operationId, sourceIp: null,
+    detail: { hostname: host, hostLifecycleId: row.hostLifecycleId, reason },
+  }, now);
+  return { row, changed: true };
 }
 
 const csrWorkerRequest = workerData as { heliopauseCsrValidation?: unknown; csrPem?: unknown; expectedHostname?: unknown } | null;

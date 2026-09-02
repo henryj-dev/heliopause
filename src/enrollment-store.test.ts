@@ -11,7 +11,8 @@ import {
   confirmHostInfrastructureDestroyed, createAppToken, createNodeToken, emptyEnrollmentDocument,
   fetchNodeCertificate, initializeEnrollmentDocument,
   loadEnrollmentDocument, looksLikeAppToken, looksLikeNodeToken, lookupAppToken, lookupNodeToken, NODE_TOKEN_PREFIX,
-  recordHostDeregistrationReplication, rejectNodeCsr, repairHostDeregistrationCertificateInventory, repairHostDeregistrationRevocationCapacity,
+  recordHostDeregistrationReplication, rejectNodeCsr, reopenRetiredHostname,
+  repairHostDeregistrationCertificateInventory, repairHostDeregistrationRevocationCapacity,
   revokeAppToken, saveEnrollmentDocument, storeNodeCertificate, submitNodeCsr, validateNodeCsrAsync,
   withEnrollmentTransaction, type NodeCsrRecord,
 } from "./enrollment-store.ts";
@@ -44,6 +45,136 @@ function storedRequest(input: Partial<NodeCsrRecord> & Pick<NodeCsrRecord, "id" 
   };
   return { ...defaults, ...input };
 }
+
+// ── Reopening a retired hostname ─────────────────────────────────────────────
+//
+// The 409 that guards a retired name has always said "an operator must explicitly reopen it before
+// reuse", and for as long as it has said that, nothing implemented it. It was found on 2026-09-02:
+// stardust submitted a re-create of `web-01.dev-icn-vtr` and the create saga stopped at token issue
+// with exactly that message. The gate was right and the door behind it did not exist.
+describe("reopenRetiredHostname", () => {
+  /** A hostname carried all the way to `completed`, the only state a reopen is allowed from. */
+  const retired = (over: { hostname?: string; stopAt?: "credentials" | "destroyed" } = {}) => {
+    const host = over.hostname ?? "web-01.dev";
+    const document = emptyEnrollmentDocument();
+    const now = new Date("2026-09-01T00:10:00.000Z");
+    createNodeToken(document, { hostname: host, hostLifecycleId: "create-1", now });
+    beginHostDeregistration(document, {
+      hostname: host, externalOperationId: "destroy-1", hostLifecycleId: "create-1",
+      reason: "instance-destroy", requestedBy: "stardust", actor: "app:destroyer", relayNames: ["dev"],
+      scope: { appTokenId: "app-1", label: "destroyer", hostnamePattern: "*.dev" }, trustedCaPems: [], now,
+    });
+    if (over.stopAt === "credentials") return { document, host, now };
+    recordHostDeregistrationReplication(document, [
+      { name: "dev", ok: true, count: 0, snapshotFingerprints: [] },
+    ], ["dev"], now);
+    confirmHostInfrastructureDestroyed(document, {
+      hostname: host, externalOperationId: "destroy-1", hostLifecycleId: "create-1",
+      provider: "vultr", providerInstanceId: "vultr-1", destroyedAt: "2026-09-01T00:09:00.000Z",
+      actor: "app:destroyer", now,
+    });
+    if (over.stopAt === "destroyed") return { document, host, now };
+    completeHostDeregistrationPolicy(document, {
+      hostname: host, externalOperationId: "destroy-1", hostLifecycleId: "create-1",
+      pullRequestUrl: "https://github.test/o/r/pull/16", commitSha: "f".repeat(40),
+      publishedGeneration: "f2628da", relayConfirmations: [{ name: "dev", absentAt: "2026-09-01T00:09:30.000Z" }],
+      relayNames: ["dev"], actor: "ops", now,
+    });
+    return { document, host, now };
+  };
+
+  const reopen = (document: ReturnType<typeof emptyEnrollmentDocument>, host: string, over: Record<string, unknown> = {}) =>
+    reopenRetiredHostname(document, {
+      hostname: host, externalOperationId: "destroy-1", reason: "stardust is re-creating the instance",
+      actor: "ops", now: new Date("2026-09-02T01:00:00.000Z"), ...over,
+    });
+
+  it("frees the hostname for a new lifecycle and keeps the old one dead", () => {
+    // The whole safety of granting this. Reuse of the *name* is what an operator decides; reuse of
+    // the retired *lifecycle* is never on the table, and the two are separate checks so the second
+    // cannot be lifted by accident along with the first.
+    const { document, host } = retired();
+    assert.throws(() => createNodeToken(document, { hostname: host, hostLifecycleId: "create-2" }), /must explicitly reopen/);
+
+    const result = reopen(document, host);
+    assert.equal(result.changed, true);
+    assert.equal(result.row.reopened?.by, "ops");
+    assert.equal(result.row.reopened?.reason, "stardust is re-creating the instance");
+
+    // The name is now available — to a *new* lifecycle.
+    const token = createNodeToken(document, { hostname: host, hostLifecycleId: "create-2" });
+    assert.equal(token.row.hostname, host);
+    // And permanently unavailable to the retired one.
+    assert.throws(() => createNodeToken(document, { hostname: host, hostLifecycleId: "create-1" }), /deregistered/);
+  });
+
+  it("keeps the deregistration as evidence rather than deleting it", () => {
+    // A retirement is what proves the teardown happened — lifecycle, provider instance, relay
+    // confirmations, reviewed commit. Reusing the name makes none of that untrue, and deleting the
+    // row to unblock a re-create would leave "was it ever actually destroyed?" with no answer.
+    const { document, host } = retired();
+    reopen(document, host);
+    assert.equal(document.hostDeregistrations.length, 1);
+    const row = document.hostDeregistrations[0]!;
+    assert.equal(row.status, "completed");
+    assert.equal(row.policy.commitSha, "f".repeat(40));
+    assert.equal(row.infrastructure.providerInstanceId, "vultr-1");
+    assert.equal(document.hostLifecycleTombstones.length, 1);
+    assert.ok(document.audit.some((event) =>
+      event.action === "host-deregistration.hostname-reopened" && event.actor === "ops"));
+  });
+
+  it("refuses to reopen a teardown that has not finished", () => {
+    // A new host taking a name whose VM may still exist, or whose policy pull request is still open,
+    // races the unfinished half over the same certificates and the same policy entry.
+    for (const stopAt of ["credentials", "destroyed"] as const) {
+      const { document, host } = retired({ stopAt });
+      assert.throws(() => reopen(document, host), /not completed/, `reopen was allowed from ${stopAt}`);
+      assert.throws(() => createNodeToken(document, { hostname: host, hostLifecycleId: "create-2" }), /reopen|deregistered/);
+    }
+  });
+
+  it("requires the exact operation, and a reason", () => {
+    const { document, host } = retired();
+    // Not "reopen whatever retired this name": an operator with the wrong retirement in mind is
+    // refused rather than quietly opening a different one.
+    assert.throws(() => reopen(document, host, { externalOperationId: "destroy-2" }), /not found/);
+    assert.throws(() => reopen(document, "other-host.dev"), /not found/);
+    // The reason is the only place the argument for reusing the name survives.
+    assert.throws(() => reopen(document, host, { reason: "  " }), /reason must be/);
+    assert.throws(() => reopen(document, host, { actor: "" }), /actor must be/);
+  });
+
+  it("is idempotent, and keeps the first operator's record", () => {
+    const { document, host } = retired();
+    const first = reopen(document, host);
+    const second = reopen(document, host, { actor: "someone-else", reason: "different reason" });
+    assert.equal(second.changed, false);
+    assert.equal(second.row.reopened?.by, "ops");
+    assert.equal(second.row.reopened?.at, first.row.reopened?.at);
+    assert.equal(document.audit.filter((e) => e.action === "host-deregistration.hostname-reopened").length, 1);
+  });
+
+  it("survives a save/load round trip, and a store written before the field existed", () => {
+    const root = mkdtempSync(join(tmpdir(), "heliopause-reopen-"));
+    try {
+      const { document, host } = retired();
+      reopen(document, host);
+      const file = join(root, "store.json");
+      saveEnrollmentDocument(file, document);
+      const reloaded = loadEnrollmentDocument(file);
+      assert.equal(reloaded!.hostDeregistrations[0]!.reopened?.by, "ops");
+      // A store written before this field existed has no `reopened` key. It must load as "not
+      // reopened" rather than being refused for an unsupported shape.
+      const older = JSON.parse(readFileSync(file, "utf8")) as { hostDeregistrations: Array<Record<string, unknown>> };
+      delete older.hostDeregistrations[0]!.reopened;
+      writeFileSync(file, JSON.stringify(older));
+      const legacy = loadEnrollmentDocument(file);
+      assert.equal(legacy!.hostDeregistrations[0]!.reopened, null);
+      assert.throws(() => createNodeToken(legacy!, { hostname: host, hostLifecycleId: "create-2" }), /must explicitly reopen/);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
 
 describe("standalone enrollment store", () => {
   it("allows exact break-glass policy evidence from every destroyed worker-pending state", () => {

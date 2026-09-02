@@ -3,7 +3,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import {
   createAppToken, createNodeToken, initializeEnrollmentDocument, normalizeEnrollmentHostname,
-  requireEnrollmentDocument, rejectNodeCsr,
+  reopenRetiredHostname, requireEnrollmentDocument, rejectNodeCsr,
   revokeAppToken, revokeNodeToken, storeNodeCertificate, type CsrStatus,
   revokeCertificate,
   withEnrollmentTransaction,
@@ -34,6 +34,7 @@ const usage = `usage:
   heliopause-enrollment audit <store.json> [--json]
   heliopause-enrollment cert-revoke <store.json> --cert=FILE --reason=TEXT [--actor=NAME]
   heliopause-enrollment revocation-list <store.json> [--json]
+  heliopause-enrollment host-reopen <store.json> <hostname> --operation=ID --reason=TEXT [--actor=NAME]
 
 Use an https manager URL instead of <store.json> for remote operation, with
 --pki=DIR [--operator=NAME] [--otp=CODE]. Remote cert-upload needs --cert and --ca-name; the
@@ -53,6 +54,24 @@ const publicToken = (row: ReturnType<typeof requireEnrollmentDocument>["tokens"]
 const publicAppToken = ({ tokenHash: _secret, ...row }: ReturnType<typeof requireEnrollmentDocument>["appTokens"][number]) => row;
 /** Split once, here, so the store sees the same list whether it was typed locally or posted. */
 const scopeList = (): string[] => requiredFlag("scopes").split(",").map((scope) => scope.trim()).filter(Boolean);
+/**
+ * Say what was opened, what stays shut, and the half this command cannot do.
+ *
+ * The second half is not a footnote. `policy/retired-hosts.json` is an independent hold —
+ * `withoutRetiredHosts` drops a retired id from the rendered host set — so a hostname reopened here
+ * and left listed there enrols cleanly and then receives **no ruleset**. A host that reads as
+ * configured and has no firewall is a worse outcome than the 409 this command exists to clear, so
+ * the follow-up is printed every time rather than left to the runbook.
+ */
+const reportReopen = (
+  changed: boolean,
+  operation: { hostname: string; hostLifecycleId: string; externalOperationId: string },
+): void => {
+  console.log(`${changed ? "reopened" : "already reopened"} ${operation.hostname} (deregistration ${operation.externalOperationId})`);
+  console.log(`  lifecycle ${operation.hostLifecycleId} stays deregistered — reuse needs a new lifecycle id`);
+  console.log("  next: remove this hostname from policy/retired-hosts.json by reviewed pull request,");
+  console.log("        or it will enrol and render no ruleset at all");
+};
 
 async function remote(): Promise<void> {
   const { api, operatorCreds } = await import("../src/api-client.ts");
@@ -102,6 +121,13 @@ async function remote(): Promise<void> {
   } else if (command === "cert-revoke") {
     const answer = await call<{ revocation: { fingerprint256: string } }>("/enrollment/revocations", "POST", { certificatePem: readFileSync(requiredFlag("cert"), "utf8"), reason: requiredFlag("reason"), otp });
     console.log(`revoked certificate sha256:${answer.revocation.fingerprint256}`);
+  } else if (command === "host-reopen") {
+    if (!subject) throw new Error(usage);
+    const answer = await call<{ reopened: boolean; operation: { hostname: string; hostLifecycleId: string; externalOperationId: string } }>(
+      `/enrollment/host-deregistrations/${encodeURIComponent(subject)}/${encodeURIComponent(requiredFlag("operation"))}/reopen`,
+      "POST", { reason: requiredFlag("reason"), otp },
+    );
+    reportReopen(answer.reopened, answer.operation);
   } else if (command === "revocation-list") {
     console.log(JSON.stringify(await call("/enrollment/revocations", "GET"), null, 2));
   } else throw new Error(usage);
@@ -174,6 +200,13 @@ try {
   } else if (command === "cert-revoke") {
     const row = persist((document) => revokeCertificate(document, { certificatePem: readFileSync(requiredFlag("cert"), "utf8"), reason: requiredFlag("reason"), actor: actor() }));
     console.log(`revoked certificate sha256:${row.fingerprint256}`);
+  } else if (command === "host-reopen") {
+    if (!subject) throw new Error(usage);
+    const result = persist((document) => reopenRetiredHostname(document, {
+      hostname: subject, externalOperationId: requiredFlag("operation"),
+      reason: requiredFlag("reason"), actor: actor(),
+    }));
+    reportReopen(result.changed, result.row);
   } else if (command === "revocation-list") {
     const rows = requireEnrollmentDocument(store).revocations;
     if (flags.has("json")) console.log(JSON.stringify({ revocations: rows }, null, 2));

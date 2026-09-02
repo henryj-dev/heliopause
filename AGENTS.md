@@ -117,9 +117,9 @@ python3 scripts/git-hooks/test-pre-commit.py              # 실패 0 (사람 통
 `if __name__ == "__main__"` 이 파일 중간에 있어서 그 아래 다섯 클래스(라우트 안전 검사
 39개)가 정의조차 되지 않은 채 몇 달을 지났고, 초록불은 그동안 한 번도 흔들리지 않았다
 — 수가 줄어든 게 아니라 센 적이 없어 비교할 기준선이 없었다. 현재 기대값(정책 심링크 연결):
-`npm test` 1,874 + 8 (`@heliopause/manager`) + 206 (`@heliopause/web`) ·
+`npm test` 1,880 + 8 (`@heliopause/manager`) + 206 (`@heliopause/web`) ·
 `test_validate.py` 257 (실행 245 · skip 12) · `test_enroll.py` 16.
-그 1,874 는 **이 저장소 1,788(`src` + `examples`) + `policy` 86** 이다. 둘로 나눠 적는 이유는
+그 1,880 은 **이 저장소 1,794(`src` + `examples`) + `policy` 86** 이다. 둘로 나눠 적는 이유는
 바로 아래에 있다 — 뒤의 86 은 이 저장소의 코드를 안 읽는다.
 
 ⚠️ **`policy/*.test.ts` 는 이 저장소의 `src/` 를 검사하지 않는다.** `policy/` 는 심링크이고

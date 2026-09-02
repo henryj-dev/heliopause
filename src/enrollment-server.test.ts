@@ -995,6 +995,41 @@ describe("lifecycle-bound host deregistration", () => {
       hostname: "retire-me.dev", hostLifecycleId: "create-operation-101",
     }, appToken)).status, 409, "policy attestation implicitly reopened a retired hostname");
 
+    // ## The door behind that 409
+    //
+    // The message it carries has always said "an operator must explicitly reopen it before reuse",
+    // and until 2026-09-02 nothing implemented that. It was found when stardust submitted a
+    // re-create of `web-01.dev-icn-vtr` and the create saga stopped here — correctly, fail-closed,
+    // with no VM leased — against a door that had never been built.
+    //
+    // The retirement surface above is app-token scoped, because retiring is what stardust drives.
+    // Reopening is not: a program must not be able to lift its own retirement, so the route lives in
+    // the operator block and an app token cannot reach it at all.
+    const reopenPath = `${path}/reopen`;
+    const byApp = await app(reopenPath, "POST", { reason: "re-creating" }, appToken);
+    assert.notEqual(byApp.status, 200, "an app token lifted its own retirement");
+    assert.equal((await app("/enrollment/tokens", "POST", {
+      hostname: "retire-me.dev", hostLifecycleId: "create-operation-101",
+    }, appToken)).status, 409, "a refused reopen still freed the hostname");
+
+    const reopened = await operator(reopenPath, "POST", {
+      otp: "123456", reason: "stardust is re-creating the instance",
+    });
+    assert.equal(reopened.status, 200, JSON.stringify(reopened.body));
+    assert.equal(reopened.body.reopened, true);
+    // The evidence stays. Reusing the name does not make the teardown untrue.
+    assert.equal(reopened.body.operation.status, "completed");
+    assert.equal(reopened.body.operation.policy.publishedGeneration, "generation-9");
+
+    // A **new** lifecycle may now take the name...
+    assert.equal((await app("/enrollment/tokens", "POST", {
+      hostname: "retire-me.dev", hostLifecycleId: "create-operation-101",
+    }, appToken)).status, 201);
+    // ...and the retired one still may not, which is what makes granting the first one safe.
+    assert.equal((await app("/enrollment/tokens", "POST", {
+      hostname: "retire-me.dev", hostLifecycleId: lifecycle,
+    }, appToken)).status, 409, "reopening the hostname also revived its retired lifecycle");
+
     const stored = loadEnrollmentDocument(deregStore);
     assert.equal(stored.requests.find((row) => row.id === "pending-exact")?.status, "host-deregistered");
     assert.ok(stored.revocations.some((row) => row.fingerprint256 === certificate.fingerprint256.replaceAll(":", "").toLowerCase()));
