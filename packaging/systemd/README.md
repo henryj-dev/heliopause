@@ -80,6 +80,13 @@ systemctl daemon-reload && systemctl restart heliopause-agent
 `packaging/kubernetes/heliopause-agent-rbac.yaml`은 ServiceAccount와 아직 아무 namespace에도
 결속되지 않은 최소권한 역할을 만든다. `heliopause-agent-rolebinding.example.yaml`을
 `HELIOPAUSE_K8S_NAMESPACES`의 각 namespace마다 복사·수정해 RoleBinding으로 결속한다.
+`HELIOPAUSE_K8S_PEER_NAMESPACES`에 이름이 있는 namespace는 **다른 예제**를 쓴다 —
+`heliopause-agent-podreader.example.yaml`은 Pod 읽기만 주는 별도 Role이다. 그쪽에
+`heliopause-workload-applier`를 결속하면 안 된다. 그 ClusterRole은 CiliumNetworkPolicy
+쓰기를 함께 주고, 이 목록에서 실제로 필요한 namespace는 `kube-system`이다 — 거기 만들 수 있는
+객체 하나가 CoreDNS를 ingress 기본거부에 넣는 것이고, 그것은 조회만 필요했던 자격에서 닿는
+클러스터 전체 DNS 장애다.
+
 **ClusterRoleBinding은 만들지 않는다.** 권한은 CiliumNetworkPolicy의 get/create/update/delete와
 selector 집행 확인에 필요한 Pod get/list뿐이다. 전용 kubeconfig는 이 ServiceAccount만 사용하고
 `0600`으로 설치한다. 에이전트는 kubeconfig 미설정, 일반 k3s/Kubernetes admin 경로, 느슨한 파일 모드,
