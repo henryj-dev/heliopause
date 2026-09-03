@@ -46,6 +46,17 @@ export interface HostStatus {
    * `undefined` on an agent too old to send one, which is itself the thing worth seeing.
    */
   agentVersion?: string | null;
+  /**
+   * Digest of the agent's own source. Optional: an older agent does not send it.
+   *
+   * Carried beside `agentVersion` rather than instead of it, because they answer different
+   * questions. The version is what a person says the build is; this is what the build *is*. On
+   * 2026-09-03 those two disagreed on the applier for a day — same version, same schema, different
+   * code — and the difference decided whether a generation applied at all.
+   */
+  agentBuild?: string | null;
+  /** The agent's own account of why it refused the last artifact. See `Heartbeat.lastRefusal`. */
+  lastRefusal?: { generation: string; reason: string; at: string } | null;
 
   /**
    * The workload half's state, on a host that was assigned one. Absent otherwise.

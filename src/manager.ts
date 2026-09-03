@@ -148,6 +148,8 @@ export interface SiteView {
      * `null` on an agent too old to send one, which is what a half-finished rollout looks like.
      */
     agentVersion: string | null;
+    agentBuild: string | null;
+    lastRefusal: { generation: string; reason: string; at: string } | null;
     /** Ports another table redirects inbound, outside what this ruleset governs (H36). */
     publishedPorts: string[] | null;
     /**
@@ -238,6 +240,8 @@ export function siteView(results: RelayResult[]): SiteView {
         contradictions: h.contradictions ?? [],
         intrusions: h.intrusions ?? null,
         agentVersion: h.agentVersion ?? null,
+        agentBuild: h.agentBuild ?? null,
+        lastRefusal: h.lastRefusal ?? null,
         publishedPorts: h.publishedPorts ?? null,
         routes: h.routes ?? null,
         ciliumExposure: h.ciliumExposure ?? null,

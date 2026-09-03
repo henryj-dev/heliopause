@@ -449,6 +449,27 @@ export interface CiliumExposure {
 export interface Heartbeat {
   host: string;
   agentVersion: string;
+  /**
+   * Digest of the agent's own source, as `agent/heliopause-pull.py` computes it.
+   *
+   * Optional because an older agent does not send it, and `null` there means "did not say" — never
+   * "matches". See `_agent_build` in the agent for why a version string was not enough: a change can
+   * be load-bearing for what an agent accepts and still move neither `agentVersion` nor
+   * `schemaVersion`, and one did.
+   */
+  agentBuild?: string | null;
+  /**
+   * Why this host refused the last artifact it was offered, when it refused one.
+   *
+   * Absent means "nothing to say". Present, it is the sentence that used to exist only in the host's
+   * journal: `verify_artifact_envelope` raises, the agent logs one line and returns, and the next
+   * heartbeat reported the *previous* generation with no reason at all.
+   *
+   * That silence cost two round trips on 2026-09-02–03 — a schema skew on one host, a peer namespace
+   * on the applier — and in both the relay was holding a generation while the agent knew exactly why
+   * it would not take it. The fleet view showed `blockedBy: null`.
+   */
+  lastRefusal?: { generation: string; reason: string; at: string } | null;
   schemaVersion: number;
 
   /**

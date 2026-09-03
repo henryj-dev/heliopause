@@ -5,6 +5,7 @@ import {
   membershipJumps,
   podsFromMembership,
   selectorsToWatch,
+  MAX_WATCH_SELECTORS,
   CiliumRenderError,
   assignsToWorkloadLayer,
   planCiliumPolicies,
@@ -1078,14 +1079,20 @@ describe("selectorsToWatch", () => {
   });
 
   it("refuses more selector queries than the agent will service", () => {
-    const items = Array.from({ length: 33 }, (_, i) => ({
+    // Derived from the constant, not typed again. The bound is a budget on kubectl forks per beat
+    // and it has been raised once already (32 → 64, exchange 219); a test that restates the number
+    // fails on the raise rather than on the behaviour, which teaches the next person to edit the
+    // assertion instead of reading it.
+    const items = Array.from({ length: MAX_WATCH_SELECTORS + 1 }, (_, i) => ({
       policy: policy({
         id: `bound-${i}`,
         src: { kind: "k8s-namespace" as const, value: `ns-${i}` },
         dst: { kind: "internet" as const, value: "" },
       }),
     }));
-    assert.throws(() => selectorsToWatch(items), /limit is 32/);
+    assert.throws(() => selectorsToWatch(items), new RegExp(`limit is ${MAX_WATCH_SELECTORS}`));
+    // The known positive: exactly at the bound is fine, so the refusal is about crossing it.
+    assert.doesNotThrow(() => selectorsToWatch(items.slice(0, MAX_WATCH_SELECTORS)));
   });
 
   it("refuses an unscoped label instead of asking the agent for every namespace", () => {
@@ -1472,8 +1479,9 @@ describe("selector-egress-default-deny baseline", () => {
     // Merged in *here* rather than at the call site: the bound is the agent's, enforced
     // independently, so a set of baselines that pushed the request past it used to be discovered on
     // the node instead of at the render.
-    const many = Array.from({ length: 33 }, (_, i) => baseline({ id: `B${i}`, selector: `${NS}=dispatcher,app=b${i}` }));
-    assert.throws(() => selectorsToWatch([], many), /limit is 32/);
+    const many = Array.from({ length: MAX_WATCH_SELECTORS + 1 }, (_, i) =>
+      baseline({ id: `B${i}`, selector: `${NS}=dispatcher,app=b${i}` }));
+    assert.throws(() => selectorsToWatch([], many), new RegExp(`limit is ${MAX_WATCH_SELECTORS}`));
   });
 });
 

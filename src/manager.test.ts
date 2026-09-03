@@ -12,6 +12,8 @@ import type { FleetView, HostView } from "./relay.ts";
 const host = (over: Partial<HostView> = {}): HostView => ({
   host: "h-a",
   agentVersion: "0.3.0-pull",
+  agentBuild: null,
+  lastRefusal: null,
   stage: "canary",
   state: "confirmed",
   generation: "gen1",
