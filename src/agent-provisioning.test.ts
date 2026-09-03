@@ -58,6 +58,43 @@ describe("the agent's required configuration is documented where it is copied fr
     }
   });
 
+  it("documents every namespace list the agent reads, so a provisioner can set them", () => {
+    // The failure this closes, measured 2026-09-03: `HELIOPAUSE_K8S_PEER_NAMESPACES` was added to
+    // the agent and to the renderer and **not to this file**. stardust renders `agent.env` from
+    // exactly this example, so a variable absent here is one their provisioning cannot set — and
+    // the first policy naming a peer outside the writable list would have had the agent refuse the
+    // *whole* workload document, taking the existing CNPs down with the new ones.
+    //
+    // Optional settings are commented out in the example, so the match allows the `#` — what is
+    // being checked is that the name and a usable value are written down, not that they are active.
+    const example = read("../packaging/systemd/agent.env.example");
+    const agent = read("../agent/heliopause-pull.py");
+    const read_by_agent = [...agent.matchAll(/os\.environ\.get\("(HELIOPAUSE_K8S_[A-Z_]*NAMESPACES)"/g)]
+      .map((m) => m[1]!);
+    assert.ok(read_by_agent.length >= 2, `expected both namespace lists, found ${read_by_agent.join(", ")}`);
+    for (const name of new Set(read_by_agent)) {
+      assert.match(example, new RegExp(`^#?${name}=.+$`, "m"), `${name} is not documented in agent.env.example`);
+    }
+  });
+
+  it("gives a peer namespace a grant that cannot close its pods", () => {
+    // The two lists are two privileges, and the example an operator copies has to keep them apart.
+    // `kube-system` is the peer namespace that matters — binding the applier ClusterRole there would
+    // let this agent create the CiliumNetworkPolicy that puts CoreDNS into ingress default-deny.
+    const podreader = read("../packaging/kubernetes/heliopause-agent-podreader.example.yaml");
+    // Comments stripped first. The header deliberately *names* `ciliumnetworkpolicies` — in the
+    // `kubectl auth can-i … # no` line that proves the boundary — so a whole-file search would fail
+    // on the very sentence that documents the property being checked.
+    const manifest = podreader.split("\n").filter((l) => !/^\s*#/.test(l)).join("\n");
+    assert.match(manifest, /resources: \["pods"\]/);
+    assert.equal(/ciliumnetworkpolicies/.test(manifest), false, "the pod-reader example grants CNP verbs");
+    // A Role, not a ClusterRole, and bound by name to itself — not to the applier role next door.
+    assert.match(manifest, /kind: Role\n\s+name: heliopause-agent-podreader/);
+    assert.equal(/name: heliopause-workload-applier/.test(manifest), false);
+    // And the README has to send the reader there, or the file is one nobody copies.
+    assert.match(read("../packaging/systemd/README.md"), /heliopause-agent-podreader\.example\.yaml/);
+  });
+
   it("starts the agent from the certificate path the agent is configured to read", () => {
     // `heliopause-agent.path` watches one file and the agent reads one file, and nothing but this
     // test says they are the same file. If the example moved the certificate — or the unit did —

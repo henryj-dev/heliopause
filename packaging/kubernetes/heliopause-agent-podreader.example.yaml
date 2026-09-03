@@ -1,0 +1,47 @@
+# Copy once per HELIOPAUSE_K8S_PEER_NAMESPACES entry and replace REPLACE-ME before applying.
+# Keeping this an invalid namespace is deliberate: applying the example verbatim must fail closed.
+#
+# ## Why this is a second, smaller grant and not the sibling example
+#
+# `heliopause-agent-rolebinding.example.yaml` binds `heliopause-workload-applier`, which carries
+# `ciliumnetworkpolicies: get,create,update,delete`. Binding that in a peer namespace would let this
+# agent **close** the pods there — and the peer namespace that matters is `kube-system`, where the
+# object it could create is one that puts CoreDNS into ingress default-deny. That is a cluster-wide
+# DNS outage reachable from a credential that only ever needed to *look*.
+#
+# So a peer namespace gets this Role instead: pods, read-only, nothing else. The agent needs it
+# because the enforcement gate runs `kubectl -n <ns> get pods` before it will call a generation
+# confirmed, and a selector pointing at a namespace it cannot list is a generation it can never
+# confirm.
+#
+# Verify the boundary after applying — the second line is the one worth checking:
+#
+#   kubectl auth can-i list pods -n REPLACE-ME \
+#     --as=system:serviceaccount:heliopause-system:heliopause-agent          # yes
+#   kubectl auth can-i create ciliumnetworkpolicies -n REPLACE-ME \
+#     --as=system:serviceaccount:heliopause-system:heliopause-agent          # no
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: heliopause-agent-podreader
+  namespace: REPLACE-ME
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    # `watch` alongside `get`/`list` because a selector query may be served from a watch cache; the
+    # applier ClusterRole above does not need it and does not have it.
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: heliopause-agent-podreader
+  namespace: REPLACE-ME
+subjects:
+  - kind: ServiceAccount
+    name: heliopause-agent
+    namespace: heliopause-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: heliopause-agent-podreader
