@@ -1331,3 +1331,63 @@ describe("a host outside this relay's generation", () => {
     assert.ok(s.statuses["h-anyone"], "with no manifest there is nothing to exclude against");
   });
 });
+
+// ── A refusal is the host's answer, and it used to stay on the host ───────────
+//
+// Twice on 2026-09-02–03 a host sat on an old generation while the relay held a new one, and every
+// field in the fleet view said fine: `state: confirmed`, `blockedBy: null`, `drifted: false`. The
+// agent knew why both times — a schema skew, then a peer namespace its build did not support — and
+// the sentence existed only in a journal on a machine the person diagnosing it could not read.
+describe("a refused generation says so where an operator looks", () => {
+  const refused = (generation: string, reason: string) =>
+    hb({
+      applied: { generation: "gen1", state: "confirmed", artifactHash: "a", observedHash: "h" },
+      lastRefusal: { generation, reason, at: AT },
+    });
+
+  it("reports the refusal and names the generation it refused", () => {
+    const s = state();
+    s.manifest = { ...manifest, generation: "gen2" };
+    handleHeartbeat(s, "h-canary", refused("gen2", "signed workload selector watch is invalid"), AT);
+    const v = fleetView(s, new Date(AT), 300);
+    contains(v.problems.join("|"), "refused generation gen2");
+    contains(v.problems.join("|"), "selector watch is invalid");
+    assert.equal(v.hosts[0]!.lastRefusal?.generation, "gen2");
+  });
+
+  it("is not `blockedBy` — a stage holding a host and a host declining are different facts", () => {
+    // `blockedBy` answers "which earlier stage is holding this one". A refusal is the host turning
+    // down something no stage was withholding, and folding it into that field would make a host
+    // that refuses look like a host that is politely waiting its turn.
+    const s = state();
+    s.manifest = { ...manifest, generation: "gen2" };
+    handleHeartbeat(s, "h-canary", refused("gen2", "whatever the reason"), AT);
+    assert.equal(fleetView(s, new Date(AT), 300).hosts[0]!.blockedBy, null);
+  });
+
+  it("stops reporting once the host is on the generation it once refused", () => {
+    // History in a status view reads as a live problem. A host that refused `gen2` and is now
+    // running `gen2` has answered the question.
+    const s = state();
+    s.manifest = { ...manifest, generation: "gen2" };
+    handleHeartbeat(s, "h-canary", hb({
+      applied: { generation: "gen2", state: "confirmed", artifactHash: "a", observedHash: "h" },
+      lastRefusal: { generation: "gen2", reason: "an earlier attempt", at: AT },
+    }), AT);
+    const v = fleetView(s, new Date(AT), 300);
+    assert.equal(v.hosts[0]!.lastRefusal, null);
+    assert.deepEqual(v.problems.filter((p) => p.includes("refused generation")), []);
+  });
+
+  it("carries the agent's source digest beside its version", () => {
+    // The two answer different questions and on 2026-09-03 they disagreed: same `agentVersion`, same
+    // `schemaVersion`, different code, and the difference decided whether a generation applied.
+    const s = state();
+    handleHeartbeat(s, "h-canary", hb({ agentBuild: "d731497715ca" }), AT);
+    assert.equal(fleetView(s, new Date(AT), 300).hosts[0]!.agentBuild, "d731497715ca");
+    // An older agent does not send it, and that is "did not say" — never a match.
+    const older = state();
+    handleHeartbeat(older, "h-canary", hb(), AT);
+    assert.equal(fleetView(older, new Date(AT), 300).hosts[0]!.agentBuild, null);
+  });
+});

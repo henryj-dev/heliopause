@@ -3817,6 +3817,91 @@ class RouteApplyAndRestore(unittest.TestCase):
         touched = [c[1] for c in self.calls]
         self.assertNotIn("10.7.0.0/16", touched)
 
+class TestObservationLossIsNotIntrusion(unittest.TestCase):
+    """Losing sight of the table and seeing somebody touch it are different facts.
+
+    They were the same fact until 2026-09-03. `take_events` appends a marker when the monitor buffer
+    overflows, and that marker carried our own table name with `byAgent: False` -- exactly the shape
+    `unauthorised_events` matches. So a burst large enough to overflow (somebody reloading the whole
+    ruleset; `systemctl disable --now firewalld` does it) was reported as one unauthorised change to
+    a table that, on the host where stardust asked about it, did not exist.
+    """
+
+    def setUp(self):
+        with hp._events_lock:
+            hp._events.clear()
+            hp._events_dropped = 0
+
+    tearDown = setUp
+
+    def test_overflow_marker_is_not_counted_as_an_intruder(self):
+        with hp._events_lock:
+            hp._events_dropped = 41
+        events = hp.take_events()
+        self.assertEqual(hp.unauthorised_events(events), [])
+        lost = hp.observation_lost(events)
+        self.assertEqual(len(lost), 1)
+        self.assertEqual(lost[0]["dropped"], 41)
+
+    def test_a_real_third_party_change_is_still_an_intruder(self):
+        # The known positive. Without it the fix above could be "count nothing" and pass.
+        with hp._events_lock:
+            hp._events.append({
+                "at": "2026-09-03T00:00:00Z",
+                "table": f"{hp.TABLE_FAMILY} {hp.TABLE_NAME}",
+                "raw": "add rule inet heliopause input accept",
+                "pid": 999, "process": "nft", "byAgent": False,
+            })
+        events = hp.take_events()
+        self.assertEqual(len(hp.unauthorised_events(events)), 1)
+        self.assertEqual(hp.observation_lost(events), [])
+
+    def test_our_own_change_is_neither(self):
+        with hp._events_lock:
+            hp._events.append({
+                "at": "2026-09-03T00:00:00Z",
+                "table": f"{hp.TABLE_FAMILY} {hp.TABLE_NAME}",
+                "raw": "add table inet heliopause",
+                "pid": 1, "process": "python3", "byAgent": True,
+            })
+        events = hp.take_events()
+        self.assertEqual(hp.unauthorised_events(events), [])
+        self.assertEqual(hp.observation_lost(events), [])
+
+
+class TestAgentBuildIdentity(unittest.TestCase):
+    """`AGENT_VERSION` is what a person says the build is; this is what the build *is*.
+
+    Measured 2026-09-03: adding `HELIOPAUSE_K8S_PEER_NAMESPACES` moved neither `AGENT_VERSION` nor
+    `SCHEMA_VERSION` -- there was no reason for either to move -- and the applier ran a build without
+    that support while reporting identical values to one with it. The refusal that followed was
+    diagnosable only from the host's journal.
+    """
+
+    def test_the_build_id_is_the_digest_of_this_file(self):
+        import hashlib
+        with open(hp.__file__, "rb") as fh:
+            expected = hashlib.sha256(fh.read()).hexdigest()[:12]
+        self.assertEqual(hp.AGENT_BUILD, expected)
+        # Twelve characters, the length `src/build-id.ts` truncates to, so the two columns an
+        # operator compares are the same shape.
+        self.assertEqual(len(hp.AGENT_BUILD), 12)
+
+    def test_it_travels_on_the_heartbeat(self):
+        beat = hp.build_heartbeat(dict(hp._EMPTY_STATE))
+        self.assertEqual(beat["agentBuild"], hp.AGENT_BUILD)
+        self.assertEqual(beat["agentVersion"], hp.AGENT_VERSION)
+        # No refusal to report, so the field is absent rather than null -- an older relay sees the
+        # shape it already knows.
+        self.assertNotIn("lastRefusal", beat)
+
+    def test_a_refusal_travels_and_is_bounded(self):
+        st = dict(hp._EMPTY_STATE)
+        st["lastRefusal"] = {"generation": "gen9", "reason": "x" * 900, "at": "2026-09-03T00:00:00Z"}
+        beat = hp.build_heartbeat(st)
+        self.assertEqual(beat["lastRefusal"]["generation"], "gen9")
+
+
 class TestRelayRequestDeadline(unittest.TestCase):
     """`HTTP_TIMEOUT_SEC` bounds the whole exchange, not each socket operation.
 

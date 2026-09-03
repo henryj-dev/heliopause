@@ -217,6 +217,16 @@ export interface HostView {
   intrusions: RulesetEvent[] | null;
   /** The agent build that last reported. `null` on an agent too old to send one. */
   agentVersion: string | null;
+  /** Source digest the agent reported. `null` is "did not say" — see `Heartbeat.agentBuild`. */
+  agentBuild: string | null;
+  /**
+   * Why this host refused the generation it was offered, in its own words.
+   *
+   * The one field that turns "a host is quietly on an old generation" into a sentence an operator
+   * can act on. `blockedBy` cannot carry it: that answers "which stage is holding this host", and a
+   * refusal is the host declining something no stage was withholding.
+   */
+  lastRefusal: { generation: string; reason: string; at: string } | null;
 
   /**
    * Ports another table redirects inbound, which this project's rules do not govern (H36).
@@ -333,6 +343,11 @@ export function fleetView(
       contradictions: state.contradictions[host] ?? [],
       intrusions: st?.intrusions ?? null,
       agentVersion: st?.agentVersion ?? null,
+      agentBuild: st?.agentBuild ?? null,
+      // Only while it still matters. A refusal of a generation the host has since moved past is
+      // history, and history in a status view reads as a live problem.
+      lastRefusal: st?.lastRefusal && st.lastRefusal.generation !== st?.generation
+        ? st.lastRefusal : null,
       publishedPorts: st?.publishedPorts ?? null,
       routes: st?.routes ?? null,
       ciliumExposure: st?.ciliumExposure ?? null,
@@ -348,6 +363,22 @@ export function fleetView(
     });
 
     if (st?.state === "rolled-back") problems.push(`${host}: rolled back — ${st.detail ?? "see its journal"}`);
+    // ## The sentence that used to live only on the host
+    //
+    // A refused artifact leaves a host sitting on an old generation with nothing wrong: `state` is
+    // `confirmed`, `blockedBy` is null (no stage is holding it), `drifted` is false. Every field
+    // says fine and the host is not taking the generation the relay is handing it.
+    //
+    // It happened twice on 2026-09-02–03 — a schema skew, then a peer namespace the applier's build
+    // did not know about — and both times the diagnosis was somebody reading `journalctl` on a
+    // machine the person asking the question could not reach. The agent knew the answer each time.
+    //
+    // Phrased with the generation it refused, because "this host refuses" and "this host refuses
+    // *what you just published*" are different problems and only the second one is urgent.
+    const refusal = st?.lastRefusal;
+    if (refusal && refusal.generation !== st?.generation) {
+      problems.push(`${host}: refused generation ${refusal.generation} — ${refusal.reason}`);
+    }
     if (drifted) problems.push(`${host}: ruleset no longer matches the dump it confirmed`);
     // Next to drift on purpose: drift is the consequence (the dump changed), this is the cause (who
     // changed it, when, from which process). A host showing both is one story, and reading them
@@ -631,6 +662,8 @@ export function handleHeartbeat(
     // Kept so a host-unit deployment can be verified from the server rather than from the
     // machine that ran the installer. See `HostStatus.agentVersion`.
     agentVersion: hb.agentVersion ?? null,
+    agentBuild: hb.agentBuild ?? null,
+    lastRefusal: hb.lastRefusal ?? null,
     state: hb.applied.state,
     // Carried, not acted on. Gating reads `state` only; this is the host's explanation, and without
     // it a rolled-back host shows up in the fleet view with no reason attached.

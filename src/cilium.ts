@@ -169,8 +169,26 @@ export interface CiliumRenderInput {
 export const DEFAULT_MANAGED_BY = "heliopause";
 /** Not a Kubernetes-valid namespace: the baseline ingress rule can never whitelist a pod. */
 export const BASELINE_NEVER_NAMESPACE = "HELI0PAUSE-NEVER";
-/** Independent matching bound in the agent; crossing it refuses publish before a host sees it. */
-export const MAX_WATCH_SELECTORS = 32;
+/**
+ * How many selector-membership queries one generation may ask an applier for.
+ *
+ * Independent matching bound in the agent; crossing it refuses publish before a host sees it.
+ *
+ * **This is a denial-of-service bound, not a correctness one** — the agent's copy says why: a
+ * compromised relay must not be able to make one heartbeat fork thousands of `kubectl` processes.
+ * Each selector is one `kubectl get pods` per beat, so the number is a budget on work per interval
+ * and nothing else depends on its exact value.
+ *
+ * Raised from 32 on 2026-09-03. The two egress sets stardust asked heliopause to take over
+ * (exchange 202) needed **35**, and the refusal arrived at render — correctly, and with no way
+ * forward that did not change this line. Sixteen of the thirty already in use are the namespaces
+ * named as destinations by `BUILD-JOBS-DENY-*` and `POLICY-RENDER-DENY-*`, so the floor rises with
+ * every deny list rather than with anything about the workloads themselves.
+ *
+ * 64 rather than "enough for 35": the value has to be raised on both sides and every raise costs an
+ * agent redeployment, so a number that only just fits buys one more round trip and nothing else.
+ */
+export const MAX_WATCH_SELECTORS = 64;
 
 // ── Output shape ──────────────────────────────────────────────────────────────
 

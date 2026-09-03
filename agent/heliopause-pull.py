@@ -135,6 +135,45 @@ import urllib.parse
 SCHEMA_VERSION = 5
 AGENT_VERSION = "0.6.0-pull-signed-routes"
 
+
+def _agent_build():
+    """Hex digest of this script's own source, truncated the way `src/build-id.ts` truncates.
+
+    ## Why a version string was not enough
+
+    Measured 2026-09-03. `HELIOPAUSE_K8S_PEER_NAMESPACES` was added to this file and neither
+    `AGENT_VERSION` nor `SCHEMA_VERSION` moved — there was no reason for either to move, because
+    reading a new environment variable changes nothing an agent and a relay have to agree on. So the
+    applier ran a build without that support while reporting the same version and the same schema as
+    a build with it, and the fleet view could not tell them apart.
+
+    What that cost: the RBAC was right, the environment was right, and the artifact was refused
+    anyway. The reason was in the host's journal and nowhere else, and stardust's own mitigation for
+    the previous skew — "compare `agentVersion` before deploying" — is blind to this class by
+    construction.
+
+    The manager has had the answer since 2026-08-18 (`src/build-id.ts`): hash the source, because the
+    source *is* the build. This is the same idea with the same reasoning, and the same truncation, so
+    an operator comparing the two columns is comparing like with like.
+
+    ## Why the file rather than a package
+
+    The agent ships as one script. `__file__` is what systemd executes and what an installer
+    replaces, so hashing it answers exactly the question that was asked — "is the code on this host
+    the code we think it is" — and needs nothing from whoever installed it.
+
+    Failure returns `None`, never a guess: a digest that might be wrong is worse than an absent one,
+    because the whole point is to be compared.
+    """
+    try:
+        with open(__file__, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()[:12]
+    except OSError:
+        return None
+
+
+AGENT_BUILD = _agent_build()
+
 TABLE_FAMILY = "inet"
 TABLE_NAME = os.environ.get("HELIOPAUSE_TABLE", "heliopause")
 
@@ -268,7 +307,7 @@ AUTH_BREAK_GLASS_MAX_TTL_SEC = 24 * 60 * 60
 # A reply is data from outside this host's trust boundary. Bounds here are independent of the
 # publisher's matching bound in src/cilium.ts: a compromised relay cannot make one heartbeat fork
 # thousands of kubectl processes even if it fabricates a reply instead of forwarding one.
-MAX_WATCH_SELECTORS = 32
+MAX_WATCH_SELECTORS = 64
 MAX_SELECTOR_BYTES = 512
 MAX_SELECTOR_TERMS = 16
 MEMBERSHIP_CACHE_SEC = 30
@@ -3355,15 +3394,31 @@ def take_events():
         _events.clear()
         _events_dropped = 0
     if dropped:
+        # Marked as its own kind, and deliberately **not** stamped with our table name.
+        #
+        # It used to carry `table: "inet heliopause"` and `byAgent: False`, which is exactly the
+        # shape `unauthorised_events` matches — so losing visibility was counted as one observed
+        # change to our table, on a host where the table did not even exist. stardust asked about
+        # that line (exchange 213) and the honest answer was that we had reported "I did not see" as
+        # "I saw somebody".
+        #
+        # The two are different facts and this file keeps them apart everywhere else (`None` versus
+        # `[]` in `wrong_addresses`, in `local_addrs`, in the membership report). Here it did not.
         out.append(
             {
                 "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "table": f"{TABLE_FAMILY} {TABLE_NAME}",
+                "kind": "observation-lost",
+                "dropped": dropped,
                 "raw": f"[{dropped} further events dropped — buffer full]",
-                "byAgent": False,
+                "byAgent": None,
             }
         )
     return out
+
+
+def observation_lost(events):
+    """Beats where the monitor buffer overflowed. Not intrusions — the absence of an answer."""
+    return [e for e in events if e.get("kind") == "observation-lost"]
 
 
 def monitor_loop():
@@ -3419,9 +3474,17 @@ def monitor_loop():
 
 
 def unauthorised_events(events):
-    """Changes to our table that this agent did not make. The reason H28 exists."""
+    """Changes to our table that this agent did not make. The reason H28 exists.
+
+    Observed changes only. The buffer-overflow marker `take_events` appends is not one of these —
+    see the comment there — and excluding it by *kind* rather than by hoping its table name never
+    matches is what keeps the two facts apart if either shape moves.
+    """
     ours = f"{TABLE_FAMILY} {TABLE_NAME}"
-    return [e for e in events if e.get("table") == ours and not e.get("byAgent")]
+    return [
+        e for e in events
+        if e.get("kind") is None and e.get("table") == ours and not e.get("byAgent")
+    ]
 
 
 # ── persisted state ───────────────────────────────────────────────────────────
@@ -3441,6 +3504,21 @@ _EMPTY_STATE = {
     # nft's normalised rendering of it, and the two are never byte-equal.
     "referenceHash": None,
     "detail": None,
+    # The last artifact this host refused, so the *next* heartbeat can say why.
+    #
+    # `{"generation": str, "reason": str, "at": str}` or `None`. Until 2026-09-03 a refusal was
+    # logged and dropped: `verify_artifact_envelope` raises, the loop catches it, writes one line to
+    # the journal and returns. The heartbeat then reported the previous generation with no reason,
+    # so the fleet view showed a host quietly sitting on an old generation with `blockedBy: null`.
+    #
+    # That happened twice in one day and cost two round trips — once for a schema skew on web-01 and
+    # once for a peer namespace on the applier. Both times the relay was holding a generation, the
+    # agent knew exactly why it would not take it, and the only place that sentence existed was a
+    # journal on a host the person diagnosing it could not read.
+    #
+    # Cleared on the next successful verification rather than on apply: what it answers is "did the
+    # last thing I was offered get through", and an artifact that verified is an answer of yes.
+    "lastRefusal": None,
     # The rollback commitment, so it outlives this process. See "surviving our own death" above.
     # `{"elements": [...] | None}` while an apply is unconfirmed, `None` otherwise. The inner
     # `None` is meaningful and distinct from the outer one: it says a backup *was* captured and
@@ -4258,6 +4336,27 @@ def _host_observation_report():
     }
 
 
+def _record_refusal(generation, reason):
+    """Remember why the last artifact was refused, so the heartbeat can carry it off this host."""
+    def mutate(st):
+        st["lastRefusal"] = {
+            "generation": str(generation)[:253],
+            # Bounded: this is an error string that crosses to a relay and into an operator's screen,
+            # and an unbounded one is a way to make a fleet view unreadable from a single host.
+            "reason": str(reason)[:400],
+            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+    update_state(mutate)
+
+
+def _clear_refusal():
+    """An artifact verified, so the last refusal is answered. Cheap no-op when there was none."""
+    def mutate(st):
+        if st.get("lastRefusal") is not None:
+            st["lastRefusal"] = None
+    update_state(mutate)
+
+
 def build_heartbeat(st):
     host_observation = _host_observation_report()
     observed, detail = host_observation["observed"], host_observation["detail"]
@@ -4279,9 +4378,21 @@ def build_heartbeat(st):
         log(f"UNAUTHORISED: {len(intruders)} change(s) to {TABLE_FAMILY} {TABLE_NAME} not made by us")
         for e in intruders[:5]:
             log(f"  {e['at']} pid={e.get('pid')} ({e.get('process')}): {e['raw'][:120]}")
+    for lost in observation_lost(events):
+        # Said separately and in the words of what happened. A burst large enough to overflow the
+        # buffer is usually somebody reloading the whole ruleset — `systemctl disable --now
+        # firewalld` did it on 2026-09-02 — and the useful sentence is that we stopped seeing, not
+        # that we saw something.
+        log(f"OBSERVATION LOST: {lost['dropped']} nft event(s) dropped — buffer full, drift detection has a gap")
     heartbeat = {
         "host": HOST_ID,
         "agentVersion": AGENT_VERSION,
+        # Additive and optional: a relay that predates it ignores an unknown key, and a relay that
+        # knows it treats `None` as "this agent did not say" rather than as a mismatch.
+        "agentBuild": AGENT_BUILD,
+        # Absent when there is nothing to say. Present, it is the sentence that was only ever in the
+        # journal before — see `lastRefusal` in `_EMPTY_STATE`.
+        **({"lastRefusal": st["lastRefusal"]} if st.get("lastRefusal") else {}),
         "schemaVersion": SCHEMA_VERSION,
         "applied": {
             "generation": st["generation"],
@@ -4693,7 +4804,9 @@ def handle_reply(st, reply):
         artifact, record, watch, expired = verify_artifact_envelope(envelope)
     except Exception as e:  # noqa: BLE001 — a bad envelope is a refusal, never a crash of the loop
         log(f"refusing artifact for generation {wanted}: {e}")
+        _record_refusal(wanted, str(e))
         return
+    _clear_refusal()
     if artifact.get("generation") != wanted:
         # The relay reloaded mid-exchange. Waiting for the next beat costs one interval; applying
         # a generation we were not gated for costs a staging decision.
