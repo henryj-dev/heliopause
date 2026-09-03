@@ -92,3 +92,86 @@ describe("deploy-fleet.sh ships every source the relay imports", () => {
     assert.ok(relay.has("bin") && relay.has("src"), "the relay must ship its own bin and src");
   });
 });
+
+/** Host names from the `HOSTS` block, in file order. */
+function fleetHosts(): string[] {
+  const script = read("../scripts/deploy-fleet.sh");
+  const block = /\nHOSTS="\n([\s\S]*?)\n"\n/.exec(script);
+  assert.ok(block, "could not find the HOSTS block in deploy-fleet.sh");
+  return block[1]!.split("\n").map((l) => l.split("=")[0]!.trim()).filter(Boolean);
+}
+
+/** The names listed in a `--all` order variable. */
+function order(name: "RELAY_ORDER" | "AGENT_ORDER"): string[] {
+  const script = read("../scripts/deploy-fleet.sh");
+  const line = new RegExp(`\\n${name}="([^"]+)"`).exec(script);
+  assert.ok(line, `could not find ${name} in deploy-fleet.sh`);
+  return line[1]!.trim().split(/\s+/).filter(Boolean);
+}
+
+// ## Why these exist
+//
+// `--all` walks a list written by hand, and a host that is in the fleet but not in that list is
+// skipped in silence — the deploy reports success having never touched it. That is the same shape as
+// the defect this file already pins for ship paths: not a wrong answer, a missing one.
+//
+// It has happened. `web-01.dev` joined the fleet and `HOSTS` did not follow, so the script could not
+// address it at all and its agent was rolled by hand instead — which is how it ended up on a build
+// nothing else was running.
+describe("deploy-fleet.sh --all reaches the whole fleet", () => {
+  it("names every known host in the agent order", () => {
+    const hosts = fleetHosts();
+    assert.ok(hosts.length >= 8, `HOSTS parsed to ${hosts.length} entries — the block shape drifted`);
+    const listed = new Set(order("AGENT_ORDER"));
+    for (const host of hosts) {
+      assert.ok(listed.has(host), `${host} is in HOSTS but not in AGENT_ORDER — --all would skip it`);
+    }
+  });
+
+  it("names only known hosts, in both orders", () => {
+    const hosts = new Set(fleetHosts());
+    for (const name of [...order("AGENT_ORDER"), ...order("RELAY_ORDER")]) {
+      assert.ok(hosts.has(name), `${name} is in a --all order but not in HOSTS`);
+    }
+  });
+
+  it("puts the canary first among agents", () => {
+    // The rollout stages already name k3s-01 as the canary; the deploy order agreeing with them is
+    // what makes a bad build stop at the same host a bad generation would.
+    assert.equal(order("AGENT_ORDER")[0], "k3s-01.dev");
+  });
+});
+
+// ## Why this exists
+//
+// `systemctl is-active` answers "is a process running", not "is it running what I just shipped".
+// Measured 2026-09-03: a relay deploy's restart line was lost in the tarball's xattr warnings, the
+// file on disk had already been replaced, and the unit reported `active` while executing code from
+// two days before. Every downstream check agreed, because every one of them read the file.
+describe("deploy-fleet.sh proves the restart happened", () => {
+  const script = read("../scripts/deploy-fleet.sh");
+
+  it("compares the start timestamp across the restart", () => {
+    assert.match(script, /before="\$\(systemctl show -p ExecMainStartTimestampMonotonic/);
+    assert.match(script, /after="\$\(systemctl show -p ExecMainStartTimestampMonotonic/);
+    assert.match(script, /\[ "\$after" = "\$before" \]/);
+  });
+
+  it("uses the monotonic timestamp, which a same-second restart cannot alias", () => {
+    assert.doesNotMatch(
+      script,
+      /\$\(systemctl show -p ExecMainStartTimestamp --value "\$unit"/,
+      "the wall-clock form has second granularity — a fast restart lands inside the same second",
+    );
+  });
+
+  it("reports a source digest rather than the version string", () => {
+    // A version string is not a build identity: eight hosts once reported one version while running
+    // two builds. `AGENT_BUILD` is sha256(source)[:12], so the column can be read against the fleet
+    // view directly.
+    assert.match(script, /sha256sum "\$f"/, "status must digest the deployed file");
+    assert.match(script, /f=\/opt\/heliopause\/agent\/heliopause-pull\.py/);
+    assert.match(script, /f=\/opt\/heliopause\/src\/relay\.ts/);
+    assert.doesNotMatch(script, /agent-schema=/);
+  });
+});
