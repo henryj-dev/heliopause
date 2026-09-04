@@ -84,6 +84,51 @@ describe("planCert — subjectAltName", () => {
   it("refuses a SAN on the CA", () => {
     assert.throws(() => planCert({ name: "ca", role: "ca", sans: ["x"] }), PkiError);
   });
+
+  // 🔴 **Everything above is a positive.** `sanEntry` had no negative test at all, and that is
+  // what let its address check be switched off for eight months: `isIp` was
+  // `/^[0-9.]+$/.test(v) || v.includes(":")`, so any value with a colon was declared an IP and
+  // never went near the name check.
+  //
+  // These extensions are written into openssl's `-extfile` with `lines.join("\n")`
+  // (`bin/heliopause-pki.ts`, `withExtFile`), so a newline inside a SAN is a **second extension
+  // line supplied by whoever passed `--san`**. The first case below was accepted before the fix,
+  // and the certificate it planned was a relay leaf that could issue certificates.
+  describe("a SAN is an address or a name, and nothing else", () => {
+    const relay = (san: string) => () => planCert({ name: "gw", role: "relay", sans: [san] });
+
+    it("refuses a newline, which would be an injected extension line", () => {
+      assert.throws(relay("::1\nbasicConstraints=critical,CA:TRUE"), PkiError);
+      assert.throws(relay("10.17.0.1\nbasicConstraints=critical,CA:TRUE"), PkiError);
+      // Carriage return alone, because openssl's config parser ends a line on it too.
+      assert.throws(relay("::1\rbasicConstraints=critical,CA:TRUE"), PkiError);
+    });
+
+    it("refuses host:port, which used to be minted as a nonsense IP SAN", () => {
+      // The everyday shape of the same hole. `IP:gw.example:8443` is a SAN no client can match, so
+      // it failed hostname verification later, somewhere else, looking like a client problem.
+      assert.throws(relay("gw.example:8443"), PkiError);
+    });
+
+    it("refuses an address that is nearly one", () => {
+      assert.throws(relay("10.17.0.256"), PkiError);
+      assert.throws(relay("10.17.0"), PkiError);
+      assert.throws(relay("2001:db8::zz"), PkiError);
+    });
+
+    it("still accepts the forms a relay legitimately needs", () => {
+      for (const [san, expected] of [
+        ["10.17.0.1", "IP:10.17.0.1"],
+        ["::1", "IP:::1"],
+        ["2001:db8::1", "IP:2001:db8::1"],
+        ["gw.example", "DNS:gw.example"],
+        ["gw-01.dev.example", "DNS:gw-01.dev.example"],
+        ["*.example", "DNS:*.example"],
+      ] as const) {
+        contains(ext(planCert({ name: "gw", role: "relay", sans: [san] }).extensions), expected);
+      }
+    });
+  });
 });
 
 describe("subjectFor", () => {

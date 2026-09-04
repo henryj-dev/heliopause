@@ -9,6 +9,7 @@ import { defineConfig, tableRef, type Config } from "./config.ts";
 import {
   baselineConflict,
   cidrsOverlap,
+  COMMENT_MAX,
   portsOverlap,
   planHostRuleset,
   renderHostRuleset,
@@ -28,6 +29,19 @@ const cfg: Config = defineConfig({
     { desc: "management SSH", proto: "tcp", ports: "22", srcCidrs: MGMT },
     { desc: "DNS", proto: "udp", ports: "53", srcCidrs: [] },
   ],
+});
+
+/**
+ * No baseline at all — the only shape in which a `proto: "any"` deny can render.
+ *
+ * With any baseline present, such a policy carries no ports, `portsOverlap` reads an empty spec as
+ * "all ports", and `baselineConflict` rejects it before it reaches a rule. That is correct: a deny
+ * over every port and protocol is precisely the rule that takes the management path away.
+ */
+const NO_BASELINE: Config = defineConfig({
+  tableName: "heliopause",
+  internalSupernet: "10.0.0.0/8",
+  baseline: [],
 });
 
 function policy(over: Partial<Policy> = {}): Policy {
@@ -236,10 +250,70 @@ describe("denyMode", () => {
     contains(r.ruleset, "tcp dport 5432 reject with tcp reset");
   });
   it("**proto=any must not use tcp reset** — TCP is not guaranteed", () => {
-    const r = renderHostRuleset(cfg, "h", [item({ policy: policy({ proto: "any", ports: "8080", denyMode: "reject" }) })]);
+    // Two changes from how this was written, both forced and both worth naming.
+    //
+    // `ports: ""`, because `proto: "any"` carrying ports is now refused outright — see the next
+    // block. It used to say `ports: "8080"`, and that is exactly how this case sat on top of the
+    // defect for as long as it did: the assertion reads one word out of the *verdict*, so the
+    // ports disappearing from the *match* was never something it could notice.
+    //
+    // And `NO_BASELINE`, because with any baseline present a `proto: "any"` deny with no ports
+    // overlaps all of it and is correctly rejected as a baseline conflict before it can render.
+    const r = renderHostRuleset(NO_BASELINE, "h", [item({ policy: policy({ proto: "any", ports: "", denyMode: "reject" }) })]);
     const line = r.ruleset.split("\n").find((l) => l.includes("reject"))!;
     contains(line, "reject");
     excludes(line, "tcp reset");
+  });
+});
+
+describe("proto \"any\" carrying ports is skipped, not silently widened", () => {
+  // The rule that used to be rendered for this input, measured before the fix:
+  //
+  //     ip saddr 0.0.0.0/0 ip daddr 10.2.0.7/32 drop comment "p1 test policy"
+  //
+  // "deny 8080 from the internet" became "deny everything from the internet", with `skipped` empty
+  // and `baselineConflict` still reasoning about the port the rule no longer carried — so it saw
+  // no conflict with the management baseline that the rule was in fact about to swallow.
+  const anyWithPorts = (over: Partial<Policy> = {}) =>
+    item({ policy: policy({ proto: "any", ports: "8080", ...over }) });
+
+  it("renders no rule rather than one that swallows every port", () => {
+    const r = renderHostRuleset(cfg, "h", [anyWithPorts()]);
+    assert.equal(r.ruleCount, 0);
+    excludes(r.ruleset, "p1 test policy");
+  });
+
+  it("records the skip with a reason an operator can act on", () => {
+    const r = renderHostRuleset(cfg, "h", [anyWithPorts()]);
+    assert.equal(r.skipped.length, 1);
+    contains(r.skipped[0]!.reason, "8080");
+    contains(r.skipped[0]!.reason, "protocol-qualified");
+    assert.equal(r.skipped[0]!.hook, "input");
+  });
+
+  // Cilium *can* express this (`protocol: ANY` plus a port), and both renderers read one policy
+  // list. Skipping keeps a policy that is legitimate for the workload layer from failing the whole
+  // host publish — the same trade `cilium.ts` makes when it skips a non-workload policy.
+  it("both emitters agree it is skipped", () => {
+    assert.equal(renderHostRulesetJson(cfg, "h", [anyWithPorts()]).skipped.length, 1);
+    assert.equal(renderHostRulesetJson(cfg, "h", [anyWithPorts()]).ruleCount, 0);
+  });
+
+  it("still renders when the ports are cleared, which is the expressible form", () => {
+    const r = renderHostRuleset(NO_BASELINE, "h", [item({ policy: policy({ proto: "any", ports: "" }) })]);
+    assert.equal(r.skipped.length, 0);
+    contains(r.ruleset, "ip daddr 10.2.0.7/32 drop");
+    // No protocol match at all: `any` is the absence of one, not a match on the word.
+    excludes(r.ruleset, "meta l4proto any");
+  });
+
+  it("skips on the egress path too", () => {
+    const r = renderHostRuleset(cfg, "h", [], [
+      { policy: policy({ id: "e1", proto: "any", ports: "25" }), dstCidrs: null },
+    ]);
+    assert.equal(r.ruleCount, 0);
+    assert.equal(r.skipped.length, 1);
+    assert.equal(r.skipped[0]!.hook, "output");
   });
 });
 
@@ -514,6 +588,78 @@ describe("allow policies under default-deny", () => {
   });
 });
 
+// ── `skipped` is documented "never silently dropped" — this is the path that broke it ──────────
+describe("a policy that renders no rule says so", () => {
+  it("reports a source and destination that share no address family", () => {
+    const r = renderHostRuleset(cfg, "h", [item({ srcCidrs: ["10.1.0.0/16"], dstCidrs: ["fd10::7/128"] })]);
+    // Before: zero rules AND zero skips — the deny evaporated with nothing recording it, while
+    // every dashboard read the empty `skipped` list as "applied".
+    assert.equal(r.ruleCount, 0);
+    assert.equal(r.skipped.length, 1);
+    contains(r.skipped[0]!.reason, "share no address family");
+    assert.equal(r.skipped[0]!.hook, "input");
+  });
+
+  it("names both sides, because which one moved is the whole question", () => {
+    const r = renderHostRuleset(cfg, "h", [item({ srcCidrs: ["fd10::/48"], dstCidrs: ["10.2.0.7/32"] })]);
+    contains(r.skipped[0]!.reason, "fd10::/48");
+    contains(r.skipped[0]!.reason, "10.2.0.7/32");
+  });
+
+  it("still renders when the families do overlap", () => {
+    const r = renderHostRuleset(cfg, "h", [
+      item({ srcCidrs: ["10.1.0.0/16", "fd10::/48"], dstCidrs: ["10.2.0.7/32"] }),
+    ]);
+    assert.equal(r.skipped.length, 0);
+    assert.equal(r.ruleCount, 1);
+  });
+});
+
+// ── One plan, two emitters, one meaning ───────────────────────────────────────
+//
+// `{proto: "tcp", ports: ""}` is how `portsOverlap` documents "all ports". It used to render as a
+// port match over an empty list, and the emitters then disagreed about what that was: text said
+// `tcp dport {  }` (which nft refuses) and JSON said `"right": 0` (port zero, which applies
+// cleanly and permits nothing). JSON is the form the fleet applies.
+describe("a baseline with no ports means all ports of that protocol", () => {
+  const c = defineConfig({
+    hookPolicy: { input: "drop", output: "accept" },
+    baseline: [{ desc: "mgmt", proto: "tcp", ports: "", srcCidrs: MGMT }],
+  });
+
+  it("renders a protocol match, not an empty port set", () => {
+    const text = renderHostRuleset(c, "h", []).ruleset;
+    contains(text, "ip saddr 10.254.0.0/16 meta l4proto tcp accept");
+    excludes(text, "dport");
+  });
+
+  it("says the same thing in the JSON the agent applies", () => {
+    const doc = JSON.parse(renderHostRulesetJson(c, "h", []).json) as { nftables: unknown[] };
+    const mgmt = doc.nftables.find(
+      (e) => (e as { add?: { rule?: { comment?: string } } }).add?.rule?.comment === "baseline: mgmt",
+    ) as { add: { rule: { expr: Array<Record<string, unknown>> } } };
+    const exprs = JSON.stringify(mgmt.add.rule.expr);
+    contains(exprs, '"l4proto"');
+    // The bug, pinned by its signature: a port match whose value is the number zero.
+    excludes(exprs, '"dport"');
+    excludes(exprs, '"right": 0');
+  });
+
+  it("still splits a comma-separated baseline into real ports in both forms", () => {
+    const multi = defineConfig({
+      hookPolicy: { input: "drop", output: "accept" },
+      baseline: [{ desc: "mgmt", proto: "tcp", ports: "22,2222", srcCidrs: MGMT }],
+    });
+    contains(renderHostRuleset(multi, "h", []).ruleset, "tcp dport { 22, 2222 }");
+    // Previously the whole spec was handed to the JSON emitter as one entry, so `Number("22,2222")`
+    // was NaN and the artifact was structurally valid nonsense.
+    const json = renderHostRulesetJson(multi, "h", []).json;
+    contains(json, '"set"');
+    contains(json, "22");
+    contains(json, "2222");
+  });
+});
+
 describe("assertions (H3)", () => {
   // Built from the configured baseline, not from the assembled rules — so a mistake in assembly
   // cannot produce a matching mistake here. It is not a check on the baseline itself; if that is
@@ -544,6 +690,75 @@ describe("assertions (H3)", () => {
 
   it("travels with the JSON artifact", () => {
     contains(renderHostRulesetJson(DENY_CFG, "h", []).assertions.join("|"), "baseline: management SSH");
+  });
+});
+
+// ── The comparison the agent actually makes ───────────────────────────────────
+//
+// 🔴 The block above compares `plan.assertions` against `plan.input[].comment`. **Both are
+// pre-emit values**, so it agrees with itself no matter what the emitters do to a comment on the
+// way out — which is why a fleet-wide auto-rollback lived behind a green suite.
+//
+// `heliopause-pull.py` (`missing_assertions`) reads the comments back out of the kernel and asks
+// `[c for c in expected if c not in have]`, where `have` is a **set** built from
+// `nft -j list ruleset`. Set membership: one character of difference is total absence. So the
+// property is not "the assertions look like the comments" but "every assertion is byte-identical
+// to a comment in the form that is applied", and the only way to test it is to read the emitted
+// output.
+//
+// Measured before the fix, with the baseline `desc` that `examples/site.ts` ships today:
+//
+//     assertion [83] baseline: ICMP (path MTU discovery) — a black hole here reads as 'the app is flaky'
+//     emitted   [80] baseline: ICMP (path MTU discovery) — a black hole here reads as 'the app is fla
+//
+// Every host would have reported that baseline missing and reverted every generation for ever.
+describe("assertions match the comments that are actually emitted", () => {
+  const commentsInJson = (json: string): Set<string> =>
+    new Set([...json.matchAll(/"comment": "((?:[^"\\]|\\.)*)"/g)].map((m) => JSON.parse(`"${m[1]}"`) as string));
+  const commentsInText = (text: string): Set<string> =>
+    new Set([...text.matchAll(/comment "([^"]*)"/g)].map((m) => m[1]!));
+
+  // Long enough that `baseline: ` + desc runs past nft's 80-character comment field, plus the
+  // characters each emitter used to strip on its own — a tab, a quote and a backslash.
+  const AWKWARD = `management SSH \tfrom the "operator" bastion \\ and the emergency out-of-band console network`;
+  const cfgs: Array<[string, Config]> = [
+    ["as shipped in examples/site.ts", defineConfig({
+      hookPolicy: { input: "drop", output: "accept" },
+      baseline: [
+        { desc: "management SSH — the way back in", proto: "tcp", ports: "22", srcCidrs: MGMT },
+        { desc: "ICMP (path MTU discovery) — a black hole here reads as 'the app is flaky'", proto: "icmp", ports: "", srcCidrs: [] },
+      ],
+    })],
+    ["over-length and full of characters the emitters rewrite", defineConfig({
+      hookPolicy: { input: "drop", output: "accept" },
+      baseline: [{ desc: AWKWARD, proto: "tcp", ports: "22", srcCidrs: MGMT }],
+    })],
+  ];
+
+  for (const [label, c] of cfgs) {
+    it(`every assertion is present verbatim in the applied JSON — ${label}`, () => {
+      const j = renderHostRulesetJson(c, "h", [item()]);
+      const have = commentsInJson(j.json);
+      // This is `missing_assertions` transcribed, set membership and all.
+      const missing = j.assertions.filter((a) => !have.has(a));
+      assert.deepEqual(missing, [], `the agent would auto-rollback on: ${JSON.stringify(missing)}`);
+    });
+
+    it(`the text preview shows the same comments as the JSON that is applied — ${label}`, () => {
+      const t = renderHostRuleset(c, "h", [item()]);
+      const j = renderHostRulesetJson(c, "h", [item()]);
+      assert.deepEqual([...commentsInText(t.ruleset)].sort(), [...commentsInJson(j.json)].sort());
+    });
+  }
+
+  it("truncates, so that nothing downstream has to", () => {
+    const c = defineConfig({
+      hookPolicy: { input: "drop", output: "accept" },
+      baseline: [{ desc: "x".repeat(200), proto: "tcp", ports: "22", srcCidrs: MGMT }],
+    });
+    for (const a of planHostRuleset(c, "h", []).assertions) {
+      assert.ok(a.length <= COMMENT_MAX, `assertion is ${a.length} characters, over nft's ${COMMENT_MAX}`);
+    }
   });
 });
 
