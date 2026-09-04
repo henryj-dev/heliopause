@@ -275,9 +275,24 @@ jobs:
   # and `.gitleaks.toml` is this repository's. Each keeps its own allowlist with its reasons.
   #
   # ⚠️ Pinned by commit SHA. At `@main`, one line over there changes this gate.
-  #    Dependabot updates this SHA.
+  #
+  # 🔴 **"Dependabot updates this SHA" is what this used to say, and it was not true.** Dependabot
+  # does update the actions in this file — it opened the pull request that bumped checkout and
+  # setup-node — but it cannot update a **reusable workflow** pinned to a commit on a repository
+  # with no tags and no releases, and `henryj-dev/.github` has neither. Measured 2026-09-04: the
+  # pin had not moved since the human commit that introduced it (#13, 2026-08-26), an upstream
+  # commit had been sitting there since 08-29, and dependabot had never proposed it.
+  #
+  # The pin was therefore permanent by accident, which is the worst version of a pin: it looks
+  # reviewed and it is simply stuck. The update it was missing mattered — upstream had discovered
+  # that `gitleaks-action`'s default binary is 8.24.3, and **that version parses no top-level
+  # `[[allowlists]]` at all**, dropping the exception list without a word. Both of this repository's
+  # gitleaks eyes now run the same pinned version because of it.
+  #
+  # **Until that upstream repository cuts tags, this line moves by hand.** Check it when you touch
+  # this file: `gh api repos/henryj-dev/.github/commits/main --jq .sha`.
   policy:
-    uses: henryj-dev/.github/.github/workflows/policy-checks.yml@f8eab7393216bd0054e6b65297a0cc5baa865630
+    uses: henryj-dev/.github/.github/workflows/policy-checks.yml@2bb32384d4b9b6acf735478cfcd229da1df3452c # 2026-08-29
     permissions:
       contents: read
       # dependency-review says inside the pull request what was blocked and why.
