@@ -143,10 +143,15 @@ describe("fetching the public certificate", () => {
   });
 
   it("carries the HTTP status on the error", async () => {
-    await fetchCert(OPTS, server({}, 404).impl).catch((e) => {
-      assert.ok(e instanceof CertApiError);
-      assert.equal((e as CertApiError).status, 404);
-    });
+    // ⚠️ Written with `assert.rejects` rather than `.catch(…)`. The `.catch` form asserts nothing if
+    // the promise ever stops rejecting — the callback simply does not run and the test passes. It
+    // happened to hold here because the sibling cases above use `assert.rejects`, so a refusal that
+    // turned into a resolved value would have been caught by them; that is a good reason to keep
+    // those and a bad reason to keep this shape.
+    await assert.rejects(
+      () => fetchCert(OPTS, server({}, 404).impl),
+      (e: Error) => e instanceof CertApiError && (e as CertApiError).status === 404,
+    );
   });
 });
 
