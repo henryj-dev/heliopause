@@ -296,3 +296,143 @@ describe("introduced-history site-data scanner", () => {
     assert.deepEqual(binary, [], "a tracked file holds a raw NUL and the leak scanner will refuse it");
   });
 });
+
+// ── Accepting a finding in history ────────────────────────────────────────────
+//
+// History is immutable, so a false positive in a merged commit made `--all` fail for ever — and
+// every scheduled run of `trusted-leaks.yml` did exactly that, on three files whose literals had
+// already been rewritten in the tree. The pull-request gate reads only introduced commits, so it
+// stayed green and the permanent failure was invisible from where anyone was looking.
+//
+// The allowlist is the fix. These pin the three properties that keep it from becoming a way to ship
+// the thing the scan exists to catch.
+describe("the scanner's history allowlist", () => {
+  /** A repo whose middle commit introduces a public address, then removes it. */
+  const repoWithLeakInHistory = () => {
+    const repo = mkdtempSync(join(tmpdir(), "heliopause-scanignore-"));
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: repo, encoding: "utf8" }).trim();
+    git("init", "-q", "-b", "main");
+    git("config", "user.name", "security-test");
+    git("config", "user.email", "security-test@example.invalid");
+    writeFileSync(join(repo, "fixture.txt"), "documentation address: 192.0.2.1\n");
+    git("add", "fixture.txt"); git("commit", "-qm", "base");
+    const base = git("rev-parse", "HEAD");
+    // Assembled rather than written, for the reason the scanner's own comments give: a file that
+    // names a forbidden address makes the scan refuse the file.
+    writeFileSync(join(repo, "fixture.txt"), `accidental address: ${["8.8", "8.8"].join(".")}\n`);
+    git("commit", "-qam", "introduce");
+    const blob = git("rev-parse", "HEAD:fixture.txt");
+    writeFileSync(join(repo, "fixture.txt"), "documentation address: 198.51.100.4\n");
+    git("commit", "-qam", "remove");
+    return { repo, base, head: git("rev-parse", "HEAD"), blob };
+  };
+
+  const scanner = () => resolve(import.meta.dirname, "../scripts/scan-public-history.mjs");
+  const run = (repo: string, ...args: string[]) =>
+    spawnSync(process.execPath, [scanner(), ...args], { cwd: repo, encoding: "utf8" });
+
+  const IPV4 = "contains a non-documentation IPv4 address";
+
+  it("accepts a finding by blob, and says how many it accepted", () => {
+    const { repo, base, head, blob } = repoWithLeakInHistory();
+    assert.equal(run(repo, "--base", base, "--head", head).status, 1, "fixture must fail without the allowlist");
+
+    writeFileSync(join(repo, ".heliopause-scanignore"), `# a known-safe example\n${blob}:${IPV4}\n`);
+    const accepted = run(repo, "--base", base, "--head", head);
+    assert.equal(accepted.status, 0);
+    assert.match(accepted.stdout, /1 accepted by \.heliopause-scanignore/);
+  });
+
+  // The entry names one blob and one class. Neither may be a wildcard by accident: an entry that
+  // silenced a *different* finding would be the worst possible failure of this file.
+  it("accepts only the blob and the class it names", () => {
+    const { repo, base, head, blob } = repoWithLeakInHistory();
+
+    writeFileSync(join(repo, ".heliopause-scanignore"), `${blob}:contains a non-documentation IPv6 address\n`);
+    assert.equal(run(repo, "--base", base, "--head", head).status, 1, "a different finding class must still refuse");
+
+    const otherBlob = "0".repeat(40);
+    writeFileSync(join(repo, ".heliopause-scanignore"), `${otherBlob}:${IPV4}\n`);
+    assert.equal(run(repo, "--base", base, "--head", head).status, 1, "a different blob must still refuse");
+  });
+
+  // 🔴 The worktree is the one place a finding must never be suppressible: the file is in front of
+  // you and the fix is to change it. An allowlist entry there would be a way to commit the thing.
+  it("does not suppress a worktree finding, even for the same content", () => {
+    const { repo, blob } = repoWithLeakInHistory();
+    writeFileSync(join(repo, "fixture.txt"), `accidental address: ${["8.8", "8.8"].join(".")}\n`);
+    writeFileSync(join(repo, ".heliopause-scanignore"), `${blob}:${IPV4}\n`);
+    const r = run(repo, "--worktree");
+    assert.equal(r.status, 1, "worktree findings are not suppressible");
+    assert.match(r.stderr, /contains a non-documentation IPv4 address/);
+  });
+
+  // An exception nobody can trace stops being an exception and becomes folklore. `--all` walks
+  // every reachable object, so there an entry that matched nothing is provably dead.
+  it("fails on a stale entry under --all, and stays quiet about it on a range scan", () => {
+    const { repo, base, head } = repoWithLeakInHistory();
+    const stale = `${"1".repeat(40)}:${IPV4}\n`;
+    writeFileSync(join(repo, ".heliopause-scanignore"), stale);
+
+    const all = run(repo, "--all");
+    assert.equal(all.status, 1);
+    assert.match(all.stderr, /matched nothing in full history — remove it/);
+
+    // A range scan sees a slice and cannot tell stale from not-yet-reached, so it must not guess.
+    const ranged = run(repo, "--base", base, "--head", head);
+    assert.equal(ranged.stderr.includes("matched nothing"), false);
+  });
+
+  // 🔴 **The trust boundary.** `trusted-leaks.yml` runs the scanner with the *candidate's* checkout
+  // as the working directory — that is the whole design: inert candidate objects, trusted code. If
+  // the allowlist came from there, a pull request could ship a leak and accept it in the same
+  // commit, and every other precaution in that workflow would still be intact and useless.
+  //
+  // So the workflow passes `--ignore-file` pointing into `.trusted-scanner`, and these pin both
+  // halves: the flag is honoured, and it is honoured *instead of* the working directory's file.
+  it("reads the allowlist from --ignore-file, not from the scanned tree", () => {
+    const { repo, base, head, blob } = repoWithLeakInHistory();
+    const elsewhere = mkdtempSync(join(tmpdir(), "heliopause-trusted-"));
+    const trusted = join(elsewhere, ".heliopause-scanignore");
+
+    writeFileSync(trusted, `${blob}:${IPV4}\n`);
+    const withFlag = run(repo, "--base", base, "--head", head, "--ignore-file", trusted);
+    assert.equal(withFlag.status, 0, "the named file must be read");
+
+    // And the candidate's own file must not be. Written as an entry that *would* suppress the
+    // finding if it were honoured — so this fails loudly if the precedence ever inverts.
+    writeFileSync(join(repo, ".heliopause-scanignore"), `${blob}:${IPV4}\n`);
+    writeFileSync(trusted, "# the trusted copy accepts nothing\n");
+    const candidateTried = run(repo, "--base", base, "--head", head, "--ignore-file", trusted);
+    assert.equal(candidateTried.status, 1, "a candidate must not be able to accept its own finding");
+  });
+
+  it("is wired into the trusted workflow, which does not run in the trusted tree", () => {
+    // The scanner defaults to the working directory, and in `trusted-leaks.yml` that is the
+    // candidate. A default is the wrong thing there, and the mistake would be silent — ENOENT is
+    // indistinguishable from an empty allowlist. Read the workflow and require the flag.
+    const workflow = readFileSync(
+      resolve(import.meta.dirname, "../.github/workflows/trusted-leaks.yml"),
+      "utf8",
+    );
+    const invocations = [...workflow.matchAll(/node "\$GITHUB_WORKSPACE\/\.trusted-scanner\S*scan-public-history\.mjs"/g)]
+      // The arguments continue on the following lines of a `run: >-` block; a bounded window after
+      // the invocation is enough to see them without parsing YAML.
+      .map((m) => workflow.slice(m.index ?? 0, (m.index ?? 0) + 400));
+    assert.equal(invocations.length, 2, "expected the pull-request scan and the scheduled scan");
+    for (const call of invocations) {
+      assert.match(call, /--ignore-file "\$GITHUB_WORKSPACE\/\.trusted-scanner\//);
+    }
+    // …and the trusted checkout has to actually contain it, or the flag names a missing file and
+    // the scan silently accepts nothing.
+    assert.match(workflow, /sparse-checkout: \|[\s\S]*?\.heliopause-scanignore/);
+  });
+
+  it("refuses a malformed allowlist rather than treating it as empty", () => {
+    const { repo, base, head } = repoWithLeakInHistory();
+    writeFileSync(join(repo, ".heliopause-scanignore"), "not-a-blob:some class\n");
+    const r = run(repo, "--base", base, "--head", head);
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /expected "<blob-sha>:<finding class>"/);
+  });
+});

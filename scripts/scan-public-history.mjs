@@ -80,6 +80,65 @@ if (process.env.HELIOPAUSE_SITE_HOSTNAME_PATTERN) {
   throw new Error("HELIOPAUSE_SITE_HOSTNAME_PATTERN is required for the site-hostname scan");
 }
 
+// ── Accepted findings in history ──────────────────────────────────────────────
+//
+// 🔴 **Why this exists, and why it is keyed by blob rather than by commit.**
+//
+// The scanner had no way to accept a finding, and history is immutable, so one false positive in a
+// merged commit made `--all` fail for ever. That is not hypothetical: `trusted-leaks.yml`'s weekly
+// full-history run failed on **every scheduled run it ever had** (2026-08-25 and 2026-09-01) on
+// three files whose literals were rewritten by `aa2efae` — "누출 스캐너가 결함을 설명하는 글을
+// 막고 있었다". The tree was fixed; the blobs stayed. The pull-request gate only reads introduced
+// commits, so it went on passing, and the one scan that reads the whole public history — the half
+// `ci.yml` calls authoritative — was a red light nobody could turn off.
+//
+// An alarm that can never be cleared is an alarm that stops being read. `.gitleaksignore` exists in
+// this repository for exactly this reason and says so in its own header: *"removing a literal from
+// the tree leaves the blob in history and the finding stands."* The site-data axis had no
+// equivalent. This is it.
+//
+// **Keyed by blob id**, not by commit: one blob appears in every commit whose tree contains it, so
+// a commit-keyed entry would need one line per commit and would grow with every merge. Ten findings
+// in that failing run were three blobs.
+//
+// ⚠️ An entry is only ever appropriate for a value that was **never sensitive**. If something
+// genuinely secret is committed, the answer is rotation plus the history work SECURITY.md
+// describes — never a line here. The reason comment above each entry has to establish which it is.
+// 🔴 **It must be possible to read this from somewhere other than the working directory, and in
+// `trusted-leaks.yml` it must be.** That workflow runs the scanner with the *candidate's* checkout
+// as the working directory, on purpose — the candidate is inert Git objects and the code executing
+// is the copy from the protected default branch. If the allowlist were read from the candidate's
+// tree, a pull request could **ship a leak and accept it in the same commit**, which is the one
+// thing this whole trusted-checkout arrangement exists to prevent.
+//
+// So the path is an input. It defaults to the working directory, which is right for a local
+// `--worktree` run and for `ci.yml` (where the checkout *is* the repository); `trusted-leaks.yml`
+// passes the trusted copy explicitly.
+const IGNORE_FILE = value("--ignore-file") ?? ".heliopause-scanignore";
+/** blobSha -> Set(finding class), plus a record of which entries actually matched. */
+const accepted = new Map();
+const acceptedUsed = new Set();
+const acceptedLines = new Map();
+try {
+  const text = readFileSync(IGNORE_FILE, "utf8");
+  text.split("\n").forEach((raw, i) => {
+    const line = raw.replace(/#.*$/, "").trim();
+    if (!line) return;
+    const m = /^([0-9a-f]{40,64}):(.+)$/.exec(line);
+    if (!m) throw new Error(`${IGNORE_FILE}:${i + 1}: expected "<blob-sha>:<finding class>", got ${JSON.stringify(raw.trim())}`);
+    const [, blob, cls] = m;
+    if (!accepted.has(blob)) accepted.set(blob, new Set());
+    accepted.get(blob).add(cls.trim());
+    acceptedLines.set(`${blob}:${cls.trim()}`, i + 1);
+  });
+} catch (e) {
+  // A missing file is fine — most repositories will never need one. A malformed file is not: an
+  // unreadable allowlist that is silently treated as empty would turn a suppressed finding back
+  // into a failure with no explanation, and the reverse mistake (silently accepting everything) is
+  // worse still. Fail loudly on anything but ENOENT.
+  if (e?.code !== "ENOENT") throw e;
+}
+
 const findings = new Set();
 const sourcePath = (label) => label.replace(/^worktree:/, "").replace(/^[0-9a-f]{12}:/, "");
 const safeSource = (label) => {
@@ -87,7 +146,31 @@ const safeSource = (label) => {
   const opaque = createHash("sha256").update(sourcePath(label)).digest("hex").slice(0, 12);
   return `${commit ? `commit ${commit} ` : ""}source ${opaque}`;
 };
-const finding = (label, message) => findings.add(`${safeSource(label)} ${message}`);
+/**
+ * The blob currently being scanned, or null in worktree mode.
+ *
+ * Worktree findings are deliberately **not** suppressible. There the file is in front of you and
+ * the fix is to change it; an allowlist entry would only be a way to ship the thing the scan is
+ * for. Only history — which cannot be changed — can be accepted.
+ */
+let currentBlob = null;
+/**
+ * Ready-to-paste allowlist lines for whatever this run refused, printed by `--print-accept-lines`.
+ *
+ * Maintaining a blob-keyed file by hand would otherwise mean reversing a redacted `source` hash
+ * back to a path and then finding the object id — a puzzle, and puzzles are how allowlists end up
+ * with entries nobody can justify. This prints only object ids and finding classes, never a
+ * matched value, so it respects the same redaction boundary as the failure output.
+ */
+const suggestions = new Set();
+const finding = (label, message) => {
+  if (currentBlob && accepted.get(currentBlob)?.has(message)) {
+    acceptedUsed.add(`${currentBlob}:${message}`);
+    return;
+  }
+  if (currentBlob) suggestions.add(`${currentBlob}:${message}`);
+  findings.add(`${safeSource(label)} ${message}`);
+};
 function scan(content, label) {
   // Credential scanners commonly skip binary blobs. A path naming a portable key container is
   // itself enough to refuse the commit even when NUL bytes prevent safe text inspection.
@@ -182,7 +265,7 @@ function worktreeFiles() {
   }).filter(Boolean);
 }
 
-function historyFiles() {
+function* historyFiles() {
   const head = value("--head") ?? "HEAD";
   let base = value("--base");
   if (!base || /^0+$/.test(base)) {
@@ -199,7 +282,21 @@ function historyFiles() {
   else commits = [String(git(["rev-parse", head])).trim()];
   if (commits.length === 0) commits = [String(git(["rev-parse", head])).trim()];
 
-  const files = [];
+  // 🔴 **Yielded, not collected.** This built an array of every blob's *decoded text* across every
+  // commit in range and returned it. For a range of a few commits that is fine; for `--all` it is
+  // the entire public history resident at once, and the process is killed before it reports
+  // anything — measured twice on this repository, both runs OOM-killed after several minutes.
+  //
+  // That mattered more than it looks: `--all` is the mode `trusted-leaks.yml` runs weekly and the
+  // one `ci.yml` calls authoritative. A scan that cannot finish is a scan that is not happening,
+  // and "killed" and "still running" look the same from outside.
+  //
+  // A generator scans each blob and lets it go. Nothing else changes — `scan()` never needed more
+  // than one file at a time, and `findings` is a Set of short strings.
+  //
+  // The same blob is re-read once per commit that contains it, which is wasteful but not the
+  // problem being solved here; deduplicating would change which commit a finding is reported
+  // against, and that attribution is what makes a finding traceable.
   for (const commit of commits) {
     const entries = String(git(["ls-tree", "-r", "-z", commit])).split("\0").filter(Boolean);
     for (const entry of entries) {
@@ -212,18 +309,47 @@ function historyFiles() {
       // ANSI controls, or workflow-command-looking text and must never reach a failing command's
       // stderr. Candidate paths are used only as input to the one-way label hash below.
       const buffer = git(["cat-file", "blob", match[1]], null);
-      files.push({ label: `${commit.slice(0, 12)}:${path}`, content: buffer.toString("utf8") });
+      // The blob id travels with the content so a finding can be accepted per blob — see
+      // `IGNORE_FILE`. It is the object's own name, so it is stable across every commit that
+      // carries these bytes and across a rename that does not change them.
+      yield { label: `${commit.slice(0, 12)}:${path}`, content: buffer.toString("utf8"), blob: match[1] };
     }
   }
-  return files;
 }
 
-for (const file of has("--worktree") ? worktreeFiles() : historyFiles()) scan(file.content, file.label);
+for (const file of has("--worktree") ? worktreeFiles() : historyFiles()) {
+  currentBlob = file.blob ?? null;
+  scan(file.content, file.label);
+}
+currentBlob = null;
+
+// Stale entries, but only where "stale" can be established. `--all` walks every reachable object,
+// so an entry that matched nothing there names a blob that is gone or a class that no longer
+// fires — dead weight that will be read as documentation of a real exception by the next person.
+// A pull-request scan sees a slice of history and cannot tell the difference, so it says nothing.
+if (has("--all")) {
+  const stale = [...acceptedLines.keys()].filter((k) => !acceptedUsed.has(k));
+  if (stale.length) {
+    for (const k of stale) {
+      console.error(`ERROR: ${IGNORE_FILE}:${acceptedLines.get(k)} matched nothing in full history — remove it`);
+    }
+    console.error(`${stale.length} stale allowlist entr(y|ies); an exception nobody can trace is not an exception`);
+    process.exitCode = 1;
+  }
+}
 
 if (findings.size) {
   for (const finding of findings) console.error(`ERROR: ${finding}`);
   console.error(`refusing ${findings.size} potential site-data/credential leak(s); values are intentionally redacted`);
+  if (has("--print-accept-lines")) {
+    console.error(`\n# Candidate ${IGNORE_FILE} entries for the refusals above.`);
+    console.error(`# ⚠️ Do not paste these without establishing, one at a time, that the value was`);
+    console.error(`#    never sensitive. A real secret is rotated, not accepted — see SECURITY.md.`);
+    for (const line of [...suggestions].sort()) console.error(line);
+  }
   process.exitCode = 1;
-} else {
-  console.log(`site-data scan passed (${has("--worktree") ? "worktree" : "introduced commit history"})`);
+} else if (!process.exitCode) {
+  const scope = has("--worktree") ? "worktree" : has("--all") ? "all reachable history" : "introduced commit history";
+  const note = acceptedUsed.size ? `, ${acceptedUsed.size} accepted by ${IGNORE_FILE}` : "";
+  console.log(`site-data scan passed (${scope}${note})`);
 }
