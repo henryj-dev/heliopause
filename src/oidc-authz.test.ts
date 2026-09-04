@@ -11,6 +11,9 @@ const id = (over: Partial<Identity> = {}): Identity => ({
   sub: "idp-sub-1",
   username: "henry",
   email: "jang@example.invalid",
+  // The default is a **verified** address, because that is the ordinary case these tests are
+  // about. The unverified one gets its own describe below — it is the interesting half.
+  emailVerified: true,
   groups: ["heliopause-operators"],
   expiresAt: new Date("2026-08-06T00:00:00Z"),
   ...over,
@@ -129,5 +132,63 @@ describe("parsing the alias configuration", () => {
     // Silently taking one of them would make which certificate name a person maps to depend on
     // configuration order.
     assert.throws(() => parseAliases("a@x=ops-a,a@x=ops-b"), /declared twice/);
+  });
+});
+
+// ── An address the issuer has not verified is not an identity ─────────────────
+//
+// 🔴 `email_verified` appeared **nowhere in this repository** — not in `src`, `bin`, `agent` or
+// `packages`. The alias map is keyed on email, that alias is what raises `canWrite`, and the name it
+// resolves to is what `approval.ts` compares for the two-person rule. Many IdPs let a user edit
+// their own profile address; only the verified one is the issuer's claim rather than the user's.
+//
+// So the hole was: a member of a writer group sets their profile email to a colleague's address,
+// takes the colleague's alias, and satisfies both halves of the two-person rule alone — with the
+// colleague's name in the audit line.
+describe("an unverified email is not an alias key", () => {
+  const writer = { groups: ["heliopause-operators", "heliopause-writers"] };
+
+  it("grants write on a verified address — the known positive", () => {
+    const d = authorize(id({ ...writer, emailVerified: true }), cfg());
+    assert.equal(d.canWrite, true);
+    assert.equal(d.principal?.name, "ops-alice");
+  });
+
+  it("refuses the same address when the issuer did not verify it", () => {
+    const d = authorize(id({ ...writer, emailVerified: false }), cfg());
+    assert.equal(d.canWrite, false);
+    assert.notEqual(d.principal?.name, "ops-alice", "the colleague's alias must not be taken");
+  });
+
+  it("says which of the two refusals it is, because the fixes differ", () => {
+    // "no alias is declared" and "an alias is declared but your address is unverified" want
+    // completely different actions, and the second is invisible from the configuration line.
+    const unverified = authorize(id({ ...writer, emailVerified: false }), cfg());
+    assert.match(unverified.reason, /email_verified=true/);
+    const noAlias = authorize(id({ ...writer, email: "nobody@example.invalid", emailVerified: true }), cfg());
+    assert.match(noAlias.reason, /no alias to a certificate name/);
+    assert.doesNotMatch(noAlias.reason, /email_verified/);
+  });
+
+  // The other two keys are not user-settable in the deployments this serves, and `sub` is the
+  // issuer's own identifier — so an unverified address must not disable them.
+  it("still resolves an alias keyed on the subject when the address is unverified", () => {
+    const aliases = new Map([["idp-sub-1", "ops-alice"]]);
+    const d = authorize(id({ ...writer, emailVerified: false }), cfg({ aliases }));
+    assert.equal(d.canWrite, true);
+    assert.equal(d.principal?.name, "ops-alice");
+  });
+
+  it("still resolves an alias keyed on preferred_username", () => {
+    const aliases = new Map([["henry", "ops-alice"]]);
+    const d = authorize(id({ ...writer, emailVerified: false }), cfg({ aliases }));
+    assert.equal(d.canWrite, true);
+  });
+
+  // A missing claim is not a yes. An issuer that will not say has not said yes, and guessing here
+  // would be guessing about who may approve a firewall change.
+  it("treats an absent email_verified claim as unverified", () => {
+    const withoutClaim = { ...id({ ...writer }), emailVerified: false };
+    assert.equal(authorize(withoutClaim, cfg()).canWrite, false);
   });
 });

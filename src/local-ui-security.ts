@@ -11,6 +11,35 @@ export class UiRequestError extends Error {
 }
 
 /**
+ * Is this request a mutation, for the purpose of the Origin check?
+ *
+ * 🔴 **Derived from the method, not from a list of routes.** The caller used to spell out
+ * `(pathname === "/api/propose" && method === "POST") || (pathname.startsWith("/api/policies/") &&
+ * (method === "PUT" || method === "DELETE"))`, and a hand-maintained list of mutating routes is a
+ * list somebody eventually forgets to extend. Measured: replacing that whole expression with
+ * `false` — every route CSRF-open at once — left all 1,835 tests green.
+ *
+ * The method is the complete answer and needs no maintenance: a safe method does not change state
+ * (that is what "safe" means in HTTP), and everything else does. Today's routes agree exactly —
+ * every mutation here is POST, PUT or DELETE and every read is GET — but the point is that the next
+ * one will agree too, without anyone remembering.
+ */
+export function isWriteMethod(method: string | undefined): boolean {
+  return method !== "GET" && method !== "HEAD" && method !== "OPTIONS";
+}
+
+/**
+ * Does this request carry a body this server will parse as JSON?
+ *
+ * Same reasoning as `isWriteMethod`: derived rather than listed. A body-bearing method must declare
+ * `application/json`, which is what stops a `<form>` — restricted to url-encoded, plain-text and
+ * multipart — from reaching a write handler at all. `DELETE` carries no body and is not asked.
+ */
+export function expectsJsonBody(method: string | undefined): boolean {
+  return method === "POST" || method === "PUT" || method === "PATCH";
+}
+
+/**
  * Validate the browser-facing boundary of the loopback-only workstation server.
  *
  * Host is checked on every request to stop DNS rebinding from turning an attacker's origin into a

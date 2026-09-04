@@ -43,7 +43,7 @@ import type { AddressObject, FirewallObject, ServiceObject } from "../src/object
 import { loadPolicyDocument, putPolicy, removePolicy, replacePolicyPlacements, savePolicyDocument, type PolicyPlacement } from "../src/policy-store.ts";
 import { applyPolicyDocument } from "../src/site-policy.ts";
 import type { Policy } from "../src/policy.ts";
-import { localUiBoundaryError, readUiBody, UiRequestError } from "../src/local-ui-security.ts";
+import { expectsJsonBody, isWriteMethod, localUiBoundaryError, readUiBody, UiRequestError } from "../src/local-ui-security.ts";
 import { resolveWebRoot, serveConsole } from "../src/web-console.ts";
 import { workstationAppPath } from "../src/app-shell.ts";
 import { installCliLanguage } from "../src/operator-i18n.ts";
@@ -185,13 +185,12 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   const listeningPort = typeof address === "object" && address ? address.port : port;
   const self = new URL(`http://127.0.0.1:${listeningPort}`);
   const url = new URL(req.url ?? "/", self);
-  const write =
-    (url.pathname === "/api/propose" && req.method === "POST") ||
-    (url.pathname.startsWith("/api/policies/") && (req.method === "PUT" || req.method === "DELETE"));
-  const json =
-    (url.pathname === "/api/propose" && req.method === "POST") ||
-    (url.pathname.startsWith("/api/policies/") && req.method === "PUT");
-  const boundaryError = localUiBoundaryError(req.headers, self, { write, json });
+  // Both derived from the method — see `isWriteMethod`. These used to be two hand-written lists of
+  // (path, method) pairs, which is a way of remembering to register every new mutating route.
+  const boundaryError = localUiBoundaryError(req.headers, self, {
+    write: isWriteMethod(req.method),
+    json: expectsJsonBody(req.method),
+  });
   if (boundaryError) return sendError(res, boundaryError.status, boundaryError.message);
 
   if (serveApp?.(req, res)) return;

@@ -172,8 +172,19 @@ describe("ending a session at the identity provider", () => {
 });
 
 describe("the token exchange", () => {
-  /** An IdP that serves discovery and JWKS normally, and the token endpoint however the test says. */
+  /**
+   * An IdP that serves discovery and JWKS normally, and the token endpoint however the test says.
+   *
+   * 🔴 **It used to take only the URL** — `(async (url: string | URL) => …)` — so no test in this
+   * file could see the request it was answering. Everything about the token request was therefore
+   * unchecked: deleting `redirect_uri`, `client_id` or `code_verifier` from the body left all 1,835
+   * tests green. The `code_verifier` is PKCE; without it an intercepted authorization code is
+   * redeemable by whoever intercepted it, and nothing here would have said so.
+   *
+   * It now records what it was sent, so a test can ask.
+   */
   function idp(tokenAnswer: () => Response) {
+    const sent: { url?: string; method?: string; headers?: Record<string, string>; body?: URLSearchParams } = {};
     const jwks = {
       keys: [
         { ...publicKey.export({ format: "jwk" }), kid: "ec-1", use: "sig", alg: "ES256" },
@@ -187,12 +198,18 @@ describe("the token exchange", () => {
       jwks_uri: `${ISSUER}/oidc/jwks`,
       code_challenge_methods_supported: ["S256"],
     };
-    const fake = (async (url: string | URL) => {
+    const fake = (async (url: string | URL, init?: RequestInit) => {
       const u = String(url);
-      if (u.endsWith("/oidc/token")) return tokenAnswer();
+      if (u.endsWith("/oidc/token")) {
+        sent.url = u;
+        sent.method = init?.method;
+        sent.headers = init?.headers as Record<string, string> | undefined;
+        sent.body = new URLSearchParams(String(init?.body ?? ""));
+        return tokenAnswer();
+      }
       return new Response(JSON.stringify(u.endsWith("/oidc/jwks") ? jwks : doc), { status: 200 });
     }) as unknown as typeof fetch;
-    return { provider: new Provider(ISSUER, fake, 0), fake };
+    return { provider: new Provider(ISSUER, fake, 0), fake, sent };
   }
 
   const OPTS = {
@@ -208,6 +225,64 @@ describe("the token exchange", () => {
     const id = await exchange(provider, OPTS, fake);
     assert.equal(id.sub, "user-1");
     assert.equal(id.username, "ops-alice");
+  });
+
+  // ── What is actually sent to the token endpoint ─────────────────────────────
+  //
+  // Every one of these was unverifiable until the fake IdP started recording its input, and each
+  // corresponds to a mutation that survived the whole suite.
+  it("redeems the code with PKCE, the redirect it registered, and its client id", async () => {
+    const { provider, fake, sent } = idp(() => new Response(JSON.stringify({ id_token: token() }), { status: 200 }));
+    await exchange(provider, OPTS, fake);
+
+    assert.equal(sent.method, "POST", "the code must not travel in a query string");
+    assert.equal(sent.body?.get("grant_type"), "authorization_code");
+    assert.equal(sent.body?.get("code"), OPTS.code);
+    // 🔴 PKCE. Without the verifier an intercepted code is redeemable by whoever intercepted it,
+    // and a public client has nothing else standing in the way.
+    assert.equal(sent.body?.get("code_verifier"), OPTS.verifier);
+    // The IdP compares this against the registered redirect; omitting it makes the check the IdP's
+    // problem rather than a guarantee, and some accept the omission.
+    assert.equal(sent.body?.get("redirect_uri"), OPTS.redirectUri);
+    assert.equal(sent.body?.get("client_id"), OPTS.clientId);
+  });
+
+  it("sends a configured client secret as Basic auth, never in the body", async () => {
+    // The body ends up in more logs than the header does — the source says so, and this pins it.
+    const { provider, fake, sent } = idp(() => new Response(JSON.stringify({ id_token: token() }), { status: 200 }));
+    await exchange(provider, { ...OPTS, clientSecret: "s3cret" }, fake);
+    assert.equal(sent.body?.get("client_secret"), null, "the secret must not be in the form body");
+    const auth = sent.headers?.authorization ?? "";
+    assert.match(auth, /^Basic /);
+    assert.equal(Buffer.from(auth.slice(6), "base64").toString(), `${CLIENT}:s3cret`);
+  });
+
+  it("sends no authorization header when there is no secret — a public client is PKCE only", async () => {
+    const { provider, fake, sent } = idp(() => new Response(JSON.stringify({ id_token: token() }), { status: 200 }));
+    await exchange(provider, OPTS, fake);
+    assert.equal(sent.headers?.authorization, undefined);
+    assert.equal(sent.body?.get("code_verifier"), OPTS.verifier, "…so the verifier is the whole proof");
+  });
+
+  // `email_verified` decides whether the address may key an alias, and an alias decides who may
+  // write and which name the two-person approval rule compares — see `oidc-authz.ts`. Read strictly,
+  // because a coercion here would be a coercion deciding who can approve a firewall change.
+  it("reports email_verified as the issuer sent it, and absent as false", async () => {
+    const cases: Array<[unknown, boolean]> = [
+      [true, true],
+      [false, false],
+      ["true", false],
+      [1, false],
+      [undefined, false],
+    ];
+    for (const [claim, expected] of cases) {
+      const payload = claim === undefined ? {} : { email_verified: claim };
+      const { provider, fake } = idp(() => new Response(JSON.stringify({ id_token: token(payload) }), { status: 200 }));
+      const id = await exchange(provider, OPTS, fake);
+      assert.equal(id.emailVerified, expected, `email_verified: ${JSON.stringify(claim)}`);
+      // The address itself still travels — it is used for display even when it cannot key an alias.
+      assert.equal(id.email, "a@example.invalid");
+    }
   });
 
   it("refuses a token minted for a different login", async () => {
