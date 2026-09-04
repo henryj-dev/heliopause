@@ -237,11 +237,20 @@ jobs:
   # by no job here at all. What it *does* is checked by `src/enroll-app-cli-contract.test.ts`, which
   # reads both ends of the CLI contract statically and runs inside `npm test` — no toolchain needed.
   #
-  # This job checks the two things a static read cannot: that `Cargo.lock` still describes
-  # `Cargo.toml`, and that the source is formatted. **No `clippy` and no build**, deliberately —
-  # compiling tauri on Linux pulls in webkit2gtk system packages and several minutes, and the defect
-  # class that would catch (a type error in 276 lines that the author never compiled) is not one
-  # this app has had. When it grows a real build, this is where it goes.
+  # This job checks the one thing a static read cannot: that `Cargo.lock` still describes
+  # `Cargo.toml`.
+  #
+  # **No `clippy` and no build**, deliberately — compiling tauri on Linux pulls in webkit2gtk system
+  # packages and several minutes, and the defect class that would catch (a type error in 276 lines
+  # that the author never compiled) is not one this app has had. When it grows a real build, this is
+  # where it goes.
+  #
+  # **And no `cargo fmt --check`.** It was here for one run and it failed: this file has never been
+  # rustfmt-formatted. Reformatting it would be a hundred lines of style noise inside a security
+  # change, and — the real reason — **nothing else in this repository is gated on formatting.**
+  # There is no prettier for the TypeScript and no black for the Python. Adopting a formatter is a
+  # decision to make deliberately and apply everywhere, not one to slip in for the language that
+  # happened to be getting its first CI job.
   enroll-app:
     name: enrolment app
     runs-on: ubuntu-latest
@@ -256,9 +265,6 @@ jobs:
       - name: Cargo.lock still describes Cargo.toml
         working-directory: packages/enroll-app/src-tauri
         run: cargo metadata --locked --format-version 1 > /dev/null
-      - name: rustfmt
-        working-directory: packages/enroll-app/src-tauri
-        run: cargo fmt --check
 
   # **The policy layer does not belong to this repository.** Credential scanning, workflow
   # auditing and dependency review ask the same question of all five repositories, whatever
