@@ -30,6 +30,19 @@
     "README.md",
     "LICENSE"
   ],
+  "//workspaces": [
+    "packages/enroll-app is deliberately NOT here, and that is a decision rather than an oversight.",
+    "It is a Tauri desktop app: its npm side is the Tauri CLI, a platform binary that every job",
+    "running `npm ci` would then download, and its real dependency tree is Cargo's. Hoisting it",
+    "would put a large build-only binary in the root lockfile for the benefit of nobody who runs",
+    "the tests.",
+    "",
+    "What it costs is that `directory: /` in dependabot does not reach it, so it has its own npm",
+    "and cargo entries there; and that nothing in `npm test` touches it, so what it does is pinned",
+    "statically by `src/enroll-app-cli-contract.test.ts` — both ends of the CLI contract, the",
+    "sanitiser, and the Tauri permission set. `.github/workflows/ci.yml` has an `enrolment app` job",
+    "for the two things a static read cannot see."
+  ],
   "workspaces": [
     "packages/core",
     "packages/agent",
