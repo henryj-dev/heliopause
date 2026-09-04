@@ -376,10 +376,32 @@ function nftSet(cidrs: string[]): string {
   return cidrs.length === 1 ? cidrs[0]! : `{ ${cidrs.join(", ")} }`;
 }
 
-/** Strip characters that would break nft's comment syntax. */
-function nftComment(s: string): string {
-  return s.replace(/[\r\n"\\]/g, " ").slice(0, 80);
+/**
+ * The exact string a rule comment is, everywhere.
+ *
+ * ⚠️ **This must run at plan time, not at emit time.** It used to run in each emitter, and the two
+ * emitters stripped different characters (`"` and `\` in the text form, `\t` in the JSON form)
+ * while `assertions` was built from the raw `desc` and never truncated at all. So three strings
+ * claimed to be one:
+ *
+ *     assertion   [83] baseline: ICMP (path MTU discovery) — a black hole here reads as 'the app is flaky'
+ *     kernel      [80] baseline: ICMP (path MTU discovery) — a black hole here reads as 'the app is fla
+ *
+ * The agent compares them with **set membership** (`heliopause-pull.py`, `missing_assertions`), so
+ * an assertion that is one character longer than the comment is simply absent. Every host would
+ * report the baseline missing and auto-rollback every generation, and the symptom reads as a bad
+ * ruleset rather than as a string length. Measured against `examples/site.ts` as shipped — the
+ * second baseline entry's `desc` is 73 characters, which is already over the line.
+ *
+ * Normalising once, here, is what makes `assertions ⊆ comments` true by construction rather than
+ * by two functions happening to agree. `nft-json.ts` imports this one rather than keeping its own.
+ */
+export function nftComment(s: string): string {
+  return s.replace(/[\r\n\t"\\]/g, " ").slice(0, COMMENT_MAX);
 }
+
+/** nft stores a rule comment as a bounded string; longer text is silently cut, not refused. */
+export const COMMENT_MAX = 80;
 
 /** nft writes ranges as `lo-hi`; the policy model uses `lo:hi`. */
 function portExpr(proto: string, ports: string): string {
@@ -388,6 +410,12 @@ function portExpr(proto: string, ports: string): string {
     .map((x) => x.trim())
     .filter(Boolean)
     .map((p) => (p.includes(":") ? p.replace(":", "-") : p));
+  // A port match over nothing is not a rule with no opinion about ports — it is `tcp dport {  }`,
+  // which nft refuses, and whose JSON counterpart is a rule matching port zero. Neither is what any
+  // caller meant, so no caller is allowed to ask. "All ports of this protocol" is `l4proto`.
+  if (exprs.length === 0) {
+    throw new RenderError(`${proto} port match has no ports — use a protocol match for "all ports"`);
+  }
   return `${proto} dport ${exprs.length === 1 ? exprs[0] : `{ ${exprs.join(", ")} }`}`;
 }
 
@@ -561,6 +589,39 @@ function portList(ports: string): string[] {
     .filter(Boolean);
 }
 
+/**
+ * Can this layer express the policy's protocol and ports at all?
+ *
+ * ⚠️ `proto: "any"` with a port spec cannot be rendered here: nft's port match is
+ * protocol-qualified, so there is no rule meaning "port 8080 of whatever protocol this is". **The
+ * old code answered by dropping the ports**, and that is not a narrower rule but a wider one.
+ * Measured — `{proto: "any", ports: "8080", action: "deny", src: internet}` rendered as:
+ *
+ *     ip saddr 0.0.0.0/0 ip daddr <host> drop
+ *
+ * Every port, every protocol, a black hole. `baselineConflict` could not catch it either: that
+ * function reads `p.ports`, so it went on reasoning about the port the rule no longer carried and
+ * reported no conflict with the management baseline the rule was about to swallow. `skipped`
+ * stayed empty, so nothing said a word.
+ *
+ * **Skipped rather than refused**, and the reason is `cilium.ts` — it skips a policy whose
+ * endpoints are not workloads with "belongs to the host layer only" rather than failing the
+ * render. The two renderers read one policy list and each drops what it cannot express; a policy
+ * that is `any`-plus-ports between two workloads is legitimate for Cilium, and failing the whole
+ * host publish over it would turn one unrenderable row into a fleet-wide publish outage. That is
+ * also what `RenderError`'s own doc says: an error is input that could not be **understood**. This
+ * is understood perfectly and has no nft spelling, which is the definition of a skip.
+ */
+function unrenderable(p: Policy): string | null {
+  if (p.proto === "any" && p.ports) {
+    return (
+      `proto "any" cannot carry ports ${JSON.stringify(p.ports)} on the host layer — ` +
+      `nft's port match is protocol-qualified. Name the protocol, or clear the ports.`
+    );
+  }
+  return null;
+}
+
 function protoMatches(p: Policy): Match[] {
   if (p.proto === "any") return [];
   const out: Match[] = [{ kind: "l4proto", proto: p.proto }];
@@ -578,7 +639,7 @@ function inputRules(p: Policy, it: InputItem, verdict: Verdict): PlannedRule[] {
   const dsts = groupByFamily(it.dstCidrs, `${at} destination`);
   const srcs = it.srcCidrs.length > 0 ? groupByFamily(it.srcCidrs, `${at} source`) : null;
   const proto = protoMatches(p);
-  const comment = `${p.id} ${p.name}`;
+  const comment = nftComment(`${p.id} ${p.name}`);
 
   const out: PlannedRule[] = [];
   for (const [dstFamily, dstCidrs] of dsts) {
@@ -609,7 +670,7 @@ function inputRules(p: Policy, it: InputItem, verdict: Verdict): PlannedRule[] {
 
 function egressRules(cfg: Config, p: Policy, it: EgressItem, verdict: Verdict): PlannedRule[] {
   const proto = protoMatches(p);
-  const comment = `${p.id} ${p.name}`;
+  const comment = nftComment(`${p.id} ${p.name}`);
   if (it.dstCidrs === null) {
     const family = familyOf(cfg.internalSupernet, "internalSupernet");
     // Note the reach of this rule: `ip daddr != <v4 supernet>` matches IPv4 only, so an egress
@@ -626,13 +687,27 @@ function egressRules(cfg: Config, p: Policy, it: EgressItem, verdict: Verdict): 
 
 function baselineRules(b: BaselineRule): PlannedRule[] {
   // ICMP has no ports; the protocol match is the whole condition.
+  //
+  // An **empty** `ports` on tcp/udp means the same thing one level up: `portsOverlap` documents
+  // that "an empty policy spec means all ports", and that is the only reading under which
+  // `{proto: "tcp", ports: ""}` is a sensible way to write "all TCP from the management range".
+  //
+  // ⚠️ It used to be rendered as a port match over an empty list, and the two emitters then
+  // disagreed about what that was. Text produced `tcp dport {  }`, which nft refuses — loud, and
+  // therefore survivable. JSON produced `"right": 0`, a structurally valid rule matching **port
+  // zero only**, and JSON is the form the fleet applies (`publish.ts`). So a management baseline
+  // written this way applied cleanly and permitted nothing, while the text preview an operator
+  // reviewed showed something else entirely. Emitting the protocol match is what both forms
+  // already mean by "all ports of this protocol".
   const proto: Match[] =
     b.proto === "icmp" || b.proto === "icmpv6"
       ? [{ kind: "l4proto", proto: b.proto === "icmpv6" ? "icmpv6" : "icmp" }]
-      : // The protocol-qualified port match already implies the protocol, so no separate
-        // `meta l4proto` is emitted for tcp/udp.
-        [{ kind: "dport", proto: b.proto, ports: [b.ports] }];
-  const comment = `baseline: ${b.desc}`;
+      : b.ports === ""
+        ? [{ kind: "l4proto", proto: b.proto }]
+        : // The protocol-qualified port match already implies the protocol, so no separate
+          // `meta l4proto` is emitted for tcp/udp.
+          [{ kind: "dport", proto: b.proto, ports: portList(b.ports) }];
+  const comment = nftComment(`baseline: ${b.desc}`);
 
   if (b.srcCidrs.length === 0) {
     // No address match, so no family qualifier — this covers IPv4 and IPv6 together. That is the
@@ -724,17 +799,17 @@ function forwardRules(cfg: Config, host: string): PlannedRule[] | null {
       {
         matches: [{ kind: "ct-established" }],
         verdict: "accept",
-        comment: "forward: established/related (replies to internally-originated flows)",
+        comment: nftComment("forward: established/related (replies to internally-originated flows)"),
       },
       {
         matches: [{ kind: "ct-dnat" }],
         verdict: "accept",
-        comment: "forward: DNAT (published container/VM ports land inside the supernet)",
+        comment: nftComment("forward: DNAT (published container/VM ports land inside the supernet)"),
       },
       {
         matches: [{ kind: "ct-invalid" }],
         verdict: "drop",
-        comment: "forward: invalid",
+        comment: nftComment("forward: invalid"),
       },
       {
         matches: [
@@ -742,7 +817,7 @@ function forwardRules(cfg: Config, host: string): PlannedRule[] | null {
           { kind: "saddr-not", family, cidr: cfg.internalSupernet },
         ],
         verdict: "drop",
-        comment: `forward: refuse routing into ${cfg.internalSupernet} from outside it`,
+        comment: nftComment(`forward: refuse routing into ${cfg.internalSupernet} from outside it`),
       },
     );
   }
@@ -799,6 +874,11 @@ export function planHostRuleset(
       skipped.push({ policyId: p.id, name: p.name, reason: `destination does not resolve to ${host}`, hook: "input" });
       continue;
     }
+    const cannot = unrenderable(p);
+    if (cannot) {
+      skipped.push({ policyId: p.id, name: p.name, reason: cannot, hook: "input" });
+      continue;
+    }
     // Only denies can collide with a protected path; an allow cannot take one away.
     const conflict = p.action === "deny" ? baselineConflict(cfg, p, it.srcCidrs) : null;
     if (conflict) {
@@ -816,7 +896,30 @@ export function planHostRuleset(
     assertCidrs(it.srcCidrs, `${at} source`);
     assertCidrs(it.dstCidrs, `${at} destination`);
     if (p.proto !== "any" && p.proto !== "icmp" && p.ports) assertPorts(p.ports, at);
-    (p.action === "deny" ? denies : allows).push(...inputRules(p, it, p.action === "deny" ? denyVerdict(p) : "accept"));
+    const rules = inputRules(p, it, p.action === "deny" ? denyVerdict(p) : "accept");
+    // `Skipped` is documented as "policies that produced no rule, and why. Never silently
+    // dropped" — and this was the one path that broke it. A single nft rule cannot mix address
+    // families, so `inputRules` pairs sources with destinations family by family and drops the
+    // pairs that cannot match. When **no** pair matches — an IPv4-only source against a
+    // destination that now resolves to AAAA only — the loop simply produced nothing: no rule, no
+    // skip, no error. A deny evaporated, and every dashboard went on reporting the policy as
+    // applied because `skipped` was empty and `RenderError` was never raised.
+    //
+    // Reported rather than refused: this is a resolver outcome, not malformed input. The policy
+    // was understood; it is the addresses that stopped overlapping, and an operator reading the
+    // skip list is exactly who can tell whether that is a mistake.
+    if (rules.length === 0) {
+      skipped.push({
+        policyId: p.id,
+        name: p.name,
+        reason:
+          `no rule renders — source (${it.srcCidrs.join(", ")}) and destination ` +
+          `(${it.dstCidrs.join(", ")}) share no address family`,
+        hook: "input",
+      });
+      continue;
+    }
+    (p.action === "deny" ? denies : allows).push(...rules);
   }
 
   // Egress is not checked against the baseline: protected management paths are inbound, and the
@@ -844,12 +947,28 @@ export function planHostRuleset(
       skipped.push({ policyId: p.id, name: p.name, reason: "destination does not resolve to any CIDR", hook: "output" });
       continue;
     }
+    const cannotEgress = unrenderable(p);
+    if (cannotEgress) {
+      skipped.push({ policyId: p.id, name: p.name, reason: cannotEgress, hook: "output" });
+      continue;
+    }
     const at = `egress policy ${p.id} (${p.name})`;
     if (it.dstCidrs !== null) assertCidrs(it.dstCidrs, `${at} destination`);
     else familyOf(cfg.internalSupernet, `${at} internalSupernet`);
     if (p.proto !== "any" && p.proto !== "icmp" && p.ports) assertPorts(p.ports, at);
     const v: Verdict = p.action === "deny" ? denyVerdict(p) : "accept";
-    (p.action === "deny" ? egressDenies : egressAllows).push(...egressRules(cfg, p, it, v));
+    const rules = egressRules(cfg, p, it, v);
+    // Same invariant as the input loop above: a policy that produced no rule says so.
+    if (rules.length === 0) {
+      skipped.push({
+        policyId: p.id,
+        name: p.name,
+        reason: `no rule renders — destination (${(it.dstCidrs ?? []).join(", ")}) resolved to no usable address family`,
+        hook: "output",
+      });
+      continue;
+    }
+    (p.action === "deny" ? egressDenies : egressAllows).push(...rules);
   }
 
   // The conntrack rule is first in both chains and is not optional. Without it a broad deny drops
@@ -858,12 +977,12 @@ export function planHostRuleset(
   const inConntrack: PlannedRule = {
     matches: [{ kind: "ct-established" }],
     verdict: "accept",
-    comment: "baseline: established/related (protects replies to our own outbound)",
+    comment: nftComment("baseline: established/related (protects replies to our own outbound)"),
   };
   const outConntrack: PlannedRule = {
     matches: [{ kind: "ct-established" }],
     verdict: "accept",
-    comment: "baseline: established/related (protects replies to inbound sessions)",
+    comment: nftComment("baseline: established/related (protects replies to inbound sessions)"),
   };
 
   // Loopback first, and only when it is needed. Measured: with `policy drop` and no such rule,
@@ -872,14 +991,19 @@ export function planHostRuleset(
   // It is prepended rather than left to the operator because forgetting it is silent and total.
   const loopback: PlannedRule[] =
     cfg.hookPolicy.input === "drop"
-      ? [{ matches: [{ kind: "iif", name: "lo" }], verdict: "accept", comment: "baseline: loopback" }]
+      ? [{ matches: [{ kind: "iif", name: "lo" }], verdict: "accept", comment: nftComment("baseline: loopback") }]
       : [];
 
   // Built from the configured baseline rather than from the rules assembled above, so a mistake
   // in assembly cannot produce a matching mistake here. See `RulesetPlan.assertions`.
+  //
+  // ⚠️ Through `nftComment`, and that is not cosmetic — see the warning on that function. The
+  // independence this list is built for is independence from rule *assembly*, not from how nft
+  // stores a comment. Skipping the normaliser here made every assertion over 80 characters
+  // unsatisfiable, which is not a weaker check but a fleet that reverts everything it is given.
   const assertions = [
-    ...(cfg.hookPolicy.input === "drop" ? ["baseline: loopback"] : []),
-    ...cfg.baseline.map((b) => `baseline: ${b.desc}`),
+    ...(cfg.hookPolicy.input === "drop" ? [nftComment("baseline: loopback")] : []),
+    ...cfg.baseline.map((b) => nftComment(`baseline: ${b.desc}`)),
   ];
 
   // See `isSingleAddress` for why the test is not "has no slash".

@@ -38,6 +38,11 @@
  * every host, its generation, and whether its ruleset has drifted — a map for choosing the next
  * target. The relay checks the role by CN against an explicit allowlist.
  */
+// `isIP` only, so this module stays pure: it decides what a certificate should say and performs no
+// I/O. See `sanEntry` for why the hand-rolled address test it replaces was a hole rather than a
+// simplification.
+import { isIP } from "node:net";
+
 export type CertRole = "ca" | "relay" | "agent" | "operator";
 
 export class PkiError extends Error {
@@ -137,13 +142,39 @@ export function subjectFor(name: string): string {
   return `/CN=${name}`;
 }
 
-/** `10.17.0.1` / `::1` → IP SAN, anything else → DNS SAN. */
+/**
+ * `10.17.0.1` / `::1` → IP SAN, a plausible hostname → DNS SAN, anything else → refused.
+ *
+ * ⚠️ **The IP test used to be `/^[0-9.]+$/.test(v) || v.includes(":")`, and the second half of that
+ * disjunction turned the whole validation off.** Any value containing a colon was declared an IP
+ * and skipped the name check entirely — including one containing a newline. The extensions this
+ * builds are written out with `lines.join("\n")` into the openssl `-extfile`
+ * (`bin/heliopause-pki.ts`, `withExtFile`), so a newline in a SAN is not a cosmetic problem: it is
+ * **a second extension line, chosen by whoever supplied `--san`**. Measured — this was accepted:
+ *
+ *     planCert({name: "gw-01", role: "relay", sans: ["<v6 literal>\nbasicConstraints=critical,CA:TRUE"]})
+ *
+ * and the relay leaf comes back able to issue certificates. The everyday version of the same hole
+ * is quieter and more likely: `--san=gw.example:8443` was silently minted as `IP:gw.example:8443`,
+ * a SAN no client will ever match, so hostname verification fails later and somewhere else.
+ *
+ * `isIP` answers the question the regex was approximating, and answers it exactly — it rejects
+ * anything with a stray character, which is every form this needs to refuse.
+ */
 function sanEntry(v: string): string {
-  const isIp = /^[0-9.]+$/.test(v) || v.includes(":");
-  if (!isIp && !NAME_OK.test(v.replace(/\*\./, "x."))) {
+  if (isIP(v)) return `IP:${v}`;
+  // Address-shaped but not an address is refused, never demoted to a DNS SAN. `10.17.0.256` and
+  // `10.17.0` both satisfy `NAME_OK` — they are digits and dots — so falling through would mint
+  // `DNS:10.17.0.256`, a SAN that is syntactically fine and matches nothing, turning a typo in an
+  // address into a hostname-verification failure discovered later and somewhere else. Whoever
+  // wrote digits and colons meant an address; say the address is wrong.
+  if (/^[0-9.]+$/.test(v) || v.includes(":")) {
+    throw new PkiError(`subjectAltName ${JSON.stringify(v)} is written as an address but is not a valid one`);
+  }
+  if (!NAME_OK.test(v.replace(/\*\./, "x."))) {
     throw new PkiError(`subjectAltName ${JSON.stringify(v)} is neither an IP nor a plausible DNS name`);
   }
-  return `${isIp ? "IP" : "DNS"}:${v}`;
+  return `DNS:${v}`;
 }
 
 /**

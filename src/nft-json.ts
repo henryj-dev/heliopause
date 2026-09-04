@@ -21,6 +21,7 @@
 
 import { tableRef, type Config } from "./config.ts";
 import {
+  nftComment,
   planHostRuleset,
   RenderError,
   type EgressItem,
@@ -90,6 +91,12 @@ function port(spec: string): NftJsonValue {
 }
 
 function portValue(ports: string[]): NftJsonValue {
+  // The counterpart of the same guard in `portExpr`. An empty list here used to serialise as
+  // `{"set": []}` — or, when the caller passed the raw empty spec as a single entry, as
+  // `"right": 0`: a rule matching port zero, which applies cleanly and permits nothing.
+  if (ports.length === 0) {
+    throw new RenderError("port match has no ports — use a protocol match for \"all ports\"");
+  }
   return ports.length === 1 ? port(ports[0]!) : { set: ports.map(port) };
 }
 
@@ -142,21 +149,16 @@ function ruleJson(cfg: Config, chain: string, r: PlannedRule): NftJsonValue {
         expr: [...r.matches.map(matchJson), VERDICT_JSON[r.verdict]],
         // Carried as a rule property rather than an expression. Comments are how a rendered rule
         // is traced back to the policy that produced it, so they are not decoration.
-        comment: comment(r.comment),
+        //
+        // `nftComment` is imported from `nft.ts` and already ran at plan time, so this is
+        // idempotent. It stays because the alternative is trusting that every future producer of a
+        // `PlannedRule` remembered — and this file used to keep its **own** copy that stripped a
+        // different set of characters from the text emitter's, which is how the plan's one comment
+        // became three different strings. One definition, applied early, re-applied harmlessly.
+        comment: nftComment(r.comment),
       },
     },
   };
-}
-
-/**
- * nft stores comments as a bounded string.
- *
- * Control characters are stripped even though JSON would carry them safely: the comment reappears
- * in `nft list` output, in the stateless dump the drift digest is taken over, and in operator
- * terminals. A newline in any of those turns one rule into what looks like two.
- */
-function comment(s: string): string {
-  return s.replace(/[\r\n\t]/g, " ").slice(0, 80);
 }
 
 // ── Emitter ───────────────────────────────────────────────────────────────────
