@@ -1,0 +1,82 @@
+# Site-data scan findings to accept, one `<blob-sha>:<finding class>` per line, each with its reason.
+#
+# ⚠️ **This file is the wrong tool for real site data.** If a hostname or address a site is actually
+# reachable at is ever committed, the answer is the destructive, owner-coordinated history work
+# SECURITY.md describes — never a line here. An entry is only ever appropriate for a value that was
+# never sensitive, and the comment above it has to establish that.
+#
+# ⚠️ **And it cannot quote the values it is about.** This file is scanned like any other, so naming
+# a refused address here would make the scan refuse this file — measured, on the first draft. The
+# reasons below therefore name *ranges by their RFC* and describe the rest. That is the same
+# constraint `geofeed.ts` and `history-leak-scan.test.ts` already work under.
+#
+# ## Why it has to exist
+#
+# `scan-public-history.mjs --all` reads every reachable **blob**, and blobs are immutable. Fixing
+# the tree does not remove them, so one false positive in a merged commit makes the full-history
+# scan fail for ever — and an alarm that can never be cleared is one that stops being read. That is
+# not hypothetical here: every scheduled run `trusted-leaks.yml` ever had (2026-08-25, 2026-09-01)
+# failed on the four entries below, while the pull-request gate — which only reads *introduced*
+# commits — went on passing. The half `ci.yml` calls authoritative was the half nobody could see.
+#
+# `.gitleaksignore` exists in this repository for exactly the same reason and says so in its own
+# header. This is the site-data axis's equivalent.
+#
+# ## Keyed by blob, not by commit
+#
+# A blob belongs to every commit whose tree contains it, so commit-keyed entries would need one line
+# per commit and would grow with every merge. The seven refusals below are four blobs.
+#
+# To generate candidate lines: `node scripts/scan-public-history.mjs --all --print-accept-lines`.
+# It prints object ids and finding classes only — never a matched value. An entry that stops
+# matching anything makes `--all` fail, so this file cannot quietly rot into folklore.
+#
+# ## ⚠️ A local `--all` is not the scan CI runs
+#
+# `--all` is `git rev-list --all`, which walks **every ref in the clone you are standing in** —
+# including other remotes. Measured here: a local run reported 722 refusals across 219 commits, and
+# **every one of those commits was unreachable from `origin/main`**; they came in over a second
+# remote sharing this object database. CI checks out this repository alone, so its `--all` sees
+# only what is reachable from the default branch.
+#
+# So a red local `--all` may be about a repository that is not this one — the same trap as the
+# `policy/` symlink in AGENTS.md, wearing different clothes. To reproduce what CI actually does,
+# scan a clean single-branch clone rather than your working checkout.
+
+# ── The 2026-08-24 renderer commits (19bf9b9, 296e287) ────────────────────────
+#
+# Three files, all fixtures and comments. `aa2efae` — "누출 스캐너가 결함을 설명하는 글을 막고
+# 있었다 — CI 는 3커밋 동안 빨갰다" — rewrote the literals so the *tree* would pass, which is why
+# the current worktree scan is clean. The blobs stayed, and `--all` reads blobs.
+#
+# I read all three blobs. Every literal the current tree no longer carries is one of:
+#
+#   · documentation space (RFC 5737 for v4, RFC 3849 for v6), RFC 1918 private space, loopback,
+#     link-local or multicast — the reserved ranges these very suites exist to test the handling of;
+#   · a deliberately malformed address in a test that refuses it — an octet above 255, and an
+#     octet with a leading zero that some parsers read as octal;
+#   · the two IANA global-unicast floor prefixes, in the tests that pin the floor. They are public
+#     by definition, which is the whole point of the assertion;
+#   · one well-known public **anycast resolver** prefix, used as the known positive. Its own comment
+#     says why it is there: "Without it every test above passes against a parser that refuses all
+#     IPv6." A known positive has to be a real global address or it proves nothing;
+#   · a v4 address and its hexadecimal v6-compatible spelling, inside a comment in `geofeed.ts`
+#     explaining a case the scanner does **not** detect. Refusing to let a defect be written down
+#     is precisely the failure `aa2efae` was named for.
+#
+# None is an address any site of ours is reachable at. The scanner cannot tell an example address
+# from a real one, and it should not try — that is what this file, with a human reason attached, is
+# for.
+
+# src/zones.test.ts — trust-zone fixtures in private and documentation space, plus the public
+# anycast address as the "a public address lands in the internet zone" positive.
+462b24f8224fdfd073b0c5293ceec6fe77cf546e:contains a non-documentation IPv6 address
+
+# src/geofeed.ts — both literals sit inside one comment documenting an **undetected** case: the
+# deprecated IPv4-compatible v6 range in hex form, which needs 128-bit arithmetic to recognise.
+4977162705e944f540325fecd2310ccf84b8ace5:contains a non-documentation IPv4 address
+4977162705e944f540325fecd2310ccf84b8ace5:contains a non-documentation IPv6 address
+
+# src/geofeed.test.ts — the reserved-range refusal table (unique-local, link-local, multicast, the
+# v6 floor, loopback) and the public anycast prefix as the known positive for accepted IPv6.
+e0b3815680b41556d8a3b285c24a509db3ed3862:contains a non-documentation IPv6 address

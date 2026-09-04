@@ -174,6 +174,12 @@ jobs:
         with:
           node-version: "22"
 
+      # ⚠️ **This job reads the candidate's `.heliopause-scanignore`**, because its checkout *is*
+      # the candidate. A fork could therefore accept its own finding here — and that is the
+      # designed layering, not an oversight: this is the backstop half, and it runs without the
+      # hostname secret for the same reason. The authoritative half is `trusted-leaks.yml`, which
+      # passes `--ignore-file` pointing into a checkout of the protected default branch, so an
+      # allowlist entry only ever takes effect once it is merged and reviewed.
       - name: scan every introduced commit for site data
         env:
           SCAN_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}

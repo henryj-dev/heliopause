@@ -39,7 +39,13 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           path: .trusted-scanner
           persist-credentials: false
-          sparse-checkout: scripts/scan-public-history.mjs
+          # 🔴 **The allowlist comes from here, not from the candidate.** It is read by path, and
+          # this job runs the scanner with the *candidate's* checkout as the working directory. If
+          # the allowlist were taken from there, a pull request could ship a leak and accept it in
+          # the same commit — the trusted-scanner arrangement would be intact and useless.
+          sparse-checkout: |
+            scripts/scan-public-history.mjs
+            .heliopause-scanignore
           sparse-checkout-cone-mode: false
 
       # GitHub publishes every PR head (including a fork) under the base repository's refs/pull
@@ -123,6 +129,7 @@ jobs:
         run: >-
           node "$GITHUB_WORKSPACE/.trusted-scanner/scripts/scan-public-history.mjs"
           --base "$SCAN_BASE" --head "$SCAN_HEAD" --require-hostname-pattern
+          --ignore-file "$GITHUB_WORKSPACE/.trusted-scanner/.heliopause-scanignore"
 
       - name: scan all reachable default-branch history
         if: github.event_name != 'pull_request_target'
@@ -132,3 +139,4 @@ jobs:
         run: >-
           node "$GITHUB_WORKSPACE/.trusted-scanner/scripts/scan-public-history.mjs"
           --all --require-hostname-pattern
+          --ignore-file "$GITHUB_WORKSPACE/.trusted-scanner/.heliopause-scanignore"
