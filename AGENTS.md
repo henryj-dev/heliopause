@@ -85,10 +85,10 @@ gh pr merge <n> --squash                         # 이것이 「메인 브랜치
 ## 검사
 
 ```bash
-npm test                                                  # node --test (src + examples + policy)
-                                                          #   + @heliopause/manager + @heliopause/web
-python3 agent/test_validate.py                            # 에이전트 검증기·롤백 상태기계
-python3 agent/test_enroll.py                              # 호스트 생성 키 · 지속 CSR 등록
+npm test                                                  # 전부 — src + examples + policy,
+                                                          #   @heliopause/{manager,web,agent}.
+                                                          #   `&&` 가 아니라 다 돌리고 합산한다
+./scripts/check-workspace-suites.sh                       # test 스크립트가 있는데 안 불리는 워크스페이스
 npm run typecheck                                         # 루트(src + bin + examples) + @heliopause/manager
 npm run check:web                                         # Svelte 진단 (루트 tsconfig 밖)
 npm run build:web                                         # 타입 통과와 빌드 성공은 다른 것이다
@@ -101,7 +101,17 @@ python3 scripts/claude-hooks/test-session-start-pull.py   # 실패 0
 python3 scripts/claude-hooks/test-session-end-cleanup.py  # 실패 0
 python3 scripts/claude-hooks/test-codex-hooks.py          # 실패 0
 python3 scripts/git-hooks/test-pre-commit.py              # 실패 0 (사람 통과 · 에이전트 거부)
+
+# 아래 둘은 오래 이 목록에 없었다 — CI 의 가장 강한 두 검사인데.
+./scripts/e2e-roundtrip.sh                                # 진짜 TLS 핸드셰이크로 신원 결속.
+                                                          #   OpenSSL 3.x 가 없으면 에이전트 절반을
+                                                          #   건너뛰고 그렇다고 말한다(18 vs 14)
+./scripts/rollback-test.sh                                # 진짜 커널. NET_ADMIN · docker 필요
 ```
+
+⚠️ **`npm test` 는 이제 `agent/test_*.py` 도 돌린다.** 따로 칠 필요가 없고, 따로 치면
+바닥 검사(`scripts/run-agent-tests.sh`)를 건너뛴다 — 그 바닥이 「스위트가 통째로 사라졌다」와
+「리눅스인데 12개가 조용히 skip 됐다」를 실패로 바꾸는 유일한 장치다.
 
 ⚠️ **누출 스캔이 이 목록에 없어서 CI 가 세 커밋 동안 빨갛게 서 있었다.** 위 검사를 전부 돌리고
 「모든 게이트 통과」라고 보고한 뒤, `defense-in-depth leak scan` 잡만 계속 실패하고 있었다. 로컬
@@ -118,8 +128,10 @@ python3 scripts/git-hooks/test-pre-commit.py              # 실패 0 (사람 통
 39개)가 정의조차 되지 않은 채 몇 달을 지났고, 초록불은 그동안 한 번도 흔들리지 않았다
 — 수가 줄어든 게 아니라 센 적이 없어 비교할 기준선이 없었다. 현재 기대값(정책 심링크 연결):
 `npm test` 1,893 + 8 (`@heliopause/manager`) + 206 (`@heliopause/web`) ·
-`test_validate.py` 263 (실행 251 · skip 12) · `test_enroll.py` 16.
-그 1,893 은 **이 저장소 1,800(`src` + `examples`) + `policy` 93** 이다. 둘로 나눠 적는 이유는
+`test_validate.py` 263 (리눅스에서 실행 263 · macOS 에서 skip 12) · `test_enroll.py` 16.
+그 1,893 은 **이 저장소 1,806(`src` + `examples`) + `policy` 87** 이다. 오래 「1,800 + 93」
+이라고 적혀 있었다 — 둘 다 틀렸고, **합이 맞아서 아무도 안 봤다.** 바로 아래 「87개가 말없이
+사라진다」와도 어긋나 있었는데 그것도 그대로 지나갔다(2026-09-04 실측). 둘로 나눠 적는 이유는
 바로 아래에 있다 — 뒤의 86 은 이 저장소의 코드를 안 읽는다.
 
 ⚠️ **`policy/*.test.ts` 는 이 저장소의 `src/` 를 검사하지 않는다.** `policy/` 는 심링크이고

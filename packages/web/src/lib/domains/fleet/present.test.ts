@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { answeredVpcNames, fleetListing, fleetSummary, hostMatches, hostStateChips, routesView, whyBits, vpcLabel, vpcTone, workloadChip, type SiteHost } from "./present.ts";
+import { answeredVpcNames, fleetListing, fleetSummary, hostMatches, hostStateChips, routesView, whyBits, vpcLabel, vpcTone, workloadChip } from "./present.ts";
+// `SiteHost` comes from `./site.ts`; `present.ts` imports it but does not re-export it, so this
+// used to be `type SiteHost` on the line above and was simply broken. Nothing said so: this
+// workspace's tests were outside every tsconfig, and `node --test` strips types rather than
+// checking them, so a broken type import runs perfectly.
+import type { SiteHost } from "./site.ts";
 
 const host = (over: Partial<SiteHost> = {}): SiteHost => ({
   vpc: "dev",

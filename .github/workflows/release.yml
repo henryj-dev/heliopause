@@ -85,8 +85,12 @@ jobs:
       # byte-for-byte what ships. Re-run the gates here anyway: `ci` passed on a commit, and a
       # release can point at a different one.
       - run: npm run typecheck
+      # `npm test` runs every suite including the agent's Python ones, with the floors that make
+      # "OK" mean something (`scripts/run-agent-tests.sh`). This step used to call the two Python
+      # files directly with **no floor at all** — so `ci` enforced "a suite must not vanish" and the
+      # release gate, the one that produces something permanent, did not.
       - run: npm test
-      - run: python3 agent/test_validate.py && python3 agent/test_enroll.py
+      - run: ./scripts/check-workspace-suites.sh
 
       # 🔴 The check that matters most, and the one a laptop publish never does.
       #

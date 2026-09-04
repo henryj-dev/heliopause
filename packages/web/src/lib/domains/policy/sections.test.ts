@@ -63,7 +63,10 @@ describe("presentSections", () => {
 
   it("omits an empty device registry the manager always sends", () => {
     const listed = presentSections(emptyView({
-      devices: { rows: [], unapproved: 0, compared: false },
+      // `unapproved` is `UnapprovedDevice[]`, not a count — it said `0` here, which type-checks
+      // nowhere and was never checked. The assertion below happened to hold either way, which is
+      // exactly why nothing surfaced it.
+      devices: { rows: [], unapproved: [], compared: false, readAt: null, addressless: 0 },
       coverage: { rows: [], failing: 0, unknown: 0, passing: 0 },
     })).map((s) => s.id);
     assert.ok(!listed.includes("devices"), "an empty devices object is not a devices table");

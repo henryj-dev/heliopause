@@ -133,3 +133,14 @@ observe-peers.log
 # Only the checkout at the repo root. `packages/web/src/routes/policy/` is the Svelte
 # console (`/app/policy/files`) and must stay tracked.
 /policy/
+
+# CPython's bytecode cache. `agent/` is standard library only and is executed rather than built, so
+# these appear the moment a test **imports** one of the modules — which `agent/test_enroll.py` does.
+#
+# It matters more than tidiness now that `npm test` runs the Python suites too: an untracked,
+# unignored `.pyc` is a binary blob, and `scan-public-history.mjs --worktree` refuses tracked or
+# untracked binary blobs by policy (it cannot inspect them, so it fails closed). So a plain
+# `npm test` left the leak scan red, and the message — "contains an unreviewable binary blob",
+# with the path redacted by design — says nothing about which file or why.
+__pycache__/
+*.py[cod]
