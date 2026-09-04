@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash, generateKeyPairSync, sign as cryptoSign, verify as cryptoVerify } from "node:crypto";
+import { closeSync, ftruncateSync, mkdirSync, mkdtempSync, openSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 import { planHash, type PlanBundle } from "./bundle.ts";
 import { SCHEMA_VERSION } from "./protocol.ts";
@@ -17,6 +20,10 @@ import {
   signHostArtifactAuthorization,
   signAuthorizedArtifactBundle,
   validateAuthorizedArtifactBundle,
+  AUTHORIZED_ARTIFACT_BUNDLE_FILE,
+  MAX_AUTHORIZED_ARTIFACT_BUNDLE_BYTES,
+  encodeAuthorizedArtifactBundle,
+  loadAuthorizedArtifactBundle,
   verifyHostArtifactAuthorization,
   type HostArtifactEnvelope,
   privateKeyFileModeError,
@@ -525,5 +532,250 @@ describe("signed routes", () => {
     payload.entry.routes.push({ dst: "0.0.0.0/0", via: "203.0.113.1" });
     const tampered = { ...e, payload: Buffer.from(JSON.stringify(payload), "utf8").toString("base64url") };
     assert.throws(() => verified(tampered), /signature is invalid/);
+  });
+});
+
+// ── The relay's strict validation, and what it binds ──────────────────────────
+//
+// 🔴 **Eleven branches here had no test at all.** Measured by disabling each one and re-running the
+// whole suite — every one survived: the three that bind an envelope to the outer manifest, the
+// "one signed planHash" rule, the exact host-set comparison, and the five ruleset/workload hash
+// bindings inside `validatePayload`.
+//
+// `validateAuthorizedArtifactBundle` is what the relay runs on `POST /publish` — network input,
+// behind mTLS and a publisher CN, but network input. It deliberately verifies **no signature**; the
+// agent does that. So what it is for is exactly these bindings, and they were the untested part.
+//
+// That also makes them reachable from a test without signing anything: hand the function a bundle
+// whose payload has been rewritten, and it will parse and bind-check it.
+describe("what the relay's bundle validation actually binds", () => {
+  const signed = () => signAuthorizedArtifactBundle(
+    { target: TARGET, bundle: bundle(), authorizedAt: AUTHORIZED, expiresAt: EXPIRES, authorizationMode: "two-person" },
+    signing.privateKey,
+  );
+
+  /**
+   * The module's canonical form, written a second time.
+   *
+   * It is `JSON.stringify` over key-sorted values, six lines, and re-implementing it here is
+   * deliberate: if the two ever disagree the module's own canonicality check fires first and says
+   * "signed payload is not canonical JSON" — a different, loud message — rather than letting a
+   * test pass for the wrong reason.
+   */
+  const sortKeys = (v: unknown): unknown =>
+    Array.isArray(v)
+      ? v.map(sortKeys)
+      : v && typeof v === "object"
+        ? Object.fromEntries(Object.keys(v as object).sort().map((k) => [k, sortKeys((v as Record<string, unknown>)[k])]))
+        : v;
+
+  /** Rewrite one host's signed payload. The signature is left stale on purpose — see above. */
+  function withPayload(b: ReturnType<typeof signed>, host: string, mutate: (p: Record<string, unknown>) => void) {
+    const clone = structuredClone(b) as unknown as { artifacts: Record<string, HostArtifactEnvelope> };
+    const env = clone.artifacts[host]!;
+    const payload = JSON.parse(Buffer.from(env.payload, "base64url").toString("utf8")) as Record<string, unknown>;
+    mutate(payload);
+    env.payload = Buffer.from(JSON.stringify(sortKeys(payload)), "utf8").toString("base64url");
+    return clone;
+  }
+
+  it("accepts what it signed — the known positive", () => {
+    assert.equal(validateAuthorizedArtifactBundle(signed()).manifest.generation, "0123456789abcdef");
+  });
+
+  // ── binding to the outer manifest ───────────────────────────────────────────
+
+  it("refuses an envelope that names a different generation", () => {
+    // The replay shape: last week's still-unexpired envelope re-served under this week's header.
+    const b = withPayload(signed(), HOST, (p) => {
+      (p.manifest as Record<string, unknown>).generation = "ffffffffffffffff";
+    });
+    assert.throws(() => validateAuthorizedArtifactBundle(b), /does not bind the outer manifest/);
+  });
+
+  it("refuses an envelope that names a different issuedAt", () => {
+    const b = withPayload(signed(), HOST, (p) => {
+      (p.manifest as Record<string, unknown>).issuedAt = "2026-01-01T00:00:00.000Z";
+    });
+    assert.throws(() => validateAuthorizedArtifactBundle(b), /does not bind the outer manifest/);
+  });
+
+  it("refuses an envelope filed under a host it was not signed for", () => {
+    const b = withPayload(signed(), HOST, (p) => { p.host = "somebody-else.dev"; });
+    assert.throws(() => validateAuthorizedArtifactBundle(b), /does not bind the outer manifest/);
+  });
+
+  // ── the host set, and one plan ──────────────────────────────────────────────
+
+  it("refuses a bundle carrying an artifact its manifest does not name", () => {
+    const b = structuredClone(signed()) as unknown as { artifacts: Record<string, unknown> };
+    b.artifacts["stowaway.dev"] = b.artifacts[HOST];
+    assert.throws(() => validateAuthorizedArtifactBundle(b), /hosts do not exactly match/);
+  });
+
+  it("refuses a bundle missing an artifact its manifest names", () => {
+    const b = structuredClone(signed()) as unknown as { artifacts: Record<string, unknown> };
+    delete b.artifacts[HOST];
+    assert.throws(() => validateAuthorizedArtifactBundle(b), /hosts do not exactly match/);
+  });
+
+  // 🔴 A receipt that is merely *shaped* like a digest is not a receipt. This binding — planHash
+  // over the target and the bundle's own hash — is what makes it one, and it fires before the
+  // agreement rule below.
+  it("refuses a planHash that does not bind its target and bundle", () => {
+    const b = withPayload(signed(), HOST, (p) => { p.planHash = `sha256:${"a".repeat(64)}`; });
+    assert.throws(() => validateAuthorizedArtifactBundle(b), /planHash does not bind its target and bundleHash/);
+  });
+
+  it("refuses artifacts that do not agree on one signed planHash", () => {
+    // Two hosts and one manifest, signed twice for **different targets**. Each envelope is
+    // internally consistent — its planHash correctly binds its own target — so every binding check
+    // above passes. What is wrong is that one bundle now describes two plans, which is the shape of
+    // a splice: an envelope lifted from another authorization and filed here.
+    const two = structuredClone(bundle()) as PlanBundle;
+    two.manifest.hosts["second.dev"] = structuredClone(two.manifest.hosts[HOST]!);
+    // The bundle carries the bytes as well as the manifest entry, and `prepareAuthorization`
+    // refuses a manifest naming a host the bundle has no ruleset for — which is itself a binding
+    // worth having, and is why this fixture has to be complete rather than manifest-only.
+    two.rulesets["second.dev"] = RULESET;
+    two.workload!["second.dev"] = WORKLOAD;
+    const common = { bundle: two, authorizedAt: AUTHORIZED, expiresAt: EXPIRES, authorizationMode: "two-person" as const };
+    const forDev = signAuthorizedArtifactBundle({ ...common, target: TARGET }, signing.privateKey);
+    const forProd = signAuthorizedArtifactBundle({ ...common, target: "prod" }, signing.privateKey);
+    assert.notEqual(
+      forDev.artifacts[HOST]!.payload,
+      forProd.artifacts[HOST]!.payload,
+      "the fixture must actually produce two different plans",
+    );
+
+    const spliced = structuredClone(forDev) as unknown as { artifacts: Record<string, unknown> };
+    spliced.artifacts["second.dev"] = forProd.artifacts["second.dev"];
+    assert.throws(() => validateAuthorizedArtifactBundle(spliced), /agree on one signed planHash/);
+  });
+
+  // ── the hashes that bind bytes to the manifest ──────────────────────────────
+
+  it("refuses a ruleset whose bytes do not hash to the signed entry", () => {
+    // The one that matters most: this is the byte string the agent applies. Without it the manifest
+    // describes one ruleset and the fleet applies another.
+    const b = withPayload(signed(), HOST, (p) => { p.ruleset = `${p.ruleset as string} `; });
+    assert.throws(() => validateAuthorizedArtifactBundle(b), /ruleset does not match the signed manifest entry hash/);
+  });
+
+  it("refuses a workload whose bytes do not hash to the signed entry", () => {
+    const b = withPayload(signed(), HOST, (p) => { p.workload = `${p.workload as string} `; });
+    assert.throws(() => validateAuthorizedArtifactBundle(b), /workload does not match the signed manifest entry hash/);
+  });
+
+  it("refuses a payload that omits a workload its entry assigns", () => {
+    const b = withPayload(signed(), HOST, (p) => { p.workload = null; });
+    assert.throws(() => validateAuthorizedArtifactBundle(b), /omits the workload assigned/);
+  });
+
+  it("refuses a workload smuggled in without a manifest assignment", () => {
+    // The other direction, and the more interesting one: cluster policy delivered to a host whose
+    // entry never assigned any.
+    const noWorkload = structuredClone(bundle()) as PlanBundle;
+    delete (noWorkload.manifest.hosts[HOST] as unknown as Record<string, unknown>).workload;
+    // …and the document too, or the signer refuses the inconsistency before this test reaches the
+    // branch it is about.
+    delete noWorkload.workload![HOST];
+    const b = signAuthorizedArtifactBundle(
+      { target: TARGET, bundle: noWorkload, authorizedAt: AUTHORIZED, expiresAt: EXPIRES, authorizationMode: "two-person" },
+      signing.privateKey,
+    );
+    const smuggled = withPayload(b, HOST, (p) => { p.workload = WORKLOAD; });
+    assert.throws(() => validateAuthorizedArtifactBundle(smuggled), /workload without a manifest assignment/);
+  });
+
+  it("refuses a workload that is neither text nor null", () => {
+    const b = withPayload(signed(), HOST, (p) => { p.workload = 7; });
+    assert.throws(() => validateAuthorizedArtifactBundle(b), /workload must be text or null/);
+  });
+
+  it("refuses a manifest issued after the authorization that signs it", () => {
+    // Time only runs one way: an authorization cannot vouch for a plan that did not exist yet.
+    const b = withPayload(signed(), HOST, (p) => {
+      (p.manifest as Record<string, unknown>).issuedAt = "2026-08-15T00:10:00.000Z";
+    });
+    assert.throws(() => validateAuthorizedArtifactBundle(b), /issuedAt is later than artifact authorization/);
+  });
+});
+
+// ── Reading the bundle off disk ───────────────────────────────────────────────
+//
+// 🔴 `loadAuthorizedArtifactBundle`'s refusals had no test, and the source comment above them
+// records that **one of them had already been lost once**: it used to `lstat` the path, refuse a
+// symlink, then read the path again — and the read follows links, so the thing refused and the
+// thing read were never guaranteed to be the same object. It was rewritten to open once with
+// `O_NOFOLLOW` and ask the descriptor. Nothing pinned the rewrite, so the next refactor could lose
+// it the same way, and just as quietly.
+//
+// This is the relay's own copy of the file that says a generation was authorized.
+describe("loading the authorized bundle from disk", () => {
+  const encoded = () => encodeAuthorizedArtifactBundle(signAuthorizedArtifactBundle(
+    { target: TARGET, bundle: bundle(), authorizedAt: AUTHORIZED, expiresAt: EXPIRES, authorizationMode: "two-person" },
+    signing.privateKey,
+  ));
+
+  it("reads a regular file — the known positive", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hp-bundle-"));
+    writeFileSync(join(dir, AUTHORIZED_ARTIFACT_BUNDLE_FILE), encoded());
+    const loaded = await loadAuthorizedArtifactBundle(dir);
+    assert.equal(loaded.manifest.generation, "0123456789abcdef");
+  });
+
+  it("refuses a symlink, even one pointing at a valid bundle", async () => {
+    // The point of `O_NOFOLLOW`. The target here is a perfectly good bundle: what is refused is the
+    // indirection, because a name that can be repointed is not the file that was checked.
+    const dir = mkdtempSync(join(tmpdir(), "hp-bundle-link-"));
+    const real = join(dir, "elsewhere.json");
+    writeFileSync(real, encoded());
+    symlinkSync(real, join(dir, AUTHORIZED_ARTIFACT_BUNDLE_FILE));
+    await assert.rejects(
+      loadAuthorizedArtifactBundle(dir),
+      (e: Error) => e instanceof ArtifactSignatureError && /not a regular file/.test(e.message),
+    );
+  });
+
+  it("refuses a directory in the bundle's place, by name and not by accident", async () => {
+    // The matcher is the test. Reading a directory fails anyway (EISDIR), so a bare `rejects` here
+    // passes just as well with the `isFile` check deleted — measured. What is pinned is that the
+    // refusal is *this* module's, decided from the descriptor, before any read is attempted.
+    const dir = mkdtempSync(join(tmpdir(), "hp-bundle-dir-"));
+    mkdirSync(join(dir, AUTHORIZED_ARTIFACT_BUNDLE_FILE));
+    await assert.rejects(
+      loadAuthorizedArtifactBundle(dir),
+      (e: Error) => e instanceof ArtifactSignatureError && /not a regular file/.test(e.message),
+    );
+  });
+
+  it("refuses a file past the byte limit", async () => {
+    // ⚠️ There are **two** limits here and only one is observable from this test. The `stat` check
+    // refuses before reading; the post-read check refuses the bytes actually in hand. Deleting the
+    // first still fails this test, because the second catches the same file with the same message —
+    // measured. That is not a gap in the test: the source says the second exists precisely because
+    // a file can grow between the stat and the read, so the first is a guard against *reading* a
+    // huge file rather than against accepting one. The correctness claim is the second, and that is
+    // what is pinned.
+    const dir = mkdtempSync(join(tmpdir(), "hp-bundle-big-"));
+    const path = join(dir, AUTHORIZED_ARTIFACT_BUNDLE_FILE);
+    const fd = openSync(path, "w");
+    try {
+      ftruncateSync(fd, MAX_AUTHORIZED_ARTIFACT_BUNDLE_BYTES + 1);
+    } finally {
+      closeSync(fd);
+    }
+    await assert.rejects(
+      loadAuthorizedArtifactBundle(dir),
+      (e: Error) => e instanceof ArtifactSignatureError && /exceeds its byte limit/.test(e.message),
+    );
+  });
+
+  it("reports a missing bundle as a missing file, not as a malformed one", async () => {
+    // The relay distinguishes "no generation has been authorized yet" from "the authorization is
+    // corrupt", and those want different operator responses.
+    const dir = mkdtempSync(join(tmpdir(), "hp-bundle-none-"));
+    await assert.rejects(loadAuthorizedArtifactBundle(dir), (e: NodeJS.ErrnoException) => e.code === "ENOENT");
   });
 });
