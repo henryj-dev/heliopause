@@ -118,7 +118,22 @@ describe("the manager's policy boundary — it does not evaluate", () => {
     const source = code(read("./manager-server.ts"));
     // Every `buildScreen(` call in the manager hands it a `repo`. The renderer's payload is the only
     // source of one, which is the point.
-    for (const call of source.matchAll(/buildScreen\(\{([^}]*)\}/gs)) {
+    //
+    // 🔴 **The loop needed a floor.** `matchAll` over zero matches iterates zero times and asserts
+    // nothing, so a refactor that assembled the argument into a variable —
+    // `buildScreen(screenArgs)` — made this test pass while dropping `repo`. Measured: that exact
+    // change survived the whole suite. Counting the calls first is what turns "no call omits
+    // `repo`" into a claim rather than a vacuous truth.
+    const calls = [...source.matchAll(/buildScreen\(\{([^}]*)\}/gs)];
+    const mentions = source.match(/\bbuildScreen\(/g)?.length ?? 0;
+    assert.ok(mentions > 0, "the manager does not call buildScreen at all — this test measures nothing");
+    assert.equal(
+      calls.length,
+      mentions,
+      "a buildScreen call is not an inline object literal, so this test cannot see its `repo`. " +
+        "Inline it, or rewrite this check to follow the variable.",
+    );
+    for (const call of calls) {
       assert.match(
         call[1]!,
         /\brepo\s*:/,
