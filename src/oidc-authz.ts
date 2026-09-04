@@ -89,6 +89,22 @@ export function authorize(id: Identity, cfg: OidcAuthzConfig): AuthzDecision {
     return { principal, canWrite: false, reason: "in an operator group, not a writer group" };
   }
   if (!alias) {
+    // Say which of the two it is. "No alias is declared" and "an alias is declared but your issuer
+    // has not verified the address it is keyed on" want completely different actions, and an
+    // operator reading the first message while looking at a configuration line that plainly
+    // contains their address would have no way to get from one to the other.
+    if (blockedByUnverifiedEmail(id, cfg.aliases)) {
+      return {
+        principal,
+        canWrite: false,
+        reason:
+          `${principal.name} has an alias declared for that email address, but the issuer did not ` +
+          `send email_verified=true for it. An address the issuer has not verified may be one the ` +
+          `user chose, and this alias decides both write access and the name the two-person ` +
+          `approval rule compares — so it is not used. Verify the address at the IdP, or key the ` +
+          `alias on the subject instead.`,
+      };
+    }
     return {
       principal,
       canWrite: false,
@@ -101,14 +117,31 @@ export function authorize(id: Identity, cfg: OidcAuthzConfig): AuthzDecision {
   return { principal: { ...principal, canWrite: true }, canWrite: true, reason: `writer as ${alias}` };
 }
 
-/** Email, then preferred_username, then sub. First match wins. */
+/**
+ * Email, then preferred_username, then sub. First match wins.
+ *
+ * 🔴 **An unverified email is not a key.** The alias this returns raises `canWrite` and becomes the
+ * name the two-person approval rule compares, so keying it on an address the issuer has not
+ * verified would let one member of a writer group take a colleague's alias — and satisfy both
+ * halves of the rule alone. Many IdPs let a user edit their own profile address; `email_verified`
+ * is the claim OIDC defines to tell the two apart, and nothing in this repository read it.
+ *
+ * `preferred_username` and `sub` are not filtered: neither is user-settable in the deployments this
+ * serves, and `sub` is the issuer's own identifier. Email is the one a person can choose.
+ */
 function lookupAlias(id: Identity, aliases: ReadonlyMap<string, string>): string | null {
-  for (const key of [id.email, id.username, id.sub]) {
+  const email = id.emailVerified ? id.email : null;
+  for (const key of [email, id.username, id.sub]) {
     if (!key) continue;
     const hit = aliases.get(key);
     if (hit) return hit;
   }
   return null;
+}
+
+/** Would this identity have matched an alias, but for the address being unverified? */
+function blockedByUnverifiedEmail(id: Identity, aliases: ReadonlyMap<string, string>): boolean {
+  return !id.emailVerified && id.email !== null && aliases.has(id.email);
 }
 
 /**
