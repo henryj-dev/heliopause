@@ -71,7 +71,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "lucide-static": "^1.35.0",
+    "lucide-static": "^1.38.0",
     "typescript": "^6.0.3"
   }
 }
