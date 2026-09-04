@@ -10,5 +10,20 @@
     "isolatedModules": true,
     "skipLibCheck": true
   },
-  "exclude": ["src/**/*.test.ts"]
+  "//exclude": [
+    "🔴 There is no `exclude`, deliberately. It read `[\"src/**/*.test.ts\"]`, and the root",
+    "tsconfig covers only `src/`, `bin/` and `examples/` — so this workspace's 24 test files were",
+    "type-checked by nothing at all. `node --test` runs them by stripping types, never by checking",
+    "them, so a broken type import runs perfectly.",
+    "",
+    "That is the same hole the root tsconfig's own `//include` note describes for `examples/`: a",
+    "file that shipped a real TS2741 while every gate stayed green. It was closed there and left",
+    "open here. `packages/manager` never had it — its `include` is `src/**/*.ts`, tests and all.",
+    "",
+    "Turning the check on found two real errors immediately: a `type SiteHost` imported from a",
+    "module that does not re-export it, and `unapproved: 0` where the type is an array.",
+    "",
+    "Written as a `//`-prefixed key rather than a `//` comment because `src/web-check-gate.test.ts`",
+    "reads this file with `JSON.parse`, which is not JSONC. The root tsconfig uses the same trick."
+  ]
 }

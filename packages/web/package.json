@@ -11,7 +11,7 @@
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "prepare": "svelte-kit sync",
-    "test": "node --test src/lib/i18n.test.ts src/lib/age.test.ts src/lib/poll.test.ts src/lib/domains/fleet/*.test.ts src/lib/domains/changes/*.test.ts src/lib/domains/enrollment/*.test.ts src/lib/domains/lookup/*.test.ts src/lib/domains/traffic/*.test.ts src/lib/domains/routing/*.test.ts src/lib/domains/policy/*.test.ts src/lib/shell/*.test.ts"
+    "test": "node --test \"src/**/*.test.ts\""
   },
   "dependencies": {
     "@heliopause/i18n": "file:../i18n"

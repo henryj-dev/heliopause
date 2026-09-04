@@ -48,4 +48,36 @@ describe("the web diagnostic gate", () => {
     };
     assert.equal(tsconfig.compilerOptions.allowImportingTsExtensions, true);
   });
+
+  // 🔴 `packages/web/tsconfig.json` carried `"exclude": ["src/**/*.test.ts"]`, and the root
+  // tsconfig's `include` stops at `src/`, `bin/` and `examples/`. So this workspace's 24 test files
+  // were type-checked by **no gate at all** — `node --test` strips types rather than checking them,
+  // which is the same reason `examples/` was added to the root `include`.
+  //
+  // Turning it on found two real errors that had been sitting there: a `type SiteHost` imported
+  // from a module that only imports it, and `unapproved: 0` where `UnapprovedDevice[]` belongs.
+  //
+  // Pinned here rather than trusted, because re-adding an `exclude` is a one-line change that looks
+  // like tidying and silently removes a gate.
+  it("type-checks the console's own tests — they are inside no other tsconfig", () => {
+    const tsconfig = JSON.parse(readFileSync(new URL("../packages/web/tsconfig.json", import.meta.url), "utf8")) as {
+      exclude?: string[];
+    };
+    const excluded = (tsconfig.exclude ?? []).filter((p) => p.includes("test"));
+    assert.deepEqual(
+      excluded,
+      [],
+      "packages/web tests are checked by nothing else — excluding them here removes the only gate",
+    );
+
+    // And the root tsconfig must not be the thing that covers them, because it does not reach
+    // `packages/` at all. Said out loud so the sentence above cannot quietly stop being true.
+    const root = JSON.parse(readFileSync(new URL("../tsconfig.json", import.meta.url), "utf8")) as {
+      include: string[];
+    };
+    assert.ok(
+      !root.include.some((p) => p.startsWith("packages/")),
+      "if the root tsconfig ever covers packages/, rewrite this test rather than deleting it",
+    );
+  });
 });

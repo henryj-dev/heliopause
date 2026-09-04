@@ -20,7 +20,7 @@
    워크트리의 사본**을, 메인에서 부르면 **메인의 사본**을 쓴다. 훅을 고쳐도 메인이 pull
    하기 전까지 메인 세션에는 안 먹는다(§2-1 의 그 지연이 여기에도 있다).
 """
-import json, os, subprocess, sys
+import json, os, shutil, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -82,16 +82,67 @@ if "PreToolUse" not in cmds:
     sys.exit(1)
 
 G = cmds["PreToolUse"]
-WT = TOP if os.path.realpath(TOP) != os.path.realpath(MAIN) else None
+GUARD_SOURCE = os.path.join(HERE, "main-tree-guard.py")
+
+
+def build_worktree():
+    """A real git worktree of a throwaway repo, built here so the ALLOW side always runs.
+
+    🔴 This used to be ``WT = TOP if realpath(TOP) != realpath(MAIN) else None`` — i.e. **only when
+    this file happened to be run from inside a worktree**. `actions/checkout` builds a plain
+    checkout, so in CI ``TOP == MAIN``, ``WT`` was ``None``, and four checks were skipped on every
+    run: worktree Edit, array-form ``apply_patch``, a patch with no envelope header, and the codex
+    launcher's worktree case. Every one of them is on the **ALLOW** side.
+
+    That is the half that matters most here. `main-tree-guard.py` is judged by two questions, and
+    only one of them was being asked in CI. A guard that has started denying too much looks exactly
+    like a guard that works — until every agent session finds it has nowhere to write, which is the
+    2026-08-14 incident this file's own comments describe.
+
+    `test-main-tree-guard.py` gets away with a bare temp directory because it calls the guard
+    script directly. This file goes through the **codex launcher**, a shell line that locates the
+    script with `git rev-parse --show-toplevel`; a non-repo cwd makes that fail and the launcher
+    fall open, so the ALLOW checks would pass without measuring anything. Hence a real repo with a
+    real worktree, built the way `test-enter-worktree.py` builds its fixture.
+
+    Returns the worktree path, or None if git could not build one — in which case the caller fails
+    rather than skipping, because "could not measure" and "measured and it was fine" must not print
+    the same thing.
+    """
+    tmp = tempfile.mkdtemp(prefix="codex-hooks-test-")
+    repo = os.path.join(tmp, "repo")
+    os.makedirs(os.path.join(repo, "scripts", "claude-hooks"))
+    shutil.copy2(GUARD_SOURCE, os.path.join(repo, "scripts", "claude-hooks", "main-tree-guard.py"))
+    q = {"capture_output": True, "text": True}
+    if subprocess.run(["git", "init", "-q", "-b", "main", repo], **q).returncode != 0:
+        return tmp, None
+    for a in (["config", "user.email", "t@example"], ["config", "user.name", "t"],
+              ["add", "-A"], ["commit", "-qm", "fixture"]):
+        subprocess.run(["git", "-C", repo, *a], **q)
+    wt = os.path.join(tmp, "wt")
+    if subprocess.run(["git", "-C", repo, "worktree", "add", "-q", "-b", "wt", wt], **q).returncode != 0:
+        return tmp, None
+    # The guard reads tracked/ignored state, so the file the ALLOW cases name has to exist.
+    open(os.path.join(wt, "PLAN.md"), "w", encoding="utf-8").write("x\n")
+    return tmp, wt
+
+
+_TMP, WT = build_worktree()
+check("워크트리 픽스처를 세웠다 — 아래 ALLOW 검사들이 실제로 돈다", WT is not None)
+if WT is None:
+    # Fail rather than skip. A guard suite whose ALLOW half quietly did not run is the exact
+    # shape this file exists to prevent.
+    print("\n실패", fail, "건")
+    shutil.rmtree(_TMP, ignore_errors=True)
+    sys.exit(1)
 
 rc, out = run(G, {"tool_name": "Edit", "tool_input": {"file_path": f"{MAIN}/PLAN.md"},
                   "cwd": MAIN, "session_id": "T"}, MAIN)
 check("메인에서 편집 → deny", "deny" in out)
 
-if WT:
-    rc, out = run(G, {"tool_name": "Edit", "tool_input": {"file_path": f"{WT}/PLAN.md"},
-                      "cwd": WT, "session_id": "T"}, WT)
-    check("워크트리에서 편집 → 통과", "deny" not in out)
+rc, out = run(G, {"tool_name": "Edit", "tool_input": {"file_path": f"{WT}/PLAN.md"},
+                  "cwd": WT, "session_id": "T"}, WT)
+check("워크트리에서 편집 → 통과", "deny" not in out)
 
 # codex 모양 — 배열 command 와 apply_patch
 rc, out = run(G, {"tool_name": "shell",
@@ -112,9 +163,13 @@ rc, out = run(G, {"tool_name": "apply_patch",
 check("apply_patch(command 키) 메인 편집 → deny", "deny" in out)
 
 rc, out = run(G, {"tool_name": "apply_patch",
-                  "tool_input": {"command": f"*** Begin Patch\n*** Update File: {WT or MAIN}/PLAN.md\n+x\n*** End Patch"},
-                  "cwd": WT or MAIN, "session_id": "T"}, WT or MAIN)
-check("apply_patch(command 키) 워크트리 → 통과", ("deny" not in out) if WT else True)
+                  "tool_input": {"command": f"*** Begin Patch\n*** Update File: {WT}/PLAN.md\n+x\n*** End Patch"},
+                  "cwd": WT, "session_id": "T"}, WT)
+# 🔴 This read `("deny" not in out) if WT else True` — literally `check(label, True)` wherever
+#    WT was None, which was CI and any plain checkout. It printed a ✓ indistinguishable from
+#    the other 27 for something it had not measured, and worse: with WT unset the patch it
+#    built named MAIN, so the value it discarded was a **deny**. WT is now always real.
+check("apply_patch(command 키) 워크트리 → 통과", "deny" not in out)
 
 # ── 같은 패치, 다른 모양 ──────────────────────────────────────────────────────
 #
@@ -157,12 +212,11 @@ check("`input` 키로 온 패치도 메인 편집 → deny",
 
 # ⚠️ **막는 쪽만 재면 「전부 막는 훅」도 통과한다.** 같은 모양들이 워크트리에서는 지나가야
 #    한다 — 넓힌 판정이 워크트리 작업을 막기 시작하면 그것이 다음 사고다.
-if WT:
-    WT_ENVELOPE = f"*** Begin Patch\n*** Update File: {WT}/PLAN.md\n+x\n*** End Patch"
-    check("배열 apply_patch 도 워크트리 → 통과",
-          not judge({"command": ["/bin/zsh", "-lc", WT_ENVELOPE]}, WT))
-    check("머리말 없는 패치도 워크트리 → 통과",
-          not judge({"command": f"*** Update File: {WT}/PLAN.md\n@@\n+x\n"}, WT))
+WT_ENVELOPE = f"*** Begin Patch\n*** Update File: {WT}/PLAN.md\n+x\n*** End Patch"
+check("배열 apply_patch 도 워크트리 → 통과",
+      not judge({"command": ["/bin/zsh", "-lc", WT_ENVELOPE]}, WT))
+check("머리말 없는 패치도 워크트리 → 통과",
+      not judge({"command": f"*** Update File: {WT}/PLAN.md\n@@\n+x\n"}, WT))
 
 # ⚠️ 그리고 **패치가 아닌 것을 패치로 오인하지 않는가.** 넓힌 신호가 평범한 읽기 명령까지
 #    삼키면 메인에서 `git status` 조차 못 하게 된다 — 2026-08-14 에 실제로 겪은 모양이다.
@@ -243,11 +297,10 @@ if "PreToolUse" in scmds:
     check("codex 조건에서 메인 편집 → deny", rc == 0 and "deny" in out)
     check("codex 조건에서 해석 실패 흔적이 없다", "can't open file" not in err)
 
-    if WT:
-        rc, out, _ = run_codex(SG, {"tool_name": "Edit",
-                                    "tool_input": {"file_path": f"{WT}/PLAN.md"},
-                                    "cwd": WT, "session_id": "T"}, WT)
-        check("codex 조건에서 워크트리 편집 → 통과", rc == 0 and "deny" not in out)
+    rc, out, _ = run_codex(SG, {"tool_name": "Edit",
+                                "tool_input": {"file_path": f"{WT}/PLAN.md"},
+                                "cwd": WT, "session_id": "T"}, WT)
+    check("codex 조건에서 워크트리 편집 → 통과", rc == 0 and "deny" not in out)
 
     rc, out, _ = run_codex(SG, {"tool_name": "apply_patch",
                                 "tool_input": {"command": f"*** Begin Patch\n*** Add File: {MAIN}/_probe.txt\n+x\n*** End Patch"},
@@ -276,6 +329,47 @@ if "PreToolUse" in scmds:
     check("`$CLAUDE_PROJECT_DIR` 가 있으면 그것으로 찾는다(Claude 경로)",
           p.returncode == 0 and "deny" in p.stdout)
 
+
+# ── 이 검사가 공허하지 않은가 ────────────────────────────────────────────────
+#
+# 🔴 **이 파일에도 변이 검사가 없었다.** `ci.yml` 의 guards 잡 주석은 "Every suite here … mutates
+#    a copy of the hook to prove the check is not vacuous" 라고 적었는데, 일곱 중 이 파일과
+#    `test-ignored-paths.py` 둘은 그렇게 하지 않고 있었다 — 주석이 스위트보다 앞서 나가 있었다.
+#
+#    묻는 것은 위의 DENY 검사들이 **판정 때문에** 통과하는가다. 픽스처 워크트리에 놓인
+#    가드 사본에서 「메인 트리인가」 판정을 뒤집으면, 그 판정에 걸려 있던 DENY 가 전부 통과로
+#    바뀌어야 한다. 안 바뀌는 것이 있으면 그 검사는 다른 이유로 초록이었던 것이다.
+MUT = os.path.join(_TMP, "main-tree-guard_mut.py")
+_src = open(GUARD_SOURCE, encoding="utf-8").read()
+_mut = _src.replace('    if main_tree is not True:\n', '    if True:\n')
+if _mut == _src:
+    check("변이를 심을 자리를 찾았다 — 못 찾으면 이 검사는 무의미하다", False)
+else:
+    open(MUT, "w", encoding="utf-8").write(_mut)
+    # 위 DENY 케이스 중 대표 셋. 전부 메인 트리에서 편집·커밋을 시도하는 모양이다.
+    _deny_shapes = [
+        ("Edit", {"file_path": f"{MAIN}/PLAN.md"}),
+        ("shell", {"command": ["/bin/zsh", "-lc", "git commit -m x"]}),
+        ("apply_patch", {"command": f"*** Begin Patch\n*** Add File: {MAIN}/_probe.txt\n+x\n*** End Patch"}),
+    ]
+    _still_denied = []
+    for _tool, _ti in _deny_shapes:
+        _p = subprocess.run([sys.executable, MUT],
+                            input=json.dumps({"tool_name": _tool, "tool_input": _ti,
+                                              "cwd": MAIN, "session_id": "T"}),
+                            capture_output=True, text=True)
+        if "deny" in _p.stdout:
+            _still_denied.append(_tool)
+    check(f"변이본(메인 판정 무력화)에서 DENY {len(_deny_shapes)}건이 전부 통과로 뒤집힌다"
+          f"{' — 남은 것: ' + ', '.join(_still_denied) if _still_denied else ''}",
+          not _still_denied)
+
+# The fixture repo holds a real worktree, so it has to be taken down through git — a bare rmtree
+# leaves the parent repo's worktree list pointing at a path that no longer exists. It is all inside
+# one temp directory, so the rmtree afterwards is what actually reclaims it.
+subprocess.run(["git", "-C", os.path.join(_TMP, "repo"), "worktree", "remove", "--force", WT],
+               capture_output=True, text=True)
+shutil.rmtree(_TMP, ignore_errors=True)
 
 print("\n실패", fail, "건")
 sys.exit(1 if fail else 0)

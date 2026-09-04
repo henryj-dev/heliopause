@@ -40,7 +40,7 @@
     "packages/workstation"
   ],
   "scripts": {
-    "test": "node --test \"src/*.test.ts\" \"examples/*.test.ts\" \"policy/*.test.ts\" && npm test -w @heliopause/manager --if-present && npm test -w @heliopause/web --if-present",
+    "test": "./scripts/run-tests.sh",
     "pki": "node bin/heliopause-pki.ts",
     "publish": "node bin/heliopause-publish.ts",
     "status": "node bin/heliopause-status.ts",

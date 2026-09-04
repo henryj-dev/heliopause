@@ -132,10 +132,21 @@ for candidate in /usr/bin/openssl "$(command -v openssl 2>/dev/null)" /opt/homeb
     OPENSSL_BIN="$candidate"; break
   fi
 done
+# 🔴 **This block used to set `SKIP_AGENT=1` and nothing ever read it.** One assignment, no
+# readers, repository-wide — so the "SKIP" line printed and the agent half then ran anyway with an
+# empty `HELIOPAUSE_OPENSSL_BIN`, failed to read the Ed25519 key, and reported as a *failure*. That
+# is precisely what the comment above says must not happen ("Reporting those cases as failures
+# would be reporting the wrong thing"): the guard was written, and then not wired.
+#
+# It is `0`/`1` and read at the two places below, so the variable now decides something. On CI
+# (Linux, OpenSSL 3.x) the branch never fires — the agent half always runs there, which is what
+# keeps this from becoming a check that quietly stops checking.
+SKIP_AGENT=0
 if [ -z "$OPENSSL_BIN" ]; then
   echo
   echo "  SKIP: no openssl here can read an Ed25519 public key (LibreSSL cannot)."
   echo "        The relay half runs; the agent half needs OpenSSL 3.x."
+  echo "        On macOS: HELIOPAUSE_OPENSSL_BIN=\$(brew --prefix openssl@3)/bin/openssl"
   SKIP_AGENT=1
 fi
 
@@ -215,6 +226,9 @@ check "reports the drifted host as a problem" 'no longer matches the dump' \
 check "refuses to instruct an agent on another schema" '"generation":null' \
   "$(post agent "$(beat h-e2e-01 99)")"
 
+# Guarded as one block: launching a doomed agent and then not reading its log wastes seven
+# seconds and leaves a log full of the tool failure this branch exists to explain.
+if [ "$SKIP_AGENT" -eq 0 ]; then
 echo "agent loop"
 AGENT_LOG="$WORK/agent.log"
 HELIOPAUSE_RELAY_URL="https://localhost:$PORT" HELIOPAUSE_HOST_ID=h-e2e-01 \
@@ -244,7 +258,15 @@ HELIOPAUSE_INTERVAL_SEC=1 HELIOPAUSE_STATE_FILE="$WORK/state2.json" \
 sleep 3; kill %2 2>/dev/null || true; wait %2 2>/dev/null || true
 check "agent refuses a relay that fails its pin" "does not match any pin" "$(cat "$WORK/agent-badpin.log")"
 check "agent survives the failure and keeps trying" "2 consecutive" "$(cat "$WORK/agent-badpin.log")"
+fi
 
 echo
 printf '%d passed, %d failed\n' "$pass" "$fail"
+# A skipped agent half must not read as a full pass. The count above is the honest answer either
+# way, but the line below is what a person skims — and "4 checks did not run" is the thing they
+# need to know before they trust it.
+if [ "$SKIP_AGENT" -ne 0 ]; then
+  echo "⚠️  the agent half did not run (no OpenSSL 3.x here) — 4 checks were not measured."
+  echo "    CI runs them on Linux; this is not a full pass."
+fi
 [ "$fail" -eq 0 ]

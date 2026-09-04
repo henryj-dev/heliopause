@@ -179,13 +179,21 @@ try:
     print(f"{'✓' if rec == 'OWNER-CHECK' else '✗'} 워크트리 소유자가 기록된다")
     fail += os.path.realpath(MAIN) in owners
     print(f"{'✓' if os.path.realpath(MAIN) not in owners else '✗'} 메인 트리는 소유자로 등록되지 않는다")
-    sub = os.path.join(MAIN, "target", "idp")
-    if os.path.isdir(sub):
-        call("SUBREPO", sub, "Bash", {"command": "git commit -m x"})
-        owners2 = json.load(open(OWNERS, encoding="utf-8")) if os.path.exists(OWNERS) else {}
-        ok = os.path.realpath(sub) not in owners2
-        fail += not ok
-        print(f"{'✓' if ok else '✗'} target/ 아래 남의 저장소는 소유자로 등록되지 않는다")
+    # ⚠️ This used to be `sub = MAIN/target/idp` behind `if os.path.isdir(sub)`, and this
+    #    repository has no `target/idp` — so the check never ran here, in CI or locally. It is the
+    #    exact mistake the FOREIGN/SUBDIR comment at the top of this file warns about, made three
+    #    dozen lines later: **a check that depends on a shape it did not build measures nothing in
+    #    the repositories that lack the shape, and says so by staying silent.**
+    #
+    #    `FOREIGN` is already a nested foreign repository built by this file, so it answers the same
+    #    question — "a foreign checkout under MAIN must not be recorded as a worktree we own" —
+    #    everywhere. That matters because session-end cleanup reclaims what it owns, and an entry
+    #    here would put someone else's checkout on that list.
+    call("SUBREPO", FOREIGN, "Bash", {"command": "git commit -m x"})
+    owners2 = json.load(open(OWNERS, encoding="utf-8")) if os.path.exists(OWNERS) else {}
+    ok = os.path.realpath(FOREIGN) not in owners2
+    fail += not ok
+    print(f"{'✓' if ok else '✗'} MAIN 아래 남의 저장소는 소유자로 등록되지 않는다")
 
     # 구제 통로 — 켜면 통과하고, 만료되면 다시 막혀야 한다
     RESCUE = f"{COMMON}/claude-main-tree-rescue"
