@@ -233,6 +233,33 @@ jobs:
           python3 scripts/claude-hooks/test-codex-hooks.py
           python3 scripts/git-hooks/test-pre-commit.py
 
+  # The desktop enrolment app: Rust + a plain page, outside the npm workspaces, and until now named
+  # by no job here at all. What it *does* is checked by `src/enroll-app-cli-contract.test.ts`, which
+  # reads both ends of the CLI contract statically and runs inside `npm test` — no toolchain needed.
+  #
+  # This job checks the two things a static read cannot: that `Cargo.lock` still describes
+  # `Cargo.toml`, and that the source is formatted. **No `clippy` and no build**, deliberately —
+  # compiling tauri on Linux pulls in webkit2gtk system packages and several minutes, and the defect
+  # class that would catch (a type error in 276 lines that the author never compiled) is not one
+  # this app has had. When it grows a real build, this is where it goes.
+  enroll-app:
+    name: enrolment app
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # `--locked` is the whole point: it resolves the manifest and **fails if the lockfile would
+      # have to change**. A tracked lock that has drifted from its manifest is worse than no lock,
+      # because it looks like a pin while `cargo build` quietly resolves something else.
+      - name: Cargo.lock still describes Cargo.toml
+        working-directory: packages/enroll-app/src-tauri
+        run: cargo metadata --locked --format-version 1 > /dev/null
+      - name: rustfmt
+        working-directory: packages/enroll-app/src-tauri
+        run: cargo fmt --check
+
   # **The policy layer does not belong to this repository.** Credential scanning, workflow
   # auditing and dependency review ask the same question of all five repositories, whatever
   # each one builds. Kept as copies they drift, and once they drift nothing says which one
@@ -261,7 +288,7 @@ jobs:
   # one-line change to `needs:`, and leaves the ruleset alone.
   gate:
     name: gate
-    needs: [check, e2e, rollback, leaks, guards, policy]
+    needs: [check, e2e, rollback, leaks, guards, enroll-app, policy]
     # This job must run even when something upstream is red. Otherwise it is a check that
     # never reported, the rule waits forever, and nothing records what broke.
     if: always()

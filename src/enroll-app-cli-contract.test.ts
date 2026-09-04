@@ -75,3 +75,94 @@ describe("enroll-app CLI contract: bin/heliopause-pki.ts sign-csr", () => {
     assert.match(source, /createHash\("sha256"\)/);
   });
 });
+
+// ── The other end of the contract ─────────────────────────────────────────────
+//
+// 🔴 **Everything above pins the CLI side only.** A contract needs two ends, and this file anchored
+// one: change `bin/heliopause-enrollment.ts` and these tests fail; change
+// `packages/enroll-app/src-tauri/src/lib.rs` — reorder the arguments, rename a flag, drop a step —
+// and **nothing anywhere fails**. The app is not in the npm workspaces, has no Rust tests, and is
+// named by no CI job, so this file was the only thing that could have noticed.
+//
+// It matters more than the line count suggests: this is the desktop tool an operator uses to
+// **sign host certificates with the local CA**. Read statically, like the CLI half — nothing here
+// runs a build, a toolchain, or the app.
+describe("enroll-app app-side contract: src-tauri/src/lib.rs", () => {
+  const rs = read("packages/enroll-app/src-tauri/src/lib.rs");
+
+  // The order the CLIs actually parse. `bin/heliopause-enrollment.ts` is command-first and then
+  // the store, which is what the tests above pin from the other side; if the app ever emits them
+  // the other way round it fails at the operator's desk with a parse error, not here.
+  it("calls the enrollment CLI command-first, then the manager URL", () => {
+    for (const command of ["csr-list", "csr-export", "cert-upload"]) {
+      const call = new RegExp(
+        `"bin/heliopause-enrollment\\.ts"\\.to_string\\(\\),\\s*"${command}"\\.to_string\\(\\),\\s*cfg\\.manager_url`,
+      );
+      assert.match(rs, call, `${command} must be passed command-first, then the manager URL`);
+    }
+  });
+
+  // `sign-csr <caDir> <csr> <crt>` — positional order, then the two flags the signer reads.
+  it("calls sign-csr with the CA dir first and both verification flags", () => {
+    const signCall = /\.arg\("bin\/heliopause-pki\.ts"\)[\s\S]{0,600}?\.output\(\)/.exec(rs)?.[0] ?? "";
+    assert.ok(signCall, "the sign-csr invocation must be findable");
+    assert.match(signCall, /\.arg\("sign-csr"\)/);
+    assert.match(signCall, /\.arg\(&cfg\.pki_dir\)/);
+    assert.match(signCall, /--name=\{hostname\}/);
+    // Dropping this flag would sign whatever CSR the manager handed over, with no check that it is
+    // the key the operator was shown. It is the whole reason the fingerprint travels.
+    assert.match(signCall, /--expect-sha256=\{expect_sha256\}/);
+  });
+
+  it("uses the field name the enrollment store actually declares", () => {
+    // `csrSha256`, not `sha256` or `fingerprint` — a drift between checkouts caused this once.
+    assert.match(rs, /csr_sha256|csrSha256/);
+  });
+
+  // 🔴 The app spawns processes. It must never do so through a shell: every argument here is
+  // operator-supplied or manager-supplied, and a shell would make the difference between an
+  // argument and a command a matter of quoting.
+  it("spawns with argument vectors and never through a shell", () => {
+    assert.doesNotMatch(rs, /Command::new\("(?:sh|bash|zsh|cmd)"\)/);
+    assert.doesNotMatch(rs, /\.arg\("-c"\)/);
+    assert.doesNotMatch(rs, /std::process::Command::new\("\/bin\//);
+  });
+
+  // The CSR id reaches the filesystem as a temp-file name. `sanitize` is the only thing standing
+  // between a manager-supplied id and a path that escapes the temp directory, and its guarantee
+  // lived in a comment.
+  it("sanitises the CSR id before it becomes a path", () => {
+    assert.match(rs, /fn sanitize\(/);
+    assert.match(rs, /is_ascii_alphanumeric\(\)/);
+    assert.match(rs, /let safe_id = sanitize\(/);
+    // …and the temp paths are built from the sanitised value, not the raw one.
+    assert.match(rs, /format!\("\{safe_id\}\.csr"\)/);
+    assert.match(rs, /format!\("\{safe_id\}\.crt"\)/);
+  });
+});
+
+// The frontend is a plain page in a webview with `withGlobalTauri`, so its permission set is the
+// boundary: whatever the page may invoke, an XSS in it may invoke too.
+describe("enroll-app permission boundary: src-tauri/capabilities/default.json", () => {
+  const caps = JSON.parse(read("packages/enroll-app/src-tauri/capabilities/default.json")) as {
+    permissions: string[];
+    windows: string[];
+  };
+
+  it("grants the core defaults and nothing else", () => {
+    assert.deepEqual(caps.permissions, ["core:default"]);
+  });
+
+  // The app's own description says the shell plugin is "intentionally NOT enabled — process
+  // spawning happens inside the Rust commands". That sentence is the security argument for the
+  // whole design, and it was enforced by nobody.
+  it("does not enable the shell plugin, which would move spawning into the page", () => {
+    for (const p of caps.permissions) {
+      assert.doesNotMatch(p, /^shell:/, "the shell plugin would let the webview spawn processes");
+    }
+  });
+
+  it("scopes the capability to the one window that exists", () => {
+    assert.deepEqual(caps.windows, ["main"]);
+  });
+});

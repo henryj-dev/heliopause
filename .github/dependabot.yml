@@ -108,6 +108,42 @@ updates:
       prefix: chore(deps)
     labels: [dependencies]
 
+  # ── Cargo (packages/enroll-app) ────────────────────────────────────────────
+  #
+  # 🔴 The desktop enrolment app was in **no** update ecosystem at all: not npm (it is deliberately
+  # outside `workspaces`, see the note there), not cargo, not anything. Its dependency tree is
+  # tauri + serde and it is the tool an operator uses to sign host certificates with the local CA —
+  # the one place in this repository where a supply-chain problem reaches a signing key.
+  #
+  # `directory` names the crate, not the repository root: `Cargo.toml` and `Cargo.lock` live under
+  # `src-tauri/`, and dependabot resolves the manifest relative to this path.
+  - package-ecosystem: cargo
+    directory: /packages/enroll-app/src-tauri
+    schedule:
+      interval: monthly
+    groups:
+      # Tauri's crates move together and a partial bump does not build.
+      tauri:
+        patterns: ["tauri", "tauri-*"]
+        update-types: [minor, patch]
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: chore(deps)
+    labels: [dependencies]
+
+  # ── npm, packages/enroll-app ───────────────────────────────────────────────
+  #
+  # Listed separately because the app is **not** a workspace of the root manifest — the `directory:
+  # /` entry above therefore does not reach it, and its `package-lock.json` is its own.
+  - package-ecosystem: npm
+    directory: /packages/enroll-app
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: chore(deps)
+    labels: [dependencies]
+
 # Not configured here, deliberately: `pip`. The agent is standard library only — that is a stated
 # property (`agent/` installs nothing, which is why a host needs no package index reachable), not an
 # omission waiting to be fixed. If a requirements file ever appears, that property is gone and this

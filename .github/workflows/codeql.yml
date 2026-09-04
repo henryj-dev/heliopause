@@ -59,6 +59,14 @@ jobs:
           - language: javascript-typescript
           # The agent — the half that runs as root on every managed host and talks to nftables.
           - language: python
+          # The desktop enrolment app's backend. It spawns processes with operator- and
+          # manager-supplied values, which is exactly the shape a taint analysis is for — and the
+          # one language in this repository that had no static analysis at all.
+          #
+          # ⚠️ Rust extraction is newer than the other two here. If it ever fails for reasons that
+          # are about the extractor rather than the code, remove this entry rather than leaving the
+          # `codeql` gate red: a gate that is red for a reason nobody can act on stops being read.
+          - language: rust
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
