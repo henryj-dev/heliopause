@@ -4,7 +4,10 @@
 // and the manager runtime image do not grow a frontend toolchain. Both the manager and
 // the workstation UI call this; the browser then talks to `/api/*` on the same origin.
 
-import { createReadStream, existsSync, readFileSync, statSync } from "node:fs";
+// `existsSync` survives for `resolveWebRoot` only — a one-off startup question about which build
+// directory to serve, where there is no second use to race against. The serving path opens instead;
+// see `openRegular`.
+import { closeSync, createReadStream, existsSync, fstatSync, openSync, readFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { extname, join, relative, resolve, sep } from "node:path";
 
@@ -76,6 +79,34 @@ export function securityHeadersForDocument(html: string): Record<string, string>
     : "script-src 'self'";
   const baseCsp = SECURITY_HEADERS["content-security-policy"] ?? "";
   return { ...SECURITY_HEADERS, "content-security-policy": baseCsp.replace("script-src 'self'", scriptSrc) };
+}
+
+/**
+ * Open a path as a regular file, or answer null.
+ *
+ * The point is that the **descriptor** is what gets checked. `existsSync` followed by `statSync`
+ * followed by a read resolves the name three times, and a name is not an object: between any two of
+ * those the thing it points at can change. Here the file is opened once and `fstat` asks about that
+ * open handle, so "it is a regular file" and "this is the file I am reading" are the same claim.
+ *
+ * Returns null for anything that is not a readable regular file — missing, a directory, a dangling
+ * symlink, or unreadable. The caller treats all of those the same way, which is what the two
+ * separate `existsSync` checks were doing less exactly.
+ */
+function openRegular(path: string): number | null {
+  let fd: number;
+  try {
+    fd = openSync(path, "r");
+  } catch {
+    return null;
+  }
+  try {
+    if (fstatSync(fd).isFile()) return fd;
+  } catch {
+    // fall through to close
+  }
+  closeSync(fd);
+  return null;
 }
 
 const TYPES: Record<string, string> = {
@@ -152,33 +183,61 @@ export function serveConsole(
       return true;
     }
 
+    // 🔴 **One handle, opened once.** This was `existsSync(file) && statSync(file).isFile()` and
+    // then, separately, `readFileSync(file)` / `createReadStream(file)` — three resolutions of the
+    // same name, with a window between each. CodeQL flagged it as `js/file-system-race` and it sat
+    // open for ten days.
+    //
+    // What the window costs here is small — `root` is a local build directory — but the shape is
+    // the one this repository keeps getting caught by: the check and the use are about **different
+    // objects that happen to share a name**. `openRegular` collapses them. What is checked is the
+    // open descriptor, and what is read is that same descriptor, so nothing can be swapped between
+    // the two.
+    //
+    // It also removes a smaller inaccuracy: `existsSync` on a dangling symlink is false, so a
+    // broken link fell through to `index.html` rather than 404-ing. Opening answers that directly.
     let file = candidate;
-    const present = existsSync(file) && statSync(file).isFile();
-    if (!present) file = join(root, "index.html");
-    if (!existsSync(file) || !statSync(file).isFile()) {
+    let fd = openRegular(candidate);
+    if (fd === null) {
+      file = join(root, "index.html");
+      fd = openRegular(file);
+    }
+    if (fd === null) {
       res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
       res.end("console build is missing — run npm run build:web");
       return true;
     }
 
-    const type = TYPES[extname(file)] ?? "application/octet-stream";
-    const isDocument = extname(file) === ".html";
-    const document = isDocument ? readFileSync(file, "utf8") : null;
-    res.writeHead(200, {
-      "content-type": type,
-      "cache-control": extname(file) === ".html" ? "no-store" : "public, max-age=31536000, immutable",
-      "x-content-type-options": "nosniff",
-      ...(document === null ? SECURITY_HEADERS : securityHeadersForDocument(document)),
-    });
-    if (req.method === "HEAD") {
-      res.end();
+    try {
+      const type = TYPES[extname(file)] ?? "application/octet-stream";
+      const isDocument = extname(file) === ".html";
+      // Reading by descriptor, not by name. `readFileSync` accepts an fd and reads from it.
+      const document = isDocument ? readFileSync(fd, "utf8") : null;
+      res.writeHead(200, {
+        "content-type": type,
+        "cache-control": extname(file) === ".html" ? "no-store" : "public, max-age=31536000, immutable",
+        "x-content-type-options": "nosniff",
+        ...(document === null ? SECURITY_HEADERS : securityHeadersForDocument(document)),
+      });
+      if (req.method === "HEAD") {
+        res.end();
+        return true;
+      }
+      if (document !== null) {
+        res.end(document);
+        return true;
+      }
+      // The stream takes ownership of the descriptor and closes it (`autoClose` defaults on), so
+      // this is the one path that must not also close it in `finally`.
+      const stream = createReadStream("", { fd, autoClose: true });
+      fd = null;
+      stream.on("error", () => res.destroy());
+      stream.pipe(res);
       return true;
+    } finally {
+      // Every other path — the document, the HEAD, and a throw from `writeHead` — leaves the
+      // descriptor to be closed here. A leak would be invisible until the process ran out.
+      if (fd !== null) closeSync(fd);
     }
-    if (document !== null) {
-      res.end(document);
-    } else {
-      createReadStream(file).pipe(res);
-    }
-    return true;
   };
 }

@@ -213,8 +213,16 @@ export function objectCidrs(
   });
 
   if (cidrs.length === 0) {
-    // `normalizeObject` already refuses an empty member list, so this is the case where every member
-    // expanded to nothing. Same inversion as above: empty means "from anywhere", not "from nobody".
+    // Empty means "from anywhere", not "from nobody" — the same inversion as above, which is why an
+    // empty expansion has to be an error rather than an empty rule.
+    //
+    // ⚠️ This used to say "`normalizeObject` already refuses an empty member list, so this is the
+    // case where every member expanded to nothing." **That premise does not hold.**
+    // `normalizeObject` has no runtime caller anywhere in this repository — it is defined, re-
+    // exported from `index.ts`, and named in this sentence, and nothing else. `site.objects` reaches
+    // the renderer through `bin/heliopause-publish.ts` typed as `FirewallObject[]`, and
+    // `policy-source.ts` checks only `Array.isArray`. So a declared-but-empty group arrives here
+    // unvalidated, and this check is not a second line of defence — it is the only one.
     throw bad(`object ${JSON.stringify(object.id)} expanded to no addresses`);
   }
   return [...new Set(cidrs)].sort();

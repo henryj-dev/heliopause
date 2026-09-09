@@ -940,7 +940,12 @@ describe("a real OIDC session, end to end", () => {
       const payload = b64({
         iss: "https://idp.example.invalid", aud: "heliopause-manager", sub: "idp-sub-1",
         nonce: mintNonce, exp: now + 300, iat: now,
-        email: "jang@example.invalid", preferred_username: "henry", groups: mintGroups,
+        // `email_verified` decides whether the address may key an alias, and the alias is what
+        // raises `canWrite` here — see `oidc-authz.ts`. A real IdP sends it for a verified address;
+        // omitting it made this fixture describe an identity that cannot write, for a reason that
+        // has nothing to do with what these cases are about.
+        email: "jang@example.invalid", email_verified: true,
+        preferred_username: "henry", groups: mintGroups,
       });
       const sig = createSign("sha256").update(`${header}.${payload}`)
         .sign({ key: privateKey, dsaEncoding: "ieee-p1363" }).toString("base64url");

@@ -74,6 +74,13 @@ def stub_artifact_verification():
     return restore
 
 
+# 🔴 The real function, captured before the stub replaces it **for the rest of the suite** — the
+# call below is never restored. That is fine for the apply-path cases, which are about what the
+# apply path does with a verified artifact; it is also the reason
+# `accept_artifact_authorization` had no behavioural coverage at all. The stub answers `({}, "")`
+# to every input, so any test that reached it was testing the stub. `TestReplayWatermark` uses this.
+_REAL_ACCEPT_AUTHORIZATION = hp.accept_artifact_authorization
+
 _RESTORE_VERIFICATION = stub_artifact_verification()
 
 
@@ -3952,6 +3959,133 @@ class TestRelayRequestDeadline(unittest.TestCase):
             "resp.read(MAX_ARTIFACT_BYTES)", body,
             "one unbounded read is the defect — the body is read in pieces",
         )
+
+
+class TestReplayWatermark(unittest.TestCase):
+    """`accept_artifact_authorization` — the durable state that stops an authorization being reused.
+
+    🔴 **It was never called by a test.** `accept_artifact_authorization` appears in this file only
+    as a stub (patched out so other cases can run the apply path), and the word "replay" appears
+    only in a test that reads the *source* to check call order. So the four decisions this function
+    makes were pinned by nothing, and disabling each in turn left all 263 tests green:
+
+      · an authorization older than the watermark is refused
+      · two different artifacts sharing one timestamp are refused
+      · the watermark is actually written
+      · an expired authorization is refused unless it is the one already confirmed
+
+    The order-of-calls test above is worth having and is not this: it says the function is called
+    before the host is touched, not that the function decides anything.
+    """
+
+    RECORD = {
+        "authorizedAt": "2026-08-15T00:05:00.000Z",
+        "payloadHash": "sha256:" + "a" * 64,
+        "keyId": "sha256:" + "b" * 64,
+        "authorizationMode": "two-person",
+        "target": hp.TARGET,
+        "host": hp.HOST_ID,
+        "planHash": "sha256:" + "c" * 64,
+        "bundleHash": "sha256:" + "d" * 64,
+        "generation": "gen-2",
+    }
+
+    def setUp(self):
+        hp.save_state(dict(hp._EMPTY_STATE))
+
+    def record(self, **over):
+        return {**self.RECORD, **over}
+
+    def test_accepts_a_first_authorization_and_writes_the_watermark(self):
+        # The known positive. Without it every refusal below would pass against a function that
+        # refuses everything, which is the same defect with the sign flipped.
+        fresh, err = _REAL_ACCEPT_AUTHORIZATION(self.record(), {}, False)
+        self.assertEqual(err, "")
+        self.assertIsNotNone(fresh)
+        self.assertEqual(fresh["authorizationWatermark"], self.record())
+        self.assertEqual(fresh["pendingAuthorization"], self.record())
+        # Durably: the point of the function is that a crash after this cannot lose it.
+        self.assertEqual(hp.load_state()["authorizationWatermark"], self.record())
+
+    def test_refuses_an_authorization_older_than_the_watermark(self):
+        # The replay itself: a still-unexpired envelope from an earlier authorization, re-served.
+        _REAL_ACCEPT_AUTHORIZATION(self.record(), {}, False)
+        fresh, err = _REAL_ACCEPT_AUTHORIZATION(
+            self.record(authorizedAt="2026-08-14T00:00:00.000Z", generation="gen-1"), {}, False,
+        )
+        self.assertIsNone(fresh)
+        self.assertIn("older than the durable authorization watermark", err)
+        # And the watermark did not move backwards.
+        self.assertEqual(hp.load_state()["authorizationWatermark"]["generation"], "gen-2")
+
+    def test_refuses_a_different_artifact_at_the_same_timestamp(self):
+        # Two authorizations cannot share an instant. If they appear to, one of them is not what it
+        # says it is — and taking either would make which one applied depend on arrival order.
+        _REAL_ACCEPT_AUTHORIZATION(self.record(), {}, False)
+        fresh, err = _REAL_ACCEPT_AUTHORIZATION(self.record(generation="gen-other"), {}, False)
+        self.assertIsNone(fresh)
+        self.assertIn("share one authorization timestamp", err)
+
+    def test_accepts_the_identical_record_again(self):
+        # Idempotence, deliberately: a retry after a crash between "recorded" and "applied" must be
+        # able to finish. It is the *different* artifact at the same timestamp that is refused.
+        _REAL_ACCEPT_AUTHORIZATION(self.record(), {}, False)
+        fresh, err = _REAL_ACCEPT_AUTHORIZATION(self.record(), {}, False)
+        self.assertEqual(err, "")
+        self.assertIsNotNone(fresh)
+
+    def test_accepts_a_newer_authorization(self):
+        _REAL_ACCEPT_AUTHORIZATION(self.record(), {}, False)
+        newer = self.record(authorizedAt="2026-08-16T00:00:00.000Z", generation="gen-3")
+        fresh, err = _REAL_ACCEPT_AUTHORIZATION(newer, {}, False)
+        self.assertEqual(err, "")
+        self.assertEqual(fresh["authorizationWatermark"]["generation"], "gen-3")
+
+    def test_refuses_an_expired_authorization(self):
+        fresh, err = _REAL_ACCEPT_AUTHORIZATION(self.record(), {}, True)
+        self.assertIsNone(fresh)
+        self.assertIn("expired", err)
+        # The key exists in the empty state with a null value; what matters is that it did not
+        # take this record.
+        self.assertIsNone(hp.load_state()["authorizationWatermark"])
+
+    def test_lets_an_expired_authorization_stand_when_it_is_the_one_already_confirmed(self):
+        # The exception that makes the rule usable. A host that already applied and confirmed this
+        # exact generation must not start refusing its own running ruleset the moment the
+        # authorization ages out — that would be a fleet reverting on a clock, not on a decision.
+        st = dict(hp._EMPTY_STATE)
+        st["currentAuthorization"] = self.record()
+        st["generation"] = self.RECORD["generation"]
+        st["state"] = "confirmed"
+        hp.save_state(st)
+        fresh, err = _REAL_ACCEPT_AUTHORIZATION(self.record(), {}, True)
+        self.assertEqual(err, "")
+        self.assertIsNotNone(fresh)
+
+    def test_an_expired_authorization_for_a_different_generation_is_still_refused(self):
+        # The narrowness of that exception is the whole of it: "already confirmed" means this
+        # generation, not any generation.
+        st = dict(hp._EMPTY_STATE)
+        st["currentAuthorization"] = self.record()
+        st["generation"] = "gen-something-else"
+        st["state"] = "confirmed"
+        hp.save_state(st)
+        fresh, err = _REAL_ACCEPT_AUTHORIZATION(self.record(), {}, True)
+        self.assertIsNone(fresh)
+        self.assertIn("expired", err)
+
+    def test_reports_a_failed_save_rather_than_proceeding(self):
+        # `update_state` returns `saved=False` when the durable write did not land. Continuing would
+        # apply a ruleset whose replay watermark is only in memory — exactly the window this
+        # function exists to close.
+        real = hp._save_state_unlocked
+        hp._save_state_unlocked = lambda st: False
+        try:
+            fresh, err = _REAL_ACCEPT_AUTHORIZATION(self.record(), {}, False)
+        finally:
+            hp._save_state_unlocked = real
+        self.assertIsNone(fresh)
+        self.assertIn("cannot persist signed authorization replay watermark", err)
 
 
 if __name__ == "__main__":

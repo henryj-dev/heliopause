@@ -823,6 +823,11 @@ describe("the forward chain", () => {
 
   it("renders the same decisions in JSON as in text", () => {
     // The agent applies the JSON. A guard that exists only in the preview is worse than no guard.
+    //
+    // ⚠️ This counts rules and reads the chain policy. That is not the same as checking what the
+    // rules *say* — `src/nft-emitter-parity.test.ts` decodes every expression back out of the JSON
+    // and compares it against the plan, which is what catches a match or a verdict changing under
+    // a rule count that stayed the same.
     const doc = JSON.parse(renderHostRulesetJson(routing, "gw-01", []).json);
     const fwd = doc.nftables.filter(
       (e: { add?: { rule?: { chain?: string } } }) => e.add?.rule?.chain === "forward",
@@ -832,5 +837,52 @@ describe("the forward chain", () => {
       (e: { add?: { chain?: { hook?: string } } }) => e.add?.chain?.hook === "forward",
     );
     assert.equal(chain.add.chain.policy, "accept");
+  });
+
+  // 🔴 `new RegExp(re)` on a configured pattern, with nothing catching the throw. Measured against
+  // `hosts: ["gw-(01"]`: `constructor name: SyntaxError`, `instanceof RenderError: false`. That is
+  // the wrong channel — `manager-server.ts` and `heliopause-ui.ts` turn it into a 500, and
+  // `packages/manager/src/listen.ts` calls synchronously, so the listener exits. `defineConfig`
+  // validates `forward.hosts` not at all, so a typo in a site module is the whole distance.
+  it("reports an unparseable host pattern as a render error, not a SyntaxError", () => {
+    const broken = defineConfig({ ...routing, forward: { guardInternal: true, hosts: ["gw-(01"] } });
+    assert.throws(() => planHostRuleset(broken, "gw-01", []), RenderError);
+    assert.throws(
+      () => planHostRuleset(broken, "gw-01", []),
+      (e: Error) => {
+        contains(e.message, "forward.hosts");
+        contains(e.message, "gw-(01");
+        return true;
+      },
+    );
+  });
+
+  // The pattern is deliberately unanchored — `config.ts` documents that for `protectedHosts` and
+  // points at this consequence. Pinned so that "should we anchor it?" stays a decision someone
+  // makes on purpose rather than a behaviour that drifts.
+  it("matches unanchored, which is what the config documents", () => {
+    const loose = defineConfig({ ...routing, forward: { guardInternal: true, hosts: ["gw-"] } });
+    assert.notEqual(planHostRuleset(loose, "k3s-gw-proxy", []).forward, null);
+    assert.equal(planHostRuleset(loose, "mailer-01", []).forward, null);
+  });
+
+  // 🔴 The family came from `internalSupernet.includes(":")` — a substring test that validated
+  // nothing, while the egress path asked `familyOf`. A malformed supernet rendered a plausible-
+  // looking guard in the wrong family, `nft -f` refused the file, and the gateway reverted every
+  // generation it was given.
+  it("refuses a malformed internalSupernet rather than guessing its family", () => {
+    for (const bad of ["10.0.0.300/8", "10.0.0.0/33", "not-an-address"]) {
+      const cfgBad = defineConfig({ ...routing, internalSupernet: bad });
+      assert.throws(
+        () => planHostRuleset(cfgBad, "gw-01", []),
+        RenderError,
+        `${bad} must not render a forward guard`,
+      );
+    }
+  });
+
+  it("still renders an IPv6 supernet in the v6 family", () => {
+    const v6 = defineConfig({ ...routing, internalSupernet: "fd00::/8" });
+    contains(renderHostRuleset(v6, "gw-01", []).ruleset, "ip6 saddr != fd00::/8");
   });
 });

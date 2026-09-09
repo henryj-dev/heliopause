@@ -179,3 +179,61 @@ describe("CSRF on a state-changing request", () => {
     assert.equal(CSRF_HEADER, "x-heliopause-csrf");
   });
 });
+
+// ── Acting on one identity's sessions ─────────────────────────────────────────
+//
+// 🔴 **`applyToSubject` had no test at all**, and the line that makes it "to subject" rather than
+// "to everyone" is one `continue`. Deleting it left all 1,835 tests green, because every session in
+// this file was issued for the same `sub`.
+//
+// `manager-server.ts` calls it twice against a **Security Event Token from the IdP**: once to apply
+// a role change (`:3304`) and once for a back-channel logout (`:3376`, `() => null`). Without the
+// filter, one person signing out anywhere ends every operator's session on the fleet console — and
+// a role change applies somebody else's new role to everyone.
+describe("applyToSubject", () => {
+  const alice: Principal = { name: "ops-alice", sub: "idp-1", groups: ["fleet-operators"], via: "oidc", canWrite: false };
+  const bob: Principal = { name: "ops-bob", sub: "idp-2", groups: ["fleet-operators"], via: "oidc", canWrite: false };
+
+  const twoPeople = () => {
+    const s = new SessionStore();
+    return { s, a: s.create(alice), b: s.create(bob), b2: s.create(bob) };
+  };
+
+  it("ends only the named subject's sessions — the back-channel logout case", () => {
+    const { s, a, b, b2 } = twoPeople();
+    const outcome = s.applyToSubject("idp-2", () => null);
+    assert.deepEqual(outcome, { updated: 0, ended: 2 });
+    assert.equal(s.get(b.id), null, "bob's first session must be gone");
+    assert.equal(s.get(b2.id), null, "bob's second session must be gone");
+    assert.equal(s.get(a.id)?.principal.name, "ops-alice", "alice must still be signed in");
+  });
+
+  it("re-roles only the named subject — the role-change case", () => {
+    const { s, a, b } = twoPeople();
+    // Bob holds two sessions — both must be re-roled, which is also what makes "updated" a count
+    // rather than a boolean.
+    const outcome = s.applyToSubject("idp-2", (current) => ({ ...current, canWrite: true }));
+    assert.deepEqual(outcome, { updated: 2, ended: 0 });
+    assert.equal(s.get(b.id)?.principal.canWrite, true);
+    assert.equal(s.get(a.id)?.principal.canWrite, false, "alice must not inherit bob's new role");
+  });
+
+  it("matching no session is an answer, not an error", () => {
+    // The person may simply not be signed in; the caller logs the counts.
+    const { s } = twoPeople();
+    assert.deepEqual(s.applyToSubject("idp-nobody", () => null), { updated: 0, ended: 0 });
+    assert.equal(s.size, 3);
+  });
+
+  it("matches on the subject, not on the display name", () => {
+    // `sub` is the IdP's stable identifier; `name` is what a directory shows and can be edited or
+    // repeated. A SET names the former, and matching the latter would let a renamed profile end
+    // somebody else's session.
+    const s = new SessionStore();
+    const impostor: Principal = { ...bob, name: "ops-alice" };
+    const real = s.create(alice);
+    s.create(impostor);
+    assert.deepEqual(s.applyToSubject("idp-2", () => null), { updated: 0, ended: 1 });
+    assert.equal(s.get(real.id)?.principal.name, "ops-alice");
+  });
+});

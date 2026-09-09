@@ -788,13 +788,51 @@ function ruleText(r: PlannedRule): string {
  * to machines behind it. That is the argument for keeping this chain small and fixed rather than
  * policy-driven.
  */
+/**
+ * Does a configured host pattern match this host?
+ *
+ * Two things the bare `new RegExp(re).test(host)` did not do.
+ *
+ * **A malformed pattern becomes a `RenderError`.** `new RegExp("gw-(01")` throws a `SyntaxError`,
+ * and that is not the channel this module's callers handle — see the note at the call site.
+ *
+ * **The pattern is not anchored, and that stays true.** `"gw-"` matching `k3s-gw-proxy` is the
+ * documented behaviour of `protectedHosts` in `config.ts`, which points at this exact consequence;
+ * anchoring here would silently change which hosts a site's existing config selects. What was
+ * missing was not anchoring but a *readable failure* for the pattern that cannot compile at all.
+ */
+function matchesHost(pattern: string, host: string, where: string): boolean {
+  let re: RegExp;
+  try {
+    re = new RegExp(pattern);
+  } catch (e) {
+    throw new RenderError(
+      `${where}: ${JSON.stringify(pattern)} is not a valid regular expression — ${(e as Error).message}`,
+    );
+  }
+  return re.test(host);
+}
+
 function forwardRules(cfg: Config, host: string): PlannedRule[] | null {
   if (!cfg.forward) return null;
   // Not this host's job. `null` rather than an empty chain — see `RulesetPlan.forward`.
-  if (!cfg.forward.hosts.some((re) => new RegExp(re).test(host))) return null;
+  //
+  // ⚠️ **A bad pattern used to leave as a raw `SyntaxError`.** `new RegExp(re)` throws
+  // `Invalid regular expression: /gw-(01/: Unterminated group`, which is not a `RenderError`, so it
+  // walked straight past the channel every caller handles — measured: `instanceof RenderError` was
+  // false and `statusCode` was undefined, so the manager answered 500 and `listen.ts`'s synchronous
+  // path would have exited. `defineConfig` validates none of this; a typo in a site module is all
+  // it takes.
+  if (!cfg.forward.hosts.some((re) => matchesHost(re, host, "forward.hosts"))) return null;
   const rules: PlannedRule[] = [];
   if (cfg.forward.guardInternal) {
-    const family: Family = cfg.internalSupernet.includes(":") ? "ip6" : "ip";
+    // 🔴 `internalSupernet.includes(":")` was the whole family decision here, and it validated
+    // nothing. The egress path asks `familyOf` (which rejects an octet above 255, a prefix length
+    // out of range, and embedded IPv4); this one took a substring test and rendered whatever came
+    // out. A malformed supernet therefore produced a *syntactically plausible* guard in the wrong
+    // family — `ip6 saddr 10.0.0.0/8` matches no packet and `nft -f` refuses the file, so the
+    // gateway reverts every generation it is given while the plan looks fine.
+    const family: Family = familyOf(cfg.internalSupernet, "forward guard internalSupernet");
     rules.push(
       {
         matches: [{ kind: "ct-established" }],

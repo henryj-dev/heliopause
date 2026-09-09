@@ -3306,7 +3306,11 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
           {
             sub: change.sub,
             username: null,
+            // A role-change SET carries roles, not an address. There is no email to verify, and
+            // an alias for this identity has to be keyed on the subject — which is the shape a
+            // machine-delivered role change should have anyway.
             email: null,
+            emailVerified: false,
             groups: change.roles,
             expiresAt: new Date(0),
           },

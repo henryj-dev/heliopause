@@ -14,6 +14,30 @@
 # It also grades things this repository will legitimately score badly on — no signed releases (there
 # are no releases), no fuzzing, few maintainers. **A low number is not a defect here.** The value is
 # in the per-check output, not the total, and nothing gates on it.
+#
+# ## The one finding it has actually produced, and why it stays open
+#
+# `Branch-Protection`, score 4, high severity, open since 2026-08-26. Three warnings, and they are
+# all the same decision:
+#
+#     branch 'main' does not require approvers
+#     codeowners review is not required on branch 'main'
+#     'last push approval' is disabled on branch 'main'
+#
+# `required_approving_review_count` is **0 on purpose**. This repository is worked by agent sessions
+# that open a pull request, wait for the checks, and merge it — that flow is written down in
+# AGENTS.md and it is the reason `main` is pull-request-only rather than push-protected. Requiring a
+# human approver would not add a reviewer; it would add a person clicking a button on their own
+# agent's work, which is the shape of review that teaches people not to read.
+#
+# What carries the weight instead is the required-checks list — `gate`, `codeql`,
+# `trusted site-data leak gate` — plus `required_review_thread_resolution` and
+# `require_extra_approval_for_unattributed_changes`, which does demand a second pair of eyes for a
+# commit whose author cannot be attributed.
+#
+# **This is recorded here because an open high-severity alert with no note is indistinguishable from
+# one nobody has looked at.** If this repository ever has more than one maintainer, revisit it: the
+# argument above is about who is available to review, not about approvals being unimportant.
 name: scorecard
 
 on:

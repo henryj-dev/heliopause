@@ -269,6 +269,47 @@ describe("hostVerdict — silence outranks the last thing a host said", () => {
     assert.deepEqual(hostVerdict({ ageSec: 3, state: "pending" }), { kind: "other", state: "pending" });
   });
 
+  // 🔴 **The `behind` branch had no test at all** — `current`, `behind` and `blockedBy` appeared
+  // nowhere in this file, and deleting the line left every case green. Its neighbours (drift,
+  // rollback, maintenance, silence) each have a paired test; this one was the gap.
+  //
+  // What it decides is the same class of thing as the regression at the top of this file: a host
+  // that is reporting *healthily about the wrong generation*. `confirmed` describes the generation
+  // the host is running, not the one being rolled out — so a green row beside a `wanted elsewhere`
+  // generation is the table contradicting itself in two columns, which is exactly how `manager.ts`
+  // and `protocol.ts` record having been misled before.
+  it("says a host on an older generation is behind, not confirmed", () => {
+    assert.deepEqual(
+      hostVerdict({ ageSec: 5, state: "confirmed", current: false }),
+      { kind: "behind", blockedBy: null, state: "confirmed" },
+    );
+  });
+
+  it("carries what is blocking it, and the state it is blocked in", () => {
+    // Both fields are the reason this is `behind` rather than a bare flag: the row has to say why a
+    // host has not moved, or the operator's next question has no answer on the screen.
+    assert.deepEqual(
+      hostVerdict({ ageSec: 5, state: "pending", current: false, blockedBy: "canary" }),
+      { kind: "behind", blockedBy: "canary", state: "pending" },
+    );
+  });
+
+  it("keeps silence and drift ahead of being behind", () => {
+    // Ordering, in the direction that matters. A host that is behind *and* silent has the worse
+    // problem, and the same is true of drift — being behind is a rollout fact, those two are host
+    // facts. Pinned because the ordering in this function has been wrong before.
+    assert.equal(hostVerdict({ ageSec: 99_999, state: "confirmed", current: false }).kind, "silent");
+    assert.equal(hostVerdict({ drifted: true, ageSec: 5, state: "confirmed", current: false }).kind, "drift");
+  });
+
+  it("a host that is current is judged on its state, not called behind", () => {
+    // The known positive for the branch above: without it the tests here pass against a function
+    // that calls every host behind.
+    assert.deepEqual(hostVerdict({ ageSec: 5, state: "confirmed", current: true }), { kind: "confirmed" });
+    // …and an absent `current` is "the caller did not say", which must not read as `false`.
+    assert.deepEqual(hostVerdict({ ageSec: 5, state: "confirmed" }), { kind: "confirmed" });
+  });
+
   // ## The ordering around `maintenance`, pinned in both directions
   //
   // `hostVerdict` carried the same `if (h.maintenance)` twice — once above `never-seen` and once

@@ -58,6 +58,19 @@ export interface Identity {
   /** Preferred human-readable name, when the IdP sends one. */
   username: string | null;
   email: string | null;
+  /**
+   * Whether the issuer says it has verified that address.
+   *
+   * 🔴 **Carried because an alias keyed on email decides who may write.** `oidc-authz.ts` resolves
+   * `email → certificate name`, that alias raises `canWrite`, and the name it resolves to is the
+   * identity the two-person approval rule compares. An IdP that lets a user set their own profile
+   * address — and many do, for anything but the verified one — would let one member of a writer
+   * group claim a colleague's alias and satisfy both halves of that rule alone.
+   *
+   * `email_verified` is the claim OIDC defines for exactly this question. **Absent counts as
+   * false**: an issuer that will not say has not said yes, and this is the wrong place to guess.
+   */
+  emailVerified: boolean;
   /** Group and role claims, flattened. Empty when the IdP sends none — never null. */
   groups: string[];
   /** When the ID token expires. The session may be shorter; it must not be longer. */
@@ -425,6 +438,9 @@ export async function verifyIdToken(
     sub: c.sub,
     username: typeof c.preferred_username === "string" ? c.preferred_username : null,
     email: typeof c.email === "string" ? c.email : null,
+    // Strictly `true`. Some issuers send the string "true"; accepting it here would mean trusting a
+    // type coercion to decide who can approve a firewall change, so a non-boolean is not verified.
+    emailVerified: c.email_verified === true,
     groups: claimList(c.groups).concat(claimList(c.roles)),
     expiresAt: new Date(c.exp * 1000),
   };
