@@ -950,6 +950,33 @@ export async function mergePullRequest(
 }
 
 /**
+ * Is this the App being told it may not look, rather than a failure to look?
+ *
+ * ## Why it is worth its own sentence
+ *
+ * `GET /commits/{sha}/check-runs` answers `403 Resource not accessible by integration` when the
+ * installation lacks **Checks: read**, and `/status` does the same without **Commit statuses: read**.
+ * Neither is transient and neither is about the pull request: the console answers the same way for
+ * every pull request, forever, until somebody edits the App. Surfaced as a bare 502 it reads like
+ * GitHub is down — measured on 2026-09-20, on the first merge anybody tried.
+ *
+ * It must never soften into a pass. A missing permission is the one failure that could be mistaken
+ * for "no checks failed", which is why `mergeRefusal` takes it as a refusal rather than as an empty
+ * list, and why this returns a sentence rather than a boolean.
+ */
+export function checksUnreadable(e: unknown, creds: AppCredentials, target: ProposalTarget): string | null {
+  if (!(e instanceof ProposalError)) return null;
+  // 404 as well as 403: GitHub hides some resources from an unpermitted installation rather than
+  // refusing them, and a gate that only recognised one of the two would fall back to a 502 for the
+  // other — the same unreadable message this function exists to replace.
+  if (e.status !== 403 && e.status !== 404) return null;
+  return (
+    `this console's app (id ${creds.appId}) may not read checks on ${target.owner}/${target.repo} — ` +
+    "grant the installation Checks: read and Commit statuses: read, then try again"
+  );
+}
+
+/**
  * Why this operator may not merge this pull request — or null when they may.
  *
  * ## Why it is one pure function and not six checks at the call site
@@ -972,6 +999,15 @@ export function mergeRefusal(input: {
   checks: readonly CommitCheck[];
   who: string;
   proposer: string | null;
+  /**
+   * Set when the checks could not be read at all, rather than read and found wanting.
+   *
+   * These are different facts and only one of them is the pull request's. "Nothing has checked this
+   * commit" sends an operator to wait for CI; "this console may not read checks" sends them to the
+   * App's permissions, and no amount of waiting will change it. The gate refuses either way — what
+   * differs is the sentence, and the sentence is the whole value of a refusal somebody has to act on.
+   */
+  checksUnavailable?: string | null;
 }): string | null {
   const { status, checks, who, proposer } = input;
   if (status.merged) return `pull request #${status.number} is already merged`;
@@ -989,6 +1025,10 @@ export function mergeRefusal(input: {
       ? `GitHub has not finished working out whether #${status.number} merges cleanly`
       : `#${status.number} does not merge cleanly (${status.mergeableState})`;
   }
+  // Ordered after the facts about the pull request itself: a merged or self-proposed one is refused
+  // for a reason the operator can act on now, and sending them to fix an App permission first would
+  // be true and useless.
+  if (input.checksUnavailable) return input.checksUnavailable;
   if (checks.length === 0) return `nothing has checked ${status.headSha.slice(0, 8)} yet`;
   const pending = checks.filter((c) => c.state === "pending").map((c) => c.name);
   const failed = checks.filter((c) => c.state === "failure").map((c) => `${c.name} (${c.detail})`);

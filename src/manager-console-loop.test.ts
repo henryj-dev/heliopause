@@ -50,6 +50,8 @@ const ghSeen: Array<{ url: string; method: string; body?: unknown }> = [];
 /** Flipped by a test that needs the pull request to look different without a second server. */
 let prOverride: Record<string, unknown> = {};
 let checkRuns: unknown[] = [{ name: "check", status: "completed", conclusion: "success" }];
+/** Set by the case that makes the installation look unpermitted, which is what GitHub answers. */
+let checkRunsStatus = 200;
 
 const ghFetch = (async (url: string, init?: { method?: string; body?: string }) => {
   const method = init?.method ?? "GET";
@@ -65,7 +67,11 @@ const ghFetch = (async (url: string, init?: { method?: string; body?: string }) 
       ...prOverride,
     });
   }
-  if (method === "GET" && /check-runs/.test(url)) return reply(200, { total_count: checkRuns.length, check_runs: checkRuns });
+  if (method === "GET" && /check-runs/.test(url)) {
+    return checkRunsStatus === 200
+      ? reply(200, { total_count: checkRuns.length, check_runs: checkRuns })
+      : reply(checkRunsStatus, { message: "Resource not accessible by integration" });
+  }
   if (method === "GET" && /commits\/[0-9a-f]+\/status/.test(url)) return reply(200, { statuses: [] });
   if (method === "PUT" && /pulls\/7\/merge$/.test(url)) return reply(200, { merged: true, sha: "c".repeat(40) });
   throw new Error(`no route for ${method} ${url}`);
@@ -287,5 +293,53 @@ describe("the console merges its own pull request", () => {
   it("is a 404 on a manager holding no write credential", async () => {
     const r = await call("ops-alice", "/policy/merge", "POST", JSON.stringify({ number: 7 }), bare);
     assert.equal(r.status, 404);
+  });
+});
+
+describe("the checks this console may not read", () => {
+  // The defect measured on 2026-09-20, the first time anybody pressed merge: the installation could
+  // commit and open a pull request and **not** read checks, so `/policy/pr` answered 502 and the
+  // screen showed nothing at all — no proposer, no state, no reason. A gate that cannot say why it
+  // refused is a gate somebody works around.
+  it("shows the pull request and names the missing permission instead of dying", async () => {
+    checkRunsStatus = 403;
+    try {
+      const r = await call("ops-henry", "/policy/pr?number=7");
+      assert.equal(r.status, 200, "the screen must still get an answer");
+      assert.equal(r.json.mayMerge, false);
+      assert.match(String(r.json.why), /may not read checks on o\/r/);
+      assert.match(String(r.json.why), /Checks: read/);
+      // The rest of the status is still there, which is the point of not answering 502.
+      assert.equal(r.json.proposedBy, "ops-alice");
+      assert.equal(r.json.state, "open");
+    } finally {
+      checkRunsStatus = 200;
+    }
+  });
+
+  it("refuses the merge with that sentence, and does not ask to merge", async () => {
+    checkRunsStatus = 403;
+    const before = ghSeen.filter((c) => c.method === "PUT").length;
+    try {
+      const r = await call("ops-henry", "/policy/merge", "POST", JSON.stringify({ number: 7 }));
+      assert.equal(r.status, 409, JSON.stringify(r.json));
+      assert.match(String(r.json.error), /Checks: read/);
+      assert.equal(ghSeen.filter((c) => c.method === "PUT").length, before, "it must not have asked to merge");
+    } finally {
+      checkRunsStatus = 200;
+    }
+  });
+
+  // Unreadable is not the same as unread, and neither is the same as broken. A 500 from GitHub must
+  // not send an operator to edit an App that was never the problem.
+  it("still answers 502 for a failure that is not about permission", async () => {
+    checkRunsStatus = 500;
+    try {
+      const r = await call("ops-henry", "/policy/pr?number=7");
+      assert.equal(r.status, 502);
+      assert.doesNotMatch(String(r.json.error ?? ""), /Checks: read/);
+    } finally {
+      checkRunsStatus = 200;
+    }
   });
 });
