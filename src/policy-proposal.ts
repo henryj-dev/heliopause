@@ -1000,6 +1000,33 @@ export function mergeRefusal(input: {
   who: string;
   proposer: string | null;
   /**
+   * The caller's other names, when this deployment knows two of them are one person.
+   *
+   * ## Why a name is not an identity
+   *
+   * `ops-henry` and `ops-henry-review` are two certificate CNs and one human — the manager knows,
+   * because both map to the same identity-provider account in its OTP user map. Comparing the
+   * proposer to the caller's name alone would let that human propose as one and merge as the other,
+   * and the harm is not that one person merged alone. **The harm is that the record says two people
+   * did.** `approval.ts` makes exactly this argument for the plan, under `alsoKnownAs`; this is the
+   * same argument applied to the source.
+   */
+  alsoKnownAs?: readonly string[];
+  /**
+   * May this operator merge what they themselves proposed?
+   *
+   * The two-person rule switched off for the identities that hold a solo role — the same escape
+   * hatch `soloApprovalRoles` opens one step later, opened here for the same reason: this site has
+   * one operator, and the alternative is that nothing authored in the console can ever be merged
+   * from it. The compensating controls are the same two, and the caller owes both: a one-time code
+   * before the merge, and a record that says `solo` afterwards.
+   *
+   * This flag only decides whether self-merge is *allowed*. It does not check the code — the route
+   * does that, before it calls anything here — because a pure function that silently stood for a
+   * second factor would be the worst possible place to keep one.
+   */
+  maySolo?: boolean;
+  /**
    * Set when the checks could not be read at all, rather than read and found wanting.
    *
    * These are different facts and only one of them is the pull request's. "Nothing has checked this
@@ -1017,8 +1044,14 @@ export function mergeRefusal(input: {
     // no trailer, and merging it here would be a two-person rule applied to a party of unknown size.
     return `pull request #${status.number} was not proposed from this console, so it cannot say who proposed it`;
   }
-  if (proposer === who) {
-    return `#${status.number} was proposed by ${who} — the operator who proposes a change does not merge it`;
+  // One person, however many names they arrived under.
+  const self = proposer === who || (input.alsoKnownAs ?? []).includes(proposer);
+  if (self && !input.maySolo) {
+    const others = (input.alsoKnownAs ?? []).length > 0 ? ` (also ${(input.alsoKnownAs ?? []).join(", ")})` : "";
+    return (
+      `#${status.number} was proposed by ${proposer} — the operator who proposes a change does not ` +
+      `merge it${proposer === who ? "" : `, and ${who}${others} is the same person`}`
+    );
   }
   if (status.mergeable !== true) {
     return status.mergeable === null
@@ -1035,4 +1068,21 @@ export function mergeRefusal(input: {
   if (failed.length > 0) return `checks failed on ${status.headSha.slice(0, 8)}: ${failed.join(", ")}`;
   if (pending.length > 0) return `checks still running on ${status.headSha.slice(0, 8)}: ${pending.join(", ")}`;
   return null;
+}
+
+/**
+ * Would merging this be a solo merge — one person on both ends?
+ *
+ * Asked separately from `mergeRefusal` because it is not a refusal. The screen needs it to warn
+ * before the button is pressed and to ask for the one-time code; the route needs it to demand that
+ * code and to write `solo` into the log. Deriving it twice from `mergeRefusal`'s sentence would be
+ * parsing prose for a decision.
+ */
+export function wouldMergeSolo(input: {
+  who: string;
+  proposer: string | null;
+  alsoKnownAs?: readonly string[];
+}): boolean {
+  if (!input.proposer) return false;
+  return input.proposer === input.who || (input.alsoKnownAs ?? []).includes(input.proposer);
 }

@@ -93,6 +93,7 @@ import {
   mergeRefusal,
   proposerFromBody,
   pullRequestChecks,
+  wouldMergeSolo,
   pullRequestStatus,
   repoHead,
   sameCommit,
@@ -2573,7 +2574,14 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         const status = await pullRequestStatus(creds, target, call, nowSec, number);
         const { checks, checksUnavailable } = await readChecks(creds, target, call, nowSec, status);
         const proposedBy = proposerFromBody(status.body);
-        const why = mergeRefusal({ status, checks, who, proposer: proposedBy, checksUnavailable });
+        const alsoKnownAs = sameHumanAs.get(who) ?? [];
+        const why = mergeRefusal({
+          status, checks, who, proposer: proposedBy, checksUnavailable,
+          alsoKnownAs, maySolo: maySoloApprove,
+        });
+        // Told before the button is pressed, not after. A solo merge needs a one-time code, and a
+        // screen that discovered that from a 401 would have already decided to merge.
+        const solo = wouldMergeSolo({ who, proposer: proposedBy, alsoKnownAs });
         return send(res, 200, {
           number: status.number,
           url: status.url,
@@ -2585,6 +2593,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
           proposedBy,
           checks,
           mayMerge: why === null,
+          solo,
           ...(why ? { why } : {}),
         });
       } catch (e) {
@@ -2615,26 +2624,39 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         // the button out; it was true when the page last polled, and a check can go red in between.
         const status = await pullRequestStatus(creds, target, call, nowSec, number);
         const { checks, checksUnavailable } = await readChecks(creds, target, call, nowSec, status);
+        const proposedBy = proposerFromBody(status.body);
+        const alsoKnownAs = sameHumanAs.get(who) ?? [];
         const why = mergeRefusal({
           status,
           checks,
           who,
-          proposer: proposerFromBody(status.body),
+          proposer: proposedBy,
           checksUnavailable,
+          alsoKnownAs,
+          maySolo: maySoloApprove,
         });
         if (why) {
           log(`policy merge REFUSED for ${who}: ${why}`, `${who}의 정책 머지 거부: ${why}`);
           return send(res, 409, { error: why });
         }
+        // The compensating control, and it is asked for **after** the gate has otherwise passed —
+        // a one-time code spent on a merge that was going to be refused anyway is a code burned for
+        // nothing, and the operator has only so many. `requireOtp` answers the response itself.
+        const solo = wouldMergeSolo({ who, proposer: proposedBy, alsoKnownAs });
+        if (solo && (await requireOtp(principal, body as { otp?: unknown }, res, url.pathname)) === "answered") return;
         const merged = await mergePullRequest(creds, target, call, nowSec, number, status.headSha);
         log(
-          `policy merge by ${who}: PR #${number} → ${merged.sha.slice(0, 8)}`,
-          `${who}의 정책 머지: PR #${number} → ${merged.sha.slice(0, 8)}`,
+          `policy merge by ${who}: PR #${number} → ${merged.sha.slice(0, 8)}` +
+            (solo ? " — SOLO MERGE, no second operator was involved" : ""),
+          `${who}의 정책 머지: PR #${number} → ${merged.sha.slice(0, 8)}` +
+            (solo ? " — 단독 머지, 두 번째 운영자가 관여하지 않음" : ""),
         );
         // Merging moves the source, and the fleet has not moved. Said here as well as in the pull
         // request body because this is the reply the console renders, and an operator who reads
         // "merged" on a policy screen has every reason to think something was deployed.
-        return send(res, 200, { ok: true, number, sha: merged.sha, published: false });
+        // `solo` travels back for the same reason it goes in the log: the console renders this, and
+        // "merged" with nothing beside it reads the same whether one person or two stood behind it.
+        return send(res, 200, { ok: true, number, sha: merged.sha, published: false, solo });
       } catch (e) {
         const msg = e instanceof ProposalError ? e.message : (e as Error).message;
         log(`policy merge failed for ${who}: ${msg}`, `${who}의 정책 머지 실패: ${msg}`);

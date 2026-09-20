@@ -102,8 +102,11 @@ const kubeFetch: KubeFetcher = async (path) => {
 
 let port = 0;
 let bare = 0;
+/** A manager that knows both writer CNs are one human, because both map to one IdP account. */
+let oneHuman = 0;
 let close: () => void = () => {};
 let closeBare: () => void = () => {};
+let closeOneHuman: () => void = () => {};
 
 before(async () => {
   pki();
@@ -141,9 +144,31 @@ before(async () => {
   });
   bare = (plain.server.address() as { port: number }).port;
   closeBare = () => plain.server.close();
+
+  // The same two certificates, now declared to be one person. Nothing else differs, which is what
+  // makes the pair of suites below a measurement rather than two unrelated stories.
+  const shared = await startManager({
+    port: 0, hostname: "127.0.0.1", relays, tls, timeoutMs: 200,
+    operatorCNs: ["ops-alice", "ops-henry"],
+    writerCNs: ["ops-alice", "ops-henry"],
+    otp: {
+      issuerUrl: "https://otp.example.invalid",
+      serviceToken: "svc",
+      users: new Map([["ops-alice", "one-account"], ["ops-henry", "one-account"]]),
+      fetchImpl: (async () => new Response(JSON.stringify({ ok: true }), { status: 200 })) as unknown as typeof fetch,
+    },
+    policyWrite: {
+      creds: { appId: "1", installationId: "2", privateKey: ghKey },
+      target: { owner: "o", repo: "r", base: "main" },
+      allowPaths: ["policies.json"],
+      fetch: ghFetch,
+    },
+  });
+  oneHuman = (shared.server.address() as { port: number }).port;
+  closeOneHuman = () => shared.server.close();
 });
 
-after(() => { close(); closeBare(); rmSync(dir, { recursive: true, force: true }); });
+after(() => { close(); closeBare(); closeOneHuman(); rmSync(dir, { recursive: true, force: true }); });
 
 function call(
   as: string,
@@ -341,5 +366,49 @@ describe("the checks this console may not read", () => {
     } finally {
       checkRunsStatus = 200;
     }
+  });
+});
+
+describe("two certificates, one human", () => {
+  // The workaround this console would otherwise have handed an operator: propose from the browser as
+  // one name, merge from the CLI as the other. Both names are the same person — the manager knows,
+  // because its OTP user map sends both to one identity-provider account.
+  //
+  // **The harm is not that one person merged alone.** It is that the log and the pull request would
+  // then say two operators signed off. `approval.ts` made this argument for the plan and the merge
+  // gate did not inherit it; these two cases are the difference, measured against two servers that
+  // differ in exactly one setting.
+  it("refuses the second certificate of the same person", async () => {
+    const before = ghSeen.filter((c) => c.method === "PUT").length;
+    const r = await call("ops-henry", "/policy/merge", "POST", JSON.stringify({ number: 7 }), oneHuman);
+    assert.equal(r.status, 409, JSON.stringify(r.json));
+    assert.match(String(r.json.error), /is the same person/);
+    assert.equal(ghSeen.filter((c) => c.method === "PUT").length, before, "it must not have asked to merge");
+  });
+
+  it("says so on the screen too, not only when the button is pressed", async () => {
+    const r = await call("ops-henry", "/policy/pr?number=7", "GET", undefined, oneHuman);
+    assert.equal(r.status, 200);
+    assert.equal(r.json.mayMerge, false);
+    assert.equal(r.json.solo, true, "one person on both ends, whichever certificate asked");
+    assert.match(String(r.json.why), /is the same person/);
+  });
+
+  // The control. The first server in this file has no OTP map, so the two names are two people
+  // there — and the identical request succeeds, which is what proves the refusal above is about the
+  // shared account and not about `ops-henry` being unwelcome.
+  it("still merges on a manager where they are two people", async () => {
+    const r = await call("ops-henry", "/policy/pr?number=7");
+    assert.equal(r.json.mayMerge, true);
+    assert.equal(r.json.solo, false);
+  });
+
+  // And a certificate never gets the solo hatch: it carries no role claim, so `maySoloApprove` is
+  // false by construction. The hatch lives on the OIDC session — `manager-server.test.ts` holds that
+  // half, against a real login.
+  it("does not open the solo hatch for a certificate", async () => {
+    const r = await call("ops-alice", "/policy/pr?number=7", "GET", undefined, oneHuman);
+    assert.equal(r.json.solo, true, "alice proposed it");
+    assert.equal(r.json.mayMerge, false, "and a certificate may not merge its own");
   });
 });
