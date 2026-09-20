@@ -2610,8 +2610,10 @@ describe("proposing asks the repository what it actually holds", () => {
 
   const propose = () => new Promise<{ status: number; body: string }>((resolve, reject) => {
     const r = request({
+      // The CA rather than `rejectUnauthorized: false`: this harness has one and a test that skips
+      // verification is a test that would pass against a server presenting anybody's certificate.
       host: "127.0.0.1", port: port8, path: "/policy/plan", method: "POST",
-      rejectUnauthorized: false,
+      ca: [readCa()],
       cert: readFileSync(join(dir, "ops.pem")), key: readFileSync(join(dir, "ops.key")),
       headers: { "content-type": "application/json" },
     }, (res) => {
@@ -2624,7 +2626,7 @@ describe("proposing asks the repository what it actually holds", () => {
 
   const plans = () => new Promise<{ status: number; body: string }>((resolve, reject) => {
     const r = request({
-      host: "127.0.0.1", port: port8, path: "/plans", method: "GET", rejectUnauthorized: false,
+      host: "127.0.0.1", port: port8, path: "/plans", method: "GET", ca: [readCa()],
       cert: readFileSync(join(dir, "ops.pem")), key: readFileSync(join(dir, "ops.key")),
     }, (res) => {
       let body = ""; res.on("data", (c) => { body += c; });
