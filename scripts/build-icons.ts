@@ -22,6 +22,8 @@
 //   node scripts/build-icons.ts            # 생성
 //   node scripts/build-icons.ts --check    # 대조만 (CI·훅용)
 import { readFileSync, writeFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { ICON_NAMES } from "../src/icon-names.ts";
 
 const LIB = "node_modules/lucide-static/icons";
@@ -106,22 +108,39 @@ ${entries.join("\n")}
 `;
 }
 
-const next = generate();
+/**
+ * 이 파일이 **프로그램일 때만** 돈다.
+ *
+ * `src/icons.test.ts` 가 여기서 `innerMarkup` 을 import 한다. 이 가드가 없던 동안 그 import 가
+ * 아래를 실행했고, 그래서 `node --test` 가 **추적 파일을 다시 쓰는 생성기**였다 — 그 순간
+ * 설치돼 있는 `lucide-static` 이 무엇이든 그것으로.
+ *
+ * 2026-09-20 실측: `node_modules` 가 낡은 설치를 가리키는 심링크였던 워크트리에서 테스트 한 번이
+ * `src/icon-paths.ts` 를 옛 lucide 판으로 되돌렸고, `git add -A` 가 그것을 담았고, CI 가 그
+ * 변경과 아무 상관 없는 파일에서 빨개졌다. **되돌아간 파일도 유효한 TypeScript 라서** 타입검사도
+ * 테스트도 아무 말을 하지 않았다 — 말한 것은 CI 의 `icons:check` 하나뿐이었다.
+ *
+ * `process.argv[1]` 비교인 이유: `npm run icons` 와 `npm run icons:check` 는 이 파일을 프로그램으로
+ * 부르고, import 는 그러지 않는다. `node -e` 로 import 해도 `argv[1]` 이 없어 역시 안 돈다.
+ */
+if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const next = generate();
 
-if (!process.argv.includes("--check")) {
-  writeFileSync(OUT, next);
-  console.log(`[icons] ${OUT} — 아이콘 ${ICON_NAMES.length}종`);
-} else {
-  let current = "";
-  try {
-    current = readFileSync(OUT, "utf8");
-  } catch {
-    /* 없으면 아래 비교에서 걸린다 */
+  if (!process.argv.includes("--check")) {
+    writeFileSync(OUT, next);
+    console.log(`[icons] ${OUT} — 아이콘 ${ICON_NAMES.length}종`);
+  } else {
+    let current = "";
+    try {
+      current = readFileSync(OUT, "utf8");
+    } catch {
+      /* 없으면 아래 비교에서 걸린다 */
+    }
+    if (current !== next) {
+      console.error(`[icons] ${OUT} 가 src/icon-names.ts · lucide-static 과 다르다.`);
+      console.error("        npm run icons 를 돌리고 결과를 커밋할 것.");
+      process.exit(1);
+    }
+    console.log(`[icons] ${OUT} 최신 · 아이콘 ${ICON_NAMES.length}종 전부 lucide-static 에 실재`);
   }
-  if (current !== next) {
-    console.error(`[icons] ${OUT} 가 src/icon-names.ts · lucide-static 과 다르다.`);
-    console.error("        npm run icons 를 돌리고 결과를 커밋할 것.");
-    process.exit(1);
-  }
-  console.log(`[icons] ${OUT} 최신 · 아이콘 ${ICON_NAMES.length}종 전부 lucide-static 에 실재`);
 }

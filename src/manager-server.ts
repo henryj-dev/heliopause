@@ -87,6 +87,7 @@ import {
   type AppCredentials,
   compareGenerations,
   isGeneratedPolicyFile,
+  checksUnreadable,
   isUsableBranchName,
   mergePullRequest,
   mergeRefusal,
@@ -95,6 +96,7 @@ import {
   pullRequestStatus,
   repoHead,
   sameCommit,
+  type CommitCheck,
   type Fetcher,
   type ProposalTarget,
 } from "./policy-proposal.ts";
@@ -987,6 +989,41 @@ export function revocationReplicationBody(revocations: readonly CertificateRevoc
  * restart costs nothing and there is no cache to go stale — the freshness question is answered by
  * each relay's own `relayAgeSec` and by the heartbeat ages inside it.
  */
+/**
+ * The checks on a pull request's head, and — when they could not be read — why not.
+ *
+ * ## Why this is a function and not two copies
+ *
+ * `/policy/pr` asks so the screen can grey the button out; `/policy/merge` asks again because a
+ * check can go red between the poll and the press. Both must treat an unreadable check exactly the
+ * same way, because the difference between them would be a button that is live over a route that
+ * refuses — or, the direction that costs something, a route that merges over a check the screen
+ * never managed to read.
+ *
+ * A merged or closed pull request is not asked about at all: `mergeRefusal` refuses it on its first
+ * line, and two more GitHub calls to decorate that refusal is rate limit spent on a screen that
+ * repolls.
+ *
+ * Anything that is not a permission refusal is rethrown. A 500 from GitHub is not a fact about this
+ * console's credential and must not be reported as one.
+ */
+async function readChecks(
+  creds: AppCredentials,
+  target: ProposalTarget,
+  call: Fetcher,
+  nowSec: number,
+  status: { merged: boolean; state: string; headSha: string },
+): Promise<{ checks: CommitCheck[]; checksUnavailable: string | null }> {
+  if (status.merged || status.state !== "open") return { checks: [], checksUnavailable: null };
+  try {
+    return { checks: await pullRequestChecks(creds, target, call, nowSec, status.headSha), checksUnavailable: null };
+  } catch (e) {
+    const unreadable = checksUnreadable(e, creds, target);
+    if (!unreadable) throw e;
+    return { checks: [], checksUnavailable: unreadable };
+  }
+}
+
 export async function startManager(opts: ManagerOptions): Promise<{ server: Server }> {
   const writeLog = opts.log ?? ((m: string) => console.error(`[manager] ${m}`));
   const logEvent = (key: Parameters<typeof formatOperatorLog>[1], params: Record<string, string | number> = {}) =>
@@ -2534,14 +2571,9 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       const nowSec = Math.floor(now().getTime() / 1000);
       try {
         const status = await pullRequestStatus(creds, target, call, nowSec, number);
-        // Not asked for when the answer cannot change anything. A merged pull request is refused by
-        // the first line of `mergeRefusal`, and two more calls to decorate that refusal is a rate
-        // limit spent on a screen that repolls.
-        const checks = status.merged || status.state !== "open"
-          ? []
-          : await pullRequestChecks(creds, target, call, nowSec, status.headSha);
+        const { checks, checksUnavailable } = await readChecks(creds, target, call, nowSec, status);
         const proposedBy = proposerFromBody(status.body);
-        const why = mergeRefusal({ status, checks, who, proposer: proposedBy });
+        const why = mergeRefusal({ status, checks, who, proposer: proposedBy, checksUnavailable });
         return send(res, 200, {
           number: status.number,
           url: status.url,
@@ -2582,10 +2614,14 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         // Decided again here, on a status read in this request. The screen's own check is what greys
         // the button out; it was true when the page last polled, and a check can go red in between.
         const status = await pullRequestStatus(creds, target, call, nowSec, number);
-        const checks = status.merged || status.state !== "open"
-          ? []
-          : await pullRequestChecks(creds, target, call, nowSec, status.headSha);
-        const why = mergeRefusal({ status, checks, who, proposer: proposerFromBody(status.body) });
+        const { checks, checksUnavailable } = await readChecks(creds, target, call, nowSec, status);
+        const why = mergeRefusal({
+          status,
+          checks,
+          who,
+          proposer: proposerFromBody(status.body),
+          checksUnavailable,
+        });
         if (why) {
           log(`policy merge REFUSED for ${who}: ${why}`, `${who}의 정책 머지 거부: ${why}`);
           return send(res, 409, { error: why });

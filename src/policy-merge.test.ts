@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 import { generateKeyPairSync } from "node:crypto";
 import {
   checksAreGreen,
+  checksUnreadable,
   forgetInstallationTokens,
   mergePullRequest,
   mergeRefusal,
@@ -375,5 +376,74 @@ describe("mergePullRequest", () => {
       () => mergePullRequest(creds, target, fetch, 1, 7, HEAD),
       (e: unknown) => e instanceof ProposalError && e.status === 409,
     );
+  });
+});
+
+describe("checks the console is not allowed to read", () => {
+  // The failure measured on 2026-09-20, on the first merge anybody tried: the installation had
+  // `contents` and `pull_requests` — enough to commit and to open the pull request — and no
+  // `checks`. Every merge would have answered 502 forever.
+  it("names the permission for the refusal GitHub actually sends", () => {
+    const why = checksUnreadable(
+      new ProposalError("GET /repos/o/r/commits/aaa/check-runs → 403: Resource not accessible by integration", 403),
+      creds,
+      target,
+    );
+    assert.match(String(why), /may not read checks on o\/r/);
+    assert.match(String(why), /Checks: read/);
+    // The app id, because an organisation has several and the operator has to open the right one.
+    assert.match(String(why), /id 1/);
+  });
+
+  // GitHub hides some resources from an unpermitted installation rather than refusing them. A gate
+  // that recognised only 403 would fall back to the unreadable 502 for the other half.
+  it("treats a 404 the same way", () => {
+    assert.ok(checksUnreadable(new ProposalError("not found", 404), creds, target));
+  });
+
+  // A 500 is not a fact about this console's credential. Reporting it as one sends the operator to
+  // edit an App that was never the problem.
+  it("does not blame the permissions for anything else", () => {
+    assert.equal(checksUnreadable(new ProposalError("boom", 500), creds, target), null);
+    assert.equal(checksUnreadable(new ProposalError("rate limited", 429), creds, target), null);
+    assert.equal(checksUnreadable(new Error("socket hang up"), creds, target), null);
+    assert.equal(checksUnreadable("not an error", creds, target), null);
+  });
+
+  // The distinction the whole thing exists for. Both refuse; only one of them is worth waiting on.
+  it("refuses with the permission sentence rather than with 'nothing has checked'", () => {
+    const why = mergeRefusal({
+      status: statusOf(),
+      checks: [],
+      who: "ops-henry",
+      proposer: "ops-alice",
+      checksUnavailable: "this console's app may not read checks",
+    });
+    assert.equal(why, "this console's app may not read checks");
+    assert.doesNotMatch(String(why), /nothing has checked/);
+  });
+
+  // An unreadable check must never be softer than an unread one.
+  it("never lets an unreadable check become a pass", () => {
+    assert.equal(
+      mergeRefusal({
+        status: statusOf(),
+        checks: green,
+        who: "ops-henry",
+        proposer: "ops-alice",
+        checksUnavailable: "cannot read",
+      }),
+      "cannot read",
+      "a stale green list must not outvote the fact that checks could not be read",
+    );
+  });
+
+  // Order: the pull request's own facts first. Telling somebody to fix an App permission on a pull
+  // request that is already merged is true and useless.
+  it("still says merged, closed and self-proposed first", () => {
+    const args = { checks: [], who: "ops-alice", proposer: "ops-alice", checksUnavailable: "cannot read" };
+    assert.match(String(mergeRefusal({ ...args, status: statusOf({ merged: true }) })), /already merged/);
+    assert.match(String(mergeRefusal({ ...args, status: statusOf({ state: "closed" }) })), /is closed/);
+    assert.match(String(mergeRefusal({ ...args, status: statusOf() })), /proposed by ops-alice/);
   });
 });
