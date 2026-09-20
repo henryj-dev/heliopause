@@ -761,6 +761,15 @@ export const MESSAGES = {
   "rule.proposedBy": { en: "proposed by {who}", ko: "제안자 {who}" },
   "rule.refresh": { en: "refresh", ko: "새로고침" },
   "rule.prNumber": { en: "pull request number", ko: "PR 번호" },
+  "rule.soloMerge": { en: "merge alone", ko: "단독 병합" },
+  "rule.soloWarn": {
+    en: "You proposed #{number}. Merging it yourself is a solo merge — it needs a one-time code and is recorded as solo.",
+    ko: "#{number} 는 당신이 제안했다. 직접 병합하면 단독 병합이다 — 일회용 코드가 필요하고 단독으로 기록된다.",
+  },
+  "rule.mergedSolo": {
+    en: "merged #{number} as {sha}, alone — recorded as a solo merge. The source moved; the fleet has not.",
+    ko: "#{number} 를 {sha} 로 혼자 병합했다 — 단독 병합으로 기록됐다. 소스가 움직였고, 함대는 아직이다.",
+  },
   "write.noMerge": { en: "the manager did not describe the merge", ko: "매니저가 병합 결과를 말하지 않았다" },
   "write.noPrStatus": { en: "the manager did not describe the pull request", ko: "매니저가 PR 상태를 말하지 않았다" },
   "m.measure": { en: "measure", ko: "실측" },

@@ -200,3 +200,39 @@ describe("the merge half", () => {
     assert.match(String("reason" in reply && reply.reason), /leak scan/);
   });
 });
+
+describe("a merge that is one person on both ends", () => {
+  // The code is omitted rather than sent empty. An empty string is a code the manager must reject,
+  // and a rejected code looks exactly like a wrong one on the screen.
+  it("carries the one-time code only when there is one", () => {
+    assert.deepEqual(JSON.parse(mergeBody(7)), { number: 7 });
+    assert.deepEqual(JSON.parse(mergeBody(7, "")), { number: 7 });
+    assert.deepEqual(JSON.parse(mergeBody(7, "123456")), { number: 7, otp: "123456" });
+  });
+
+  // `solo` is the manager's answer: it depends on which certificate names this deployment knows to
+  // be one human, and the browser has no way to ask that.
+  it("takes the solo verdict from the manager", () => {
+    const reply = readPrReply({ number: 7, mayMerge: true, solo: true, checks: [] });
+    assert.ok(reply.ok);
+    assert.equal(reply.status.solo, true);
+  });
+
+  // Absent reads as "not solo" on purpose: the screen then asks for no code, the route demands one,
+  // and the merge is refused until the operator supplies it. The opposite default would collect a
+  // code for a merge that never needed one — training an operator to type codes on reflex.
+  it("defaults to not solo when the manager did not say", () => {
+    const reply = readPrReply({ number: 7, mayMerge: true, checks: [] });
+    assert.ok(reply.ok);
+    assert.equal(reply.status.solo, false);
+  });
+
+  it("reports back whether the merge that happened was solo", () => {
+    const solo = readMergeReply({ ok: true, number: 7, sha: "c".repeat(40), solo: true });
+    assert.ok(solo.ok);
+    assert.equal(solo.solo, true);
+    const two = readMergeReply({ ok: true, number: 7, sha: "c".repeat(40) });
+    assert.ok(two.ok);
+    assert.equal(two.solo, false);
+  });
+});

@@ -4,6 +4,8 @@
   import { t } from "$lib/i18n";
   import { chromePrefs } from "$lib/shell/prefs.svelte";
   import { whoQuery } from "$lib/shell/who.svelte";
+  import WriteDialog from "$lib/shell/WriteDialog.svelte";
+  import { writeAsk } from "$lib/shell/write-ask.svelte";
   import RuleTable from "./RuleTable.svelte";
   import type { PolicyEdit } from "./screen";
   import { readPolicyDoc, rulesWithoutNotes, writePolicyDoc, type PolicyDoc } from "./rules";
@@ -24,6 +26,7 @@
 
   const prefs = chromePrefs();
   const who = whoQuery();
+  const write = writeAsk();
 
   let { edit, showRules, showFiles }: {
     edit: PolicyEdit;
@@ -201,17 +204,29 @@
 
   async function merge(): Promise<void> {
     if (!pr) return;
+    // The warning and the code are asked for here, before the request, because the manager will
+    // demand the code and a 401 after the fact tells the operator nothing about *why* this merge
+    // was different from the last one. `solo` comes from the manager — see `PrStatus.solo`.
+    const answer = await write.ask({
+      what: t(prefs.lang, "rule.soloMerge"),
+      warning: pr.solo ? t(prefs.lang, "rule.soloWarn", { number: pr.number }) : undefined,
+      needsOtp: pr.solo,
+    });
+    if (answer === null) return;
     busy = "merge";
     try {
       const res = await fetch("/api/policy/merge", {
         method: "POST",
         credentials: "same-origin",
         headers: writeHeaders(csrf()),
-        body: mergeBody(pr.number),
+        body: mergeBody(pr.number, answer.otp),
       });
       const reply = readMergeReply(await res.json());
       if (!reply.ok) throw new Error(writeFailMessage(reply, (key) => t(prefs.lang, key)));
-      say(t(prefs.lang, "rule.merged", { number: reply.number, sha: reply.sha.slice(0, 8) }));
+      say(t(prefs.lang, reply.solo ? "rule.mergedSolo" : "rule.merged", {
+        number: reply.number,
+        sha: reply.sha.slice(0, 8),
+      }));
       await loadPr(reply.number);
     } catch (e) {
       say(e instanceof Error ? e.message : String(e), true);
@@ -335,9 +350,15 @@
       </ul>
       {#if !pr.mayMerge && pr.why}
         <p class="banner warn">{t(prefs.lang, "rule.mergeGate", { why: pr.why })}</p>
+      {:else if pr.solo}
+        <p class="banner warn">{t(prefs.lang, "rule.soloWarn", { number: pr.number })}</p>
       {/if}
     {/if}
   </section>
+{/if}
+
+{#if write.pending}
+  <WriteDialog spec={write.pending.spec} onsubmit={write.submit} oncancel={write.cancel} />
 {/if}
 
 {#if note}

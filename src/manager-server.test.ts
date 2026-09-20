@@ -894,6 +894,7 @@ describe("a real OIDC session, end to end", () => {
     publicKeyEncoding: { type: "pkcs1", format: "pem" },
   }).privateKey;
   const ghSeen: Array<{ url: string; method: string }> = [];
+  const PR_HEAD = "a".repeat(40);
   const ghFetch = (async (url: string, init?: { method?: string }) => {
     const method = init?.method ?? "GET";
     ghSeen.push({ url, method });
@@ -905,6 +906,22 @@ describe("a real OIDC session, end to end", () => {
     // 404 is "this file is not on the branch yet", which `commitToBranch` swallows on purpose.
     if (method === "GET" && /contents\//.test(url)) return reply(404, { message: "Not Found" });
     if (method === "PUT" && /contents\//.test(url)) return reply(200, { commit: { sha: "c0ffee1234567890" } });
+    // The merge half. `ops-alice` is the alias this harness's OIDC identity collapses onto, so a
+    // pull request proposed by that name is one this session proposed itself — which is the whole
+    // point of the solo cases below.
+    if (method === "GET" && /pulls\/7$/.test(url)) {
+      return reply(200, {
+        number: 7, html_url: "https://example.invalid/pull/7", state: "open", merged: false,
+        head: { sha: PR_HEAD, ref: "policy/ops-alice/20260920-000000" }, base: { sha: "b", ref: "main" },
+        mergeable: true, mergeable_state: "clean",
+        body: "heliopause-proposed-by: `ops-alice`",
+      });
+    }
+    if (method === "GET" && /check-runs/.test(url)) {
+      return reply(200, { total_count: 1, check_runs: [{ name: "ci", status: "completed", conclusion: "success" }] });
+    }
+    if (method === "GET" && /commits\/[0-9a-f]+\/status/.test(url)) return reply(200, { statuses: [] });
+    if (method === "PUT" && /pulls\/7\/merge$/.test(url)) return reply(200, { merged: true, sha: "d".repeat(40) });
     throw new Error(`no route for ${method} ${url}`);
   }) as unknown as NonNullable<Parameters<typeof startManager>[0]["policyWrite"]>["fetch"];
 
@@ -1173,6 +1190,78 @@ describe("a real OIDC session, end to end", () => {
     // Never for a certificate: no role claim, so the two-person rule stays on for the CLI.
     const asCert = JSON.parse((await get("/plans", "operator")).body);
     assert.equal(asCert.maySoloApprove, false, "a certificate caller may never approve its own plan");
+  });
+
+  describe("merging one's own pull request", () => {
+    // The console authors a rule, commits it, opens the pull request — and then, with one operator,
+    // could not merge it. The publish path has answered this since `soloApprovalRoles` existed: one
+    // person may do both ends **with a one-time code**, and the plan records that nobody else was
+    // involved. The merge gate had no such hatch, so "everything in the console" stopped one step
+    // short for the only deployment this fleet actually has.
+    //
+    // These run against the real TLS server because the thing under test is an identity: which role
+    // the session carries, and which name the manager collapses it onto.
+    function browserHeaders(cookie: string, tok: string): Record<string, string> {
+      return { cookie, origin: `https://127.0.0.1:${port5}`, [CSRF_HEADER]: tok, "content-type": "application/json" };
+    }
+
+    async function csrfFor(cookie: string): Promise<string> {
+      return JSON.parse((await call("/plans", "GET", { cookie })).body).csrf as string;
+    }
+
+    it("tells the screen the merge would be solo, before the button is pressed", async () => {
+      const cookie = await signIn(["heliopause-operators", "heliopause-writers", "heliopause-admins"]);
+      const r = JSON.parse((await call("/policy/pr?number=7", "GET", { cookie })).body);
+      assert.equal(r.proposedBy, "ops-alice");
+      assert.equal(r.solo, true, "this session proposed #7, so merging it is one person on both ends");
+      assert.equal(r.mayMerge, true, "an admin may merge their own — with a code");
+    });
+
+    // The compensating control. Without it the role would simply switch the two-person rule off,
+    // which is not what `soloApprovalRoles` does one step later and must not be what this does.
+    it("refuses a solo merge with no one-time code", async () => {
+      const cookie = await signIn(["heliopause-operators", "heliopause-writers", "heliopause-admins"]);
+      const before = ghSeen.filter((c) => c.method === "PUT").length;
+      const r = await call("/policy/merge", "POST", browserHeaders(cookie, await csrfFor(cookie)), JSON.stringify({ number: 7 }));
+      assert.equal(r.status, 401, r.body);
+      assert.match(r.body, /one-time code/);
+      assert.equal(ghSeen.filter((c) => c.method === "PUT").length, before, "it must not have asked to merge");
+    });
+
+    it("merges with the code, and says it was solo", async () => {
+      const cookie = await signIn(["heliopause-operators", "heliopause-writers", "heliopause-admins"]);
+      const r = await call(
+        "/policy/merge", "POST", browserHeaders(cookie, await csrfFor(cookie)),
+        JSON.stringify({ number: 7, otp: "123456" }),
+      );
+      assert.equal(r.status, 200, r.body);
+      const body = JSON.parse(r.body);
+      assert.equal(body.sha, "d".repeat(40));
+      // Recorded, not inferred. An audit reading "merged" cannot otherwise tell one person from two.
+      assert.equal(body.solo, true);
+      assert.equal(body.published, false, "merging moves the source, not the fleet");
+    });
+
+    // The known negative. Without it this suite passes against a server that lets anyone merge their
+    // own pull request as long as they send six digits — the role would be decoration.
+    it("refuses a writer without the role, code or no code", async () => {
+      const cookie = await signIn(["heliopause-operators", "heliopause-writers"]);
+      const r = await call(
+        "/policy/merge", "POST", browserHeaders(cookie, await csrfFor(cookie)),
+        JSON.stringify({ number: 7, otp: "123456" }),
+      );
+      assert.equal(r.status, 409, r.body);
+      assert.match(r.body, /does not merge it/);
+    });
+
+    // A certificate carries no role claim, so the hatch is unreachable from the CLI by construction
+    // — the same sentence `maySoloApprove` earns one step later.
+    it("never offers it to a certificate caller", async () => {
+      const r = JSON.parse((await callWithCert("/policy/pr?number=7")).body);
+      assert.equal(r.solo, true, "the certificate CN is also ops-alice, so it is still one person");
+      assert.equal(r.mayMerge, false, "and a certificate may not merge its own");
+      assert.match(String(r.why), /does not merge it/);
+    });
   });
 
   it("hands the session its CSRF token, and only to a session", async () => {

@@ -78,9 +78,14 @@ export function proposeRefusal(
   return { key: "rule.saveBeforeProposeIn", paths: block.paths.join(", ") };
 }
 
-/** `POST /api/policy/merge` — the number and nothing else; the gate is the manager's. */
-export function mergeBody(number: number): string {
-  return JSON.stringify({ number });
+/**
+ * `POST /api/policy/merge` — the number, and a one-time code when the merge is a solo one.
+ *
+ * The code is omitted rather than sent empty. An empty string is a code the manager would have to
+ * reject, and a rejected code is indistinguishable on the screen from a wrong one.
+ */
+export function mergeBody(number: number, otp = ""): string {
+  return JSON.stringify(otp ? { number, otp } : { number });
 }
 
 export interface PrCheck {
@@ -98,6 +103,14 @@ export interface PrStatus {
   proposedBy: string | null;
   checks: PrCheck[];
   mayMerge: boolean;
+  /**
+   * Would this be one person on both ends?
+   *
+   * From the manager, never derived here: it depends on which certificate names this deployment
+   * knows to be the same human, which the browser has no way to ask. The screen uses it to warn
+   * before the button is pressed and to collect the one-time code the route will demand.
+   */
+  solo: boolean;
   /** The manager's sentence for why not. Absent exactly when `mayMerge` is true. */
   why: string;
 }
@@ -136,16 +149,20 @@ export function readPrReply(data: unknown): WriteOk<{ status: PrStatus }> | Writ
           detail: typeof c.detail === "string" ? c.detail : "",
         })),
       mayMerge: rec.mayMerge,
+      // Absent reads as "not solo", which is the safe direction on this one: it means the screen
+      // asks for no code, the route demands one, and the merge is refused until the operator gives
+      // it. The opposite default would collect a code for a merge that never needed one.
+      solo: rec.solo === true,
       why: typeof rec.why === "string" ? rec.why : "",
     },
   };
 }
 
-export function readMergeReply(data: unknown): WriteOk<{ number: number; sha: string }> | WriteFail {
+export function readMergeReply(data: unknown): WriteOk<{ number: number; sha: string; solo: boolean }> | WriteFail {
   if (typeof data !== "object" || data === null) return { ok: false, key: "write.noMerge" };
   const rec = data as { error?: unknown; number?: unknown; sha?: unknown };
   if (typeof rec.error === "string") return { ok: false, reason: rec.error };
   if (typeof rec.number !== "number") return { ok: false, key: "write.noPrNumber" };
   if (typeof rec.sha !== "string" || rec.sha === "") return { ok: false, key: "write.noMerge" };
-  return { ok: true, number: rec.number, sha: rec.sha };
+  return { ok: true, number: rec.number, sha: rec.sha, solo: (rec as { solo?: unknown }).solo === true };
 }

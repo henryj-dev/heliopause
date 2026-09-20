@@ -18,6 +18,7 @@ import {
   proposerFromBody,
   pullRequestChecks,
   pullRequestStatus,
+  wouldMergeSolo,
   type AppCredentials,
   type CommitCheck,
   type Fetcher,
@@ -445,5 +446,97 @@ describe("checks the console is not allowed to read", () => {
     assert.match(String(mergeRefusal({ ...args, status: statusOf({ merged: true }) })), /already merged/);
     assert.match(String(mergeRefusal({ ...args, status: statusOf({ state: "closed" }) })), /is closed/);
     assert.match(String(mergeRefusal({ ...args, status: statusOf() })), /proposed by ops-alice/);
+  });
+});
+
+describe("one person, two names", () => {
+  // `ops-henry` and `ops-henry-review` are two certificate CNs and one human — the manager knows
+  // because both map to the same identity-provider account. Comparing the proposer to the caller's
+  // name alone let that human propose as one and merge as the other.
+  //
+  // **The harm is not that one person merged alone.** It is that the record says two people did.
+  // `approval.ts` argues exactly this for the plan; this is the same argument for the source.
+  it("refuses the other certificate of the same human", () => {
+    const why = mergeRefusal({
+      status: statusOf(),
+      checks: green,
+      who: "ops-henry-review",
+      proposer: "ops-henry",
+      alsoKnownAs: ["ops-henry"],
+    });
+    assert.match(String(why), /is the same person/);
+    assert.match(String(why), /proposed by ops-henry/);
+  });
+
+  // The known negative. Without it the rule passes against an implementation that refuses every
+  // merge whose proposer differs from the caller — which is no rule at all, it is a stuck gate.
+  it("still lets a genuinely different operator merge", () => {
+    assert.equal(
+      mergeRefusal({
+        status: statusOf(),
+        checks: green,
+        who: "ops-henry",
+        proposer: "ops-alice",
+        alsoKnownAs: ["ops-henry-review"],
+      }),
+      null,
+      "ops-alice is not one of this caller's names",
+    );
+  });
+
+  it("knows when a merge would be solo, whichever name proposed it", () => {
+    assert.equal(wouldMergeSolo({ who: "ops-henry", proposer: "ops-henry" }), true);
+    assert.equal(wouldMergeSolo({ who: "ops-henry", proposer: "ops-henry-review", alsoKnownAs: ["ops-henry-review"] }), true);
+    assert.equal(wouldMergeSolo({ who: "ops-henry", proposer: "ops-alice" }), false);
+    // Unattributed is not solo — it is unattributed, and `mergeRefusal` refuses it on its own line.
+    assert.equal(wouldMergeSolo({ who: "ops-henry", proposer: null }), false);
+  });
+});
+
+describe("the solo hatch", () => {
+  // The same escape the publish path opens one step later, and for the same stated reason: this site
+  // has one operator, and without it nothing authored in the console could ever be merged from it.
+  it("lets a solo-capable operator merge what they proposed", () => {
+    assert.equal(
+      mergeRefusal({ status: statusOf(), checks: green, who: "ops-alice", proposer: "ops-alice", maySolo: true }),
+      null,
+    );
+  });
+
+  it("still refuses them without the role", () => {
+    assert.match(
+      String(mergeRefusal({ status: statusOf(), checks: green, who: "ops-alice", proposer: "ops-alice" })),
+      /does not merge it/,
+    );
+  });
+
+  // The hatch is about *who*, not about *what*. Opening it must not also wave through a red check,
+  // an unreadable one, or a branch that does not combine — each of those is a separate refusal and
+  // each would be a different kind of accident.
+  it("opens nothing else", () => {
+    const solo = { who: "ops-alice", proposer: "ops-alice", maySolo: true } as const;
+    assert.match(
+      String(mergeRefusal({ ...solo, status: statusOf(), checks: [{ name: "ci", state: "failure", detail: "failure" }] })),
+      /checks failed/,
+    );
+    assert.match(String(mergeRefusal({ ...solo, status: statusOf(), checks: [] })), /nothing has checked/);
+    assert.match(
+      String(mergeRefusal({ ...solo, status: statusOf(), checks: green, checksUnavailable: "cannot read" })),
+      /cannot read/,
+    );
+    assert.match(
+      String(mergeRefusal({ ...solo, status: statusOf({ mergeable: false, mergeableState: "dirty" }), checks: green })),
+      /dirty/,
+    );
+    assert.match(String(mergeRefusal({ ...solo, status: statusOf({ merged: true }), checks: green })), /already merged/);
+  });
+
+  // Attribution comes first, and the hatch does not substitute for it: a pull request this console
+  // did not open has no proposer to be the same as.
+  it("does not rescue a pull request it cannot attribute", () => {
+    assert.match(
+      String(mergeRefusal({ status: statusOf({ body: null }), checks: green, who: "ops-alice", proposer: null, maySolo: true })),
+      /cannot say who proposed/,
+    );
   });
 });
