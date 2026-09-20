@@ -7,7 +7,10 @@ import {
   proposeBlock,
   proposePolicyBody,
   proposeRefusal,
+  mergeBody,
   readEditReply,
+  readMergeReply,
+  readPrReply,
   readProposeReply,
   writeFailMessage,
   writeHeaders,
@@ -142,5 +145,58 @@ describe("proposeBlock", () => {
       key: "rule.saveBeforeProposeIn",
       paths: "policies.json, dev.ts",
     });
+  });
+});
+
+describe("the merge half", () => {
+  it("sends the number and nothing that could be mistaken for a decision", () => {
+    assert.deepEqual(JSON.parse(mergeBody(7)), { number: 7 });
+  });
+
+  // `mayMerge` is the manager's answer, not a conclusion drawn here. A browser that recomputed it
+  // would be a second copy of `mergeRefusal`, and the copy is the one that goes stale.
+  it("takes the verdict and the sentence from the manager", () => {
+    const reply = readPrReply({
+      number: 7, url: "u", state: "open", merged: false, headSha: "a".repeat(40),
+      proposedBy: "ops-alice", checks: [{ name: "build", state: "success", detail: "success" }],
+      mayMerge: false, why: "#7 was proposed by ops-alice",
+    });
+    assert.ok(reply.ok);
+    assert.equal(reply.status.mayMerge, false);
+    assert.equal(reply.status.why, "#7 was proposed by ops-alice");
+    assert.equal(reply.status.proposedBy, "ops-alice");
+  });
+
+  // A reply with no `mayMerge` is not "may merge". The field's absence would otherwise read as
+  // falsy in one place and be rendered as an enabled button in another.
+  it("refuses a status that never said whether it may merge", () => {
+    const reply = readPrReply({ number: 7, url: "u", checks: [] });
+    assert.equal(reply.ok, false);
+    assert.equal("key" in reply && reply.key, "write.noPrStatus");
+  });
+
+  // A check state this console does not know about is shown as pending. Falling back to success
+  // would turn an unrecognised word into a green tick.
+  it("never reads an unknown check state as a pass", () => {
+    const reply = readPrReply({
+      number: 7, mayMerge: true,
+      checks: [{ name: "odd", state: "whatever", detail: "" }, { name: "none", detail: "" }],
+    });
+    assert.ok(reply.ok);
+    assert.deepEqual(reply.status.checks.map((c) => c.state), ["pending", "pending"]);
+  });
+
+  it("reads a merge that happened, and refuses one that only claims to have", () => {
+    const ok = readMergeReply({ ok: true, number: 7, sha: "c".repeat(40) });
+    assert.ok(ok.ok);
+    assert.equal(ok.sha, "c".repeat(40));
+    assert.equal(readMergeReply({ ok: true, number: 7 }).ok, false);
+    assert.equal(readMergeReply({ ok: true, number: 7, sha: "" }).ok, false);
+  });
+
+  it("passes the manager's refusal through rather than inventing one", () => {
+    const reply = readMergeReply({ error: "checks failed on aaaaaaaa: leak scan (failure)" });
+    assert.equal(reply.ok, false);
+    assert.match(String("reason" in reply && reply.reason), /leak scan/);
   });
 });

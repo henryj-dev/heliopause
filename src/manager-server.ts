@@ -88,11 +88,17 @@ import {
   compareGenerations,
   isGeneratedPolicyFile,
   isUsableBranchName,
+  mergePullRequest,
+  mergeRefusal,
+  proposerFromBody,
+  pullRequestChecks,
+  pullRequestStatus,
   repoHead,
   sameCommit,
   type Fetcher,
   type ProposalTarget,
 } from "./policy-proposal.ts";
+import { KubeReadError, measureNamespace, type KubeReadConfig } from "./kube-read.ts";
 import {
   startHostDeregistrationPolicyWorker,
   type PolicyWorkerPlan,
@@ -203,6 +209,9 @@ export const API_ROUTES: ReadonlySet<string> = new Set([
   "/policy/screen",
   "/policy/edit",
   "/policy/propose",
+  "/policy/pr",
+  "/policy/merge",
+  "/policy/measure",
   "/policy/plan",
   "/enrollment/requests",
   "/enrollment/tokens",
@@ -348,6 +357,17 @@ export interface ManagerOptions {
     allowPaths: readonly string[];
     fetch?: Fetcher;
   };
+  /**
+   * Read-only sight of the cluster, for the rule editor's "measure" panel.
+   *
+   * Separate from every other option here for the same reason `policyWrite` is separate from
+   * `policySource`: it is a different power held for a different purpose. A console without it
+   * authors rules from transcriptions, which is what every console did until this existed, and
+   * `kube-read.ts` says why that was the one step worth granting an apiserver credential for.
+   *
+   * Unset — or set with an empty namespace list — leaves `/policy/measure` answering 404.
+   */
+  kubeRead?: KubeReadConfig;
   /** Reviewed-Git host retirement orchestration. It never approves, merges or publishes. */
   policyWorker?: {
     /** Machine-owned JSON file in the policy repository, also exposed by the renderer allowlist. */
@@ -2481,6 +2501,138 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         const msg = e instanceof ProposalError ? e.message : (e as Error).message;
         log(`policy write failed for ${who}: ${msg}`, `${who}의 정책 쓰기 실패: ${msg}`);
         return send(res, 502, { error: msg });
+      }
+    }
+
+    // ── Merging the pull request the console opened ────────────────────────────
+    //
+    // ## Why the console merges at all
+    //
+    // Everything else in this loop already lived here: the rule is authored on `/policy`, committed
+    // through `/policy/edit`, proposed through `/policy/propose`, then rendered, approved and
+    // published through `/plans`. Merging was the one step in the middle that sent an operator to
+    // another site — and a step that leaves the console is a step whose gate this process cannot
+    // state, so "the change was reviewed" became something a person remembered rather than something
+    // anything checked.
+    //
+    // ## The gate is the publish path's, brought forward
+    //
+    // `mergeRefusal` holds it: the operator who proposed does not merge, and nothing merges over a
+    // check that is red or still running. Both halves already existed one step later, on the plan —
+    // this is the same two-person rule applied to the source, so that `main` cannot hold a commit
+    // that no second operator ever looked at. Read `PROPOSER_TRAILER` for what that identity is
+    // derived from and, more importantly, for what it does not guarantee.
+    if (req.method === "GET" && url.pathname === "/policy/pr") {
+      if (!opts.policyWrite) return send(res, 404, { error: "this console has no write credential" });
+      if (!mayWrite) return refuseWrite(res, who, url.pathname, principal.via);
+      const number = Number(url.searchParams.get("number") ?? "");
+      if (!Number.isSafeInteger(number) || number < 1) {
+        return send(res, 400, { error: "number must be a pull request number" });
+      }
+      const { creds, target } = opts.policyWrite;
+      const call = opts.policyWrite.fetch ?? (fetch as unknown as Fetcher);
+      const nowSec = Math.floor(now().getTime() / 1000);
+      try {
+        const status = await pullRequestStatus(creds, target, call, nowSec, number);
+        // Not asked for when the answer cannot change anything. A merged pull request is refused by
+        // the first line of `mergeRefusal`, and two more calls to decorate that refusal is a rate
+        // limit spent on a screen that repolls.
+        const checks = status.merged || status.state !== "open"
+          ? []
+          : await pullRequestChecks(creds, target, call, nowSec, status.headSha);
+        const proposedBy = proposerFromBody(status.body);
+        const why = mergeRefusal({ status, checks, who, proposer: proposedBy });
+        return send(res, 200, {
+          number: status.number,
+          url: status.url,
+          state: status.state,
+          merged: status.merged,
+          mergeable: status.mergeable,
+          mergeableState: status.mergeableState,
+          headSha: status.headSha,
+          proposedBy,
+          checks,
+          mayMerge: why === null,
+          ...(why ? { why } : {}),
+        });
+      } catch (e) {
+        const msg = e instanceof ProposalError ? e.message : (e as Error).message;
+        log(`policy pr read failed for ${who}: ${msg}`, `${who}의 PR 조회 실패: ${msg}`);
+        return send(res, 502, { error: msg });
+      }
+    }
+
+    if (req.method === "POST" && url.pathname === "/policy/merge") {
+      if (!opts.policyWrite) return send(res, 404, { error: "this console has no write credential" });
+      if (!mayWrite) return refuseWrite(res, who, url.pathname, principal.via);
+      let body: Record<string, unknown>;
+      try {
+        body = JSON.parse(await readBody(req)) as Record<string, unknown>;
+      } catch {
+        return send(res, 400, { error: "expected a JSON body" });
+      }
+      const number = Number(body.number ?? NaN);
+      if (!Number.isSafeInteger(number) || number < 1) {
+        return send(res, 400, { error: "number must be a pull request number" });
+      }
+      const { creds, target } = opts.policyWrite;
+      const call = opts.policyWrite.fetch ?? (fetch as unknown as Fetcher);
+      const nowSec = Math.floor(now().getTime() / 1000);
+      try {
+        // Decided again here, on a status read in this request. The screen's own check is what greys
+        // the button out; it was true when the page last polled, and a check can go red in between.
+        const status = await pullRequestStatus(creds, target, call, nowSec, number);
+        const checks = status.merged || status.state !== "open"
+          ? []
+          : await pullRequestChecks(creds, target, call, nowSec, status.headSha);
+        const why = mergeRefusal({ status, checks, who, proposer: proposerFromBody(status.body) });
+        if (why) {
+          log(`policy merge REFUSED for ${who}: ${why}`, `${who}의 정책 머지 거부: ${why}`);
+          return send(res, 409, { error: why });
+        }
+        const merged = await mergePullRequest(creds, target, call, nowSec, number, status.headSha);
+        log(
+          `policy merge by ${who}: PR #${number} → ${merged.sha.slice(0, 8)}`,
+          `${who}의 정책 머지: PR #${number} → ${merged.sha.slice(0, 8)}`,
+        );
+        // Merging moves the source, and the fleet has not moved. Said here as well as in the pull
+        // request body because this is the reply the console renders, and an operator who reads
+        // "merged" on a policy screen has every reason to think something was deployed.
+        return send(res, 200, { ok: true, number, sha: merged.sha, published: false });
+      } catch (e) {
+        const msg = e instanceof ProposalError ? e.message : (e as Error).message;
+        log(`policy merge failed for ${who}: ${msg}`, `${who}의 정책 머지 실패: ${msg}`);
+        return send(res, 502, { error: msg });
+      }
+    }
+
+    // ── What the cluster says the labels are ───────────────────────────────────
+    //
+    // The authoring step that could not be done in a browser. `kube-read.ts` carries the reasoning;
+    // what belongs here is the authorisation: this is behind the *write* gate rather than the read
+    // one. A viewer has no rule to author, and pod labels are the one thing on this console that is
+    // read straight out of the cluster rather than out of the policy — keeping it with the writers
+    // means the apiserver credential is reachable by exactly the people who already hold the power
+    // to commit against what it says.
+    if (req.method === "GET" && url.pathname === "/policy/measure") {
+      if (!opts.kubeRead || opts.kubeRead.namespaces.length === 0) {
+        return send(res, 404, { error: "this console cannot read the cluster" });
+      }
+      if (!mayWrite) return refuseWrite(res, who, url.pathname, principal.via);
+      const namespaces = opts.kubeRead.namespaces;
+      const ns = url.searchParams.get("ns");
+      // No namespace means "what may I look at". The editor asks this first, so the operator picks
+      // from what the RoleBinding actually granted instead of typing a name and reading a 403.
+      if (!ns) return send(res, 200, { namespaces });
+      try {
+        const out = await measureNamespace(opts.kubeRead, ns);
+        return send(res, 200, { namespaces, ...out });
+      } catch (e) {
+        if (e instanceof KubeReadError) {
+          log(`measure ${ns} refused for ${who}: ${e.message}`, `${who}의 ${ns} 실측 거부: ${e.message}`);
+          return send(res, e.status === 403 ? 403 : 502, { error: e.message });
+        }
+        throw e;
       }
     }
 

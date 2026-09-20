@@ -10,6 +10,7 @@
     PROTOS,
     type RuleDraft,
   } from "./rules";
+  import MeasurePanel from "./MeasurePanel.svelte";
 
   const prefs = chromePrefs();
 
@@ -33,6 +34,23 @@
     dialog?.showModal();
     return () => dialog?.close();
   });
+
+  /**
+   * Take a measured selector into the draft.
+   *
+   * The kind is set alongside the value, because the two disagreeing is the quiet failure: a
+   * `k8s:`-prefixed string sitting in an endpoint still marked `cidr` renders into a rule that
+   * matches nothing, and the editor would show the right text the whole time.
+   */
+  function pick(where: "src" | "dst", selector: string): void {
+    if (where === "src") {
+      draft.srcKind = "k8s-label";
+      draft.srcValue = selector;
+    } else {
+      draft.dstKind = "k8s-label";
+      draft.dstValue = selector;
+    }
+  }
 </script>
 
 <dialog
@@ -122,6 +140,16 @@
       <label>{t(prefs.lang, "c.notes")}
         <textarea rows="4" bind:value={draft.notes}></textarea>
       </label>
+      <!--
+        Collapsed, and below the fields rather than above them. An operator who already knows the
+        selector should not have to walk past a cluster query to type it; one who is guessing should
+        find the measurement in the same dialog rather than in another window, which is where the
+        transcription errors came from.
+      -->
+      <details class="measure-box">
+        <summary>{t(prefs.lang, "m.measure")}</summary>
+        <MeasurePanel onpick={pick} />
+      </details>
     </div>
     <footer class="modal-ft">
       <button type="button" onclick={oncancel}>{t(prefs.lang, "m.cancel")}</button>
@@ -131,6 +159,9 @@
 </dialog>
 
 <style>
+  .measure-box { border: 1px solid var(--bd-2); border-radius: var(--r-md); padding: 8px; }
+  .measure-box summary { cursor: pointer; }
+
   dialog.modal {
     width: min(520px, calc(100vw - 32px));
     max-height: calc(100vh - 48px);

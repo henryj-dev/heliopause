@@ -17,6 +17,7 @@ import { closeSync, constants, fstatSync, openSync, readFileSync } from "node:fs
 import { createPrivateKey, createPublicKey } from "node:crypto";
 import { artifactSigningKeyId, privateKeyFileModeError, privateKeyFileOwnerError } from "../src/artifact-signature.ts";
 import { fetchCert } from "../src/cert-api.ts";
+import { measureNamespaces } from "../src/kube-read.ts";
 import {
   boundedInteger, boundedNumber, ENV_BOUNDS, EnvSpecError, parsePairs, parseRelays,
   type BoundedEnvName,
@@ -262,6 +263,29 @@ const { server } = await startManager({
           // An edit lands on a branch, the renderer only ever evaluates the merged checkout, merging
           // takes a second person, and the evaluation happens in a pod holding no credential. The
           // dangerous version of this was the one where the manager itself ran what arrived.
+          //
+          // ## The second person moved inside the console, and the argument still holds
+          //
+          // `POST /policy/merge` means this process can now merge what it wrote, so "merging takes a
+          // second person" stopped being a fact about another site and became a rule this code has
+          // to keep. `mergeRefusal` is where it is kept: a different operator, and every check on the
+          // head green. Both were already true of the publish path one step later; what changed is
+          // that they are now stated here rather than remembered.
+          //
+          // ## Naming a test file here is a deliberate, and smaller, second grant
+          //
+          // The rules in `policies.json` are guarded by `*.test.ts` in the same repository, and a
+          // rule authored in the console whose guard can only be written at a terminal is a rule
+          // that ships without one. So those paths belong in this list — the deployment's value
+          // decides, and the renderer's `HELIOPAUSE_POLICY_ALLOW_PATHS` has to name them too or the
+          // console can commit a file it cannot read back.
+          //
+          // What that grants is CI execution, not execution here: a `.test.ts` is run by the policy
+          // repository's workflow. It is the same class of power as `dev.ts`, which this list has
+          // always carried and which the renderer imports. The new edge is narrower and worth
+          // saying out loud — a writer could weaken a check in the same branch that needs it, and
+          // the checks would go green because the check itself moved. That is what the diff in
+          // front of the second operator is for, and it is the one thing the merge gate cannot see.
           allowPaths: (process.env.HELIOPAUSE_POLICY_EDITABLE ?? "policies.json,dev.ts")
             .split(",")
             .map((p) => p.trim())
@@ -276,6 +300,25 @@ const { server } = await startManager({
           ...(process.env.HELIOPAUSE_POLICY_WORKER_INTERVAL_MS
             ? { intervalMs: Number(process.env.HELIOPAUSE_POLICY_WORKER_INTERVAL_MS) }
             : {}),
+        },
+      }
+    : {}),
+  // The rule editor's sight of the cluster. Off unless a namespace is named, and `kube-read.ts`
+  // explains why the grant behind it is `pods`/`services` read-only in listed namespaces.
+  //
+  // The apiserver address comes from the environment the kubelet injects rather than from a variable
+  // somebody sets: in a cluster it is always there, and outside one its absence is what should turn
+  // this off. A deployment that names namespaces but is not running in a cluster gets a startup
+  // failure from `env()` rather than a console whose measure button answers 502.
+  ...(measureNamespaces(process.env).length > 0
+    ? {
+        kubeRead: {
+          namespaces: measureNamespaces(process.env),
+          apiUrl: `https://${env("KUBERNETES_SERVICE_HOST")}:${process.env.KUBERNETES_SERVICE_PORT_HTTPS ?? "443"}`,
+          tokenFile: process.env.HELIOPAUSE_K8S_TOKEN_FILE
+            ?? "/var/run/secrets/kubernetes.io/serviceaccount/token",
+          caFile: process.env.HELIOPAUSE_K8S_CA_FILE
+            ?? "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
         },
       }
     : {}),

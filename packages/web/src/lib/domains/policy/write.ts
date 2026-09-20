@@ -31,7 +31,9 @@ export type WriteReplyKey =
   | "write.noCommitId"
   | "write.noPr"
   | "write.noPrNumber"
-  | "write.noPrUrl";
+  | "write.noPrUrl"
+  | "write.noPrStatus"
+  | "write.noMerge";
 export type WriteFail = { ok: false; reason: string } | { ok: false; key: WriteReplyKey };
 
 export function writeFailMessage(fail: WriteFail, speak: (key: WriteReplyKey) => string): string {
@@ -74,4 +76,76 @@ export function proposeRefusal(
   if (block.kind === "need-branch") return { key: "rule.saveFirst" };
   if (block.paths.length === 1) return { key: "rule.saveBeforePropose" };
   return { key: "rule.saveBeforeProposeIn", paths: block.paths.join(", ") };
+}
+
+/** `POST /api/policy/merge` — the number and nothing else; the gate is the manager's. */
+export function mergeBody(number: number): string {
+  return JSON.stringify({ number });
+}
+
+export interface PrCheck {
+  name: string;
+  state: "success" | "pending" | "failure";
+  detail: string;
+}
+
+export interface PrStatus {
+  number: number;
+  url: string;
+  state: string;
+  merged: boolean;
+  headSha: string;
+  proposedBy: string | null;
+  checks: PrCheck[];
+  mayMerge: boolean;
+  /** The manager's sentence for why not. Absent exactly when `mayMerge` is true. */
+  why: string;
+}
+
+/**
+ * Read the pull request's state.
+ *
+ * `mayMerge` is taken from the manager rather than recomputed here, and that is the point: the
+ * button and the route must not be able to disagree. A browser that decided for itself would be a
+ * second copy of a rule that lives in `mergeRefusal`, and the copy would be the one that goes stale.
+ */
+export function readPrReply(data: unknown): WriteOk<{ status: PrStatus }> | WriteFail {
+  if (typeof data !== "object" || data === null) return { ok: false, key: "write.noPrStatus" };
+  const rec = data as Record<string, unknown>;
+  if (typeof rec.error === "string") return { ok: false, reason: rec.error };
+  if (typeof rec.number !== "number") return { ok: false, key: "write.noPrNumber" };
+  if (typeof rec.mayMerge !== "boolean") return { ok: false, key: "write.noPrStatus" };
+  const checks = Array.isArray(rec.checks) ? rec.checks : [];
+  return {
+    ok: true,
+    status: {
+      number: rec.number,
+      url: typeof rec.url === "string" ? rec.url : "",
+      state: typeof rec.state === "string" ? rec.state : "",
+      merged: rec.merged === true,
+      headSha: typeof rec.headSha === "string" ? rec.headSha : "",
+      proposedBy: typeof rec.proposedBy === "string" ? rec.proposedBy : null,
+      checks: checks
+        .map((raw) => (raw ?? {}) as Record<string, unknown>)
+        .filter((c) => typeof c.name === "string")
+        .map((c) => ({
+          name: c.name as string,
+          // Anything that is not one of the three known words is shown as pending rather than as a
+          // pass. A state this browser does not recognise is not a state it may treat as green.
+          state: c.state === "success" || c.state === "failure" ? c.state : "pending",
+          detail: typeof c.detail === "string" ? c.detail : "",
+        })),
+      mayMerge: rec.mayMerge,
+      why: typeof rec.why === "string" ? rec.why : "",
+    },
+  };
+}
+
+export function readMergeReply(data: unknown): WriteOk<{ number: number; sha: string }> | WriteFail {
+  if (typeof data !== "object" || data === null) return { ok: false, key: "write.noMerge" };
+  const rec = data as { error?: unknown; number?: unknown; sha?: unknown };
+  if (typeof rec.error === "string") return { ok: false, reason: rec.error };
+  if (typeof rec.number !== "number") return { ok: false, key: "write.noPrNumber" };
+  if (typeof rec.sha !== "string" || rec.sha === "") return { ok: false, key: "write.noMerge" };
+  return { ok: true, number: rec.number, sha: rec.sha };
 }
