@@ -9,13 +9,17 @@
   import { readPolicyDoc, rulesWithoutNotes, writePolicyDoc, type PolicyDoc } from "./rules";
   import {
     editBody,
+    mergeBody,
     proposeBlock,
     proposePolicyBody,
     proposeRefusal,
     readEditReply,
+    readMergeReply,
+    readPrReply,
     readProposeReply,
     writeFailMessage,
     writeHeaders,
+    type PrStatus,
   } from "./write";
 
   const prefs = chromePrefs();
@@ -46,6 +50,15 @@
   let note = $state("");
   let noteKind = $state<"ok" | "bad">("ok");
   let busy = $state("");
+  let pr = $state<PrStatus | null>(null);
+  /**
+   * The pull request to look at, as a string because it is bound to a text input.
+   *
+   * Typed as well as remembered, because a page reload loses `prNumber` and the review it was
+   * waiting on outlives the tab. Without this box the only way back to a pull request opened
+   * yesterday is the site the console exists to stop sending people to.
+   */
+  let prLookup = $state("");
 
   const dirtyPaths = $derived.by(() => {
     const paths: string[] = [];
@@ -147,7 +160,59 @@
       }
       prUrl = reply.url;
       prNumber = reply.number;
+      prLookup = String(reply.number);
       say(t(prefs.lang, "rule.proposed", { number: reply.number, url: reply.url }));
+      // Asked for straight away, so the operator sees "checks still running" rather than a button
+      // whose state they have to guess at. It is the same sentence the route would answer with.
+      void loadPr(reply.number);
+    } catch (e) {
+      say(e instanceof Error ? e.message : String(e), true);
+    } finally {
+      busy = "";
+    }
+  }
+
+  /**
+   * What the manager says about the pull request, including whether this operator may merge it.
+   *
+   * The verdict is never computed here. `mergeRefusal` in the manager decides it for both the button
+   * and the route, so a browser that drew its own conclusion would be a second copy of the rule —
+   * and the copy is the one that goes stale, leaving a live button over a route that refuses.
+   */
+  async function loadPr(number: number): Promise<void> {
+    if (!Number.isSafeInteger(number) || number < 1) return;
+    busy = "pr";
+    try {
+      const res = await fetch(`/api/policy/pr?number=${number}`, { credentials: "same-origin" });
+      const reply = readPrReply(await res.json());
+      if (!reply.ok) {
+        pr = null;
+        throw new Error(writeFailMessage(reply, (key) => t(prefs.lang, key)));
+      }
+      pr = reply.status;
+      prNumber = reply.status.number;
+      if (reply.status.url) prUrl = reply.status.url;
+    } catch (e) {
+      say(e instanceof Error ? e.message : String(e), true);
+    } finally {
+      busy = "";
+    }
+  }
+
+  async function merge(): Promise<void> {
+    if (!pr) return;
+    busy = "merge";
+    try {
+      const res = await fetch("/api/policy/merge", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: writeHeaders(csrf()),
+        body: mergeBody(pr.number),
+      });
+      const reply = readMergeReply(await res.json());
+      if (!reply.ok) throw new Error(writeFailMessage(reply, (key) => t(prefs.lang, key)));
+      say(t(prefs.lang, "rule.merged", { number: reply.number, sha: reply.sha.slice(0, 8) }));
+      await loadPr(reply.number);
     } catch (e) {
       say(e instanceof Error ? e.message : String(e), true);
     } finally {
@@ -232,6 +297,46 @@
         {/if}
       </p>
     {/if}
+
+    <!--
+      The step that used to leave the console. Merging adopts the source and moves nothing on the
+      fleet — the note after a merge says so, because "merged" on a policy screen reads like a deploy.
+    -->
+    <p class="act">
+      <input
+        bind:value={prLookup}
+        placeholder="#"
+        aria-label={t(prefs.lang, "rule.prNumber")}
+        class="pr"
+        inputmode="numeric"
+      >
+      <button type="button" disabled={busy !== ""} onclick={() => void loadPr(Number(prLookup))}>
+        {t(prefs.lang, "rule.refresh")}
+      </button>
+      {#if pr}
+        <button type="button" disabled={busy !== "" || !pr.mayMerge} onclick={() => void merge()}>
+          {busy === "merge" ? t(prefs.lang, "rule.merging") : t(prefs.lang, "rule.merge")}
+        </button>
+      {/if}
+    </p>
+
+    {#if pr}
+      <p class="dim">
+        {#if pr.proposedBy}{t(prefs.lang, "rule.proposedBy", { who: pr.proposedBy })} · {/if}
+        {t(prefs.lang, "rule.checksOn", { sha: pr.headSha.slice(0, 8) })}
+      </p>
+      <ul class="checks">
+        {#each pr.checks as check (check.name)}
+          <li class={check.state}>
+            <code>{check.name}</code>
+            <span class="dim"> · {check.detail || check.state}</span>
+          </li>
+        {/each}
+      </ul>
+      {#if !pr.mayMerge && pr.why}
+        <p class="banner warn">{t(prefs.lang, "rule.mergeGate", { why: pr.why })}</p>
+      {/if}
+    {/if}
   </section>
 {/if}
 
@@ -240,6 +345,11 @@
 {/if}
 
 <style>
+  .pr { width: 6rem; }
+  .checks { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }
+  .checks li.failure code { color: var(--danger-fg); }
+  .checks li.pending code { color: var(--text-2); }
+
   textarea {
     width: 100%;
     min-height: 16rem;

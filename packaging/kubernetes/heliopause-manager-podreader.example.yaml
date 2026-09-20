@@ -1,0 +1,67 @@
+# Copy once per HELIOPAUSE_K8S_MEASURE_NAMESPACES entry and replace REPLACE-ME before applying.
+# Keeping this an invalid namespace is deliberate: applying the example verbatim must fail closed.
+#
+# ## What this is for
+#
+# The console's rule editor measures a destination instead of transcribing it — see `src/kube-read.ts`.
+# Without this Role the measure panel answers 403 and an operator is back to writing a selector from
+# whatever a request document said the labels were, which is the way every wrong selector this fleet
+# has shipped got written.
+#
+# ## Why it is not the agent's grant, and not the agent's ServiceAccount
+#
+# `heliopause-agent-podreader.example.yaml` is the same shape for a different subject, and the reason
+# both are narrow is written there: the applier Role next to it carries `ciliumnetworkpolicies:
+# create`, and that verb in a peer namespace is a way to put CoreDNS into ingress default-deny. The
+# manager needs strictly less than the agent — it never applies anything — so it gets `pods` and
+# `services`, `get` and `list`, and no `watch`: it reads when somebody presses a button, not
+# continuously.
+#
+# ## The ServiceAccount has to be its own
+#
+# Bind this to a ServiceAccount the manager alone uses, and set `serviceAccountName` on its
+# Deployment to match. A Deployment with no `serviceAccountName` runs as `default`, which every other
+# pod in that namespace also runs as — binding this to `default` would hand cluster-wide pod reading
+# to every workload that happens to share the namespace, including ones that hold no credential today
+# precisely so that they cannot read anything.
+#
+# Verify the boundary after applying — the second and third lines are the ones worth checking:
+#
+#   kubectl auth can-i list pods -n REPLACE-ME \
+#     --as=system:serviceaccount:heliopause:heliopause-manager               # yes
+#   kubectl auth can-i create ciliumnetworkpolicies -n REPLACE-ME \
+#     --as=system:serviceaccount:heliopause:heliopause-manager               # no
+#   kubectl auth can-i get secrets -n REPLACE-ME \
+#     --as=system:serviceaccount:heliopause:heliopause-manager               # no
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: heliopause-manager
+  namespace: heliopause
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: heliopause-manager-podreader
+  namespace: REPLACE-ME
+rules:
+  - apiGroups: [""]
+    # `services` alongside `pods` because the ClusterIP is the other half of the measurement: a rule
+    # names pod labels, and the operator checking their work reaches the workload by the service
+    # address. Reading one without the other sends them back to a terminal for the second number.
+    resources: ["pods", "services"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: heliopause-manager-podreader
+  namespace: REPLACE-ME
+subjects:
+  - kind: ServiceAccount
+    name: heliopause-manager
+    namespace: heliopause
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: heliopause-manager-podreader

@@ -536,7 +536,7 @@ export async function findPullRequestByBranch(
   )) as Array<{
     number?: number; html_url?: string; state?: string; merged_at?: string | null;
     merge_commit_sha?: string | null; head?: { sha?: string; ref?: string };
-    base?: { sha?: string; ref?: string };
+    base?: { sha?: string; ref?: string }; body?: string | null;
   }>;
   const row = rows.find((candidate) => candidate.state === "open") ?? rows[0];
   if (!row) return null;
@@ -555,6 +555,14 @@ export async function findPullRequestByBranch(
     headRef: row.head.ref,
     baseSha: typeof row.base.sha === "string" ? row.base.sha : null,
     baseRef: row.base.ref,
+    // **The list endpoint never computes mergeability.** GitHub works it out when a single pull
+    // request is asked for, so these two are `null`/`unknown` here as a fact about the API and not
+    // as a default. `mergeRefusal` reads `mergeable !== true` as "not yet", which means a status
+    // from this function can never authorise a merge — it fails closed, and that is the right way
+    // round: the caller that wants to merge must ask `pullRequestStatus` for the one it is merging.
+    mergeable: null,
+    mergeableState: "unknown",
+    body: typeof row.body === "string" ? row.body : null,
   };
 }
 
@@ -569,6 +577,18 @@ export interface PullRequestStatus {
   /** Exact base commit GitHub records for the PR; required by crash recovery before local CAS. */
   baseSha: string | null;
   baseRef: string;
+  /**
+   * GitHub's own verdict on whether the branches combine, and its word for why.
+   *
+   * `mergeable` is null while GitHub is still computing it — a state that lasts a second or two
+   * after a push and is neither yes nor no. The merge gate treats it as "not yet", because the
+   * alternative is to read a pending computation as a permission.
+   */
+  mergeable: boolean | null;
+  /** `clean`, `blocked`, `dirty`, `behind`, `unknown` — shown to the operator, not branched on. */
+  mergeableState: string;
+  /** The description, which carries `PROPOSER_TRAILER` when the console opened this one. */
+  body: string | null;
 }
 
 /** Poll review/merge outcome without attempting to review or merge. */
@@ -589,6 +609,7 @@ export async function pullRequestStatus(
     number?: number; html_url?: string; state?: string; merged?: boolean;
     merge_commit_sha?: string | null; head?: { sha?: string; ref?: string };
     base?: { sha?: string; ref?: string };
+    mergeable?: boolean | null; mergeable_state?: string; body?: string | null;
   };
   if (out.number !== number || typeof out.html_url !== "string" || !["open", "closed"].includes(String(out.state))
     || typeof out.merged !== "boolean" || typeof out.head?.sha !== "string"
@@ -605,6 +626,9 @@ export async function pullRequestStatus(
     headRef: out.head.ref,
     baseSha: typeof out.base.sha === "string" ? out.base.sha : null,
     baseRef: out.base.ref,
+    mergeable: typeof out.mergeable === "boolean" ? out.mergeable : null,
+    mergeableState: typeof out.mergeable_state === "string" ? out.mergeable_state : "unknown",
+    body: typeof out.body === "string" ? out.body : null,
   };
 }
 
@@ -735,6 +759,11 @@ export function proposalBody(input: {
   const lines = [
     `Proposed from the heliopause console by \`${input.who}\`.`,
     "",
+    // Machine-readable and human-visible in the same line. The merge gate reads this back to refuse
+    // a proposer merging their own proposal; see `PROPOSER_TRAILER` for why it is written rather
+    // than derived, and for what it does and does not guarantee.
+    `${PROPOSER_TRAILER} \`${input.who}\``,
+    "",
     `- site: \`${input.site}\``,
     `- policies: ${input.policies}${input.rendersNowhere ? ` — **${input.rendersNowhere} render nowhere**` : ""}`,
   ];
@@ -751,4 +780,219 @@ export function proposalBody(input: {
     lines.push("No plan was rendered for this branch, so nothing has been proposed to the fleet yet.");
   }
   return lines.join("\n");
+}
+
+/**
+ * The trailer a merge gate reads back to learn who proposed.
+ *
+ * ## Why the body, and not the author or the branch
+ *
+ * The pull request is opened by the *App*, so `pulls/{n}.user.login` is the installation and never
+ * the operator — the one field that looks like an answer is the one field that cannot be one. The
+ * branch is closer: `/policy/edit` defaults it to `branchName(who, …)`, which slugs the operator in.
+ * But that route accepts a `branch` from the request body and only falls back to the default, so a
+ * caller who supplies their own branch supplies their own slug. Deriving identity from it would make
+ * the two-person rule an honour system with a machine-readable veneer.
+ *
+ * So the console writes the name where it cannot be mistaken for something derived, and the gate
+ * refuses a pull request that has no such line rather than guessing (see `mergeRefusal`).
+ *
+ * ## What this is not
+ *
+ * A pull request body is editable by anyone with write access to the repository. This trailer
+ * therefore **records** the two-person rule where both halves can see it; it does not enforce it
+ * against someone who already holds repository write and is willing to rewrite the record. The
+ * boundary that does hold is the publish path's — `plan.proposedBy` is compared with the approver
+ * inside this process, over a plan hash neither party can edit. A merge moves source; publishing is
+ * what moves the fleet, and that is the gate that was never advisory.
+ */
+export const PROPOSER_TRAILER = "heliopause-proposed-by:";
+
+/** The operator named by `PROPOSER_TRAILER`, or null when the body carries no such line. */
+export function proposerFromBody(body: string | null | undefined): string | null {
+  if (typeof body !== "string") return null;
+  for (const line of body.split("\n")) {
+    const at = line.indexOf(PROPOSER_TRAILER);
+    if (at === -1) continue;
+    // Backticks because the body renders the name as code; a reader copying it should not carry the
+    // quoting into a comparison that is done on strings.
+    const value = line.slice(at + PROPOSER_TRAILER.length).trim().replace(/^`|`$/g, "").trim();
+    if (value) return value;
+  }
+  return null;
+}
+
+/** One check GitHub attributes to a commit, reduced to the three states a gate can act on. */
+export interface CommitCheck {
+  name: string;
+  state: "success" | "pending" | "failure";
+  /** GitHub's own word — `success`, `skipped`, `timed_out`, `error` — kept for the operator's eyes. */
+  detail: string;
+}
+
+/**
+ * Every check GitHub attributes to one commit: check runs **and** commit statuses.
+ *
+ * ## Why both, and why a missing one is not a pass
+ *
+ * These are two different APIs and a repository can use either. A gate that read only check runs
+ * would see an empty list on a repository whose CI reports statuses, and "no failures" would be
+ * indistinguishable from "green" — the merge would go through on a commit nothing had tested. The
+ * caller is expected to refuse an empty list for the same reason; `checksAreGreen` does.
+ *
+ * `skipped` and `neutral` count as success because that is what branch protection does with them: a
+ * conditional job that correctly did not run must not hold a merge forever. `stale` does not — it
+ * means the result belongs to a commit that is no longer this one.
+ */
+export async function pullRequestChecks(
+  creds: AppCredentials,
+  target: ProposalTarget,
+  fetcher: Fetcher,
+  nowSec: number,
+  headSha: string,
+): Promise<CommitCheck[]> {
+  if (!/^[0-9a-f]{40}$/.test(headSha)) throw new ProposalError("head commit is not a sha");
+  const token = await installationToken(creds, fetcher, nowSec);
+  const at = (p: string) =>
+    `/repos/${encodeURIComponent(target.owner)}/${encodeURIComponent(target.repo)}/commits/${headSha}${p}`;
+
+  const runs = (await gh(fetcher, token, at("/check-runs?per_page=100"))) as {
+    total_count?: number;
+    check_runs?: Array<{ name?: string; status?: string; conclusion?: string | null }>;
+  };
+  const rows = runs.check_runs ?? [];
+  // Closed-world, like `pullRequestChangedFiles`. A full page means a failing run could be on page
+  // two, and a gate that cannot see every check has not checked.
+  if (rows.length >= 100 || (typeof runs.total_count === "number" && runs.total_count > rows.length)) {
+    throw new ProposalError(`commit ${headSha.slice(0, 8)} has too many check runs to prove they all passed`);
+  }
+  const out: CommitCheck[] = [];
+  for (const row of rows) {
+    if (typeof row.name !== "string" || typeof row.status !== "string") {
+      throw new ProposalError(`commit ${headSha.slice(0, 8)} returned an invalid check run`);
+    }
+    const conclusion = typeof row.conclusion === "string" ? row.conclusion : "";
+    out.push({
+      name: row.name,
+      detail: row.status === "completed" ? conclusion : row.status,
+      state: row.status !== "completed"
+        ? "pending"
+        : ["success", "skipped", "neutral"].includes(conclusion)
+          ? "success"
+          : "failure",
+    });
+  }
+
+  const combined = (await gh(fetcher, token, at("/status?per_page=100"))) as {
+    statuses?: Array<{ context?: string; state?: string }>;
+  };
+  const statuses = combined.statuses ?? [];
+  if (statuses.length >= 100) {
+    throw new ProposalError(`commit ${headSha.slice(0, 8)} has too many statuses to prove they all passed`);
+  }
+  for (const row of statuses) {
+    if (typeof row.context !== "string" || typeof row.state !== "string") {
+      throw new ProposalError(`commit ${headSha.slice(0, 8)} returned an invalid status`);
+    }
+    out.push({
+      name: row.context,
+      detail: row.state,
+      state: row.state === "success" ? "success" : row.state === "pending" ? "pending" : "failure",
+    });
+  }
+  return out;
+}
+
+/**
+ * Green means: something ran, and nothing that ran is pending or failed.
+ *
+ * The empty list is the case worth naming. It reads as "no failures" and means "nothing has tested
+ * this commit", which is the state a pull request is in for the first few seconds of its life —
+ * exactly when a console button is most likely to be pressed.
+ */
+export function checksAreGreen(checks: readonly CommitCheck[]): boolean {
+  return checks.length > 0 && checks.every((c) => c.state === "success");
+}
+
+/**
+ * Squash-merge, pinned to the head the caller decided about.
+ *
+ * `sha` is the compare-and-set. Without it GitHub merges whatever the branch points at now, so a
+ * commit pushed between the gate's read and this call would be merged with the *previous* commit's
+ * green checks — the exact race the gate exists to prevent. GitHub answers 409 when it no longer
+ * matches, which is a refusal an operator can act on.
+ */
+export async function mergePullRequest(
+  creds: AppCredentials,
+  target: ProposalTarget,
+  fetcher: Fetcher,
+  nowSec: number,
+  number: number,
+  headSha: string,
+): Promise<{ sha: string }> {
+  if (!Number.isSafeInteger(number) || number < 1) throw new ProposalError("pull request number is invalid");
+  if (!/^[0-9a-f]{40}$/.test(headSha)) throw new ProposalError("head commit is not a sha");
+  const token = await installationToken(creds, fetcher, nowSec);
+  const out = (await gh(
+    fetcher,
+    token,
+    `/repos/${encodeURIComponent(target.owner)}/${encodeURIComponent(target.repo)}/pulls/${number}/merge`,
+    "PUT",
+    // No `commit_title`: GitHub then squashes under the pull request's own title, which is the one
+    // a reviewer read. Inventing a title here would put a sentence in `main`'s history that nobody
+    // reviewed and that no longer matches the pull request it came from.
+    { merge_method: "squash", sha: headSha },
+  )) as { merged?: boolean; sha?: string };
+  if (out.merged !== true || typeof out.sha !== "string") {
+    throw new ProposalError(`pull request #${number} did not merge`);
+  }
+  return { sha: out.sha };
+}
+
+/**
+ * Why this operator may not merge this pull request — or null when they may.
+ *
+ * ## Why it is one pure function and not six checks at the call site
+ *
+ * The console shows the operator whether the button will work *before* they press it, and the route
+ * decides again when they do. Those are two callers of the same rule, and a rule with two
+ * implementations is a rule that will disagree with itself the day one of them is edited: the button
+ * would be live and the route would refuse, or — the direction that costs something — the button
+ * would be grey while the route quietly allowed it. So the reason is computed once and returned as
+ * the sentence the operator is going to read either way.
+ *
+ * ## The order is the message
+ *
+ * A pull request that is already merged is not "missing a check", and saying so sends an operator to
+ * look at CI for a merge that happened. The terminal facts come first, then identity, then the two
+ * conditions that change on their own while somebody watches.
+ */
+export function mergeRefusal(input: {
+  status: PullRequestStatus;
+  checks: readonly CommitCheck[];
+  who: string;
+  proposer: string | null;
+}): string | null {
+  const { status, checks, who, proposer } = input;
+  if (status.merged) return `pull request #${status.number} is already merged`;
+  if (status.state !== "open") return `pull request #${status.number} is closed`;
+  if (!proposer) {
+    // Fail closed. A pull request opened outside this console — by hand, by another tool — carries
+    // no trailer, and merging it here would be a two-person rule applied to a party of unknown size.
+    return `pull request #${status.number} was not proposed from this console, so it cannot say who proposed it`;
+  }
+  if (proposer === who) {
+    return `#${status.number} was proposed by ${who} — the operator who proposes a change does not merge it`;
+  }
+  if (status.mergeable !== true) {
+    return status.mergeable === null
+      ? `GitHub has not finished working out whether #${status.number} merges cleanly`
+      : `#${status.number} does not merge cleanly (${status.mergeableState})`;
+  }
+  if (checks.length === 0) return `nothing has checked ${status.headSha.slice(0, 8)} yet`;
+  const pending = checks.filter((c) => c.state === "pending").map((c) => c.name);
+  const failed = checks.filter((c) => c.state === "failure").map((c) => `${c.name} (${c.detail})`);
+  if (failed.length > 0) return `checks failed on ${status.headSha.slice(0, 8)}: ${failed.join(", ")}`;
+  if (pending.length > 0) return `checks still running on ${status.headSha.slice(0, 8)}: ${pending.join(", ")}`;
+  return null;
 }

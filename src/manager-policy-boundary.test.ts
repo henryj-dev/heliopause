@@ -183,16 +183,44 @@ describe("the manager's policy boundary — it is still the console", () => {
   // every assertion above passed.
   const source = code(read("./manager-server.ts"));
 
-  for (const route of ["/policy", "/policy/edit", "/policy/propose"]) {
+  // One entry per step of the loop an operator does without leaving the console, and the sentence
+  // says what stops working when the route goes. The list grew when merging and measuring moved
+  // here: a console missing one of those is not a smaller console, it is one that sends the operator
+  // back to a terminal for the step in the middle — which is how the gate on that step stopped being
+  // anything this process could state.
+  const steps: Record<string, string> = {
+    "/policy": "be read",
+    "/policy/edit": "save",
+    "/policy/propose": "open a review",
+    "/policy/pr": "say whether the review passed",
+    "/policy/merge": "merge what was reviewed",
+    "/policy/measure": "read the labels a selector is written against",
+  };
+  for (const [route, cannot] of Object.entries(steps)) {
     it(`serves ${route}`, () => {
-      assert.ok(
-        source.includes(`"${route}"`),
-        `manager-server.ts no longer serves ${route} — the console cannot ${
-          route === "/policy" ? "be read" : route.endsWith("edit") ? "save" : "open a review"
-        }`,
-      );
+      assert.ok(source.includes(`"${route}"`), `manager-server.ts no longer serves ${route} — the console cannot ${cannot}`);
     });
   }
+
+  // The gate, asserted on the source because the behavioural half lives in
+  // `manager-console-loop.test.ts` and this file's job is that the boundary did not quietly move.
+  // `mergeRefusal` holding the rule is the whole reason the screen and the route cannot disagree.
+  it("decides a merge with the shared rule rather than a second copy of it", () => {
+    assert.match(source, /mergeRefusal\(\{[\s\S]*?proposer:/, "the merge route stopped using the shared rule");
+    assert.equal(
+      (source.match(/mergeRefusal\(/g) ?? []).length,
+      2,
+      "the rule is asked twice — once for the screen, once when the button is pressed — and nowhere else",
+    );
+  });
+
+  it("keeps the cluster reader behind the write gate", () => {
+    assert.match(
+      source,
+      /pathname === "\/policy\/measure"\)[\s\S]*?mayWrite/,
+      "the measure route no longer requires write permission",
+    );
+  });
 
   it("renders the page rather than answering with data", () => {
     // `/policy` returning JSON would pass a route check and still be useless in a browser, which is
