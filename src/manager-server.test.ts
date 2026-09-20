@@ -26,6 +26,7 @@ import {
   API_ROUTES,
   API_ROUTE_PATTERNS,
   rateLimited,
+  republishRefusal,
   startManager,
   trimPendingOidcLogins,
 } from "./manager-server.ts";
@@ -2477,5 +2478,200 @@ describe("the enrollment rate limiter", () => {
     assert.equal(seen.size, 4);
     assert.equal(seen.has("10.0.0.9"), true, "the newest source must survive eviction");
     assert.equal(seen.has("10.0.0.0"), false, "the oldest must not");
+  });
+});
+
+describe("republishRefusal", () => {
+  // Agents dedup by generation string, so re-publishing one the fleet already holds reports success
+  // and changes nothing. Measured 2026-09-20: generation `fe58a6c` was published twice — 100 workload
+  // objects, then 101 after a render fix — and the second publish never landed while the relay
+  // reported `expected: 101` against 100 applied and the host still read `confirmed`.
+  it("refuses a generation the whole target is already confirmed on", () => {
+    const why = republishRefusal({
+      target: "dev-icn-vtr",
+      generation: "fe58a6c",
+      onTarget: { kind: "one", generation: "fe58a6c" },
+    });
+    assert.match(String(why), /already confirmed on fe58a6c/);
+    assert.match(String(why), /dev-icn-vtr/);
+    // The sentence has to say what to do, or an operator reads it as the console being broken and
+    // publishes again from the CLI — which the agents skip for exactly the same reason.
+    assert.match(String(why), /commit the change and propose again/);
+  });
+
+  it("allows a generation the target is not on", () => {
+    assert.equal(
+      republishRefusal({ target: "dev", generation: "6fd4f04", onTarget: { kind: "one", generation: "fe58a6c" } }),
+      null,
+    );
+  });
+
+  // A fleet carrying two generations is a roll-out in flight or a host rolled back, and publishing
+  // is what finishes it. Refusing there would make the one state that needs a publish the one state
+  // that cannot have one.
+  it("allows a mixed fleet", () => {
+    assert.equal(republishRefusal({ target: "dev", generation: "fe58a6c", onTarget: { kind: "mixed" } }), null);
+  });
+
+  // An unreadable relay is not a fact about the fleet. Refusing on it would make one unreachable
+  // relay a reason nothing can be published at all.
+  it("allows when the fleet could not be read, rather than guessing either way", () => {
+    assert.equal(
+      republishRefusal({ target: "dev", generation: "fe58a6c", onTarget: { kind: "unknown", why: "timeout" } }),
+      null,
+    );
+  });
+});
+
+describe("proposing asks the repository what it actually holds", () => {
+  // **The check existed and this step never asked it.** `/policy/screen` has drawn a freshness banner
+  // from the same two shas since 2026-08-16; the plan route, where the answer decides something, went
+  // straight past it. Measured 2026-09-20: a pull request merged at 14:48:40 was proposed at 14:49:36
+  // and the plan named the commit before it — and every screen agreed, because the approval diff
+  // compares the plan against the *fleet* and never against the repository.
+  let port8 = 0;
+  let close8: () => void = () => {};
+  let renderer8: import("node:http").Server;
+  let rendered = "abc1234abc1234abc1234abc1234abc1234abc1";
+  let repoSha: string | null = "abc1234abc1234abc1234abc1234abc1234abc1";
+  let headCalls = 0;
+
+  const gh = (async (url: string, init?: { method?: string }) => {
+    const method = init?.method ?? "GET";
+    const reply = (status: number, body: unknown) =>
+      ({ ok: status < 400, status, text: async () => JSON.stringify(body) });
+    if (method === "POST" && /access_tokens$/.test(url)) return reply(200, { token: "t" });
+    if (method === "GET" && /git\/ref\/heads\/main$/.test(url)) {
+      headCalls += 1;
+      return repoSha === null
+        ? reply(500, { message: "the repository is unreachable" })
+        : reply(200, { object: { sha: repoSha } });
+    }
+    throw new Error(`no route for ${method} ${url}`);
+  }) as unknown as NonNullable<Parameters<typeof startManager>[0]["policyWrite"]>["fetch"];
+
+  before(async () => {
+    const { createServer } = await import("node:http");
+    renderer8 = createServer((_req, res) => {
+      const source = collectPolicySource({
+        site: {
+          cfg: {
+            ...DEFAULT_CONFIG,
+            hookPolicy: { input: "drop" as const, output: "accept" as const },
+            baseline: [{ desc: "management SSH", proto: "tcp" as const, ports: "22", srcCidrs: [] }],
+          },
+          hosts: [{
+            id: "h1",
+            stage: "canary" as const,
+            items: [{
+              policy: {
+                id: "P1", name: "n", src: { kind: "cidr", value: "198.51.100.0/24" },
+                dst: { kind: "host", value: "h1" }, proto: "tcp", ports: "22",
+                action: "allow", denyMode: "drop", priority: 100, enabled: true,
+              },
+              srcCidrs: ["198.51.100.0/24"],
+              dstCidrs: ["198.51.100.1/32"],
+            }],
+          }],
+        } as never,
+        sitePath: "/nonexistent/policy/site.ts",
+        label: "test-site",
+        allowPaths: [],
+      });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ...source, head: { sha: rendered, dirty: false } }));
+    });
+    await new Promise<void>((r) => renderer8.listen(0, "127.0.0.1", r));
+    const rendererPort = (renderer8.address() as { port: number }).port;
+    const ghKey = generateKeyPairSync("rsa", {
+      modulusLength: 2048,
+      privateKeyEncoding: { type: "pkcs1", format: "pem" },
+      publicKeyEncoding: { type: "pkcs1", format: "pem" },
+    }).privateKey;
+    const started = await startManager({
+      port: 0, hostname: "127.0.0.1",
+      relays: [{ name: "dev", url: "https://127.0.0.1:1/", pkiDir: dir }],
+      tls: { certFile: join(dir, "server.pem"), keyFile: join(dir, "server.key"), caFile: join(dir, "ca.pem") },
+      operatorCNs: ["ops-alice"], writerCNs: ["ops-alice"],
+      timeoutMs: 2000,
+      policySource: { url: `http://127.0.0.1:${rendererPort}` },
+      policyWrite: {
+        creds: { appId: "1", installationId: "2", privateKey: ghKey },
+        target: { owner: "o", repo: "r", base: "main" },
+        allowPaths: ["policies.json"],
+        fetch: gh,
+      },
+    });
+    port8 = (started.server.address() as { port: number }).port;
+    close8 = () => started.server.close();
+  });
+
+  after(() => { close8(); renderer8.close(); });
+
+  const propose = () => new Promise<{ status: number; body: string }>((resolve, reject) => {
+    const r = request({
+      host: "127.0.0.1", port: port8, path: "/policy/plan", method: "POST",
+      rejectUnauthorized: false,
+      cert: readFileSync(join(dir, "ops.pem")), key: readFileSync(join(dir, "ops.key")),
+      headers: { "content-type": "application/json" },
+    }, (res) => {
+      let body = ""; res.on("data", (c) => { body += c; });
+      res.on("end", () => resolve({ status: res.statusCode ?? 0, body }));
+    });
+    r.on("error", reject);
+    r.end(JSON.stringify({ target: "dev" }));
+  });
+
+  const plans = () => new Promise<{ status: number; body: string }>((resolve, reject) => {
+    const r = request({
+      host: "127.0.0.1", port: port8, path: "/plans", method: "GET", rejectUnauthorized: false,
+      cert: readFileSync(join(dir, "ops.pem")), key: readFileSync(join(dir, "ops.key")),
+    }, (res) => {
+      let body = ""; res.on("data", (c) => { body += c; });
+      res.on("end", () => resolve({ status: res.statusCode ?? 0, body }));
+    });
+    r.on("error", reject); r.end();
+  });
+
+  it("proposes when the render is the repository's head", async () => {
+    repoSha = rendered;
+    const r = await propose();
+    assert.equal(r.status, 200, r.body);
+  });
+
+  it("refuses a render behind the repository, and names both commits", async () => {
+    repoSha = "9999999999999999999999999999999999999999";
+    const before = JSON.parse((await plans()).body).plans.length as number;
+    const r = await propose();
+    assert.equal(r.status, 409, r.body);
+    assert.match(r.body, /renderer is at abc1234/);
+    assert.match(r.body, /repository is at 9999999/);
+    assert.match(r.body, /propose again/);
+    // Refused means nothing was recorded. A plan left behind would be approvable — and it is exactly
+    // the plan of the commit before the operator's change.
+    assert.equal(JSON.parse((await plans()).body).plans.length, before, "a refused proposal left a plan behind");
+  });
+
+  // The cache is sixty seconds and the incident's window was fifty-six. A gate reading a recollection
+  // would have said "current" about a render that was not.
+  it("measures the head rather than reusing one cached seconds ago", async () => {
+    repoSha = rendered;
+    assert.equal((await propose()).status, 200);
+    const after = headCalls;
+    repoSha = "8888888888888888888888888888888888888888";
+    const r = await propose();
+    assert.equal(r.status, 409, "the second proposal reused a cached head");
+    assert.ok(headCalls > after, "the repository was not asked again");
+  });
+
+  // "Could not check" and "checked, current" are the same silence otherwise — the distinction the
+  // screen's own banner was built for, carried onto the plan the approver is asked to agree to.
+  it("proposes but says so when the repository cannot be reached", async () => {
+    repoSha = null;
+    const r = await propose();
+    assert.equal(r.status, 200, r.body);
+    const body = JSON.parse(r.body) as { freshness?: string };
+    assert.match(String(body.freshness), /unchecked/);
+    assert.match(String(body.freshness), /unreachable/);
   });
 });
