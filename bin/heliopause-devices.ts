@@ -18,7 +18,7 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { fetchRegistrations, TruncatedRead, userRows } from "../src/cf-devices.ts";
+import { fetchRegistrations, lastSeenColumn, TruncatedRead, userRows } from "../src/cf-devices.ts";
 import { deviceRows } from "../src/device-view.ts";
 import { TRUST_LABEL, zoneOf } from "../src/zones.ts";
 import type { Site } from "./heliopause-publish.ts";
@@ -144,18 +144,24 @@ const trustedZone = (addr: string | undefined) => {
 const unapprovedInZone = screen.unapproved.filter((c) => trustedZone(c.after?.v4));
 const unapprovedOutside = screen.unapproved.filter((c) => !trustedZone(c.after?.v4));
 
+// What Cloudflare last recorded for each registration, keyed by device so a report line can carry
+// it. Rendered by `lastSeenColumn`, which is also where the reason this is an ordering and not a
+// liveness signal is written down.
+const liveByDevice = new Map(read.registrations.map((r) => [r.deviceId, r]));
+const seenColumn = (deviceId: string): string => lastSeenColumn(liveByDevice.get(deviceId));
+
 for (const c of unapprovedInZone) {
   const z = zoneOf(loaded.zones ?? [], c.after?.v4 ?? "");
   console.log(
     `  UNAPPROVED ${c.deviceName} (${c.userEmail})  ${c.after?.v4}  ${c.after?.v6}` +
-      `  — ${z ? `${z.id} (${TRUST_LABEL[z.trust]})` : "?"}`,
+      `  — ${z ? `${z.id} (${TRUST_LABEL[z.trust]})` : "?"}${seenColumn(c.deviceId)}`,
   );
 }
 for (const c of unapprovedOutside) {
   const z = zoneOf(loaded.zones ?? [], c.after?.v4 ?? "");
   console.log(
     `  unapproved, untrusted zone: ${c.deviceName} (${c.userEmail})  ${c.after?.v4}` +
-      `  — ${z ? `${z.id} (${TRUST_LABEL[z.trust]})` : "no zone"}`,
+      `  — ${z ? `${z.id} (${TRUST_LABEL[z.trust]})` : "no zone"}${seenColumn(c.deviceId)}`,
   );
 }
 

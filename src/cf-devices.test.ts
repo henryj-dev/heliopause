@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 import {
   diffRegistrations,
   fetchRegistrations,
+  lastSeenColumn,
   parsePage,
   totalFromCursor,
   TruncatedRead,
@@ -87,6 +88,37 @@ describe("parsePage", () => {
   it("reports both when neither address is present", () => {
     const p = parsePage(ok([reg({ virtual_ipv4: null, virtual_ipv6: null })]));
     assert.equal(p.addressless[0]!.missing, "both");
+  });
+});
+
+// The column exists to order a revocation review, and the two ways it could mislead are a blank
+// timestamp rendered as a truncated line and a caller that cannot tell "not in the read" from
+// "read with nothing to say".
+describe("lastSeenColumn", () => {
+  it("prints what the API recorded, with the tunnel type", () => {
+    assert.equal(
+      lastSeenColumn(row()),
+      "  — last seen 2026-08-12T00:00:00Z, wireguard",
+    );
+  });
+
+  // `str()` yields "" for a missing or non-string `last_seen_at`. "last seen " with nothing after it
+  // reads as a cut-off line rather than as the fact that the API said nothing.
+  it("says so when the API reported no timestamp", () => {
+    assert.equal(
+      lastSeenColumn(row({ lastSeenAt: "" })),
+      "  — last seen never reported, wireguard",
+    );
+  });
+
+  it("omits the tunnel type when there is none", () => {
+    assert.equal(lastSeenColumn(row({ tunnelType: null })), "  — last seen 2026-08-12T00:00:00Z");
+  });
+
+  // Appended unconditionally by the caller, so a registration it cannot find must add nothing at
+  // all rather than a dangling separator.
+  it("renders nothing for a registration that is not in the read", () => {
+    assert.equal(lastSeenColumn(undefined), "");
   });
 });
 

@@ -243,6 +243,33 @@ export async function fetchRegistrations(opts: FetchOptions): Promise<RegistryRe
   return { registrations, addressless, pages };
 }
 
+/**
+ * What Cloudflare last recorded for a registration, as a trailing column for a report line.
+ *
+ * ## Why this is rendered here rather than at the call site
+ *
+ * Both fields were read, typed, and never printed — `lastSeenAt` and `tunnelType` reached
+ * `Registration` and stopped there. The question that follows every unapproved row is "do I revoke
+ * this one", and the answer was being sought from the address alone.
+ *
+ * ⚠️ **Read it as an ordering, never as liveness.** The note at the top of this file measured the
+ * trap: three gateway registrations last reported 91–93 days earlier and all three were alive and
+ * taking policy, because a WARP Connector does not refresh `last_seen_at` the way an interactive
+ * client does. So a stale timestamp here is not evidence that a connector is gone, and this column
+ * cannot decide a revocation — only sort a review. `tunnelType` is carried beside it because it
+ * separates a connector from a person's client, and unlike the timestamp it does not decay.
+ *
+ * Returns `""` for a registration that is not in the read, so a caller can append it unconditionally.
+ */
+export function lastSeenColumn(r: Registration | undefined): string {
+  if (!r) return "";
+  // An empty string is what `str()` yields for a missing or non-string `last_seen_at`. Printing it
+  // raw would render "last seen " with nothing after it, which reads as a truncated line rather
+  // than as the fact that the API told us nothing.
+  const seen = r.lastSeenAt || "never reported";
+  return `  — last seen ${seen}${r.tunnelType ? `, ${r.tunnelType}` : ""}`;
+}
+
 /** One device's address moving, or the device appearing/leaving. */
 export interface RegistryChange {
   kind: "added" | "removed" | "moved";
