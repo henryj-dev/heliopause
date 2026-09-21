@@ -198,6 +198,53 @@ const PENDING_OIDC_LOGIN_TTL_MS = 10 * 60_000;
  * stardust's SNI allowlist. Moving that one is not a rename, it is a handoff to another organisation.
  * Screens are absent for the obvious reason and the test below keeps them out.
  */
+/**
+ * What one target's hosts are agreeing on, or why that is not known.
+ *
+ * Three answers kept apart on purpose. `one` is a fleet agreeing with itself; `mixed` is a roll-out
+ * in flight or a host rolled back; `unknown` is a relay this manager could not read, which is not a
+ * fact about the fleet at all.
+ */
+export type TargetGeneration =
+  | { kind: "one"; generation: string }
+  | { kind: "mixed" }
+  | { kind: "unknown"; why: string };
+
+/**
+ * Why publishing this plan would change nothing — or null when it would.
+ *
+ * ## Agents dedup by generation string
+ *
+ * A host already confirmed on a generation skips that artifact without reading it. So publishing a
+ * generation the target already holds is a no-op **that reports success**, and if the new bundle
+ * differs from the one that first carried the string, the difference silently never lands.
+ *
+ * Measured 2026-09-20: a stale render published generation `fe58a6c` carrying 100 workload objects.
+ * The render was fixed and the same generation published again, now carrying 101. The agents skipped
+ * it; the relay reported `expected: 101` — read from the new manifest — against 100 applied objects;
+ * the host's workload state still read `confirmed`. Three screens agreed with each other and the
+ * policy was not in the cluster.
+ *
+ * ## Only when the whole target is on it
+ *
+ * `mixed` is a rollback or a roll-out in flight, and re-publishing is exactly what fixes those.
+ * `unknown` is an unreadable relay, and refusing on it would make one unreachable relay a reason
+ * nothing can be published — the same trade `/policy/propose` makes for its render counts.
+ */
+export function republishRefusal(input: {
+  target: string;
+  generation: string;
+  onTarget: TargetGeneration;
+}): string | null {
+  if (input.onTarget.kind !== "one") return null;
+  if (input.onTarget.generation !== input.generation) return null;
+  return (
+    `${input.target} is already confirmed on ${input.onTarget.generation} — agents skip an artifact ` +
+    `whose generation they already hold, so this would report success and change nothing. ` +
+    `A generation names a commit: commit the change and propose again.`
+  );
+}
+
 export const API_ROUTES: ReadonlySet<string> = new Set([
   "/site",
   "/authz",
@@ -1088,10 +1135,23 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
    */
   let repoHeadCache: { at: number; sha: string } | null = null;
   const REPO_HEAD_TTL_MS = 60_000;
-  async function currentRepoHead(): Promise<{ sha: string } | { error: string }> {
+  /**
+   * @param now_ `"cached"` for a screen, `"measured"` for a gate.
+   *
+   * The cache above is sixty seconds, which is right for a page that redraws while somebody reads it
+   * and wrong for the one caller that decides whether a plan carries the commit just merged. Measured
+   * 2026-09-20: a merge at 14:48:40 was proposed at 14:49:36 — **fifty-six seconds** — and a cached
+   * answer from before the merge would have said "current" about a render that was not.
+   *
+   * Spending one call there is what the cache was for. Its own comment says so: the poll is cached so
+   * it does not spend "a rate limit shared with the thing that actually needs it — proposing".
+   */
+  async function currentRepoHead(now_: "cached" | "measured" = "cached"): Promise<{ sha: string } | { error: string }> {
     if (!opts.policyWrite) return { error: "this console has no repository credential" };
     const at = now().getTime();
-    if (repoHeadCache && at - repoHeadCache.at < REPO_HEAD_TTL_MS) return { sha: repoHeadCache.sha };
+    if (now_ === "cached" && repoHeadCache && at - repoHeadCache.at < REPO_HEAD_TTL_MS) {
+      return { sha: repoHeadCache.sha };
+    }
     try {
       const sha = await repoHead(
         opts.policyWrite.creds,
@@ -1107,10 +1167,10 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
   }
 
   /** Turn the two shas into the three states the screen draws. */
-  async function freshnessOf(rendered: string | null): Promise<
+  async function freshnessOf(rendered: string | null, now_: "cached" | "measured" = "cached"): Promise<
     { state: "fresh" } | { state: "stale"; rendered: string | null; repository: string } | { state: "unknown"; why: string }
   > {
-    const head = await currentRepoHead();
+    const head = await currentRepoHead(now_);
     if ("error" in head) return { state: "unknown", why: head.error };
     // A checkout with no git reports `null`, and that is not "fresh" — it is a page that cannot say
     // what it is showing, which is the state this banner was built to stop being invisible.
@@ -3040,11 +3100,32 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
      * hash, the retention sweep and the log line are the parts that decide what an approver later
      * sees, and two of them would drift the way every other pair in this system has.
      */
+    /** Read one target's fleet and reduce it to a `TargetGeneration`. The rule is `republishRefusal`. */
+    const generationOnTarget = async (relayName: string): Promise<TargetGeneration> => {
+      try {
+        const view = siteView(await pollRelays(opts.relays.filter((r) => r.name === relayName), timeoutMs));
+        const hosts = view.vpcs.flatMap((v) => ("view" in v && v.view ? v.view.hosts : []));
+        const gens = [...new Set(hosts.map((h) => h.generation).filter((g): g is string => Boolean(g)))];
+        if (gens.length === 1) return { kind: "one", generation: gens[0]! };
+        return gens.length === 0 ? { kind: "unknown", why: "no host reported a generation" } : { kind: "mixed" };
+      } catch (e) {
+        return { kind: "unknown", why: (e as Error).message };
+      }
+    };
+
     const recordProposal = (
       response: ServerResponse,
       targetName: string,
       bundle: PlanBundle,
       by: string,
+      /**
+       * Said when this process could not establish that the render is current.
+       *
+       * Empty when it checked and the render matched the repository, which is the ordinary case. It
+       * is **not** empty for "did not check" — that distinction is the whole point: an approver
+       * reading a plan needs to know whether "this is the newest commit" was verified or assumed.
+       */
+      freshness = "",
     ) => {
       // Computed here, from the bytes that arrived. Never taken from the request — a submitted hash
       // would be the proposer's claim about content the approver never sees, and then the approval
@@ -3070,7 +3151,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
           }
         }
         log(`plan ${hash.slice(0, 20)} proposed by ${by} for ${targetName} (generation ${bundle.manifest.generation})`, `${by}이(가) ${targetName}에 계획 ${hash.slice(0, 20)}을(를) 제안함 (세대 ${bundle.manifest.generation})`);
-        return send(response, 200, publicPlan(plan, targetName));
+        return send(response, 200, { ...publicPlan(plan, targetName), ...(freshness ? { freshness } : {}) });
       } catch (e) {
         return sendApprovalError(response, e);
       }
@@ -3155,6 +3236,44 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       if (source.head.dirty) {
         return send(res, 409, { error: `the policy checkout at ${source.head.sha} has uncommitted edits` });
       }
+
+      // ── Is the renderer looking at what the repository actually holds? ────────────────────
+      //
+      // **This check already existed and this step never asked it.** `/policy/screen` has drawn a
+      // freshness banner from `freshnessOf` since 2026-08-16 — the same two shas, the same three
+      // states — and the plan route, which is where the answer decides something, went straight past
+      // it. The capability was built, configured, displayed, and not consulted by the one caller
+      // whose correctness depended on it.
+      //
+      // What it costs: the checkout is pulled by a sidecar on its own schedule and this process only
+      // reads what is there, so a rule merged a minute ago can be absent from the render. The plan
+      // built from it is a correct plan **of the previous commit**, and nothing downstream can tell.
+      // Measured 2026-09-20 — merged 14:48:40, proposed 14:49:36, plan named the commit before it.
+      // The approval screen's diff banner said "no difference" and was telling the truth: it compares
+      // the plan against the *fleet*, never against the repository.
+      //
+      // Refused rather than waited out, because this process cannot make the sidecar pull. The wait
+      // belongs to the operator, and naming both commits is what tells them it is a wait, not a bug.
+      const fresh = await freshnessOf(source.head.sha, "measured");
+      if (fresh.state === "stale") {
+        log(
+          `plan REFUSED for ${who}: renderer at ${fresh.rendered}, repository at ${fresh.repository}`,
+          `${who}의 계획 거부: 렌더러 ${fresh.rendered}, 저장소 ${fresh.repository}`,
+        );
+        return send(res, 409, {
+          error:
+            `the renderer is at ${String(fresh.rendered).slice(0, 7)} and the repository is at ` +
+            `${fresh.repository.slice(0, 7)} — its checkout has not synced yet, so this plan would ` +
+            `carry the commit before yours. Wait for the sync and propose again.`,
+        });
+      }
+      // "Could not check" must never read as "checked and current", so it travels on the plan to the
+      // approver — they are the one being asked to agree that this is the change. It does not refuse:
+      // a repository this console cannot reach is not a reason to be unable to publish the policy
+      // already rendered in front of it.
+      const freshness = fresh.state === "unknown" ? `freshness unchecked: ${fresh.why}` : "";
+      if (freshness) log(`plan ${freshness} (${who})`, `계획 ${freshness} (${who})`);
+
       let bundle: PlanBundle;
       try {
         const site = screenSiteOf(source);
@@ -3173,7 +3292,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         // "the policy repository is unreachable" send an operator to completely different places.
         return send(res, 400, { error: `the policy did not render: ${(e as Error).message}` });
       }
-      return recordProposal(res, target.name, bundle, who);
+      return recordProposal(res, target.name, bundle, who, freshness);
     }
 
     if (req.method === "POST" && url.pathname === "/approve") {
@@ -3241,6 +3360,27 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
           error: `plan ${hash} is no longer held by this manager (it restarted, or its target VPC was ` +
             `reconfigured) — re-propose it`,
         });
+      }
+
+      // Would publishing this move anything? `republishRefusal` holds the reasoning; the short of it
+      // is that agents dedup by generation string, so re-publishing one the fleet already holds
+      // reports success and changes nothing.
+      const already = await generationOnTarget(target.name);
+      const noop = republishRefusal({
+        target: target.name,
+        generation: bundle.manifest.generation,
+        onTarget: already,
+      });
+      if (noop) {
+        release(approvals, hash);
+        log(`publish REFUSED for ${who}: ${noop}`, `${who}의 발행 거부: ${noop}`);
+        return send(res, 409, { error: noop });
+      }
+      if (already.kind === "unknown") {
+        log(
+          `publish proceeding without a fleet comparison for ${who}: ${already.why}`,
+          `${who}의 발행을 함대 대조 없이 진행: ${already.why}`,
+        );
       }
 
       let pushed;
