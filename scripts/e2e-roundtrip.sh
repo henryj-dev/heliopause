@@ -17,7 +17,15 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"
-PORT="${HELIOPAUSE_E2E_PORT:-18446}"
+
+# A drawn port rather than a named one — see the longer note in `scripts/rollback-test.sh`, which
+# had the same fixed number for the same reason. This relay binds 127.0.0.1 rather than 0.0.0.0,
+# so it is reachable only from the machine; that narrows who can collide with it but not whether
+# they can, and the other copy of this script on a shared runner is on that same machine.
+free_port() {
+  node -e 'const s=require("net").createServer();s.listen(0,"127.0.0.1",()=>{const p=s.address().port;s.close(()=>console.log(p))})'
+}
+PORT="${HELIOPAUSE_E2E_PORT:-}"
 RELAY_PID=""
 
 cleanup() {
@@ -152,19 +160,31 @@ fi
 
 # ── Relay ─────────────────────────────────────────────────────────────────────
 
-HELIOPAUSE_ARTIFACT_DIR="$WORK/artifacts" \
-HELIOPAUSE_RELAY_PORT="$PORT" \
-HELIOPAUSE_RELAY_HOST=127.0.0.1 \
-HELIOPAUSE_CERT_FILE="$WORK/pki/relay.pem" \
-HELIOPAUSE_KEY_FILE="$WORK/pki/relay.key" \
-HELIOPAUSE_CA_FILE="$WORK/pki/ca.pem" \
-HELIOPAUSE_OPERATOR_CNS=ops-alice \
-  node "$REPO/bin/heliopause-relay.ts" > "$WORK/relay.log" 2>&1 &
-RELAY_PID=$!
+# Redraw if the port was taken between the draw and the bind. Three attempts, then report the
+# relay's own reason — which is what matters whether the cause was that race or anything else.
+for attempt in 1 2 3; do
+  : > "$WORK/relay.log"
+  [ -n "$PORT" ] || PORT="$(free_port)"
+  HELIOPAUSE_ARTIFACT_DIR="$WORK/artifacts" \
+  HELIOPAUSE_RELAY_PORT="$PORT" \
+  HELIOPAUSE_RELAY_HOST=127.0.0.1 \
+  HELIOPAUSE_CERT_FILE="$WORK/pki/relay.pem" \
+  HELIOPAUSE_KEY_FILE="$WORK/pki/relay.key" \
+  HELIOPAUSE_CA_FILE="$WORK/pki/ca.pem" \
+  HELIOPAUSE_OPERATOR_CNS=ops-alice \
+    node "$REPO/bin/heliopause-relay.ts" > "$WORK/relay.log" 2>&1 &
+  RELAY_PID=$!
 
-for _ in $(seq 1 40); do
-  grep -q "listening on" "$WORK/relay.log" 2>/dev/null && break
-  sleep 0.25
+  for _ in $(seq 1 40); do
+    grep -q "listening on" "$WORK/relay.log" 2>/dev/null && break
+    sleep 0.25
+  done
+  grep -q "listening on" "$WORK/relay.log" && break
+  kill "$RELAY_PID" 2>/dev/null || true
+  RELAY_PID=""
+  # Pinned by hand means there is nothing to redraw, so report the first failure as-is.
+  [ -n "${HELIOPAUSE_E2E_PORT:-}" ] && break
+  PORT=""
 done
 if ! grep -q "listening on" "$WORK/relay.log"; then
   echo "relay failed to start:"; cat "$WORK/relay.log"; exit 1

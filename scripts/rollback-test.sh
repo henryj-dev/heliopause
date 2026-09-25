@@ -19,14 +19,51 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"
-PORT="${HELIOPAUSE_ROLLBACK_PORT:-18447}"
-IMAGE=heliopause-rollback-test
+
+# Ask the kernel for an unused port instead of naming one. `listen(0)` and read back what was
+# assigned — the same draw `src/policy-render-service.test.ts` makes.
+#
+# ⚠️ **This is about sharing a machine, not about tidiness.** The relay below runs on the *host*,
+# not in the container, and binds 0.0.0.0. A fixed number was safe only while this script was
+# guaranteed to be alone: the self-hosted runner ran one job at a time, so two of these could not
+# overlap. Once that runner has more than one instance — or once the fork and this repository both
+# point at it — two can, and the second would have died at `bind` while the first looked innocent.
+# The container name already carried `$$` for exactly this reason; the port did not.
+#
+# There is still a window between closing this socket and the relay binding it, and — unlike
+# `scripts/e2e-roundtrip.sh`, which redraws on failure — this script cannot retry. The number is
+# baked into the generation published below (`HP_PORT`), and phase 4 asserts the kernel no longer
+# holds a rule naming it, so a second draw would be checking the ruleset against a port the
+# artifact never mentioned. One draw, and a collision fails loudly at the relay instead — which,
+# against a fixed number that two concurrent runs collide on *every* time, is the whole of the
+# improvement being claimed here. It is not zero.
+#
+# The draw asks for 127.0.0.1 and the relay then binds 0.0.0.0. That is the conservative direction
+# and not an oversight: a wildcard bind conflicts with a loopback bind on the same port, so a port
+# the kernel will hand out on 127.0.0.1 is one nothing holds on 0.0.0.0 either.
+#
+# Set HELIOPAUSE_ROLLBACK_PORT to pin it.
+free_port() {
+  node -e 'const s=require("net").createServer();s.listen(0,"127.0.0.1",()=>{const p=s.address().port;s.close(()=>console.log(p))})'
+}
+PORT="${HELIOPAUSE_ROLLBACK_PORT:-$(free_port)}"
+
+# Same reason as the port, one layer up: a fixed tag is a name two concurrent runs both write.
+# Today the heredoc below is identical in this repository and in the build fork, so overwriting
+# each other's tag is harmless — but that is a coincidence with no mechanism keeping it true, and
+# the failure it would produce (a container built from the *other* branch's Dockerfile) reads as
+# a test flake rather than as what it is.
+IMAGE="heliopause-rollback-test:$$"
 RELAY_PID=""
 CONTAINER=hp-rollback-$$
 
 cleanup() {
   [ -n "$RELAY_PID" ] && kill "$RELAY_PID" 2>/dev/null || true
   docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  # The tag is per-run now, so it has to be dropped per-run or the runner accumulates one dangling
+  # tag per invocation. The layers are shared and the build below is cached, so this costs nothing
+  # on the next run.
+  docker rmi -f "$IMAGE" >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -78,7 +115,13 @@ TS
 cat >> "$WORK/site.ts" <<'TS'
 
 const which = process.env.HP_WHICH ?? "safe";
-const port = process.env.HP_PORT ?? "18447";
+// No default. This used to fall back to 18447, which was the port the caller also hardcoded — so
+// the default was never taken and never noticed. Now that the caller draws a port, a fallback
+// would be actively harmful: `??` does not catch the empty string, so an unset HP_PORT would
+// render `dport ` into the ruleset and phase 4 would then look for a port nothing denied and call
+// the rollback a success. Fail here instead, where the reason is still legible.
+const port = process.env.HP_PORT;
+if (!port) throw new Error("HP_PORT is required — the relay port is baked into this generation");
 
 const cfg = defineConfig({
   tableName: "heliopause",
@@ -166,7 +209,11 @@ publish safe
 
 # ── relay ─────────────────────────────────────────────────────────────────────
 
-say "starting relay on the host"
+say "starting relay on the host ($PORT)"
+# One attempt. The draw happened at the top of the file because the generation published above
+# names this port; by here it is already in a signed artifact and in the assertion phase 4 makes,
+# so there is nothing to redraw *into*. If the port was taken in between, the relay says so and
+# this exits — which is the honest outcome, and distinguishable from a rollback failure.
 HELIOPAUSE_ARTIFACT_DIR="$WORK/artifacts" HELIOPAUSE_RELAY_PORT="$PORT" HELIOPAUSE_RELAY_HOST=0.0.0.0 \
 HELIOPAUSE_CERT_FILE="$WORK/pki/relay.pem" HELIOPAUSE_KEY_FILE="$WORK/pki/relay.key" \
 HELIOPAUSE_CA_FILE="$WORK/pki/ca.pem" HELIOPAUSE_RELOAD_SEC=2 \
