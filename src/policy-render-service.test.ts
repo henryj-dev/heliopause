@@ -382,6 +382,44 @@ describe("the renderer serves every site it was given", () => {
     }
   });
 
+  it("labels each site with its own name, not the one the process was given", async () => {
+    // `HELIOPAUSE_POLICY_LABEL` is one value for the process and the console prints it as "which
+    // site this is". Left alone, picking `beta` would draw a page headed with alpha's label — a
+    // screen reporting the opposite of what it drew, which is the shape of the incident this whole
+    // change exists to stop. stardust caught this in the deployment manifest before it shipped: the
+    // live value there names a module (`heliopause-deploy/dev.ts`), so all three sites would have
+    // claimed to be dev.
+    const { dir, sites } = twoSites();
+    let started: Started | undefined;
+    try {
+      started = await start(dir, { ...MULTI(sites), HELIOPAUSE_POLICY_LABEL: "checkout/alpha.ts" });
+      const a = parsePolicySource(await (await fetchAt(started.port, "/source?site=alpha")).json());
+      const b = parsePolicySource(await (await fetchAt(started.port, "/source?site=beta")).json());
+      assert.equal(a.label, "alpha");
+      assert.equal(b.label, "beta", "beta was drawn under the label the process was started with");
+      const listed = (await (await fetchAt(started.port, "/sites")).json()) as { sites?: { label: string }[] };
+      assert.deepEqual(listed.sites?.map((s) => s.label), ["alpha", "beta"]);
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the given label when there is one unnamed site", async () => {
+    // The single-site deployment is unchanged: nothing named it, so the operator's label is the
+    // only thing that can describe it and replacing that with "policy" would lose information.
+    const dir = checkout();
+    let started: Started | undefined;
+    try {
+      started = await start(dir);
+      const got = parsePolicySource(await (await fetchSource(started.port)).json());
+      assert.equal(got.label, "test-site");
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
   it("lists what it holds, behind the same bearer as the policy itself", async () => {
     const { dir, sites } = twoSites();
     let started: Started | undefined;

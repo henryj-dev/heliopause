@@ -278,7 +278,15 @@ async function currentSource(site: { name: string | null; path: string }): Promi
   const wrongZone = name === null ? null : zoneMismatch({ target: name, hostIds: hostIdsOf(mod.site) });
   if (wrongZone) throw new ZoneMismatchError(wrongZone);
   const source = collectPolicySource({
-    site: mod.site, sitePath, label, allowPaths,
+    site: mod.site, sitePath, allowPaths,
+    // ## The label follows the site once there is more than one
+    //
+    // `HELIOPAUSE_POLICY_LABEL` is one value for the process, and the console prints it as "which
+    // site this is". With several sites that makes every screen say the same thing — pick
+    // `prod-icn-vtr` and the header still reads the label somebody wrote for dev, which is the
+    // shape of the incident this whole change exists to stop: a page reporting the opposite of
+    // what it drew. A named site knows its own name, so it uses it.
+    label: name ?? label,
     ...(name === null ? {} : { siteName: name }),
   });
   cached.set(sitePath, { stamp, source });
@@ -319,7 +327,7 @@ const server = createServer((req, res) => {
   // fleet's zone names, which is the same class of information the payload carries.
   if (req.method === "GET" && url.pathname === "/sites") {
     if (!bearerOk(req.headers.authorization)) return send(401, { error: "bad or missing bearer" });
-    return send(200, { sites: sites.map((s) => ({ name: s.name, label })) });
+    return send(200, { sites: sites.map((s) => ({ name: s.name, label: s.name ?? label })) });
   }
 
   if (req.method === "GET" && url.pathname === "/source") {

@@ -12,6 +12,7 @@ bug ("the validator can be talked past") is what matters, not the specific synta
 import atexit
 import base64
 import hashlib
+import ast
 import json
 import os
 import pathlib
@@ -21,6 +22,7 @@ import sys
 import tempfile
 import time
 import unittest
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault("HELIOPAUSE_RELAY_URL", "https://unused.invalid")
@@ -660,6 +662,60 @@ class TestRestartWhilePending(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(state, "pending")
         self.assertTrue(seen["pending"])
+
+    def test_confirming_promotes_the_authorization_this_host_is_enforcing(self):
+        # ## The one test the old ones could not be
+        #
+        # `currentAuthorization` was read in three places and assigned in none, and the test that
+        # covered the expiry escape set it **by hand** — so it passed against a state the program
+        # could not produce, for as long as the field was dead. Its comment even described the
+        # outcome ("a fleet reverting on a clock, not on a decision"), which is what a gateway did
+        # on 2026-09-28 with no ruleset and no way back.
+        #
+        # So this one never touches the field. It drives a real apply and a real confirm and then
+        # asks what the state says. A `currentAuthorization` that is still `None` here is the defect,
+        # and nothing about how this test is written can hide it.
+        hp.save_state({**hp._EMPTY_STATE, "pendingAuthorization": {
+            "authorizedAt": "2026-08-15T00:05:00.000Z",
+            "payloadHash": "sha256:" + "a" * 64,
+            "keyId": "sha256:" + "b" * 64,
+            "authorizationMode": "two-person",
+            "generation": "g-promote",
+        }})
+        real_snapshot = hp.snapshot
+        snapshots = iter((([], [], ""), ([{"table": TABLE}], [], "")))
+        hp.snapshot = lambda: next(snapshots)
+        hp._nft_apply_json = lambda _doc: (0, "")
+        with hp._host_observe_lock:
+            hp._host_observe_value = {
+                "observed": "sha256:" + "0" * 64,
+                "detail": "", "foreignFilters": [], "publishedPorts": [],
+            }
+            hp._host_observe_at = time.monotonic()
+        try:
+            ok, _, _ = hp.apply_artifact({
+                "generation": "g-promote", "ruleset": VALID,
+                "rulesetHash": VALID_HASH,
+                "confirmTimeoutSec": hp.NFT_CONFIRM_MIN_SEC,
+            })
+            self.assertTrue(ok)
+            pending = hp.load_state()
+            # The known negative: before confirmation this host is not yet enforcing anything, and
+            # saying otherwise would make the assertion below pass on a promotion that happened at
+            # the wrong moment.
+            self.assertIsNone(pending["currentAuthorization"])
+            self.assertTrue(hp.confirm(pending))
+        finally:
+            hp.snapshot = real_snapshot
+        settled = hp.load_state()
+        self.assertEqual(settled["state"], "confirmed")
+        self.assertEqual(
+            settled["currentAuthorization"], settled["pendingAuthorization"],
+            "confirming did not promote the authorization — the expiry escape, the break-glass "
+            "alarm and the key-rotation check all read this field and all of them stay dead",
+        )
+        # Durably, not only in the returned copy: the reboot this exists for reads it from disk.
+        self.assertEqual(settled["currentAuthorization"]["generation"], "g-promote")
 
     def test_post_apply_hash_does_not_reuse_the_previous_generation_cache(self):
         real_snapshot = hp.snapshot
@@ -3961,6 +4017,122 @@ class TestRelayRequestDeadline(unittest.TestCase):
         )
 
 
+class TestStateSchemaHasBothHalves(unittest.TestCase):
+    """Every key in `_EMPTY_STATE` is written somewhere and read somewhere.
+
+    🔴 **This is the check that would have found the defect this file's other new tests describe.**
+    `currentAuthorization` was declared, initialised, and read in three places for months, and
+    assigned in none. Nothing failed: the key existed, reads returned `None`, and `None` raises
+    nothing. The behavioural tests could not see it either — the one covering the expiry escape set
+    the field by hand, so it passed against a state the program could not produce.
+
+    What makes a write-never field findable is not another assertion about behaviour. It is asking
+    the schema whether each half of each key exists at all.
+
+    ## Read the source with `ast`, not a regex
+
+    `policy-render-service.test.ts` records why: a source-level regex check there was defeated by the
+    *declaration text of the function it was checking for*, and only running the real process caught
+    it. A regex over `st["k"] = ` has the same weakness — a string in a comment or a docstring
+    counts. `ast` sees assignments and loads, and it cannot be talked into either by prose.
+
+    ## Deliberately coarse
+
+    Any subscript assignment with a constant key counts as a write, whatever dict it was on. So a key
+    that is only ever written to some *other* mapping would slip through. Narrowing it to
+    `st`/`fresh` by variable name would be a check that depends on what the locals happen to be
+    called, which drifts. Coarse-and-honest catches the shape that has actually occurred here — a key
+    with no assignment anywhere in the file — and says so in its own docstring rather than implying
+    more.
+    """
+
+    def _halves(self):
+        tree = ast.parse(Path(hp.__file__).read_text())
+        keys = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "_EMPTY_STATE" for t in node.targets
+            ):
+                keys = [k.value for k in node.value.keys]
+        self.assertIsNotNone(keys, "_EMPTY_STATE is not a literal dict any more — this check is blind")
+        written, read = set(), set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Subscript) and isinstance(t.slice, ast.Constant):
+                        written.add(t.slice.value)
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in {"get", "pop", "setdefault"}
+                    and node.args and isinstance(node.args[0], ast.Constant)):
+                read.add(node.args[0].value)
+                if node.func.attr in {"pop", "setdefault"}:
+                    written.add(node.args[0].value)
+            if (isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Load)
+                    and isinstance(node.slice, ast.Constant)):
+                read.add(node.slice.value)
+        return keys, written, read
+
+    def test_every_state_key_is_both_written_and_read(self):
+        keys, written, read = self._halves()
+        never_written = [k for k in keys if k not in written]
+        never_read = [k for k in keys if k not in read]
+        self.assertEqual(
+            never_written, [],
+            f"state keys that nothing assigns — they will read as None forever: {never_written}",
+        )
+        self.assertEqual(
+            never_read, [],
+            f"state keys that nothing consumes — written and never used: {never_read}",
+        )
+
+    def test_the_check_can_see_a_key_at_all(self):
+        # The known positive. Without it the assertions above are satisfied by a parser that found
+        # no keys, or that put every identifier in both sets — and either would be a check that
+        # cannot fail, which is the thing it exists to prevent.
+        keys, written, read = self._halves()
+        self.assertGreater(len(keys), 10, "the schema was not parsed")
+        self.assertIn("currentAuthorization", keys)
+        self.assertNotIn("thisKeyDoesNotExist", written)
+        self.assertNotIn("thisKeyDoesNotExist", read)
+
+
+class TestAuthorizationRefusalIsRecorded(unittest.TestCase):
+    """A refusal that only reaches the log is a refusal nobody acts on.
+
+    🔴 Two refusal branches sit ten lines apart in `handle_reply`. The envelope one records; the
+    authorization one did not. On 2026-09-28 a gateway took the second roughly every sixteen seconds
+    for over two hours **with no ruleset loaded**, and the fleet view stayed clean the whole time
+    because `lastRefusal` was `None` and `relay.ts` had nothing to surface.
+
+    The heartbeat is the only thing that leaves a host whose firewall is absent.
+    """
+
+    def setUp(self):
+        hp.save_state(dict(hp._EMPTY_STATE))
+
+    def test_an_authorization_refusal_reaches_the_heartbeat(self):
+        real_fetch = hp.fetch_artifact
+        real_accept = hp.accept_artifact_authorization
+        hp.fetch_artifact = lambda: {"generation": "g-refused", "ruleset": VALID,
+                                     "rulesetHash": VALID_HASH,
+                                     "confirmTimeoutSec": hp.NFT_CONFIRM_MIN_SEC}
+        hp.accept_artifact_authorization = lambda record, watch, expired: (
+            None, "signed artifact authorization has expired",
+        )
+        try:
+            hp.handle_reply(hp.load_state(), {"schemaVersion": hp.SCHEMA_VERSION,
+                                              "generation": "g-refused", "gate": {"open": True}})
+        finally:
+            hp.fetch_artifact, hp.accept_artifact_authorization = real_fetch, real_accept
+
+        st = hp.load_state()
+        self.assertIsNotNone(st["lastRefusal"], "the refusal that stranded a gateway was not recorded")
+        self.assertEqual(st["lastRefusal"]["generation"], "g-refused")
+        self.assertIn("expired", st["lastRefusal"]["reason"])
+        # And nothing was applied on the way past — the refusal is a refusal, not a warning.
+        self.assertEqual(st["state"], "none")
+
+
 class TestReplayWatermark(unittest.TestCase):
     """`accept_artifact_authorization` — the durable state that stops an authorization being reused.
 
@@ -4023,6 +4195,38 @@ class TestReplayWatermark(unittest.TestCase):
         # says it is — and taking either would make which one applied depend on arrival order.
         _REAL_ACCEPT_AUTHORIZATION(self.record(), {}, False)
         fresh, err = _REAL_ACCEPT_AUTHORIZATION(self.record(generation="gen-other"), {}, False)
+        self.assertIsNone(fresh)
+        self.assertIn("share one authorization timestamp", err)
+
+    def test_accepts_a_record_that_gained_a_descriptive_field_since_the_watermark(self):
+        # ## The upgrade, which whole-record equality would have refused
+        #
+        # `expiresAt` was added to the record after these watermarks were already on disk. With the
+        # comparison written as `record != prior`, the first host to run the new build would build a
+        # ten-key record, compare it against its own nine-key watermark for the *same* artifact, and
+        # refuse it as a replay — "different signed artifacts share one authorization timestamp", on
+        # every upgraded host at once, for a field that describes the authorization.
+        #
+        # So the prior here is written the way the old build wrote it: without the field.
+        old_shape = {k: v for k, v in self.record().items() if k != "expiresAt"}
+        hp.save_state({**hp._EMPTY_STATE, "authorizationWatermark": old_shape})
+        fresh, err = _REAL_ACCEPT_AUTHORIZATION(
+            self.record(expiresAt="2026-08-16T00:05:00.000Z"), {}, False,
+        )
+        self.assertEqual(err, "", "an upgraded host refused its own authorization as a replay")
+        self.assertIsNotNone(fresh)
+
+    def test_still_refuses_a_different_artifact_when_only_the_new_field_is_ignored(self):
+        # The narrowing has to stop at the one field. An earlier attempt at this listed the fields
+        # that identify an authorization instead of the one that does not, left `generation` out,
+        # and made two records claiming one signed payload for two generations compare equal. The
+        # test above went green and this one would have caught it — so it is here rather than left
+        # to the older case, which varies `generation` against a prior of the *current* shape.
+        old_shape = {k: v for k, v in self.record().items() if k != "expiresAt"}
+        hp.save_state({**hp._EMPTY_STATE, "authorizationWatermark": old_shape})
+        fresh, err = _REAL_ACCEPT_AUTHORIZATION(
+            self.record(expiresAt="2026-08-16T00:05:00.000Z", generation="gen-other"), {}, False,
+        )
         self.assertIsNone(fresh)
         self.assertIn("share one authorization timestamp", err)
 
