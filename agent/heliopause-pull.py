@@ -2350,6 +2350,33 @@ def confirm(state):
         def mutate(fresh):
             fresh["state"] = "confirmed"
             fresh["detail"] = None
+            # ## The promotion that was never written
+            #
+            # `pendingAuthorization` and `currentAuthorization` are a two-phase pair: the first is
+            # recorded before the kernel is touched, the second is what this host is *enforcing*.
+            # The second half was never implemented. `currentAuthorization` was initialised to
+            # `None`, read in three places, and assigned in none — measured 2026-09-28, on every
+            # host in the fleet.
+            #
+            # Four things were dead because of it, and none of them failed loudly:
+            #
+            #   1. `accept_artifact_authorization` lets an expired authorization stand when it is
+            #      the one already confirmed. That comparison is `current == record`, so it was
+            #      `None == dict` — always false. **An expired authorization could never be
+            #      re-applied by any host**, which is how `gw-01.prod-icn-vtr` came back from a
+            #      reboot with no ruleset and could not restore itself.
+            #   2. Every `artifactTrust.current*` field the heartbeat carries was null.
+            #   3. The relay's break-glass alarm reads `currentAuthorizationMode`, and its own
+            #      comment calls it "the one sentence in the system that can say a break-glass is
+            #      still on". It could never say it.
+            #   4. `fleetView` reads exactly two things from that block, and the other one is
+            #      "did a key rotation reach every host?" — without it, "the new signing key is
+            #      deployed" is an assumption about a file rather than an observation of the fleet.
+            #
+            # This is the line. The test for it runs a real apply and confirm rather than building
+            # the state by hand — the existing test did the latter, passed, and described a state
+            # the program could not produce.
+            fresh["currentAuthorization"] = fresh.get("pendingAuthorization")
             _clear_commitment(fresh)
 
         fresh, saved = update_state(mutate)
@@ -4039,6 +4066,18 @@ def verify_artifact_envelope(envelope, now=None):
     }
     record = {
         "authorizedAt": payload["authorizedAt"],
+        # ## Carried, not compressed to a boolean
+        #
+        # The signed payload has always had this, and this function has always read it — into
+        # `expires`, used once for the `expires <= current` below and then dropped. So every host
+        # held the moment its authorization lapses and could not say when that was.
+        #
+        # Nothing here can warn about it yet: `artifact_trust_report` does not carry it to the
+        # relay, and adding a heartbeat field is a wire change with an approval-path consequence.
+        # But the state file is read directly by an operator's script, and a copy of
+        # `MAX_MANAGER_AUTHORIZATION_LIFETIME_MS` in that script is a constant that goes silently
+        # wrong the day this one moves. This is the field that lets it read the issued value.
+        "expiresAt": payload["expiresAt"],
         "payloadHash": "sha256:" + hashlib.sha256(payload_bytes).hexdigest(),
         "keyId": key_id,
         "authorizationMode": mode,
@@ -4051,6 +4090,35 @@ def verify_artifact_envelope(envelope, now=None):
     return artifact, record, watch, expires <= current
 
 
+# Fields that describe an authorization without distinguishing it from another one.
+#
+# `expiresAt` is derived from the same signed payload as everything else here, so it cannot differ
+# between two records that agree on the rest — carrying it in the comparison would only make the
+# record's *shape* part of its identity.
+_AUTHORIZATION_DESCRIPTIVE_FIELDS = frozenset({"expiresAt"})
+
+
+def _authorization_identity(record):
+    """What makes two authorization records the same authorization.
+
+    ## An exclusion list, not an enumeration, and that direction is the point
+
+    This was `==` on the whole record, which made the record's shape part of its identity: a host
+    that upgraded built a ten-key record, compared it against the nine-key one on disk, found them
+    unequal, and refused a re-fetch of the generation it was already enforcing as `different signed
+    artifacts share one authorization timestamp` — a replay refusal on every upgraded host, for a
+    field that describes the authorization rather than changes it.
+
+    The first attempt at this listed the fields that *do* identify one. That is the wrong direction,
+    and a test said so within the minute: it named `payloadHash`, `keyId` and `authorizationMode`
+    and left out `generation`, so two records claiming one signed payload for two different
+    generations compared equal. Written as an exclusion, a field added later joins the comparison by
+    default — refusing rather than accepting is the safe way to be wrong here, and anything
+    deliberately outside it has to be named above with a reason.
+    """
+    return {k: v for k, v in record.items() if k not in _AUTHORIZATION_DESCRIPTIVE_FIELDS}
+
+
 def accept_artifact_authorization(record, watch, expired):
     """Durably advance replay state before any nft/kubectl commitment or side effect."""
     result = {"error": None}
@@ -4061,12 +4129,16 @@ def accept_artifact_authorization(record, watch, expired):
             if record["authorizedAt"] < prior.get("authorizedAt", ""):
                 result["error"] = "signed artifact is older than the durable authorization watermark"
                 return
-            if record["authorizedAt"] == prior.get("authorizedAt") and record != prior:
+            if (
+                record["authorizedAt"] == prior.get("authorizedAt")
+                and _authorization_identity(record) != _authorization_identity(prior)
+            ):
                 result["error"] = "different signed artifacts share one authorization timestamp"
                 return
         current = st.get("currentAuthorization")
         if expired and not (
-            current == record
+            isinstance(current, dict)
+            and _authorization_identity(current) == _authorization_identity(record)
             and st.get("generation") == record["generation"]
             and st.get("state") == "confirmed"
         ):
@@ -4815,6 +4887,16 @@ def handle_reply(st, reply):
     accepted, accept_error = accept_artifact_authorization(record, watch, expired)
     if accepted is None:
         log(f"refusing authorization for generation {wanted}: {accept_error}")
+        # ## Recorded, not only logged
+        #
+        # Its sibling ten lines above records the refusal and this branch did not, so the one that
+        # actually fired went nowhere a person looks. On 2026-09-28 a gateway refused here roughly
+        # every sixteen seconds for over two hours with no ruleset loaded, and the fleet view stayed
+        # clean the whole time — `lastRefusal` was `None`, so `relay.ts` had nothing to surface.
+        #
+        # The heartbeat is the only thing that leaves a host whose firewall is absent. A refusal
+        # that does not reach it is a refusal nobody can act on.
+        _record_refusal(wanted, accept_error)
         return
 
     # Validate the host half without touching the kernel, then apply the workload half first. A
