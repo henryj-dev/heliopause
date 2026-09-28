@@ -108,6 +108,7 @@ import {
 } from "./host-deregistration-policy-worker.ts";
 import { siteView, type RelaySource, type RelayResult, type SiteView } from "./manager.ts";
 import { bundleFromPlan, planHash, validateBundle, type PlanBundle } from "./bundle.ts";
+import { zoneMismatch } from "./site-zone.ts";
 import { diffRulesets } from "./ruleset-diff.ts";
 import {
   AuthorizationTimestampIssuer,
@@ -3127,6 +3128,29 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
        */
       freshness = "",
     ) => {
+      // ## Is this bundle even this VPC's?
+      //
+      // Both callers name a target and hand over hosts, and until 2026-09-28 nothing compared the
+      // two. The console renders from a policy service pinned to one site while its target selector
+      // offers every relay, so picking `prod-icn-vtr` proposed dev's six hosts under prod's name;
+      // the CLI takes `<site-module>` and `<vpc-name>` as two independent arguments and has the same
+      // hole. Three publishes went out that way. No host applied another VPC's rules — the agent
+      // checks `payload.host` against its own id — but the two hosts that should have received a
+      // generation received nothing, while every screen said one had been published for them.
+      //
+      // Checked here rather than in the two callers for the reason the docblock above already gives
+      // about the hash and the sweep: a second copy is a copy that drifts. Checked over both the
+      // manifest and the rendered rulesets because `POST /plan` accepts a bundle it did not render,
+      // so the two lists are not guaranteed to agree with each other.
+      const proposedHosts = [...new Set([...Object.keys(bundle.manifest.hosts), ...Object.keys(bundle.rulesets)])];
+      const wrongZone = zoneMismatch({ target: targetName, hostIds: proposedHosts });
+      if (wrongZone) {
+        log(
+          `plan REFUSED for ${by}: ${wrongZone}`,
+          `${by}의 계획 거부: ${targetName} 의 계획인데 호스트가 다른 존을 가리킵니다`,
+        );
+        return send(response, 409, { error: wrongZone });
+      }
       // Computed here, from the bytes that arrived. Never taken from the request — a submitted hash
       // would be the proposer's claim about content the approver never sees, and then the approval
       // check is decorative.

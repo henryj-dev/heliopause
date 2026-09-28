@@ -1960,6 +1960,14 @@ describe("the console can propose a plan, which is the step it could not take", 
    * rather than a banner that was never given anything to disagree with.
    */
   let rendererBuild: "same" | "different" | "absent" = "same";
+  /**
+   * The rendered site's one host id.
+   *
+   * `h1` carries no zone label, which is the ordinary case here and the case the zone rule lets
+   * through untouched (`site-zone.ts`). A test that wants the rule to bite sets this to an id that
+   * names a VPC, and the relay in this harness is `dev`.
+   */
+  let fixtureHost = "h1";
 
   const fixture = () => ({
     // ## The baseline is not decoration in this fixture
@@ -1979,12 +1987,12 @@ describe("the console can propose a plan, which is the step it could not take", 
       baseline: [{ desc: "management SSH", proto: "tcp" as const, ports: "22", srcCidrs: [] }],
     },
     hosts: [{
-      id: "h1",
+      id: fixtureHost,
       stage: "canary" as const,
       items: [{
         policy: {
           id: "P1", name: "n", src: { kind: "cidr", value: "198.51.100.0/24" },
-          dst: { kind: "host", value: "h1" }, proto: "tcp", ports: "22",
+          dst: { kind: "host", value: fixtureHost }, proto: "tcp", ports: "22",
           action: "allow", denyMode: "drop", priority: 100, enabled: true,
         },
         srcCidrs: ["198.51.100.0/24"],
@@ -2035,6 +2043,19 @@ describe("the console can propose a plan, which is the step it could not take", 
     });
     r.on("error", reject);
     r.end(JSON.stringify({ target }));
+  });
+
+  /** The pending plans, so a refusal can be checked for having recorded nothing. */
+  const getPlans = () => new Promise<{ status: number; body: string }>((resolve, reject) => {
+    const r = request({
+      host: "127.0.0.1", port: port7, path: "/plans", method: "GET",
+      rejectUnauthorized: false,
+      cert: readFileSync(join(dir, "ops.pem")), key: readFileSync(join(dir, "ops.key")),
+    }, (res) => {
+      let body = ""; res.on("data", (c) => { body += c; });
+      res.on("end", () => resolve({ status: res.statusCode ?? 0, body }));
+    });
+    r.on("error", reject); r.end();
   });
 
   const read = (hash: string, host: string) => new Promise<{ status: number; body: string }>((resolve, reject) => {
@@ -2350,6 +2371,53 @@ describe("the console can propose a plan, which is the step it could not take", 
     const r = await propose("not-a-vpc");
     assert.equal(r.status, 400);
     assert.match(r.body, /unknown target/);
+  });
+
+  it("refuses a render whose hosts belong to another VPC", async () => {
+    // ## 2026-09-28, exactly
+    //
+    // The renderer serves one site, pinned at startup; the target selector offers every relay.
+    // Picking `prod-icn-vtr` got dev's six hosts rendered and proposed under prod's name, and the
+    // same happened for util. Nothing here compared the two, so all three publishes were recorded
+    // and signed. The agents refused them — each checks `payload.host` against its own id — so no
+    // host applied another VPC's firewall, but the two gateways that needed a generation received
+    // nothing while the console reported one published for them. One of them was answering SSH on a
+    // public address with an empty ruleset at the time.
+    //
+    // A stub renderer can be told to serve the wrong site in one line, which is the whole distance
+    // between this test and the incident.
+    head = { sha: "abc1234", dirty: false };
+    const before = JSON.parse((await getPlans()).body).plans.length as number;
+    fixtureHost = "gw-01.prod-icn-vtr";
+    try {
+      const r = await propose("dev");
+      assert.equal(r.status, 409, r.body);
+      assert.match(r.body, /this plan is for dev/, "the refusal does not name the VPC it was for");
+      assert.match(r.body, /gw-01\.prod-icn-vtr/, "the refusal does not name the host that gave it away");
+      // Refused means nothing was recorded. A plan left behind here is approvable, and what it would
+      // publish is one VPC's policy under another's signature.
+      assert.equal(
+        JSON.parse((await getPlans()).body).plans.length, before,
+        "a refused proposal left a plan behind",
+      );
+    } finally {
+      fixtureHost = "h1";
+    }
+  });
+
+  it("proposes normally for a site whose hosts do name this VPC", async () => {
+    // The known positive for the test above. Without it, the refusal is equally satisfied by a
+    // manager that refuses every labelled site — which would be a publish outage for the real fleet,
+    // whose host ids all carry their zone.
+    head = { sha: "abc1234", dirty: false };
+    fixtureHost = "gw-01.dev";
+    try {
+      const r = await propose("dev");
+      assert.equal(r.status, 200, r.body);
+      assert.equal(JSON.parse(r.body).generation, "abc1234");
+    } finally {
+      fixtureHost = "h1";
+    }
   });
 });
 
