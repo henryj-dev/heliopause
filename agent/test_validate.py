@@ -12,6 +12,7 @@ bug ("the validator can be talked past") is what matters, not the specific synta
 import atexit
 import base64
 import hashlib
+import ast
 import json
 import os
 import pathlib
@@ -21,6 +22,7 @@ import sys
 import tempfile
 import time
 import unittest
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault("HELIOPAUSE_RELAY_URL", "https://unused.invalid")
@@ -4013,6 +4015,85 @@ class TestRelayRequestDeadline(unittest.TestCase):
             "resp.read(MAX_ARTIFACT_BYTES)", body,
             "one unbounded read is the defect — the body is read in pieces",
         )
+
+
+class TestStateSchemaHasBothHalves(unittest.TestCase):
+    """Every key in `_EMPTY_STATE` is written somewhere and read somewhere.
+
+    🔴 **This is the check that would have found the defect this file's other new tests describe.**
+    `currentAuthorization` was declared, initialised, and read in three places for months, and
+    assigned in none. Nothing failed: the key existed, reads returned `None`, and `None` raises
+    nothing. The behavioural tests could not see it either — the one covering the expiry escape set
+    the field by hand, so it passed against a state the program could not produce.
+
+    What makes a write-never field findable is not another assertion about behaviour. It is asking
+    the schema whether each half of each key exists at all.
+
+    ## Read the source with `ast`, not a regex
+
+    `policy-render-service.test.ts` records why: a source-level regex check there was defeated by the
+    *declaration text of the function it was checking for*, and only running the real process caught
+    it. A regex over `st["k"] = ` has the same weakness — a string in a comment or a docstring
+    counts. `ast` sees assignments and loads, and it cannot be talked into either by prose.
+
+    ## Deliberately coarse
+
+    Any subscript assignment with a constant key counts as a write, whatever dict it was on. So a key
+    that is only ever written to some *other* mapping would slip through. Narrowing it to
+    `st`/`fresh` by variable name would be a check that depends on what the locals happen to be
+    called, which drifts. Coarse-and-honest catches the shape that has actually occurred here — a key
+    with no assignment anywhere in the file — and says so in its own docstring rather than implying
+    more.
+    """
+
+    def _halves(self):
+        tree = ast.parse(Path(hp.__file__).read_text())
+        keys = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "_EMPTY_STATE" for t in node.targets
+            ):
+                keys = [k.value for k in node.value.keys]
+        self.assertIsNotNone(keys, "_EMPTY_STATE is not a literal dict any more — this check is blind")
+        written, read = set(), set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Subscript) and isinstance(t.slice, ast.Constant):
+                        written.add(t.slice.value)
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in {"get", "pop", "setdefault"}
+                    and node.args and isinstance(node.args[0], ast.Constant)):
+                read.add(node.args[0].value)
+                if node.func.attr in {"pop", "setdefault"}:
+                    written.add(node.args[0].value)
+            if (isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Load)
+                    and isinstance(node.slice, ast.Constant)):
+                read.add(node.slice.value)
+        return keys, written, read
+
+    def test_every_state_key_is_both_written_and_read(self):
+        keys, written, read = self._halves()
+        never_written = [k for k in keys if k not in written]
+        never_read = [k for k in keys if k not in read]
+        self.assertEqual(
+            never_written, [],
+            f"state keys that nothing assigns — they will read as None forever: {never_written}",
+        )
+        self.assertEqual(
+            never_read, [],
+            f"state keys that nothing consumes — written and never used: {never_read}",
+        )
+
+    def test_the_check_can_see_a_key_at_all(self):
+        # The known positive. Without it the assertions above are satisfied by a parser that found
+        # no keys, or that put every identifier in both sets — and either would be a check that
+        # cannot fail, which is the thing it exists to prevent.
+        keys, written, read = self._halves()
+        self.assertGreater(len(keys), 10, "the schema was not parsed")
+        self.assertIn("currentAuthorization", keys)
+        self.assertNotIn("thisKeyDoesNotExist", written)
+        self.assertNotIn("thisKeyDoesNotExist", read)
 
 
 class TestAuthorizationRefusalIsRecorded(unittest.TestCase):
