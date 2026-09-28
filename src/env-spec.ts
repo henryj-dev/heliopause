@@ -211,6 +211,68 @@ export function parseRelays(spec: string): RelaySpec[] {
   return out;
 }
 
+/** One site module the renderer serves, and the zone name it serves it under. */
+export interface PolicySiteSpec {
+  name: string;
+  path: string;
+}
+
+/**
+ * `HELIOPAUSE_POLICY_SITES` — `dev-icn-vtr=./dev.ts,prod-icn-vtr=./prod.ts` — for the renderer.
+ *
+ * ## Why neither neighbour was reused
+ *
+ * Not `parsePairs`: its whole refusal design is "position only, never quote the entry", because one
+ * of its callers holds shared OTP secrets. Site names and module paths are configuration, and
+ * "entry 2 is malformed" is useless to an operator who has mistyped a filename — here the name is
+ * the only thing that makes the message actionable.
+ *
+ * Not `parseRelays`: that is three positional fields split on `=`, and a path may legitimately
+ * contain one. This splits on the *first* `=` only.
+ *
+ * ## The duplicate-path refusal is the point of this function
+ *
+ * Two names pointing at one module is the 2026-09-28 incident written as configuration — the
+ * renderer would answer `prod-icn-vtr` with whatever that module holds, and everything downstream
+ * would agree with it. It costs one line to catch here, before anything is served.
+ *
+ * The name is compared against a relay name and ends up in a signed artifact's `target`, so it is
+ * held to the same shape `artifact-signature.ts` holds that field to. A name this parser accepts
+ * and the signer later refuses would fail at publish time, which is several hours too late.
+ */
+export function parsePolicySites(spec: string): PolicySiteSpec[] {
+  const SAFE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+  const out: PolicySiteSpec[] = [];
+  for (const entry of spec.split(",").map((s) => s.trim()).filter(Boolean)) {
+    const eq = entry.indexOf("=");
+    if (eq <= 0 || eq === entry.length - 1) {
+      throw new EnvSpecError(`malformed policy site entry ${JSON.stringify(entry)} — expected name=path`);
+    }
+    const name = entry.slice(0, eq).trim();
+    const path = entry.slice(eq + 1).trim();
+    if (!SAFE_NAME.test(name) || name.length > 128) {
+      throw new EnvSpecError(
+        `policy site name ${JSON.stringify(name)} is overlong or contains characters a signed target may not`,
+      );
+    }
+    if (out.some((s) => s.name === name)) {
+      throw new EnvSpecError(`policy site ${JSON.stringify(name)} is named twice — each zone name must be unique`);
+    }
+    const sharing = out.find((s) => s.path === path);
+    if (sharing) {
+      throw new EnvSpecError(
+        `policy sites ${JSON.stringify(sharing.name)} and ${JSON.stringify(name)} both name ${JSON.stringify(path)}` +
+          ` — a zone is one module, and serving one VPC's policy under another's name is the failure this names`,
+      );
+    }
+    out.push({ name, path });
+  }
+  if (out.length === 0) {
+    throw new EnvSpecError("HELIOPAUSE_POLICY_SITES is empty — there is no policy to serve");
+  }
+  return out;
+}
+
 /**
  * `a=1,b=2` into a map, refusing anything malformed.
  *

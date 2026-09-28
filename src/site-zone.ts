@@ -27,6 +27,18 @@
 // reason it can afford to be lenient in the one case below.
 
 /**
+ * Thrown where a zone mismatch has to be told apart from any other failure.
+ *
+ * The renderer needs that distinction and cannot get it from the message: a wrong name is fatal
+ * (somebody must edit the Deployment) while a module that fails to import is not (a later commit
+ * fixes it). Matching on message text would make the difference depend on wording, which is the kind
+ * of coupling that goes wrong the first time somebody improves a sentence.
+ */
+export class ZoneMismatchError extends Error {
+  override readonly name = "ZoneMismatchError";
+}
+
+/**
  * The text after the last dot, or null when there is none.
  *
  * `gw-01.prod-icn-vtr` → `prod-icn-vtr`. `h1` → null.
