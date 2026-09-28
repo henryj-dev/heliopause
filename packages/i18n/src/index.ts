@@ -664,6 +664,14 @@ export const MESSAGES = {
     en: "△ the renderer did not name its build — it may be an older image than this manager.",
     ko: "△ 렌더러가 자기 빌드를 말하지 않았다 — 이 매니저보다 오래된 이미지일 수 있다.",
   },
+  "m.agentBuildSplit": {
+    en: "{n} different agent builds across {hosts} hosts — a rollout reached some of them and not the rest. the agent is not in the manager image; it is rolled per host.",
+    ko: "{hosts}대에 에이전트 빌드가 {n}종이다 — 롤아웃이 일부에만 닿았다. 에이전트는 매니저 이미지에 없고 호스트마다 따로 굴린다.",
+  },
+  "m.agentBuildSilent": {
+    en: "{n} host(s) do not report which agent build they run — older than the field, or not reporting at all.",
+    ko: "{n}대가 어느 에이전트 빌드인지 말하지 않는다 — 그 필드보다 오래됐거나, 아예 보고를 안 하거나.",
+  },
   "m.policyForVpc": {
     en: "policy for",
     ko: "정책 대상 VPC",

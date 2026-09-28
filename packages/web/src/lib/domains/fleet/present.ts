@@ -113,6 +113,34 @@ export function fleetSummary(site: SiteView): { problems: number; generations: s
   };
 }
 
+/**
+ * How many distinct agent builds the fleet is running, and how many hosts could not say.
+ *
+ * ## Why the split matters rather than the digest
+ *
+ * `agentBuild` is the agent's own source hashed by itself, added 2026-09-03 for a case a version
+ * string cannot see: code changing without `AGENT_VERSION` moving, because nothing an agent and a
+ * relay must agree on changed. It has travelled from the host through the relay to the manager ever
+ * since. **Nothing drew it.**
+ *
+ * What that cost, measured 2026-09-29: a fix was merged, an image rolled, and eight hosts kept
+ * running a three-week-old agent — the image carries `src/` and `bin/`, and the agent lives in
+ * `agent/`. Every screen was green. The value that would have said so was one step away the whole
+ * time.
+ *
+ * A digest in a column would not have helped either; nobody compares sixteen hex characters across
+ * eight rows. **The finding is the disagreement**: one build across the fleet is a rollout that
+ * landed, two is a rollout that is partway, and that is a sentence rather than a value.
+ *
+ * `unknown` counts hosts that reported nothing — either older than the field or not reporting at
+ * all. Kept apart from the builds because "did not say" is not a third version.
+ */
+export function agentBuildSplit(hosts: readonly SiteHost[]): { builds: string[]; unknown: number } {
+  const builds = [...new Set(hosts.map((h) => h.agentBuild).filter((b): b is string => Boolean(b)))];
+  builds.sort();
+  return { builds, unknown: hosts.filter((h) => !h.agentBuild).length };
+}
+
 export function vpcTone(vpc: SiteView["vpcs"][number], hosts: readonly SiteHost[]): "ok" | "warn" | "bad" {
   if (!vpc.ok) return "bad";
   return hosts.some((host) => host.vpc === vpc.name && hostHasProblem(host)) ? "warn" : "ok";

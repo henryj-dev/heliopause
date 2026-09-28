@@ -6,7 +6,7 @@
   import { chromeFreshness } from "$lib/shell/freshness.svelte";
   import { chromePrefs } from "$lib/shell/prefs.svelte";
   import { ageLabel } from "$lib/age";
-  import {
+  import { agentBuildSplit,
     answeredVpcNames, fleetListing, fleetSummary, hostMatches, hostRowClass, hostsOnVpc, hostStateChips,
     membershipPodCount, routesView, vpcLabel, vpcTone, wantedGeneration, whyBits, workloadChip,
   } from "./present";
@@ -84,6 +84,22 @@
         <div>· {line}</div>
       {/each}
     </div>
+  {/if}
+
+  <!--
+    Two agent builds across the fleet means a rollout landed on some hosts and not others. The agent
+    is not in the manager image — it is a systemd unit rolled by `scripts/deploy-fleet.sh`, one host
+    at a time — so "merged" and "deployed" and "reached every host" are three different facts, and
+    on 2026-09-29 the third was false for a day while the first two were true and every screen was
+    green. The value that says so has travelled from every host since 2026-09-03; nothing drew it.
+  -->
+  {@const agents = agentBuildSplit(site.hosts)}
+  {#if agents.builds.length > 1}
+    <p class="banner warn">
+      {t(prefs.lang, "m.agentBuildSplit", { n: agents.builds.length, hosts: site.hosts.length })}
+    </p>
+  {:else if agents.unknown > 0 && agents.builds.length > 0}
+    <p class="banner hatch">{t(prefs.lang, "m.agentBuildSilent", { n: agents.unknown })}</p>
   {/if}
 
   <div class="vpc-strip">

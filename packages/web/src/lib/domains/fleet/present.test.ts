@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { answeredVpcNames, fleetListing, fleetSummary, hostMatches, hostStateChips, routesView, whyBits, vpcLabel, vpcTone, workloadChip } from "./present.ts";
+import { agentBuildSplit, answeredVpcNames, fleetListing, fleetSummary, hostMatches, hostStateChips, routesView, whyBits, vpcLabel, vpcTone, workloadChip } from "./present.ts";
 // `SiteHost` comes from `./site.ts`; `present.ts` imports it but does not re-export it, so this
 // used to be `type SiteHost` on the line above and was simply broken. Nothing said so: this
 // workspace's tests were outside every tsconfig, and `node --test` strips types rather than
@@ -22,6 +22,7 @@ const host = (over: Partial<SiteHost> = {}): SiteHost => ({
   workload: null,
   unexpectedFilters: [],
   intrusions: [],
+  agentBuild: null,
   publishedPorts: [],
   routes: [],
   ...over,
@@ -279,5 +280,34 @@ describe("the routes cell", () => {
       hosts: [host({ routes: [dhcp, staticRoute] })],
     });
     assert.equal(summary.problems, 0);
+  });
+});
+
+describe("which agent build the fleet is running", () => {
+  it("says one build when a rollout landed everywhere", () => {
+    const split = agentBuildSplit([host({ agentBuild: "aaa" }), host({ agentBuild: "aaa" })]);
+    assert.deepEqual(split, { builds: ["aaa"], unknown: 0 });
+  });
+
+  it("says two when it did not", () => {
+    // 2026-09-29: a fix merged, an image rolled, and eight hosts kept the agent they had — the image
+    // carries `src/` and `bin/` and the agent lives in `agent/`. This is the shape that would have
+    // said so, from a value every host had already been sending.
+    const split = agentBuildSplit([
+      host({ agentBuild: "new" }), host({ agentBuild: "old" }), host({ agentBuild: "old" }),
+    ]);
+    assert.deepEqual(split.builds, ["new", "old"], "a partial rollout read as agreement");
+  });
+
+  it("counts a host that did not say apart from a version of its own", () => {
+    // An agent older than the field, or one not reporting at all. Folding it in with the builds
+    // would make one silent host look like a second rollout, and a fleet of silent hosts look like
+    // agreement.
+    const split = agentBuildSplit([host({ agentBuild: "aaa" }), host({ agentBuild: null })]);
+    assert.deepEqual(split, { builds: ["aaa"], unknown: 1 });
+  });
+
+  it("says nothing about an empty fleet rather than claiming agreement", () => {
+    assert.deepEqual(agentBuildSplit([]), { builds: [], unknown: 0 });
   });
 });

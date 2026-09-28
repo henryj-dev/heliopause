@@ -4017,6 +4017,88 @@ class TestRelayRequestDeadline(unittest.TestCase):
         )
 
 
+class TestBackfillCurrentAuthorization(unittest.TestCase):
+    """A host that confirmed under an older build adopts the authorization it is already enforcing.
+
+    Promotion happens at confirmation, and a host that is already `confirmed` never confirms again —
+    so deploying the promotion fix alone leaves every existing host with `currentAuthorization:
+    None` for as long as its generation stands. The alternative to this is publishing a fresh
+    generation to every VPC, which costs a two-person approval and an OTP per site to write down
+    something already on disk.
+    """
+
+    REC = {
+        "authorizedAt": "2026-08-15T00:05:00.000Z",
+        "expiresAt": "2026-08-16T00:05:00.000Z",
+        "payloadHash": "sha256:" + "a" * 64,
+        "keyId": "sha256:" + "b" * 64,
+        "authorizationMode": "two-person",
+        "generation": "g-live",
+    }
+
+    def state(self, **over):
+        return {**hp._EMPTY_STATE, "authorizationWatermark": self.REC,
+                "generation": "g-live", "state": "confirmed", **over}
+
+    def test_adopts_the_watermark_when_the_three_conditions_hold(self):
+        hp.save_state(self.state())
+        hp.backfill_current_authorization()
+        self.assertEqual(hp.load_state()["currentAuthorization"], self.REC)
+
+    def test_leaves_a_host_that_already_named_one(self):
+        # Idempotence, and more: a later authorization must not be overwritten by an earlier
+        # watermark on a restart. Running this twice must be the same as running it once.
+        later = {**self.REC, "generation": "g-live", "payloadHash": "sha256:" + "f" * 64}
+        hp.save_state(self.state(currentAuthorization=later))
+        hp.backfill_current_authorization()
+        self.assertEqual(hp.load_state()["currentAuthorization"], later)
+
+    def test_leaves_a_host_that_is_not_confirmed(self):
+        # `pending` and `rolled-back` are hosts whose running ruleset is not what the watermark last
+        # authorized. Adopting there would name the wrong thing, which is worse than naming nothing.
+        for state in ("pending", "rolled-back", "rollback-failed", "none"):
+            hp.save_state(self.state(state=state))
+            hp.backfill_current_authorization()
+            self.assertIsNone(
+                hp.load_state()["currentAuthorization"], f"adopted while {state}",
+            )
+
+    def test_leaves_a_host_whose_watermark_names_another_generation(self):
+        # The watermark moves when an authorization is *accepted*, which is before the apply settles.
+        # So a host can hold a watermark for a generation it never finished applying, while still
+        # enforcing the previous one. The two records then describe different moments.
+        hp.save_state(self.state(generation="g-other"))
+        hp.backfill_current_authorization()
+        self.assertIsNone(hp.load_state()["currentAuthorization"])
+
+    def test_does_nothing_with_no_watermark_at_all(self):
+        hp.save_state(self.state(authorizationWatermark=None))
+        hp.backfill_current_authorization()
+        self.assertIsNone(hp.load_state()["currentAuthorization"])
+
+    def test_the_adopted_record_arms_the_expiry_escape(self):
+        # ## The whole point, end to end
+        #
+        # Adopting is only worth doing if it makes the expired-but-confirmed case work — that is the
+        # path a rebooted host takes when its table is gone, and the one `gw-01.prod-icn-vtr` could
+        # not take on 2026-09-28. Asserting the field is populated says nothing about that on its
+        # own; this drives the real decision function afterwards.
+        hp.save_state(self.state())
+        hp.backfill_current_authorization()
+        fresh, err = _REAL_ACCEPT_AUTHORIZATION(dict(self.REC), {}, True)
+        self.assertEqual(err, "", "an adopted authorization did not satisfy its own expiry escape")
+        self.assertIsNotNone(fresh)
+
+    def test_without_adopting_the_same_record_is_still_refused(self):
+        # The known negative for the case above. Without it that assertion is equally satisfied by an
+        # escape that lets every expired authorization through, which is the refusal this whole
+        # mechanism exists to make survivable rather than to remove.
+        hp.save_state(self.state())
+        fresh, err = _REAL_ACCEPT_AUTHORIZATION(dict(self.REC), {}, True)
+        self.assertIsNone(fresh)
+        self.assertIn("expired", err)
+
+
 class TestStateSchemaHasBothHalves(unittest.TestCase):
     """Every key in `_EMPTY_STATE` is written somewhere and read somewhere.
 

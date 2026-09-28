@@ -1920,6 +1920,62 @@ def _clear_commitment(st):
     st["rollbackAt"] = None
 
 
+def backfill_current_authorization():
+    """Name the authorization this host is already enforcing, when an older build never did.
+
+    ## Why a host needs this at all
+
+    `confirm()` promotes `pendingAuthorization` into `currentAuthorization`, and that line did not
+    exist until 2026-09-29. So every host that confirmed under an older build is enforcing a ruleset
+    whose authorization it cannot name — `currentAuthorization` is `None` and nothing will fill it,
+    because promotion happens at confirmation and a host that is already `confirmed` never confirms
+    again.
+
+    Deploying the fix alone therefore changes nothing on those hosts: the code is new and the state
+    is not. What they would need instead is a fresh generation published to every VPC, which costs a
+    two-person approval and an OTP per site for a field that could be derived from what is already on
+    disk.
+
+    ## Why the watermark is the right value, and not a guess
+
+    `authorizationWatermark` is the last authorization this host *accepted* — written durably before
+    any kernel change, by the same function that refuses replays. When all three conditions below
+    hold, that record is the authorization for exactly what is running:
+
+      · `currentAuthorization` is absent — nothing to contradict
+      · `state` is `confirmed` — the apply settled, so a ruleset is in force
+      · the watermark names the generation the state names — the two agree on *which* ruleset
+
+    Any one of them failing means the two records describe different moments, and then this does
+    nothing. In particular a `rolled-back` or `pending` host is left alone: what it is enforcing is
+    not what the watermark last authorized.
+
+    ## What it is not
+
+    Not a migration of stored shapes — nothing is rewritten, one absent field is filled from another
+    field beside it. And not a way to accept an authorization that was never accepted: the watermark
+    only exists because `accept_artifact_authorization` wrote it, having verified the signature
+    first.
+    """
+    def mutate(st):
+        if st.get("currentAuthorization") is not None:
+            return
+        if st.get("state") != "confirmed":
+            return
+        prior = st.get("authorizationWatermark")
+        if not isinstance(prior, dict):
+            return
+        if prior.get("generation") != st.get("generation"):
+            return
+        st["currentAuthorization"] = prior
+        # Logged because it happens once per host and an operator reading a journal after a rollout
+        # should be able to see that it did — silence here is indistinguishable from a host the
+        # rollout missed, which is the whole class of problem this sits inside.
+        log(f"adopted the authorization already in force for generation {prior.get('generation')}")
+
+    update_state(mutate)
+
+
 def recover_commitment():
     """Re-arm or fire a rollback left behind by a previous process. Called once, before heartbeating.
 
@@ -5076,6 +5132,9 @@ def main():
     # Before the first heartbeat, and before the monitor. If the previous process left an
     # unconfirmed apply that severed the relay path, heartbeating first would block for the HTTP
     # timeout while a deadline this host owes went unhonoured.
+    # Before the recovery paths, because it only reads what is already settled and they may change
+    # `state`. A host that has nothing to adopt passes straight through.
+    backfill_current_authorization()
     recover_commitment()
     # Same reasoning for the workload half, and it needs its own call because the two commitments have
     # separate deadlines. A no-op on every host that is not the applier.
