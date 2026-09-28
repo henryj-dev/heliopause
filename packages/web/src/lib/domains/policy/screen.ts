@@ -200,6 +200,16 @@ export interface PolicyScreenView {
   addressSpace: AddressSpaceRow[];
   history: HistoryRow[];
   site: string;
+  /**
+   * The zone this policy was rendered for, or null when the renderer is too old to say.
+   *
+   * Not `site`, which is display text the renderer's operator chose. This is the name the target
+   * selector uses, and the two being different is why they are separate fields: on 2026-09-28 the
+   * screen drew one VPC while the selector said another, and nothing on the page disagreed.
+   */
+  siteName: string | null;
+  /** Every VPC this console can draw, same list as the changes screen's targets. */
+  sites: string[];
   generation: string | null;
   hostIds: string[];
   freshness: Freshness | null;
@@ -621,6 +631,11 @@ export function readPolicyScreen(data: unknown): PolicyScreenRead {
       addressSpace,
       history,
       site: typeof data.site === "string" ? data.site : "",
+      siteName: typeof data.siteName === "string" ? data.siteName : null,
+      // Absent rather than malformed on an older manager, the same tolerance `targets` gets on the
+      // changes screen — a console that refuses to draw because one field is new is a console that
+      // cannot be rolled independently of the manager.
+      sites: readStrings(data.sites) ?? [],
       generation: typeof data.generation === "string" ? data.generation : null,
       hostIds,
       freshness: data.freshness === undefined ? null : readFreshness(data.freshness),

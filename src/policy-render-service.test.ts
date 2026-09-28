@@ -439,6 +439,28 @@ describe("the renderer serves every site it was given", () => {
     }
   });
 
+  it("answers a ?site= it was never given a name for, which is the rollout order", async () => {
+    // New manager, renderer still deployed with the old single-site variable. It sends `?site=dev`
+    // to a process that named nothing. A 404 here would force the renderer's env to be flipped
+    // before the manager is rolled — and flipping it first is exactly what takes the console down,
+    // because the old manager's nameless request then gets a 400. This cell is what lets the two be
+    // deployed in the order that keeps the console up.
+    const dir = checkout();
+    let started: Started | undefined;
+    try {
+      started = await start(dir);
+      const res = await fetchAt(started.port, "/source?site=dev-icn-vtr");
+      assert.equal(res.status, 200, "a single unnamed site refused a name it could not contradict");
+      const got = parsePolicySource(await res.json());
+      // And it does not pretend to be the site it was asked for. The absence is the honest answer:
+      // the manager reads it as "this renderer cannot say" and falls back to the host-id rule.
+      assert.equal(got.siteName, undefined, "an unnamed site answered with a name it was handed");
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
   it("keeps each site's cache to itself", async () => {
     // One cache slot for every site is merely wasteful. A key that drops the site is what serves
     // alpha's payload under beta's name, and on the page that answer is indistinguishable from a

@@ -17,9 +17,14 @@ function readError(data: unknown, fallback: string): string {
 export function policyQuery() {
   let state = $state<PolicyState>({ kind: "loading" });
 
-  async function refresh(): Promise<void> {
+  /**
+   * @param site Which VPC to draw. Omitted keeps the request the manager has always answered, which
+   * is what a single-site deployment sends and what an older manager understands.
+   */
+  async function refresh(site?: string): Promise<void> {
     try {
-      const res = await fetch("/api/policy/screen", { credentials: "include" });
+      const at = site ? `/api/policy/screen?site=${encodeURIComponent(site)}` : "/api/policy/screen";
+      const res = await fetch(at, { credentials: "include" });
       if (res.status === 401) {
         state = { kind: "unauth" };
         return;

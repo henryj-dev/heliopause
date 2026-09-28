@@ -17,9 +17,17 @@
   const policy = policyQuery();
   const prefs = chromePrefs();
 
+  /** Which VPC is on screen. Empty means "whatever the manager answers", the single-site case. */
+  let site = $state("");
+
   onMount(() => {
     void policy.refresh();
   });
+
+  function pickSite(name: string): void {
+    site = name;
+    void policy.refresh(name);
+  }
 
   const present = $derived(policy.state.kind === "ok" ? presentSections(policy.state.view) : []);
   const resolved = $derived(resolveSection(present.map((s) => s.id), asked));
@@ -68,6 +76,29 @@
       · {view.site}
     {/if}
   </p>
+  {#if view.sites.length > 1}
+    <!--
+      One selector, and it names the same VPCs the changes screen proposes to — both lists are the
+      manager's relay names. Drawing one site while the operator proposes another is what happened
+      on 2026-09-28, and a screen that cannot say which VPC it is showing cannot warn about it.
+    -->
+    <div class="act" style="padding:9px 11px;background:var(--surface-card);border:1px solid var(--bd-1);border-radius:var(--r-md)">
+      <span class="dim" style="font-family:var(--font-mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase">
+        {t(prefs.lang, "m.policyForVpc")}
+      </span>
+      <select value={site} onchange={(e) => pickSite(e.currentTarget.value)}>
+        {#each view.sites as name (name)}
+          <option value={name}>{name}</option>
+        {/each}
+      </select>
+      {#if view.siteName}
+        <span class="dim mono">{view.siteName}</span>
+      {:else}
+        <!-- The renderer did not say. Absence is a fact about that renderer, not a blank. -->
+        <span class="dim">{t(prefs.lang, "m.rendererUnnamedSite")}</span>
+      {/if}
+    </div>
+  {/if}
   {#if view.freshness?.state === "fresh"}
     <p class="banner ok">{t(prefs.lang, "m.fresh")}</p>
   {:else if view.freshness?.state === "stale"}

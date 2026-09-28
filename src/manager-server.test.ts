@@ -1968,6 +1968,15 @@ describe("the console can propose a plan, which is the step it could not take", 
    * names a VPC, and the relay in this harness is `dev`.
    */
   let fixtureHost = "h1";
+  /** The last `?site=` this manager asked for, so a test can say whether the target was carried. */
+  let askedSite: string | null | undefined;
+  /**
+   * What the stub claims it served, as `siteName`.
+   *
+   * `undefined` is a renderer too old to say — the ordinary case for everything deployed before
+   * 2026-09-29, and the one the manager must keep working with.
+   */
+  let servedSiteName: string | undefined;
 
   const fixture = () => ({
     // ## The baseline is not decoration in this fixture
@@ -2003,10 +2012,12 @@ describe("the console can propose a plan, which is the step it could not take", 
 
   before(async () => {
     const { createServer } = await import("node:http");
-    renderer = createServer((_req, res) => {
+    renderer = createServer((req, res) => {
+      askedSite = new URL(req.url ?? "/", "http://x").searchParams.get("site");
       const source = collectPolicySource({
         site: fixture() as never, sitePath: "/nonexistent/policy/site.ts",
         label: "test-site", allowPaths: [],
+        ...(servedSiteName === undefined ? {} : { siteName: servedSiteName }),
       });
       const payload: Record<string, unknown> = { ...source, head };
       if (rendererBuild === "different") payload.build = "b32a7c6b32a7";
@@ -2371,6 +2382,60 @@ describe("the console can propose a plan, which is the step it could not take", 
     const r = await propose("not-a-vpc");
     assert.equal(r.status, 400);
     assert.match(r.body, /unknown target/);
+  });
+
+  it("asks the renderer for the site the target names", async () => {
+    // The target *is* the site name — a relay's name keys its CA, its agents' HELIOPAUSE_TARGET and
+    // the last label of every host id under it. Carrying it is the whole of the fix on this side:
+    // without it the renderer answers with whatever single site it was pinned to, which is how one
+    // VPC's policy reached three relays.
+    head = { sha: "abc1234", dirty: false };
+    askedSite = undefined;
+    assert.equal((await propose("dev")).status, 200);
+    assert.equal(askedSite, "dev", "the target was not carried to the renderer");
+  });
+
+  it("refuses when the renderer says it served a different site", async () => {
+    // The renderer knows its own configuration and this process does not, so its account is the
+    // strongest signal available — it catches a site map that is wrong in a way the host ids happen
+    // not to reveal (a module whose hosts carry no zone label at all, for instance).
+    head = { sha: "abc1234", dirty: false };
+    servedSiteName = "prod-icn-vtr";
+    try {
+      const r = await propose("dev");
+      assert.equal(r.status, 409, r.body);
+      assert.match(r.body, /asked the renderer for dev/);
+      assert.match(r.body, /served prod-icn-vtr/);
+    } finally {
+      servedSiteName = undefined;
+    }
+  });
+
+  it("proposes against a renderer too old to name what it served", async () => {
+    // Every renderer deployed before 2026-09-29 omits `siteName`. Refusing on absence would take the
+    // console down until the renderer rolls, in order to report that it is old — and it would make
+    // the two processes deployable in only one order. The zone rule reads host ids and needs nothing
+    // from the renderer, so the gate still holds here.
+    head = { sha: "abc1234", dirty: false };
+    servedSiteName = undefined;
+    assert.equal((await propose("dev")).status, 200);
+  });
+
+  it("still refuses an old renderer's site when its hosts name another VPC", async () => {
+    // The compatibility path must not become a way to switch the check off. This is the same
+    // refusal as the zone test below, with `siteName` absent — if the manager only checked the
+    // renderer's account, an old renderer would silently disable the gate, which is the incident
+    // reintroduced through the door left open for it.
+    head = { sha: "abc1234", dirty: false };
+    servedSiteName = undefined;
+    fixtureHost = "gw-01.prod-icn-vtr";
+    try {
+      const r = await propose("dev");
+      assert.equal(r.status, 409, r.body);
+      assert.match(r.body, /gw-01\.prod-icn-vtr/);
+    } finally {
+      fixtureHost = "h1";
+    }
   });
 
   it("refuses a render whose hosts belong to another VPC", async () => {

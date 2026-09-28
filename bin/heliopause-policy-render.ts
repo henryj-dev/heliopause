@@ -327,7 +327,18 @@ const server = createServer((req, res) => {
     const asked = url.searchParams.get("site");
     const named = sites.filter((s) => s.name !== null).map((s) => s.name).join(", ");
     let site: { name: string | null; path: string } | undefined;
-    if (asked !== null) {
+    if (asked !== null && sites.length === 1 && sites[0]!.name === null) {
+      // ## One unnamed site: `?site=` is ignored, deliberately
+      //
+      // `HELIOPAUSE_POLICY_SITE` names nothing, so this process has no claim to contradict — and a
+      // manager new enough to send `?site=` talking to a renderer still deployed the old way is the
+      // ordinary state during a rollout. A 404 here would mean the manager must be rolled *after*
+      // the renderer's env is flipped, which is the reverse of the order that keeps the console up.
+      //
+      // Nothing is lost: the payload carries no `siteName`, so the manager knows the name was never
+      // confirmed, and its own zone rule reads the host ids either way.
+      site = sites[0]!;
+    } else if (asked !== null) {
       site = sites.find((s) => s.name === asked);
       // 404 and not a fallback. Answering a name this process does not serve with the site it
       // happens to hold is the whole of the 2026-09-28 incident, reproduced inside the renderer by a

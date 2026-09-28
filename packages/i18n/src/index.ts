@@ -664,6 +664,14 @@ export const MESSAGES = {
     en: "△ the renderer did not name its build — it may be an older image than this manager.",
     ko: "△ 렌더러가 자기 빌드를 말하지 않았다 — 이 매니저보다 오래된 이미지일 수 있다.",
   },
+  "m.policyForVpc": {
+    en: "policy for",
+    ko: "정책 대상 VPC",
+  },
+  "m.rendererUnnamedSite": {
+    en: "the renderer did not name the site it served — it serves one and cannot say which",
+    ko: "렌더러가 어느 사이트를 줬는지 말하지 않았다 — 사이트 하나만 서빙해 이름이 없다",
+  },
   "m.policyReadOnly": {
     en: "this account can read the policy but edit and propose are not offered. rules and files are not in the list.",
     ko: "이 계정은 정책을 읽을 수 있지만 편집·제안은 제공되지 않는다. rules와 files는 목록에 없다.",
