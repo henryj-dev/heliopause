@@ -20,6 +20,8 @@ const emptyView = (over: Partial<PolicyScreenView> = {}): PolicyScreenView => ({
   addressSpace: [],
   history: [],
   site: "dev",
+  siteName: null,
+  sites: [],
   generation: "abc",
   hostIds: [],
   freshness: null,
@@ -175,5 +177,24 @@ describe("readPolicyScreen", () => {
   it("refuses a coverage object that cannot be read, rather than hiding it", () => {
     const read = readPolicyScreen({ rows: [], extra: { coverage: { rows: "no" } }, site: "dev" });
     assert.equal(read.ok, false);
+  });
+});
+
+describe("which VPC the screen is of", () => {
+  it("carries the rendered zone and the list of zones that can be drawn", () => {
+    const read = readPolicyScreen({ rows: [], extra: {}, site: "dev", siteName: "dev-icn-vtr", sites: ["dev-icn-vtr", "prod-icn-vtr"] });
+    assert.ok(read.ok);
+    assert.equal(read.view.siteName, "dev-icn-vtr");
+    assert.deepEqual(read.view.sites, ["dev-icn-vtr", "prod-icn-vtr"]);
+  });
+
+  it("reads an older manager that sends neither, rather than refusing to draw", () => {
+    // The console and the manager roll separately. A screen that will not render because one field
+    // is new cannot be deployed before the manager that sends it — and `siteName` absent is also the
+    // honest answer from a single-site renderer, which is every renderer until this change ships.
+    const read = readPolicyScreen({ rows: [], extra: {}, site: "dev" });
+    assert.ok(read.ok);
+    assert.equal(read.view.siteName, null, "a missing zone became a value");
+    assert.deepEqual(read.view.sites, [], "a missing list became something other than empty");
   });
 });

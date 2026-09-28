@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
-  boundedInteger, boundedNumber, ENV_BOUNDS, parsePairs, parseRelays, EnvSpecError,
+  boundedInteger, boundedNumber, ENV_BOUNDS, parsePairs, parseRelays, parsePolicySites, EnvSpecError,
   type BoundedEnvName,
 } from "./env-spec.ts";
 
@@ -166,6 +166,60 @@ describe("parseRelays", () => {
 //
 // So what is pinned here is that an unreadable value **stops the process**, rather than becoming a
 // number that quietly means "no limit".
+describe("parsePolicySites", () => {
+  test("name=path per entry, split on the first = so a path may contain one", () => {
+    const got = parsePolicySites("dev-icn-vtr=./dev.ts, prod-icn-vtr=/opt/p=1/prod.ts");
+    assert.deepEqual(got, [
+      { name: "dev-icn-vtr", path: "./dev.ts" },
+      { name: "prod-icn-vtr", path: "/opt/p=1/prod.ts" },
+    ]);
+  });
+
+  test("refuses two names pointing at one module", () => {
+    // 2026-09-28 as a configuration line. A renderer that accepted this would answer `prod-icn-vtr`
+    // with dev's hosts, and every instrument downstream would agree with it — which is exactly what
+    // happened when the pairing lived in nobody's head instead of in this string.
+    assert.throws(
+      () => parsePolicySites("prod-icn-vtr=./dev.ts,util-icn-vtr=./dev.ts"),
+      (e: unknown) => e instanceof EnvSpecError && /both name "\.\/dev\.ts"/.test((e as Error).message),
+    );
+  });
+
+  test("refuses two paths that differ as strings and resolve to one module", () => {
+    // The renderer resolves these after this parser runs, so a raw-string comparison lets the exact
+    // configuration this check exists to refuse through — and the two names then share one cache
+    // slot. Copilot found this on PR #55.
+    assert.throws(
+      () => parsePolicySites("alpha=./site.ts,beta=subdir/../site.ts"),
+      (e: unknown) => e instanceof EnvSpecError && /both name/.test((e as Error).message),
+    );
+  });
+
+  test("refuses a name twice, and quotes it — a name is not a secret", () => {
+    assert.throws(
+      () => parsePolicySites("dev=./a.ts,dev=./b.ts"),
+      (e: unknown) => e instanceof EnvSpecError && /"dev" is named twice/.test((e as Error).message),
+    );
+  });
+
+  test("refuses a name the artifact signer would later refuse", () => {
+    // The name becomes a signed artifact's `target`. Accepting one here that `artifact-signature.ts`
+    // rejects moves the failure from start-up to publish time, hours later and with a stranger
+    // message.
+    for (const bad of ["-leading-dash", "has space", "has/slash", "a".repeat(129)]) {
+      assert.throws(() => parsePolicySites(`${bad}=./x.ts`), EnvSpecError, bad);
+    }
+  });
+
+  test("refuses a malformed or empty entry", () => {
+    assert.throws(() => parsePolicySites("dev"), EnvSpecError);
+    assert.throws(() => parsePolicySites("=./dev.ts"), EnvSpecError);
+    assert.throws(() => parsePolicySites("dev="), EnvSpecError);
+    assert.throws(() => parsePolicySites(""), /is empty/);
+    assert.throws(() => parsePolicySites("  ,  "), /is empty/);
+  });
+});
+
 describe("boundedInteger", () => {
   const bounds = { min: 1, max: 100, fallback: 10 };
 

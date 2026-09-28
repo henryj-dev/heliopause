@@ -324,3 +324,259 @@ describe("the renderer answers with a policy the manager can parse", () => {
     }
   });
 });
+
+/**
+ * Two site modules in one checkout, each naming its own zone in its host ids.
+ *
+ * `alpha`/`beta` rather than real zone names on purpose: the leak scanner cannot tell a comment from
+ * a site record, and it should not have to.
+ */
+function twoSites(): { dir: string; sites: string; alpha: string; beta: string } {
+  const root = mkdtempSync(join(tmpdir(), "hp-policy-multi-"));
+  mkdirSync(join(root, "src"));
+  const dir = join(root, "policy");
+  mkdirSync(dir);
+  writeFileSync(join(dir, "policies.json"), '{\n  "schemaVersion": 1,\n  "groups": []\n}\n');
+  const body = (zone: string, extra = "") =>
+    `export const site = {
+       cfg: { hookPolicy: { input: "drop", output: "accept" } },
+       hosts: [{ id: "gw-01.${zone}", stage: "canary", items: [] }],
+       objects: [{ id: "ao-${zone}", kind: "address", name: "${zone}${extra}",
+                   members: [{ kind: "cidr", value: "10.0.0.0/8" }] }],
+     };\n`;
+  const alpha = join(dir, "alpha.ts");
+  const beta = join(dir, "beta.ts");
+  writeFileSync(alpha, body("alpha"));
+  writeFileSync(beta, body("beta"));
+  return { dir, sites: `alpha=${alpha},beta=${beta}`, alpha, beta };
+}
+
+/** `start()` pins `HELIOPAUSE_POLICY_SITE`; multi-site runs have to clear it. Empty reads as unset. */
+const MULTI = (sites: string) => ({ HELIOPAUSE_POLICY_SITE: "", HELIOPAUSE_POLICY_SITES: sites });
+
+const fetchAt = (port: number, path: string, init: RequestInit = {}) =>
+  fetch(`http://127.0.0.1:${port}${path}`, {
+    ...init,
+    headers: { authorization: `Bearer ${BEARER}`, ...(init.headers ?? {}) },
+  });
+
+describe("the renderer serves every site it was given", () => {
+  it("answers each name with its own policy", async () => {
+    // Both directions in one test. A renderer that ignored `?site=` and always served the first
+    // module would pass a one-site assertion, and that is precisely the defect: on 2026-09-28 the
+    // console asked for three VPCs and got one site's hosts three times.
+    const { dir, sites } = twoSites();
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      const a = parsePolicySource(await (await fetchAt(started.port, "/source?site=alpha")).json());
+      const b = parsePolicySource(await (await fetchAt(started.port, "/source?site=beta")).json());
+      assert.equal(a.site.hosts?.[0]?.id, "gw-01.alpha");
+      assert.equal(b.site.hosts?.[0]?.id, "gw-01.beta");
+      // The name travels, so the manager can say whether it got what it asked for.
+      assert.equal(a.siteName, "alpha");
+      assert.equal(b.siteName, "beta");
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("lists what it holds, behind the same bearer as the policy itself", async () => {
+    const { dir, sites } = twoSites();
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      const listed = (await (await fetchAt(started.port, "/sites")).json()) as { sites?: { name: string }[] };
+      assert.deepEqual(listed.sites?.map((s) => s.name), ["alpha", "beta"]);
+      // Site names are zone names — the same class of fact the payload carries, so the same gate.
+      const bare = await fetch(`http://127.0.0.1:${started.port}/sites`);
+      assert.equal(bare.status, 401, "the site list answered without a bearer");
+      const wrong = await fetchAt(started.port, "/sites", { headers: { authorization: "Bearer nope" } });
+      assert.equal(wrong.status, 401, "the site list answered a wrong bearer");
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a name it does not serve rather than falling back to one it does", async () => {
+    // A fallback here is the incident with a typo in place of a manifest.
+    const { dir, sites } = twoSites();
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      const res = await fetchAt(started.port, "/source?site=gamma");
+      assert.equal(res.status, 404);
+      const said = String(((await res.json()) as { error?: string }).error);
+      assert.match(said, /gamma/);
+      assert.match(said, /alpha, beta/, "the refusal does not say what it does serve");
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("goes dark rather than guessing when a caller names no site", async () => {
+    // The old manager's request shape. With one site it is unambiguous and still answered — that is
+    // what lets the new image deploy before the manager learns `?site=`. With two it is a 400: an
+    // answer here would be this process choosing a VPC on the caller's behalf.
+    const { dir, sites, alpha } = twoSites();
+    let one: Started | undefined;
+    let two: Started | undefined;
+    try {
+      one = await start(dir, MULTI(`alpha=${alpha}`));
+      assert.equal((await fetchAt(one.port, "/source")).status, 200, "a single named site stopped answering");
+
+      two = await start(dir, MULTI(sites));
+      const res = await fetchAt(two.port, "/source");
+      assert.equal(res.status, 400);
+      assert.match(String(((await res.json()) as { error?: string }).error), /name one with \?site=/);
+    } finally {
+      one?.stop();
+      two?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("answers a ?site= it was never given a name for, which is the rollout order", async () => {
+    // New manager, renderer still deployed with the old single-site variable. It sends `?site=dev`
+    // to a process that named nothing. A 404 here would force the renderer's env to be flipped
+    // before the manager is rolled — and flipping it first is exactly what takes the console down,
+    // because the old manager's nameless request then gets a 400. This cell is what lets the two be
+    // deployed in the order that keeps the console up.
+    const dir = checkout();
+    let started: Started | undefined;
+    try {
+      started = await start(dir);
+      const res = await fetchAt(started.port, "/source?site=dev-icn-vtr");
+      assert.equal(res.status, 200, "a single unnamed site refused a name it could not contradict");
+      const got = parsePolicySource(await res.json());
+      // And it does not pretend to be the site it was asked for. The absence is the honest answer:
+      // the manager reads it as "this renderer cannot say" and falls back to the host-id rule.
+      assert.equal(got.siteName, undefined, "an unnamed site answered with a name it was handed");
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("keeps each site's cache to itself", async () => {
+    // One cache slot for every site is merely wasteful. A key that drops the site is what serves
+    // alpha's payload under beta's name, and on the page that answer is indistinguishable from a
+    // correct one.
+    //
+    // ## How to prove this test is alive
+    //
+    // Two things identify the site — the `Map` bucket and the path inside `sourceStamp` — and they
+    // are redundant on purpose. So removing **either one alone leaves this test green**, and that is
+    // the right outcome rather than a dead test: the other mechanism still holds. It goes red when
+    // both are removed together, on the first assertion, because beta's request then answers with
+    // alpha's payload. Measured 2026-09-29; a single-point mutation here proves nothing either way.
+    const { dir, sites, alpha, beta } = twoSites();
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      // Pin the two modules to the *same* mtime first. They already share a git state and an
+      // allowlist, so with equal mtimes every other ingredient of the stamp is identical — which is
+      // the adversarial case, and the only one that can tell a site-blind cache from a correct one.
+      // Left to chance the two files differ by a millisecond and the bug hides.
+      const pin = new Date(Date.now() - 60_000);
+      utimesSync(alpha, pin, pin);
+      utimesSync(beta, pin, pin);
+
+      const a1 = parsePolicySource(await (await fetchAt(started.port, "/source?site=alpha")).json());
+      const b1 = parsePolicySource(await (await fetchAt(started.port, "/source?site=beta")).json());
+      assert.notDeepEqual(a1.site, b1.site, "the two fixtures never differed — this proves nothing");
+
+      // Move beta only, and move its mtime with it: the stamp reads mtimes, and a write inside the
+      // same millisecond does not shift one.
+      writeFileSync(beta, `export const site = {
+         cfg: { hookPolicy: { input: "drop", output: "accept" } },
+         hosts: [{ id: "gw-01.beta", stage: "canary", items: [] }],
+         objects: [{ id: "ao-beta", kind: "address", name: "beta-moved",
+                     members: [{ kind: "cidr", value: "10.0.0.0/8" }] }],
+       };\n`);
+      const t = statSync(beta);
+      utimesSync(beta, t.atime, new Date(t.mtimeMs + 5_000));
+
+      const a2 = parsePolicySource(await (await fetchAt(started.port, "/source?site=alpha")).json());
+      const b2 = parsePolicySource(await (await fetchAt(started.port, "/source?site=beta")).json());
+      assert.deepEqual(a2.site, a1.site, "an edit to beta changed what alpha serves");
+      assert.notDeepEqual(b2.site, b1.site, "beta's edit was served from a stale cache");
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+});
+
+describe("a site module has to be the site it is declared as", () => {
+  it("refuses to start when a declared name is not what the module's hosts say", async () => {
+    // The 2026-09-28 incident at its earliest checkable point, and one copy-paste away in a
+    // manifest: `alpha=…/beta.ts` produces a renderer that answers `?site=alpha` with beta's
+    // firewall, and nothing downstream knows what alpha was supposed to hold.
+    const { dir, beta } = twoSites();
+    try {
+      const { code, err } = await startExpectingRefusal(dir, {
+        HELIOPAUSE_POLICY_SITE: "",
+        HELIOPAUSE_POLICY_SITES: `alpha=${beta}`,
+        HELIOPAUSE_POLICY_RENDER_TOKEN: BEARER,
+      });
+      assert.equal(code, 2, `the renderer came up serving beta's hosts as alpha\n${err}`);
+      // The message, not just the code — a refusal for some other reason would satisfy the code.
+      assert.match(err, /alpha/, "it did not say which declared name was wrong");
+      assert.match(err, /gw-01\.beta/, "it did not name the host that gave it away");
+    } finally {
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("starts when every name matches its module — the known positive", async () => {
+    // Without this, the refusal above is equally satisfied by a renderer that never starts.
+    const { dir, sites } = twoSites();
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      assert.equal((await fetchAt(started.port, "/source?site=alpha")).status, 200);
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("keeps serving its siblings when one module will not import", async () => {
+    // Refusing to start on a module that throws would mean a git-sync landing a broken file takes
+    // every other VPC's console down at the next pod restart — an outage manufactured by the fix.
+    const { dir, sites, beta } = twoSites();
+    writeFileSync(beta, "throw new Error('beta does not load');\n");
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      assert.equal((await fetchAt(started.port, "/source?site=alpha")).status, 200, "alpha went down with beta");
+      const bad = await fetchAt(started.port, "/source?site=beta");
+      assert.equal(bad.status, 503);
+      assert.match(String(((await bad.json()) as { error?: string }).error), /beta does not load/);
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("refuses when both site variables are set", async () => {
+    // Two answers to one question. Merging them would make the behaviour depend on which line of the
+    // manifest was edited last.
+    const { dir, sites, alpha } = twoSites();
+    try {
+      const { code, err } = await startExpectingRefusal(dir, {
+        HELIOPAUSE_POLICY_SITE: alpha,
+        HELIOPAUSE_POLICY_SITES: sites,
+        HELIOPAUSE_POLICY_RENDER_TOKEN: BEARER,
+      });
+      assert.equal(code, 2);
+      assert.match(err, /both set/);
+    } finally {
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+});

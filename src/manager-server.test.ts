@@ -1960,6 +1960,23 @@ describe("the console can propose a plan, which is the step it could not take", 
    * rather than a banner that was never given anything to disagree with.
    */
   let rendererBuild: "same" | "different" | "absent" = "same";
+  /**
+   * The rendered site's one host id.
+   *
+   * `h1` carries no zone label, which is the ordinary case here and the case the zone rule lets
+   * through untouched (`site-zone.ts`). A test that wants the rule to bite sets this to an id that
+   * names a VPC, and the relay in this harness is `dev`.
+   */
+  let fixtureHost = "h1";
+  /** The last `?site=` this manager asked for, so a test can say whether the target was carried. */
+  let askedSite: string | null | undefined;
+  /**
+   * What the stub claims it served, as `siteName`.
+   *
+   * `undefined` is a renderer too old to say — the ordinary case for everything deployed before
+   * 2026-09-29, and the one the manager must keep working with.
+   */
+  let servedSiteName: string | undefined;
 
   const fixture = () => ({
     // ## The baseline is not decoration in this fixture
@@ -1979,12 +1996,12 @@ describe("the console can propose a plan, which is the step it could not take", 
       baseline: [{ desc: "management SSH", proto: "tcp" as const, ports: "22", srcCidrs: [] }],
     },
     hosts: [{
-      id: "h1",
+      id: fixtureHost,
       stage: "canary" as const,
       items: [{
         policy: {
           id: "P1", name: "n", src: { kind: "cidr", value: "198.51.100.0/24" },
-          dst: { kind: "host", value: "h1" }, proto: "tcp", ports: "22",
+          dst: { kind: "host", value: fixtureHost }, proto: "tcp", ports: "22",
           action: "allow", denyMode: "drop", priority: 100, enabled: true,
         },
         srcCidrs: ["198.51.100.0/24"],
@@ -1995,10 +2012,12 @@ describe("the console can propose a plan, which is the step it could not take", 
 
   before(async () => {
     const { createServer } = await import("node:http");
-    renderer = createServer((_req, res) => {
+    renderer = createServer((req, res) => {
+      askedSite = new URL(req.url ?? "/", "http://x").searchParams.get("site");
       const source = collectPolicySource({
         site: fixture() as never, sitePath: "/nonexistent/policy/site.ts",
         label: "test-site", allowPaths: [],
+        ...(servedSiteName === undefined ? {} : { siteName: servedSiteName }),
       });
       const payload: Record<string, unknown> = { ...source, head };
       if (rendererBuild === "different") payload.build = "b32a7c6b32a7";
@@ -2037,6 +2056,19 @@ describe("the console can propose a plan, which is the step it could not take", 
     r.end(JSON.stringify({ target }));
   });
 
+  /** The pending plans, so a refusal can be checked for having recorded nothing. */
+  const getPlans = () => new Promise<{ status: number; body: string }>((resolve, reject) => {
+    const r = request({
+      host: "127.0.0.1", port: port7, path: "/plans", method: "GET",
+      rejectUnauthorized: false,
+      cert: readFileSync(join(dir, "ops.pem")), key: readFileSync(join(dir, "ops.key")),
+    }, (res) => {
+      let body = ""; res.on("data", (c) => { body += c; });
+      res.on("end", () => resolve({ status: res.statusCode ?? 0, body }));
+    });
+    r.on("error", reject); r.end();
+  });
+
   const read = (hash: string, host: string) => new Promise<{ status: number; body: string }>((resolve, reject) => {
     const r = request({
       host: "127.0.0.1", port: port7,
@@ -2066,9 +2098,9 @@ describe("the console can propose a plan, which is the step it could not take", 
     r.on("error", reject); r.end();
   });
 
-  const getPolicyScreen = () => new Promise<{ status: number; body: string }>((resolve, reject) => {
+  const getPolicyScreen = (query = "") => new Promise<{ status: number; body: string }>((resolve, reject) => {
     const r = request({
-      host: "127.0.0.1", port: port7, path: "/api/policy/screen", method: "GET",
+      host: "127.0.0.1", port: port7, path: `/api/policy/screen${query}`, method: "GET",
       rejectUnauthorized: false,
       cert: readFileSync(join(dir, "ops.pem")), key: readFileSync(join(dir, "ops.key")),
     }, (res) => {
@@ -2350,6 +2382,143 @@ describe("the console can propose a plan, which is the step it could not take", 
     const r = await propose("not-a-vpc");
     assert.equal(r.status, 400);
     assert.match(r.body, /unknown target/);
+  });
+
+  it("names a site for a read that did not, so the console can bootstrap", async () => {
+    // ## The deadlock this closes
+    //
+    // A multi-site renderer refuses an unqualified `/source` — correctly, it has no roster and
+    // choosing there is the incident one layer down. But the console renders its VPC selector only
+    // from a successful `/policy/screen`, and its first request names nothing. So the page that
+    // exists to let an operator *choose* a site could never load without one, and every other read
+    // path (`/policy/lookup`, `/workload-traffic`, the policy worker) would 400 the moment
+    // `HELIOPAUSE_POLICY_SITES` was configured. Copilot found it on PR #55 before it shipped.
+    //
+    // This process has the roster the renderer lacks, and it says which one it picked.
+    head = { sha: "abc1234", dirty: false };
+    askedSite = undefined;
+    const r = await getPolicyScreen();
+    assert.equal(r.status, 200, r.body);
+    assert.equal(askedSite, "dev", "the screen asked the renderer for nothing in particular");
+    const body = JSON.parse(r.body) as { sites?: unknown; siteName?: unknown };
+    // The selector's options, so a first load can offer the choice.
+    assert.deepEqual(body.sites, ["dev"]);
+    // And it does not invent a name the renderer never confirmed.
+    assert.equal(body.siteName, null);
+  });
+
+  it("draws the site it was asked for, and refuses one this manager does not know", async () => {
+    head = { sha: "abc1234", dirty: false };
+    askedSite = undefined;
+    assert.equal((await getPolicyScreen("?site=dev")).status, 200);
+    assert.equal(askedSite, "dev");
+
+    // Checked against the relay roster here rather than passed through, so an unknown name is this
+    // manager's refusal and not a 503 from the renderer describing a request it could not parse.
+    const bad = await getPolicyScreen("?site=not-a-vpc");
+    assert.equal(bad.status, 400, bad.body);
+    assert.match(bad.body, /unknown site/);
+  });
+
+  it("asks the renderer for the site the target names", async () => {
+    // The target *is* the site name — a relay's name keys its CA, its agents' HELIOPAUSE_TARGET and
+    // the last label of every host id under it. Carrying it is the whole of the fix on this side:
+    // without it the renderer answers with whatever single site it was pinned to, which is how one
+    // VPC's policy reached three relays.
+    head = { sha: "abc1234", dirty: false };
+    askedSite = undefined;
+    assert.equal((await propose("dev")).status, 200);
+    assert.equal(askedSite, "dev", "the target was not carried to the renderer");
+  });
+
+  it("refuses when the renderer says it served a different site", async () => {
+    // The renderer knows its own configuration and this process does not, so its account is the
+    // strongest signal available — it catches a site map that is wrong in a way the host ids happen
+    // not to reveal (a module whose hosts carry no zone label at all, for instance).
+    head = { sha: "abc1234", dirty: false };
+    servedSiteName = "prod-icn-vtr";
+    try {
+      const r = await propose("dev");
+      assert.equal(r.status, 409, r.body);
+      assert.match(r.body, /asked the renderer for dev/);
+      assert.match(r.body, /served prod-icn-vtr/);
+    } finally {
+      servedSiteName = undefined;
+    }
+  });
+
+  it("proposes against a renderer too old to name what it served", async () => {
+    // Every renderer deployed before 2026-09-29 omits `siteName`. Refusing on absence would take the
+    // console down until the renderer rolls, in order to report that it is old — and it would make
+    // the two processes deployable in only one order. The zone rule reads host ids and needs nothing
+    // from the renderer, so the gate still holds here.
+    head = { sha: "abc1234", dirty: false };
+    servedSiteName = undefined;
+    assert.equal((await propose("dev")).status, 200);
+  });
+
+  it("still refuses an old renderer's site when its hosts name another VPC", async () => {
+    // The compatibility path must not become a way to switch the check off. This is the same
+    // refusal as the zone test below, with `siteName` absent — if the manager only checked the
+    // renderer's account, an old renderer would silently disable the gate, which is the incident
+    // reintroduced through the door left open for it.
+    head = { sha: "abc1234", dirty: false };
+    servedSiteName = undefined;
+    fixtureHost = "gw-01.prod-icn-vtr";
+    try {
+      const r = await propose("dev");
+      assert.equal(r.status, 409, r.body);
+      assert.match(r.body, /gw-01\.prod-icn-vtr/);
+    } finally {
+      fixtureHost = "h1";
+    }
+  });
+
+  it("refuses a render whose hosts belong to another VPC", async () => {
+    // ## 2026-09-28, exactly
+    //
+    // The renderer serves one site, pinned at startup; the target selector offers every relay.
+    // Picking `prod-icn-vtr` got dev's six hosts rendered and proposed under prod's name, and the
+    // same happened for util. Nothing here compared the two, so all three publishes were recorded
+    // and signed. The agents refused them — each checks `payload.host` against its own id — so no
+    // host applied another VPC's firewall, but the two gateways that needed a generation received
+    // nothing while the console reported one published for them. One of them was answering SSH on a
+    // public address with an empty ruleset at the time.
+    //
+    // A stub renderer can be told to serve the wrong site in one line, which is the whole distance
+    // between this test and the incident.
+    head = { sha: "abc1234", dirty: false };
+    const before = JSON.parse((await getPlans()).body).plans.length as number;
+    fixtureHost = "gw-01.prod-icn-vtr";
+    try {
+      const r = await propose("dev");
+      assert.equal(r.status, 409, r.body);
+      assert.match(r.body, /this plan is for dev/, "the refusal does not name the VPC it was for");
+      assert.match(r.body, /gw-01\.prod-icn-vtr/, "the refusal does not name the host that gave it away");
+      // Refused means nothing was recorded. A plan left behind here is approvable, and what it would
+      // publish is one VPC's policy under another's signature.
+      assert.equal(
+        JSON.parse((await getPlans()).body).plans.length, before,
+        "a refused proposal left a plan behind",
+      );
+    } finally {
+      fixtureHost = "h1";
+    }
+  });
+
+  it("proposes normally for a site whose hosts do name this VPC", async () => {
+    // The known positive for the test above. Without it, the refusal is equally satisfied by a
+    // manager that refuses every labelled site — which would be a publish outage for the real fleet,
+    // whose host ids all carry their zone.
+    head = { sha: "abc1234", dirty: false };
+    fixtureHost = "gw-01.dev";
+    try {
+      const r = await propose("dev");
+      assert.equal(r.status, 200, r.body);
+      assert.equal(JSON.parse(r.body).generation, "abc1234");
+    } finally {
+      fixtureHost = "h1";
+    }
   });
 });
 

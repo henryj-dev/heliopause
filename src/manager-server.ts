@@ -108,6 +108,7 @@ import {
 } from "./host-deregistration-policy-worker.ts";
 import { siteView, type RelaySource, type RelayResult, type SiteView } from "./manager.ts";
 import { bundleFromPlan, planHash, validateBundle, type PlanBundle } from "./bundle.ts";
+import { zoneMismatch } from "./site-zone.ts";
 import { diffRulesets } from "./ruleset-diff.ts";
 import {
   AuthorizationTimestampIssuer,
@@ -849,9 +850,21 @@ export function rateLimited(
 async function fetchPolicySource(
   src: NonNullable<ManagerOptions["policySource"]>,
   timeoutMs: number,
+  /**
+   * Which site to ask for, when this deployment's renderer serves more than one.
+   *
+   * Omitted is the old request and stays the old request: a single-site renderer answers it, and a
+   * multi-site one refuses with 400 rather than choosing a VPC on this process's behalf. That
+   * refusal is what makes the deployment order matter — see the renderer's `/source` handler.
+   */
+  site?: string,
 ): Promise<PolicySource> {
   const call = src.fetch ?? fetch;
-  const res = await call(`${src.url.replace(/\/$/, "")}/source`, {
+  // Built with `URL`, not a template. A site name reaching this as `a&b=c` would otherwise smuggle
+  // a second parameter into a request this process signs the consequences of.
+  const at = new URL("source", `${src.url.replace(/\/$/, "")}/`);
+  if (site !== undefined) at.searchParams.set("site", site);
+  const res = await call(at.toString(), {
     signal: AbortSignal.timeout(timeoutMs),
     headers: src.token ? { authorization: `Bearer ${src.token}` } : {},
   });
@@ -879,8 +892,10 @@ async function renderPolicyScreen(
   src: NonNullable<ManagerOptions["policySource"]>,
   relays: ManagerOptions["relays"],
   timeoutMs: number,
+  /** Which VPC's policy to draw. Omitted keeps a single-site deployment byte-identical to before. */
+  site?: string,
 ): Promise<{ screen: Screen; source: PolicySource }> {
-  const source = await fetchPolicySource(src, timeoutMs);
+  const source = await fetchPolicySource(src, timeoutMs, site);
   // The same assembly `/site` answers with, so the hosts table here and the console's own table
   // cannot disagree about the fleet — two differently-aged answers on one screen is the kind of
   // instrument that makes a reader trust the wrong one.
@@ -1239,6 +1254,25 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       }
     : null;
   const timeoutMs = opts.timeoutMs ?? 5_000;
+  /**
+   * Which site a **read** asks the renderer for when the request named none.
+   *
+   * ## Why this process may name one and the renderer may not
+   *
+   * The renderer refuses an unqualified request once it serves several sites, because choosing there
+   * would be a process with no roster picking a VPC for a caller that could not say — the 2026-09-28
+   * incident, one layer down. This process has the roster: `opts.relays` is the list, and it puts the
+   * name it chose in the response (`siteName`) so nothing about the answer is silent.
+   *
+   * Without this every read path — `/policy/lookup`, `/workload-traffic`, the policy worker, and the
+   * console's own first request — sends a bare `/source` and gets a 400 the moment
+   * `HELIOPAUSE_POLICY_SITES` is configured. The console is the worst of those: it renders its VPC
+   * selector only from a successful response, so the page that would let an operator *choose* a site
+   * could never load without one. Copilot found that on PR #55 before it shipped.
+   *
+   * **Publishing does not use this.** `/policy/plan` has a target the operator chose and passes it.
+   */
+  const defaultSite = (): string | undefined => opts.relays[0]?.name;
   const publishTimeoutMs = opts.publishTimeoutMs ?? 30_000;
   const limits = opts.limits ?? DEFAULT_LIMITS;
   const now = opts.now ?? (() => new Date());
@@ -1324,7 +1358,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     if (!opts.policySource) throw new Error("policy worker has no renderer");
     const target = opts.relays.find((relay) => relay.name === targetName);
     if (!target) throw new Error(`policy worker target ${targetName} is not configured`);
-    const source = await fetchPolicySource(opts.policySource, timeoutMs);
+    const source = await fetchPolicySource(opts.policySource, timeoutMs, defaultSite());
     if (source.head.sha === null || source.head.dirty) {
       throw new Error("policy worker cannot propose from an unnamed or dirty renderer checkout");
     }
@@ -2304,7 +2338,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       }
       let source: PolicySource;
       try {
-        source = await fetchPolicySource(opts.policySource, timeoutMs);
+        source = await fetchPolicySource(opts.policySource, timeoutMs, defaultSite());
       } catch (e) {
         return send(res, 503, { error: `the policy could not be read: ${(e as Error).message}` });
       }
@@ -2358,7 +2392,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       }
       let source: PolicySource;
       try {
-        source = await fetchPolicySource(opts.policySource, timeoutMs);
+        source = await fetchPolicySource(opts.policySource, timeoutMs, defaultSite());
       } catch (e) {
         return send(res, 503, { error: `the policy could not be read: ${(e as Error).message}` });
       }
@@ -2448,7 +2482,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       }
       let source: PolicySource;
       try {
-        source = await fetchPolicySource(opts.policySource, timeoutMs);
+        source = await fetchPolicySource(opts.policySource, timeoutMs, defaultSite());
       } catch (e) {
         return send(res, 503, { error: `the policy could not be read: ${(e as Error).message}` });
       }
@@ -2476,7 +2510,22 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       let screen: Screen;
       let source: PolicySource;
       try {
-        ({ screen, source } = await renderPolicyScreen(opts.policySource, opts.relays, timeoutMs));
+        // ## Which VPC this screen is of
+        //
+        // Without this the console draws one site's policy while the operator proposes another —
+        // which is not a hypothetical: on 2026-09-28 the screen showed dev and the target selector
+        // said prod, and nothing on the page disagreed. The name is a relay name, so it is checked
+        // against the same list `/policy/plan` checks `target` against rather than passed through.
+        const asked = url.searchParams.get("site");
+        if (asked !== null && !opts.relays.some((r) => r.name === asked)) {
+          return send(res, 400, {
+            error: `unknown site ${JSON.stringify(asked)} — this manager knows ` +
+              `${opts.relays.map((r) => r.name).join(", ")}`,
+          });
+        }
+        ({ screen, source } = await renderPolicyScreen(
+          opts.policySource, opts.relays, timeoutMs, asked ?? defaultSite(),
+        ));
       } catch (e) {
         log(`policy screen failed: ${(e as Error).message}`, `정책 화면 실패: ${(e as Error).message}`);
         return send(res, 503, { error: `the policy could not be read: ${(e as Error).message}` });
@@ -2490,6 +2539,14 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         rows: screen.rows,
         extra: screen.extra,
         site: screen.meta.site,
+        // `site` above is the renderer's *label* — display text an operator chose. This is the zone
+        // the payload actually came from, or null when the renderer is too old to say. The console
+        // needs the second to know whether the page and the target selector agree.
+        siteName: source.siteName ?? null,
+        // The VPCs this console can draw, same list and same source as `/plans`'s `targets`. Carried
+        // on this response so the policy screen can offer the choice without a second round trip —
+        // and so the picker here and the picker on the changes screen cannot come to differ.
+        sites: opts.relays.map((r) => r.name),
         generation: screen.meta.generation ?? source.head.sha,
         hosts: screen.meta.hosts,
         freshness: await freshnessOf(source.head.sha),
@@ -3127,6 +3184,29 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
        */
       freshness = "",
     ) => {
+      // ## Is this bundle even this VPC's?
+      //
+      // Both callers name a target and hand over hosts, and until 2026-09-28 nothing compared the
+      // two. The console renders from a policy service pinned to one site while its target selector
+      // offers every relay, so picking `prod-icn-vtr` proposed dev's six hosts under prod's name;
+      // the CLI takes `<site-module>` and `<vpc-name>` as two independent arguments and has the same
+      // hole. Three publishes went out that way. No host applied another VPC's rules — the agent
+      // checks `payload.host` against its own id — but the two hosts that should have received a
+      // generation received nothing, while every screen said one had been published for them.
+      //
+      // Checked here rather than in the two callers for the reason the docblock above already gives
+      // about the hash and the sweep: a second copy is a copy that drifts. Checked over both the
+      // manifest and the rendered rulesets because `POST /plan` accepts a bundle it did not render,
+      // so the two lists are not guaranteed to agree with each other.
+      const proposedHosts = [...new Set([...Object.keys(bundle.manifest.hosts), ...Object.keys(bundle.rulesets)])];
+      const wrongZone = zoneMismatch({ target: targetName, hostIds: proposedHosts });
+      if (wrongZone) {
+        log(
+          `plan REFUSED for ${by}: ${wrongZone}`,
+          `${by}의 계획 거부: ${targetName} 의 계획인데 호스트가 다른 존을 가리킵니다`,
+        );
+        return send(response, 409, { error: wrongZone });
+      }
       // Computed here, from the bytes that arrived. Never taken from the request — a submitted hash
       // would be the proposer's claim about content the approver never sees, and then the approval
       // check is decorative.
@@ -3223,9 +3303,33 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       }
       let source;
       try {
-        source = await fetchPolicySource(opts.policySource, timeoutMs);
+        // The target *is* the site name. A relay's name keys its CA, its agents' `HELIOPAUSE_TARGET`
+        // and the last label of every host id under it (`env-spec.ts`), so asking the renderer for
+        // `target.name` is asking it for this VPC's policy — and a renderer that serves only one
+        // unnamed site answers it anyway, which is what lets the two processes roll in either order.
+        source = await fetchPolicySource(opts.policySource, timeoutMs, target.name);
       } catch (e) {
         return send(res, 503, { error: `the policy could not be read: ${(e as Error).message}` });
+      }
+      // ## The renderer's own account of what it served
+      //
+      // Refused when it names a site and that site is not this target: the renderer knows its
+      // configuration and this process does not, so a disagreement here is the strongest signal
+      // available — it catches a site map that is wrong in a way the host ids happen not to reveal.
+      //
+      // **Absent is not refused.** A single-site renderer has no name to give, and every renderer
+      // deployed before 2026-09-29 is one. Refusing on absence would take the console down until the
+      // renderer rolls, in order to report that it is old. The zone rule in `recordProposal` reads
+      // host ids and needs nothing from the renderer, so the gate holds either way.
+      if (source.siteName !== undefined && source.siteName !== target.name) {
+        log(
+          `plan REFUSED for ${who}: renderer served ${source.siteName}, target is ${target.name}`,
+          `${who}의 계획 거부: 렌더러가 ${source.siteName} 를 줬는데 대상은 ${target.name} 입니다`,
+        );
+        return send(res, 409, {
+          error: `asked the renderer for ${target.name} and it served ${source.siteName} — ` +
+            `this manager and its renderer disagree about which site that name means. Nothing was proposed.`,
+        });
       }
       // The generation *names* the commit, so a checkout that cannot say which commit it is at, or is
       // not exactly at one, cannot be published from. `heliopause-publish` refuses the same two
@@ -4269,7 +4373,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       relayNames: opts.relays.map((relay) => relay.name),
       renderer: async () => {
         const [source, head] = await Promise.all([
-          fetchPolicySource(opts.policySource!, timeoutMs),
+          fetchPolicySource(opts.policySource!, timeoutMs, defaultSite()),
           currentRepoHead(),
         ]);
         if ("error" in head) throw new Error(`policy repository head is unavailable: ${head.error}`);

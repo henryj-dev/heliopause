@@ -67,6 +67,21 @@ export interface PolicySource {
    */
   build?: string;
   /**
+   * The zone name this renderer was configured to serve this module under.
+   *
+   * **Not `label`.** `label` is display text an operator chose; this is an identity the manager
+   * makes a publish decision on, and overloading the first with the second is the distinction this
+   * file already draws between `repo.generation` and `head.sha` below.
+   *
+   * **Optional, for the same reason `build` is.** A single-site renderer has no name to give, and
+   * requiring one would refuse every renderer deployed today in order to report that they are
+   * single-site. Its absence is not a gap in the check: the manager's zone rule reads host ids,
+   * which every renderer sends.
+   *
+   * Not part of the schema version — it adds a fact and alters nothing.
+   */
+  siteName?: string;
+  /**
    * What the page calls the site.
    *
    * A label, not a location. The manager's own filesystem has no policy on it, so printing a
@@ -169,6 +184,9 @@ export function parsePolicySource(raw: unknown): PolicySource {
   if (v.build !== undefined && (typeof v.build !== "string" || !v.build)) {
     bad("build must be a non-empty string when present");
   }
+  if (v.siteName !== undefined && (typeof v.siteName !== "string" || !v.siteName)) {
+    bad("siteName must be a non-empty string when present");
+  }
 
   const site = v.site;
   if (!isObject(site)) bad("site must be an object");
@@ -206,6 +224,7 @@ export function parsePolicySource(raw: unknown): PolicySource {
     // Carried through rather than defaulted. `undefined` here is "the renderer did not say", which
     // the console prints as its own sentence; substituting anything would answer for it.
     ...(v.build === undefined ? {} : { build: v.build as string }),
+    ...(v.siteName === undefined ? {} : { siteName: v.siteName as string }),
     label: v.label,
     site: site as unknown as ScreenSite,
     services: services as Readonly<Record<string, ServiceSelector>>,
@@ -280,8 +299,10 @@ export function collectPolicySource(input: {
   sitePath: string;
   label: string;
   allowPaths: readonly string[];
+  /** Omitted by a single-site renderer, which has no name to give. See `PolicySource.siteName`. */
+  siteName?: string;
 }): PolicySource {
-  const { site, sitePath, label, allowPaths } = input;
+  const { site, sitePath, label, allowPaths, siteName } = input;
   const dir = dirname(resolve(sitePath));
 
   const services: Record<string, ServiceSelector> = {};
@@ -332,6 +353,9 @@ export function collectPolicySource(input: {
     // The renderer naming itself. This is the whole of the fix on this side — the manager can now
     // hold it next to its own and say whether the two processes are the same code.
     build: buildId(),
+    // Absent, not empty, when the renderer serves one unnamed site — the far side reads the absence
+    // as "this renderer cannot say", which is a different fact from "it said nothing".
+    ...(siteName === undefined ? {} : { siteName }),
     label,
     site: wire,
     services,

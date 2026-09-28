@@ -32,7 +32,8 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { timingSafeEqual } from "node:crypto";
-import { boundedInteger, ENV_BOUNDS } from "../src/env-spec.ts";
+import { boundedInteger, ENV_BOUNDS, parsePolicySites } from "../src/env-spec.ts";
+import { zoneMismatch, ZoneMismatchError } from "../src/site-zone.ts";
 import { armedReasons } from "../src/policy-render-guard.ts";
 import { collectPolicySource, type PolicySource } from "../src/policy-source.ts";
 import { policyHead, type ScreenSite } from "../src/policy-screen.ts";
@@ -80,7 +81,42 @@ function refuseIfArmed(): void {
 
 refuseIfArmed();
 
-const sitePath = resolve(env("HELIOPAUSE_POLICY_SITE"));
+const label = process.env.HELIOPAUSE_POLICY_LABEL ?? "policy";
+
+/**
+ * Which modules this process serves, and under which zone names.
+ *
+ * ## Two variables, and only one of them names the zones
+ *
+ * `HELIOPAUSE_POLICY_SITE` is one module with no name. That is how every renderer was deployed
+ * before 2026-09-29 and it keeps working exactly as it did: a bare `GET /source` answers it, and the
+ * payload carries no `siteName` because there is none to carry.
+ *
+ * `HELIOPAUSE_POLICY_SITES` is `name=path,name=path`. The names are zone names — the same strings as
+ * `HELIOPAUSE_RELAYS` and the agents' `HELIOPAUSE_TARGET` — and they are what `?site=` selects.
+ *
+ * Both set is refused rather than merged. They are two answers to one question, and a process that
+ * picks between them silently is a process whose behaviour is decided by whichever line of the
+ * manifest was edited last.
+ */
+const sites: { name: string | null; path: string }[] = (() => {
+  const many = process.env.HELIOPAUSE_POLICY_SITES;
+  const one = process.env.HELIOPAUSE_POLICY_SITE;
+  if (many && one) {
+    console.error("[policy-render] refusing to start: HELIOPAUSE_POLICY_SITES and HELIOPAUSE_POLICY_SITE are both set.");
+    console.error("[policy-render]   they are two answers to one question — keep the one this deployment means");
+    process.exit(2);
+  }
+  if (many) {
+    try {
+      return parsePolicySites(many).map((s) => ({ name: s.name, path: resolve(s.path) }));
+    } catch (e) {
+      console.error(`[policy-render] refusing to start: ${(e as Error).message}`);
+      process.exit(2);
+    }
+  }
+  return [{ name: null, path: resolve(env("HELIOPAUSE_POLICY_SITE")) }];
+})();
 
 /**
  * The checkout has to be mounted where the site module's own imports resolve.
@@ -98,16 +134,19 @@ const sitePath = resolve(env("HELIOPAUSE_POLICY_SITE"));
  * pod is written, and knowable before anything has been cloned — `../src` is this image's own
  * directory, not the policy repository's.
  */
-const modelDir = resolve(sitePath, "..", "..", "src");
-if (!existsSync(modelDir)) {
-  console.error(
-    `[policy-render] refusing to start: ${sitePath} is mounted where its own imports do not resolve.`,
-  );
-  console.error(`[policy-render]   a site module imports the model with ../src, which from there is ${modelDir}`);
-  console.error(`[policy-render]   mount the checkout inside this image's directory — /opt/heliopause/policy`);
-  process.exit(2);
+// Per module, not once: the answer is the same for three modules in one directory today, and it is
+// a property of each module's own location rather than of the deployment.
+for (const site of sites) {
+  const modelDir = resolve(site.path, "..", "..", "src");
+  if (!existsSync(modelDir)) {
+    console.error(
+      `[policy-render] refusing to start: ${site.path} is mounted where its own imports do not resolve.`,
+    );
+    console.error(`[policy-render]   a site module imports the model with ../src, which from there is ${modelDir}`);
+    console.error(`[policy-render]   mount the checkout inside this image's directory — /opt/heliopause/policy`);
+    process.exit(2);
+  }
 }
-const label = process.env.HELIOPAUSE_POLICY_LABEL ?? "policy";
 const allowPaths = (process.env.HELIOPAUSE_POLICY_ALLOW_PATHS ?? "policies.json")
   .split(",")
   .map((s) => s.trim())
@@ -181,7 +220,11 @@ if (!token) {
  * screen that keeps drawing the last policy that worked is a screen that lies about what is
  * deployed, and it lies most convincingly right after somebody breaks the policy.
  */
-let cached: { stamp: string; source: PolicySource } | null = null;
+// Keyed by site path, not by name — the single-site case has no name, and the path is what the
+// stamp is computed from. One slot for all of them would make every request to a second site a
+// miss, which is merely wasteful; a key that drops the site is what serves one VPC's payload under
+// another's name, which is the failure this whole change exists to stop.
+const cached = new Map<string, { stamp: string; source: PolicySource }>();
 
 /**
  * Everything that can change what `/source` should answer, in one string.
@@ -190,7 +233,7 @@ let cached: { stamp: string; source: PolicySource } | null = null;
  * that could not see a change to `policies.json`. A path that does not exist contributes `-`, so
  * its appearance and disappearance both move the key.
  */
-function sourceStamp(): string {
+function sourceStamp(sitePath: string): string {
   const head = policyHead(sitePath);
   const dir = dirname(resolve(sitePath));
   const mtime = (p: string): string => {
@@ -201,20 +244,45 @@ function sourceStamp(): string {
     }
   };
   const files = [sitePath, ...allowPaths.map((p) => resolve(dir, p))].map(mtime).join(",");
-  return `${head.sha ?? "nogit"}:${head.dirty ? "dirty" : "clean"}:${files}`;
+  // The path is in the key, not only in the `Map` bucket it is stored under. Two modules in one
+  // directory share a git sha and an allowlist, so the rest of this string is identical for both —
+  // and two files written in the same millisecond have the same mtime too. Without this prefix the
+  // stamp for `alpha.ts` and `beta.ts` can be byte-identical, and then a cache that keys on the
+  // stamp alone answers one site's request with the other's policy. Belt and braces on purpose: the
+  // bucket and the stamp each encode the site, so a mistake in either is caught by the other.
+  return `${sitePath}:${head.sha ?? "nogit"}:${head.dirty ? "dirty" : "clean"}:${files}`;
 }
 
-async function currentSource(): Promise<PolicySource> {
-  const stamp = sourceStamp();
-  if (cached && cached.stamp === stamp) return cached.source;
+/** The host ids a rendered site declares, for the zone check. */
+function hostIdsOf(site: ScreenSite): string[] {
+  const hosts = (site as { hosts?: readonly { id?: unknown }[] }).hosts ?? [];
+  return hosts.map((h) => String(h?.id ?? "")).filter(Boolean);
+}
+
+async function currentSource(site: { name: string | null; path: string }): Promise<PolicySource> {
+  const { name, path: sitePath } = site;
+  const stamp = sourceStamp(sitePath);
+  const hit = cached.get(sitePath);
+  if (hit && hit.stamp === stamp) return hit.source;
   // The import specifier still needs a value that moves, and `stamp` is not URL-safe.
   const mod = (await import(`${pathToFileURL(sitePath).href}?v=${encodeURIComponent(stamp)}`)) as {
     site?: ScreenSite;
   };
   if (!mod.site) throw new Error(`${sitePath} does not export \`site\``);
-  const source = collectPolicySource({ site: mod.site, sitePath, label, allowPaths });
-  cached = { stamp, source };
-  log(`evaluated ${label} at ${source.head.sha ?? "unknown"}${source.head.dirty ? " (dirty)" : ""}`);
+  // ## Checked on every evaluation, not only at startup
+  //
+  // Startup is where a wrong manifest is caught while somebody is watching, but a module that threw
+  // at startup was never checked, and a commit can move a host id at any time. This is the gate that
+  // holds; the startup one is the one that is loud. Throwing here surfaces as the 503 below, which
+  // is the right shape — the module is present and this process will not vouch for it.
+  const wrongZone = name === null ? null : zoneMismatch({ target: name, hostIds: hostIdsOf(mod.site) });
+  if (wrongZone) throw new ZoneMismatchError(wrongZone);
+  const source = collectPolicySource({
+    site: mod.site, sitePath, label, allowPaths,
+    ...(name === null ? {} : { siteName: name }),
+  });
+  cached.set(sitePath, { stamp, source });
+  log(`evaluated ${name ?? label} at ${source.head.sha ?? "unknown"}${source.head.dirty ? " (dirty)" : ""}`);
   return source;
 }
 
@@ -247,9 +315,46 @@ const server = createServer((req, res) => {
 
   if (req.method === "GET" && url.pathname === "/healthz") return send(200, { ok: true });
 
+  // Behind the bearer, beside `/source` rather than beside `/healthz`: the site names are the
+  // fleet's zone names, which is the same class of information the payload carries.
+  if (req.method === "GET" && url.pathname === "/sites") {
+    if (!bearerOk(req.headers.authorization)) return send(401, { error: "bad or missing bearer" });
+    return send(200, { sites: sites.map((s) => ({ name: s.name, label })) });
+  }
+
   if (req.method === "GET" && url.pathname === "/source") {
     if (!bearerOk(req.headers.authorization)) return send(401, { error: "bad or missing bearer" });
-    void currentSource().then(
+    const asked = url.searchParams.get("site");
+    const named = sites.filter((s) => s.name !== null).map((s) => s.name).join(", ");
+    let site: { name: string | null; path: string } | undefined;
+    if (asked !== null && sites.length === 1 && sites[0]!.name === null) {
+      // ## One unnamed site: `?site=` is ignored, deliberately
+      //
+      // `HELIOPAUSE_POLICY_SITE` names nothing, so this process has no claim to contradict — and a
+      // manager new enough to send `?site=` talking to a renderer still deployed the old way is the
+      // ordinary state during a rollout. A 404 here would mean the manager must be rolled *after*
+      // the renderer's env is flipped, which is the reverse of the order that keeps the console up.
+      //
+      // Nothing is lost: the payload carries no `siteName`, so the manager knows the name was never
+      // confirmed, and its own zone rule reads the host ids either way.
+      site = sites[0]!;
+    } else if (asked !== null) {
+      site = sites.find((s) => s.name === asked);
+      // 404 and not a fallback. Answering a name this process does not serve with the site it
+      // happens to hold is the whole of the 2026-09-28 incident, reproduced inside the renderer by a
+      // typo instead of by a manifest.
+      if (!site) return send(404, { error: `no site named ${JSON.stringify(asked)} here — this renderer serves ${named}` });
+    } else if (sites.length === 1) {
+      // The old manager's request, and the single-site deployment's. Unchanged.
+      site = sites[0]!;
+    } else {
+      // 🔴 Deliberately dark rather than deliberately wrong. A caller that did not name a site is a
+      // caller that cannot tell these apart, and serving the first one would be the incident again.
+      // This is what makes the deployment order matter: flip the renderer to several sites before
+      // the manager learns `?site=`, and the console goes down until it is rolled.
+      return send(400, { error: `this renderer serves ${sites.length} sites — name one with ?site=: ${named}` });
+    }
+    void currentSource(site).then(
       (source) => send(200, source),
       (e: Error) => {
         // The manager turns this into a 503 with this sentence in it. An empty page there would read
@@ -261,8 +366,39 @@ const server = createServer((req, res) => {
     return;
   }
 
-  return send(404, { error: "this service answers GET /source and GET /healthz" });
+  return send(404, { error: "this service answers GET /source, GET /sites and GET /healthz" });
 });
+
+// ## Is each module the site it is declared as? Checked before anything is served.
+//
+// Two failure modes live here and they must not be conflated.
+//
+// **A name that does not match its module** — `prod-icn-vtr=./dev.ts` — is a *configuration* fact.
+// It cannot heal itself; somebody has to edit the Deployment. Refusing to start is right, and it
+// matches the three refusals above: a renderer that will not come up costs the console, and coming
+// up serving one VPC's firewall under another's name costs the fleet.
+//
+// **A module that throws when imported** is a *content* fact that changes commit to commit, and it
+// is already handled — `/source` answers 503 and the console says so. Refusing to start on it would
+// mean a git-sync landing a broken `dev.ts` takes prod's and util's consoles down at the next pod
+// restart: a new outage manufactured by the fix. So it is logged and the process keeps listening,
+// with that one site answering 503. `currentSource` re-checks the zone on every evaluation, so a
+// module that could not be verified here is verified before it is ever served.
+for (const site of sites) {
+  if (site.name === null) continue; // Nothing was declared, so there is nothing to contradict.
+  try {
+    const source = await currentSource(site);
+    log(`verified ${site.name} — ${source.site.hosts?.length ?? 0} hosts`);
+  } catch (e) {
+    const why = (e as Error).message;
+    if (e instanceof ZoneMismatchError) {
+      console.error(`[policy-render] refusing to start: ${site.name} is declared for ${site.path}, but ${why}`);
+      console.error(`[policy-render]   a zone's name is the last label of every host id under it — one of these is wrong`);
+      process.exit(2);
+    }
+    log(`${site.name} did not evaluate at startup and will answer 503 until it does: ${why}`);
+  }
+}
 
 server.listen(port, hostname, () => {
   // The bound port rather than the requested one. They differ when the request was 0, which is how
@@ -270,6 +406,10 @@ server.listen(port, hostname, () => {
   // number it asked for is a line that cannot be used to connect.
   const bound = server.address();
   const at = typeof bound === "object" && bound ? bound.port : port;
-  log(`listening on ${hostname}:${at} — site ${sitePath}, editable ${allowPaths.join(", ") || "(nothing)"}`);
-  log("bearer required on GET /source");
+  // The `listening on host:port` prefix is parsed by `policy-render-service.test.ts` to learn the
+  // port; what follows it is for a person reading `kubectl logs`. Naming every site is how that
+  // person tells a three-site pod from a one-site pod without reading the manifest.
+  const serving = sites.map((s) => (s.name === null ? s.path : `${s.name}=${s.path}`)).join(", ");
+  log(`listening on ${hostname}:${at} — serving ${serving}, editable ${allowPaths.join(", ") || "(nothing)"}`);
+  log("bearer required on GET /source and GET /sites");
 });
