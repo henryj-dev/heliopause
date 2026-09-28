@@ -82,6 +82,20 @@ describe("whether a rendered site may be published to a target", () => {
     );
   });
 
+  it("does not let a nested zone name walk through the suffix", () => {
+    // `parsePolicySites` allows dots in a name, so `icn` and `prod.icn` can both be zones. A plain
+    // `endsWith(".icn")` accepts `gw.prod.icn` for `icn`, and that host belongs to the more specific
+    // zone — the gate would pass a plan of one VPC addressed to another by nesting. Found by Copilot
+    // on PR #55, before it shipped.
+    assert.ok(
+      zoneMismatch({ target: "icn", hostIds: ["gw.prod.icn"] }),
+      "a host one level deeper was accepted for the shorter zone",
+    );
+    // And the specific zone still accepts its own host, so the rule above did not simply refuse
+    // everything with two dots in it.
+    assert.equal(zoneMismatch({ target: "prod.icn", hostIds: ["gw.prod.icn"] }), null);
+  });
+
   it("lets a site that claims no zone through, and says so by doing nothing", () => {
     // The deliberate lenient branch. Fixtures, examples and the real-kernel rollback harness name
     // their hosts `h1` / `h-a` / `h-rb-01`; those sites have not claimed a zone and this function

@@ -1254,6 +1254,25 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       }
     : null;
   const timeoutMs = opts.timeoutMs ?? 5_000;
+  /**
+   * Which site a **read** asks the renderer for when the request named none.
+   *
+   * ## Why this process may name one and the renderer may not
+   *
+   * The renderer refuses an unqualified request once it serves several sites, because choosing there
+   * would be a process with no roster picking a VPC for a caller that could not say — the 2026-09-28
+   * incident, one layer down. This process has the roster: `opts.relays` is the list, and it puts the
+   * name it chose in the response (`siteName`) so nothing about the answer is silent.
+   *
+   * Without this every read path — `/policy/lookup`, `/workload-traffic`, the policy worker, and the
+   * console's own first request — sends a bare `/source` and gets a 400 the moment
+   * `HELIOPAUSE_POLICY_SITES` is configured. The console is the worst of those: it renders its VPC
+   * selector only from a successful response, so the page that would let an operator *choose* a site
+   * could never load without one. Copilot found that on PR #55 before it shipped.
+   *
+   * **Publishing does not use this.** `/policy/plan` has a target the operator chose and passes it.
+   */
+  const defaultSite = (): string | undefined => opts.relays[0]?.name;
   const publishTimeoutMs = opts.publishTimeoutMs ?? 30_000;
   const limits = opts.limits ?? DEFAULT_LIMITS;
   const now = opts.now ?? (() => new Date());
@@ -1339,7 +1358,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     if (!opts.policySource) throw new Error("policy worker has no renderer");
     const target = opts.relays.find((relay) => relay.name === targetName);
     if (!target) throw new Error(`policy worker target ${targetName} is not configured`);
-    const source = await fetchPolicySource(opts.policySource, timeoutMs);
+    const source = await fetchPolicySource(opts.policySource, timeoutMs, defaultSite());
     if (source.head.sha === null || source.head.dirty) {
       throw new Error("policy worker cannot propose from an unnamed or dirty renderer checkout");
     }
@@ -2319,7 +2338,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       }
       let source: PolicySource;
       try {
-        source = await fetchPolicySource(opts.policySource, timeoutMs);
+        source = await fetchPolicySource(opts.policySource, timeoutMs, defaultSite());
       } catch (e) {
         return send(res, 503, { error: `the policy could not be read: ${(e as Error).message}` });
       }
@@ -2373,7 +2392,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       }
       let source: PolicySource;
       try {
-        source = await fetchPolicySource(opts.policySource, timeoutMs);
+        source = await fetchPolicySource(opts.policySource, timeoutMs, defaultSite());
       } catch (e) {
         return send(res, 503, { error: `the policy could not be read: ${(e as Error).message}` });
       }
@@ -2463,7 +2482,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       }
       let source: PolicySource;
       try {
-        source = await fetchPolicySource(opts.policySource, timeoutMs);
+        source = await fetchPolicySource(opts.policySource, timeoutMs, defaultSite());
       } catch (e) {
         return send(res, 503, { error: `the policy could not be read: ${(e as Error).message}` });
       }
@@ -2505,7 +2524,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
           });
         }
         ({ screen, source } = await renderPolicyScreen(
-          opts.policySource, opts.relays, timeoutMs, asked ?? undefined,
+          opts.policySource, opts.relays, timeoutMs, asked ?? defaultSite(),
         ));
       } catch (e) {
         log(`policy screen failed: ${(e as Error).message}`, `정책 화면 실패: ${(e as Error).message}`);
@@ -4354,7 +4373,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       relayNames: opts.relays.map((relay) => relay.name),
       renderer: async () => {
         const [source, head] = await Promise.all([
-          fetchPolicySource(opts.policySource!, timeoutMs),
+          fetchPolicySource(opts.policySource!, timeoutMs, defaultSite()),
           currentRepoHead(),
         ]);
         if ("error" in head) throw new Error(`policy repository head is unavailable: ${head.error}`);

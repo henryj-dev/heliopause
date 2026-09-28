@@ -185,6 +185,16 @@ describe("parsePolicySites", () => {
     );
   });
 
+  test("refuses two paths that differ as strings and resolve to one module", () => {
+    // The renderer resolves these after this parser runs, so a raw-string comparison lets the exact
+    // configuration this check exists to refuse through — and the two names then share one cache
+    // slot. Copilot found this on PR #55.
+    assert.throws(
+      () => parsePolicySites("alpha=./site.ts,beta=subdir/../site.ts"),
+      (e: unknown) => e instanceof EnvSpecError && /both name/.test((e as Error).message),
+    );
+  });
+
   test("refuses a name twice, and quotes it — a name is not a secret", () => {
     assert.throws(
       () => parsePolicySites("dev=./a.ts,dev=./b.ts"),

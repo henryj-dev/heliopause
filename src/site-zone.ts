@@ -77,8 +77,22 @@ export function zoneMismatch(input: { target: string; hostIds: readonly string[]
   // `endsWith("." + target)`, never `includes(target)` and never `endsWith(target)`. The first would
   // accept `gw-01.prod-icn-vtr-old` and the second would accept a host literally named
   // `prod-icn-vtr`, and both are exactly the shape a typo takes.
+  // ## Exactly `<label>.<target>`, not "ends with the target somewhere"
+  //
+  // `SAFE_NAME` in `parsePolicySites` allows dots, so `icn` and `prod.icn` can both be valid zone
+  // names. A plain `endsWith(".icn")` then accepts `gw.prod.icn` for target `icn`, even though that
+  // host belongs to the more specific zone — a nested name walks straight through the gate. Copilot
+  // found this on PR #55.
+  //
+  // Requiring the part before the suffix to carry no dot of its own settles it: a host is in a zone
+  // when its id is one label followed by that zone's name. Every real host id is that shape
+  // (`gw-01.dev-icn-vtr`), and `gw.prod.icn` is refused for `icn` because `gw.prod` is not one label.
   const suffix = `.${target}`;
-  const outside = hostIds.filter((id) => !id.endsWith(suffix));
+  const outside = hostIds.filter((id) => {
+    if (!id.endsWith(suffix)) return true;
+    const prefix = id.slice(0, -suffix.length);
+    return prefix.length === 0 || prefix.includes(".");
+  });
   if (outside.length === 0) return null;
 
   const named = outside.slice(0, NAMED).join(", ");

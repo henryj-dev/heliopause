@@ -86,7 +86,9 @@
       <span class="dim" style="font-family:var(--font-mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase">
         {t(prefs.lang, "m.policyForVpc")}
       </span>
-      <select value={site} onchange={(e) => pickSite(e.currentTarget.value)}>
+      <!-- The label text above is a `span`, so it names nothing. Without this the control is read out
+           as an unlabelled combobox. -->
+      <select aria-label={t(prefs.lang, "m.policyForVpc")} value={site} onchange={(e) => pickSite(e.currentTarget.value)}>
         {#each view.sites as name (name)}
           <option value={name}>{name}</option>
         {/each}

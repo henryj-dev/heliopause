@@ -21,6 +21,8 @@
  * that refuses to start should see the same sentence as before.
  */
 
+import { resolve } from "node:path";
+
 /** One relay the manager aggregates: a name, an https URL, and the PKI directory for that VPC. */
 export interface RelaySpec {
   name: string;
@@ -258,7 +260,12 @@ export function parsePolicySites(spec: string): PolicySiteSpec[] {
     if (out.some((s) => s.name === name)) {
       throw new EnvSpecError(`policy site ${JSON.stringify(name)} is named twice — each zone name must be unique`);
     }
-    const sharing = out.find((s) => s.path === path);
+    // Normalised before comparing. `alpha=./site.ts,beta=subdir/../site.ts` are two strings and one
+    // module, and the renderer resolves them to one path *after* this — so a raw-string comparison
+    // lets exactly the configuration this check exists to refuse through, and the two names then
+    // share a cache slot. `resolve` is pure path arithmetic, no filesystem, and the renderer runs it
+    // in this same process so the two agree. Copilot found this on PR #55.
+    const sharing = out.find((s) => resolve(s.path) === resolve(path));
     if (sharing) {
       throw new EnvSpecError(
         `policy sites ${JSON.stringify(sharing.name)} and ${JSON.stringify(name)} both name ${JSON.stringify(path)}` +

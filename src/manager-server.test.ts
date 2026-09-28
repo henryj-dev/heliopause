@@ -2098,9 +2098,9 @@ describe("the console can propose a plan, which is the step it could not take", 
     r.on("error", reject); r.end();
   });
 
-  const getPolicyScreen = () => new Promise<{ status: number; body: string }>((resolve, reject) => {
+  const getPolicyScreen = (query = "") => new Promise<{ status: number; body: string }>((resolve, reject) => {
     const r = request({
-      host: "127.0.0.1", port: port7, path: "/api/policy/screen", method: "GET",
+      host: "127.0.0.1", port: port7, path: `/api/policy/screen${query}`, method: "GET",
       rejectUnauthorized: false,
       cert: readFileSync(join(dir, "ops.pem")), key: readFileSync(join(dir, "ops.key")),
     }, (res) => {
@@ -2382,6 +2382,42 @@ describe("the console can propose a plan, which is the step it could not take", 
     const r = await propose("not-a-vpc");
     assert.equal(r.status, 400);
     assert.match(r.body, /unknown target/);
+  });
+
+  it("names a site for a read that did not, so the console can bootstrap", async () => {
+    // ## The deadlock this closes
+    //
+    // A multi-site renderer refuses an unqualified `/source` — correctly, it has no roster and
+    // choosing there is the incident one layer down. But the console renders its VPC selector only
+    // from a successful `/policy/screen`, and its first request names nothing. So the page that
+    // exists to let an operator *choose* a site could never load without one, and every other read
+    // path (`/policy/lookup`, `/workload-traffic`, the policy worker) would 400 the moment
+    // `HELIOPAUSE_POLICY_SITES` was configured. Copilot found it on PR #55 before it shipped.
+    //
+    // This process has the roster the renderer lacks, and it says which one it picked.
+    head = { sha: "abc1234", dirty: false };
+    askedSite = undefined;
+    const r = await getPolicyScreen();
+    assert.equal(r.status, 200, r.body);
+    assert.equal(askedSite, "dev", "the screen asked the renderer for nothing in particular");
+    const body = JSON.parse(r.body) as { sites?: unknown; siteName?: unknown };
+    // The selector's options, so a first load can offer the choice.
+    assert.deepEqual(body.sites, ["dev"]);
+    // And it does not invent a name the renderer never confirmed.
+    assert.equal(body.siteName, null);
+  });
+
+  it("draws the site it was asked for, and refuses one this manager does not know", async () => {
+    head = { sha: "abc1234", dirty: false };
+    askedSite = undefined;
+    assert.equal((await getPolicyScreen("?site=dev")).status, 200);
+    assert.equal(askedSite, "dev");
+
+    // Checked against the relay roster here rather than passed through, so an unknown name is this
+    // manager's refusal and not a 503 from the renderer describing a request it could not parse.
+    const bad = await getPolicyScreen("?site=not-a-vpc");
+    assert.equal(bad.status, 400, bad.body);
+    assert.match(bad.body, /unknown site/);
   });
 
   it("asks the renderer for the site the target names", async () => {
