@@ -162,6 +162,64 @@ describe("what the fleet reports about which keys may sign", () => {
     assert.match(line!, /h-canary/);
   });
 
+  it("reports a host enforcing a generation it cannot name the authorization for", () => {
+    // ## The fifth silence, and it hid inside the alarm above
+    //
+    // That line compares `=== "break-glass"`, so a `null` mode reads as *not* break-glass — the calm
+    // answer, and not an answer. It was the whole fleet's state: `confirm()` never promoted
+    // `pendingAuthorization` into `currentAuthorization` until 2026-09-29, which left the
+    // expired-but-confirmed re-apply escape dark as well. That is how a gateway came to hold zero nft
+    // rules with public v6:22 answering for 39 hours — an expired authorization and no way to
+    // re-apply it.
+    const s = state();
+    handleHeartbeat(
+      s, "h-canary",
+      hb({
+        artifactTrust: trust({ currentAuthorizationMode: null, currentAuthorizedAt: null }),
+        applied: { generation: "g-live", state: "confirmed", artifactHash: null, observedHash: null },
+      }),
+      AT,
+    );
+    const line = fleetView(s, new Date(AT), 300).problems.find((p) => p.includes("cannot name"));
+    assert.ok(line, "a host that cannot name its authorization must be reported");
+    assert.match(line!, /g-live/, "which generation it is enforcing is half the sentence");
+    assert.match(line!, /h-canary/);
+  });
+
+  it("distinguishes a host that cannot name one from an agent that never said", () => {
+    // ## The distinction that keeps the line above honest
+    //
+    // `artifactTrust` absent is an agent too old to send the object — "did not say", not "cannot
+    // name". Collapsing the two would turn a reporting gap into an alarm about the firewall, and it
+    // would fire hardest on the hosts it knows least about. Same distinction `agentBuildSplit` draws
+    // between builds and `unknown`, and the `?? null` contract this file keeps everywhere else.
+    const s = state();
+    handleHeartbeat(
+      s, "h-canary",
+      hb({ applied: { generation: "g-live", state: "confirmed", artifactHash: null, observedHash: null } }),
+      AT,
+    );
+    assert.equal(
+      fleetView(s, new Date(AT), 300).problems.find((p) => p.includes("cannot name")), undefined,
+      "an agent that sent no trust object was reported as enforcing something it cannot name",
+    );
+  });
+
+  it("says nothing about a host that has applied nothing at all", () => {
+    // A host with no generation has no authorization to name, so this would otherwise fire loudest on
+    // the hosts it has nothing to say about — every freshly enrolled machine.
+    const s = state();
+    handleHeartbeat(
+      s, "h-canary",
+      hb({ artifactTrust: trust({ currentAuthorizationMode: null, currentAuthorizedAt: null }) }),
+      AT,
+    );
+    assert.equal(
+      fleetView(s, new Date(AT), 300).problems.find((p) => p.includes("cannot name")), undefined,
+      "reported a host that has applied nothing",
+    );
+  });
+
   it("says nothing about an ordinary two-person authorization", () => {
     // The known negative. Without it, a check that reported every mode would pass the test above and
     // put a line on the screen for every healthy host.
