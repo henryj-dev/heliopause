@@ -167,6 +167,27 @@ export const ENV_BOUNDS = {
   HELIOPAUSE_PUBLISH_TIMEOUT_MS: { min: 1_000, max: 600_000, fallback: 30_000 },
   HELIOPAUSE_PLAN_TTL_SEC: { min: 60, max: 86_400, fallback: 600 },
   HELIOPAUSE_MAX_PENDING_PLANS: { min: 1, max: 1024, fallback: 32 },
+
+  /**
+   * How long one policy module gets to import before the renderer gives up on it at startup.
+   *
+   * It bounds a module that **never settles**, not a slow one: unbounded, the verification loop's
+   * own `await` never returns, `server.listen` is never reached, and the process answers nothing at
+   * all — not even `/healthz`.
+   *
+   * 🔴 **It lives here because its first version did not, and that was a hole.** Read as
+   * `Number(raw)` with a `isFinite && > 0` guard, `2147483648` passed — and `setTimeout` clamps
+   * anything past 2³¹−1 to **one millisecond**, so the largest-looking value became the smallest
+   * possible budget while the error text still quoted the number the operator typed. Worse, it is
+   * invisible in a smoke test: a healthy synchronous module blocks the loop, so the 1 ms timer
+   * cannot fire and every site still verifies. It bites only on a module that does async work at
+   * import, which is the module the bound is for.
+   *
+   * The `max` is what makes that unrepresentable. The other half of the fix is being in this table
+   * at all: `env-spec.test.ts` cross-checks scripts and env examples against these names, and a
+   * number read anywhere else is a number that check cannot see.
+   */
+  HELIOPAUSE_POLICY_STARTUP_BUDGET_MS: { min: 100, max: 120_000, fallback: 30_000 },
 } as const satisfies Record<string, NumberBounds>;
 
 export type BoundedEnvName = keyof typeof ENV_BOUNDS;

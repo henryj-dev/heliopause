@@ -366,17 +366,23 @@ async function currentSource(site: { name: string | null; path: string }): Promi
 const READY_MEMO_MS = 2_000;
 const READY_SITE_BUDGET_MS = 5_000;
 // Larger than the request-path budget: this is the first, cold import of each module, and being slow
-// at boot is not the failure being bounded here — never settling is. Overridable because a test
-// cannot spend thirty seconds proving the process still comes up, and because a site with a very
-// large policy tree is the one deployment that might legitimately need longer. Malformed or
-// non-positive values fall back rather than refusing to start: this is a bound on a pathological
-// case, and a typo in it must not become a second way to lose the renderer.
-const STARTUP_SITE_BUDGET_MS = (() => {
-  const given = Number(process.env["HELIOPAUSE_POLICY_STARTUP_BUDGET_MS"]);
-  return Number.isFinite(given) && given > 0 ? given : 30_000;
-})();
+// at boot is not the failure being bounded here — never settling is.
+//
+// Through `boundedInteger` like every other number this file reads, and **not** through a local
+// `Number(...)` guard, which is what it was. That guard admitted `2147483648`, which `setTimeout`
+// clamps to one millisecond: the largest-looking value became the smallest possible budget while
+// the timeout text still quoted what the operator asked for. See the entry in `ENV_BOUNDS`.
+const STARTUP_SITE_BUDGET_MS = boundedInteger(
+  "HELIOPAUSE_POLICY_STARTUP_BUDGET_MS",
+  process.env["HELIOPAUSE_POLICY_STARTUP_BUDGET_MS"],
+  ENV_BOUNDS.HELIOPAUSE_POLICY_STARTUP_BUDGET_MS,
+);
 
-let readyMemo: { at: number; answer: Promise<{ serving: number; total: number }> } | null = null;
+let readyMemo: {
+  /** `null` while in flight — an unsettled answer is shared regardless of age, never expired. */
+  settledAt: number | null;
+  answer: Promise<{ serving: number; total: number }>;
+} | null = null;
 
 /**
  * `currentSource`, or a rejection once the budget is spent. Never hangs.
@@ -413,14 +419,36 @@ function evaluateWithin(
   });
 }
 
-/** Whether each site can be evaluated right now, bounded and memoised. Never rejects. */
+/**
+ * Whether each site can be evaluated right now, bounded and memoised. Never rejects.
+ *
+ * ## The window runs from when the answer *settled*, not from when it started
+ *
+ * Stamped at the start, an evaluation slower than the window was stale the moment it finished and
+ * was served to nobody: measured against one never-settling site, a caller arriving at +2.5s found
+ * the memo already expired and began its own full five-second evaluation, so the process carried
+ * two and then three concurrent evaluations — each opening with two synchronous `git` calls per
+ * site — for an answer it already had in flight. The slow case is the only case this memo exists
+ * for, and it was the one case it could not memoise.
+ *
+ * An in-flight answer is shared regardless of age (that half was always right and is kept): callers
+ * queue behind it rather than starting rivals. The age test applies to a *settled* answer, which is
+ * the only kind that can be stale.
+ */
 function readiness(): Promise<{ serving: number; total: number }> {
-  const now = Date.now();
-  if (readyMemo && now - readyMemo.at < READY_MEMO_MS) return readyMemo.answer;
+  if (readyMemo && (readyMemo.settledAt === null || Date.now() - readyMemo.settledAt < READY_MEMO_MS)) {
+    return readyMemo.answer;
+  }
   const answer = Promise.all(
     sites.map((site) => evaluateWithin(site, READY_SITE_BUDGET_MS).then(() => true, () => false)),
   ).then((results) => ({ serving: results.filter(Boolean).length, total: results.length }));
-  readyMemo = { at: now, answer };
+  const memo: { settledAt: number | null; answer: typeof answer } = { settledAt: null, answer };
+  readyMemo = memo;
+  // `void` because `answer` cannot reject — every per-site promise is already caught above — so this
+  // only ever stamps. Guarded on identity so a superseded memo cannot stamp the current one.
+  void answer.then(() => {
+    memo.settledAt = Date.now();
+  });
   return answer;
 }
 
@@ -511,7 +539,10 @@ const server = createServer((req, res) => {
   // import at boot is fixed by the next git-sync two minutes later, and one that verified then can
   // break the same way, so an answer frozen at startup would be the past wearing the present's
   // clothes. `READY_MEMO_MS` is far shorter than that sync interval, so the answer is live at the
-  // only granularity that exists — and it makes a flood O(1) instead of O(requests × sites × git).
+  // only granularity that exists — and it caps the work at one evaluation per window instead of one
+  // per request. Not O(1): a sustained poll still costs `elapsed / READY_MEMO_MS` evaluations, which
+  // is what an earlier version of this line overclaimed. What it removes is the *rate* lever, which
+  // is the one that reached `/healthz`.
   if (req.method === "GET" && url.pathname === "/readyz") {
     if (!bearerOk(req.headers.authorization)) return send(401, { error: "bad or missing bearer" });
     void readiness().then(({ serving, total }) => {
@@ -561,7 +592,13 @@ const server = createServer((req, res) => {
       // the manager learns `?site=`, and the console goes down until it is rolled.
       return send(400, { error: `this renderer serves ${sites.length} sites — name one with ?site=: ${named}` });
     }
-    void currentSource(site).then(
+    // Bounded for the reason the paragraph below gives. Unbounded, a module that never settles makes
+    // this route answer nothing — and "nothing" is the empty page that comment calls the much worse
+    // claim. The manager does abort its own request (`AbortSignal.timeout`, `HELIOPAUSE_RELAY_TIMEOUT_MS`)
+    // so this was never an unbounded socket in production, but the abort arrives as a client-side
+    // timeout and the renderer never gets to say its sentence. This is the route that sentence is
+    // for, so it is the route that should still be able to send it.
+    void evaluateWithin(site, READY_SITE_BUDGET_MS).then(
       (source) => send(200, source),
       (e: Error) => {
         // The manager turns this into a 503 with this sentence in it. An empty page there would read
@@ -591,26 +628,61 @@ const server = createServer((req, res) => {
 // restart: a new outage manufactured by the fix. So it is logged and the process keeps listening,
 // with that one site answering 503. `currentSource` re-checks the zone on every evaluation, so a
 // module that could not be verified here is verified before it is ever served.
-for (const site of sites) {
-  if (site.name === null) continue; // Nothing was declared, so there is nothing to contradict.
-  try {
-    // Bounded, and the budget is generous because a cold first import of a real policy module is
-    // slower than any later one. What it rules out is not slowness but a module that never settles:
-    // unbounded, `server.listen` below is never reached and the process answers nothing at all, so a
-    // single `await new Promise(() => {})` in a policy commit takes the console down harder than a
-    // module that throws. Timing out lands in the same branch as a throw — logged, and that site
-    // answers 503 until it evaluates — which is the right place for it.
-    const source = await evaluateWithin(site, STARTUP_SITE_BUDGET_MS);
-    log(`verified ${site.name} — ${source.site.hosts?.length ?? 0} hosts`);
-  } catch (e) {
-    const why = (e as Error).message;
-    if (e instanceof ZoneMismatchError) {
-      console.error(`[policy-render] refusing to start: ${site.name} is declared for ${site.path}, but ${why}`);
-      console.error(`[policy-render]   a zone's name is the last label of every host id under it — one of these is wrong`);
-      process.exit(2);
+// ## Together, not one after another
+//
+// This was a `for … await`, which made the budget below **additive**: three sites that all hang cost
+// three budgets before `server.listen` is reached, and until then nothing answers — `/healthz`
+// included, because it does not exist yet. Measured at 2s × 3 = 6.1s, so the three-site deployment
+// at the 30s default is ninety seconds dark. The liveness probe this file is careful about is
+// 30s × 3, so the serial loop reached the very crashloop the `/healthz` comment argues must never
+// be created, by way of the bound added to prevent a worse version of it.
+//
+// There is no ordering between sites — nothing here reads another site's result — and the same
+// `evaluateWithin` is already used in parallel by `readiness()`. One helper with opposite
+// concurrency in its two callers, and nothing said so.
+const verified = await Promise.all(
+  sites.map(async (site) => {
+    // Nothing was declared, so there is nothing to contradict.
+    if (site.name === null) return null;
+    try {
+      const source = await evaluateWithin(site, STARTUP_SITE_BUDGET_MS);
+      log(`verified ${site.name} — ${source.site.hosts?.length ?? 0} hosts`);
+      return null;
+    } catch (e) {
+      return { site, error: e as Error };
     }
-    log(`${site.name} did not evaluate at startup and will answer 503 until it does: ${why}`);
+  }),
+);
+
+for (const failure of verified) {
+  if (!failure) continue;
+  const { site, error } = failure;
+  const why = error.message;
+  if (error instanceof ZoneMismatchError) {
+    console.error(`[policy-render] refusing to start: ${site.name} is declared for ${site.path}, but ${why}`);
+    console.error(`[policy-render]   a zone's name is the last label of every host id under it — one of these is wrong`);
+    process.exit(2);
   }
+  // 🔴 A timeout is not the same silence as a throw, and saying so is the whole of this branch.
+  //
+  // The paragraph above splits configuration faults from content faults, and the budget quietly
+  // merged them: a module that times out was never zone-checked, so a *misdeclared* site — the case
+  // the block above says "cannot heal itself" and must refuse — lands here instead of in `exit 2`.
+  // Measured: the same wrong-zone module exits 2 when it imports fast and merely logs when the
+  // budget is short enough to cut it off. An earlier version of this comment claimed the timeout
+  // "lands in the same branch as a throw … which is the right place for it", which is true of a
+  // content fault and false of the one the code was about to mishandle.
+  //
+  // Not fatal, because a slow-but-correct module must not take the pod down — that is the outage the
+  // fix would manufacture. What changes is that the line says which check did not run, so the
+  // absence is not read as a pass. Containment is unchanged either way: `currentSource` re-checks
+  // the zone on every evaluation, so an unverified site 503s rather than serving the wrong policy.
+  if (why.includes("did not finish within")) {
+    log(`${site.name} did not evaluate at startup — the declared-name check did not run for it, ` +
+      `and it will answer 503 until it does: ${why}`);
+    continue;
+  }
+  log(`${site.name} did not evaluate at startup and will answer 503 until it does: ${why}`);
 }
 
 server.listen(port, hostname, () => {
@@ -624,5 +696,7 @@ server.listen(port, hostname, () => {
   // person tells a three-site pod from a one-site pod without reading the manifest.
   const serving = sites.map((s) => (s.name === null ? s.path : `${s.name}=${s.path}`)).join(", ");
   log(`listening on ${hostname}:${at} — serving ${serving}, editable ${allowPaths.join(", ") || "(nothing)"}`);
-  log("bearer required on GET /source and GET /sites");
+  // `/readyz` joined this set in the commit that gated it, and this line did not follow. It is what
+  // an operator reads in `kubectl logs` to learn what needs a token.
+  log("bearer required on GET /source, GET /sites and GET /readyz");
 });

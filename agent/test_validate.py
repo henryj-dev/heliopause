@@ -4059,16 +4059,28 @@ class TestBackfillCurrentAuthorization(unittest.TestCase):
         # field through, and a hand-written list would be the same fixture drift one layer up. When
         # `record` gains or loses a field, this fails on the commit that does it rather than on the
         # day someone wonders why a comparison never catches anything.
+        #
+        # Every match is collected and then there must be exactly one. This kept the *last* match,
+        # and `ast.walk` is breadth-first, so "last" meant **deepest, then latest** — a rule with no
+        # relation to which assignment is the authorization record. A decoy `record = {...}` anywhere
+        # in the file won, and the failure then pointed at `REC`, whose obvious repair is to edit
+        # `REC` to match the decoy — at which point every comparison in this class is against a shape
+        # the program never produces. That is the defect this test exists to prevent, one layer up.
         source = pathlib.Path(hp.__file__).read_text()
-        built = None
-        for node in ast.walk(ast.parse(source)):
-            if (isinstance(node, ast.Assign)
-                    and any(getattr(t, "id", "") == "record" for t in node.targets)
-                    and isinstance(node.value, ast.Dict)):
-                built = {k.value for k in node.value.keys if isinstance(k, ast.Constant)}
-        self.assertIsNotNone(built, "could not find the `record = {...}` the agent builds")
+        built = [
+            {k.value for k in node.value.keys if isinstance(k, ast.Constant)}
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Assign)
+            and any(getattr(t, "id", "") == "record" for t in node.targets)
+            and isinstance(node.value, ast.Dict)
+        ]
         self.assertEqual(
-            set(self.REC), built,
+            len(built), 1,
+            f"expected exactly one `record = {{...}}` in the agent, found {len(built)} — this test "
+            f"cannot tell which is the authorization record, so fix this anchor, not the fixture",
+        )
+        self.assertEqual(
+            set(self.REC), built[0],
             "the fixture no longer has the shape the agent builds, so every identity comparison "
             "in this class is comparing something the program never produces",
         )

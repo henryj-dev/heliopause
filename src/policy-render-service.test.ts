@@ -24,7 +24,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcessByStdio } from "node:child_process";
 import type { Readable } from "node:stream";
-import { mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -684,6 +684,66 @@ describe("a site module has to be the site it is declared as", () => {
     }
   });
 
+  it("still refuses when the misdeclared module is slow to import", { timeout: 30_000 }, async () => {
+    // ## The budget above the refusal quietly turned a configuration fault into a content one
+    //
+    // The startup verification bounds each import so that a module which never settles cannot stop
+    // the process reaching `server.listen`. But a timeout means the zone check **never ran**, and
+    // the `catch` distinguishes `ZoneMismatchError` — refuse, it cannot heal itself — from every
+    // other failure — log, it changes commit to commit. A timed-out misdeclared site landed in the
+    // second branch, so the pod came up and served 503 for that VPC behind one log line instead of
+    // exiting 2 with the sentence that says which of the two names is wrong.
+    //
+    // Measured: the same wrong-zone module exits 2 at 148ms when it imports instantly, and merely
+    // logged when a budget shorter than its import cut it off. Any `await` at a policy module's top
+    // level — one `readFile`, a dynamic import, a cold transpile — is enough to be on the wrong side
+    // of that line. So the budget has to be larger than a real cold import, which is what this pins:
+    // a module that takes a second still gets zone-checked and still refuses.
+    const { dir, beta } = twoSites();
+    writeFileSync(beta, `await new Promise((r) => setTimeout(r, 1000));\n${readFileSync(beta, "utf8")}`);
+    try {
+      const { code, err } = await startExpectingRefusal(dir, {
+        HELIOPAUSE_POLICY_SITE: "",
+        HELIOPAUSE_POLICY_SITES: `alpha=${beta}`,
+        HELIOPAUSE_POLICY_RENDER_TOKEN: BEARER,
+        HELIOPAUSE_POLICY_STARTUP_BUDGET_MS: "10000",
+      });
+      assert.equal(code, 2, `a slow misdeclared module came up instead of refusing\n${err}`);
+      assert.match(err, /gw-01\.beta/, "it did not name the host that gave it away");
+    } finally {
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("verifies its sites together, so one hung module does not delay the rest", { timeout: 30_000 }, async () => {
+    // ## The bound was additive, and additive is its own outage
+    //
+    // This loop was `for … await`, so N hung sites cost N budgets before `server.listen` — and until
+    // that line nothing answers, `/healthz` included, because the listener does not exist yet.
+    // Measured 2s × 3 = 6.1s; at the 30s default with the three-VPC deployment this file keeps
+    // describing, that is ninety seconds dark, against a liveness probe of 30s × 3. The bound added
+    // to stop a hang reached the crashloop the `/healthz` comment says must never be created.
+    //
+    // Two hung sites and a budget of 2s: serial is ~4s, together is ~2s. The threshold sits between
+    // them, so this fails if the loop ever goes back to sequential.
+    const { dir, sites, alpha, beta } = twoSites();
+    const hang = "await new Promise(() => {});\nexport const site = { cfg: {}, hosts: [] };\n";
+    writeFileSync(alpha, hang);
+    writeFileSync(beta, hang);
+    let started: Started | undefined;
+    const began = Date.now();
+    try {
+      started = await start(dir, { ...MULTI(sites), HELIOPAUSE_POLICY_STARTUP_BUDGET_MS: "2000" });
+      const took = Date.now() - began;
+      assert.ok(took < 3_500, `startup took ${took}ms — the sites were verified one after another`);
+      // And it is listening, which is the point of bounding at all.
+      assert.equal((await fetchAt(started.port, "/healthz")).status, 200);
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
   it("starts when every name matches its module — the known positive", async () => {
     // Without this, the refusal above is equally satisfied by a renderer that never starts.
     const { dir, sites } = twoSites();
@@ -719,6 +779,11 @@ describe("a site module has to be the site it is declared as", () => {
       // startup verification already refused to make — and the test below pins the other half.
       assert.equal(res.status, 200, "one broken site made the whole renderer report unready");
       assert.deepEqual(await res.json(), { ok: true, degraded: true, serving: 1, total: 2 });
+      // The half this test's name promises. `deepEqual` above already rejects an added key, so this
+      // is belt and braces — but it was deleted once for exactly that reason, and then the name was
+      // the only thing left claiming the property. A name is not a check.
+      const body = await (await fetchAt(started.port, "/readyz")).text();
+      assert.ok(!body.includes("alpha") && !body.includes("beta"), `named a site: ${body}`);
     } finally {
       started?.stop();
       rmSync(join(dir, ".."), { recursive: true, force: true });
@@ -785,6 +850,58 @@ describe("a site module has to be the site it is declared as", () => {
         await (await fetchAt(started.port, "/readyz")).json(),
         { ok: true, degraded: true, serving: 1, total: 2 },
         "the answer was remembered from startup instead of read from the tree",
+      );
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("shares an evaluation that outlives the memo window instead of starting a rival", { timeout: 30_000 }, async () => {
+    // ## The memo could not memoise the one case it exists for
+    //
+    // The window was stamped when the evaluation *started*, so anything slower than the window was
+    // stale the moment it settled and was served to nobody. Measured against a never-settling site:
+    // a caller at +2.5s found the memo expired and began its own full five-second evaluation, so the
+    // process carried two and then three concurrent evaluations — each opening with two synchronous
+    // `git` calls per site — for an answer already in flight.
+    //
+    // An in-flight answer is now shared regardless of age; the window applies to a *settled* one,
+    // which is the only kind that can be stale.
+    //
+    // 🔴 **Counted, not timed, and the timed version of this test was green against the bug.** With
+    // a rival evaluation the second caller reaches the same `import()` specifier — same path, same
+    // stamp — and Node's module loader hands back the *same* pending promise, so both finish at the
+    // same instant however many callers there are. Wall-clock cannot see the duplication at all.
+    // What it costs is real and is not time: another `sourceStamp` (two synchronous `git` forks per
+    // site) and another trip through `currentSource`, which is what the log line below records.
+    const { dir, sites, alpha } = twoSites();
+    writeFileSync(alpha, `await new Promise((r) => setTimeout(r, 3000));\n${readFileSync(alpha, "utf8")}`);
+    let started: Started | undefined;
+    try {
+      started = await start(dir, { ...MULTI(sites), HELIOPAUSE_POLICY_STARTUP_BUDGET_MS: "10000" });
+      // Move the stamp so the request path actually has an evaluation to share. Startup already
+      // cached alpha, and without this both callers are cache hits and there is nothing slow in
+      // flight — the first version of this test asserted against that and failed either way, which
+      // is the "green against the bug" it was written to avoid, arriving from the other side.
+      const later = new Date(Date.now() + 5_000);
+      utimesSync(alpha, later, later);
+      // Attached after `start()` resolves, so the startup verification's own evaluations — which
+      // happen before "listening" is printed — are not in the count.
+      let evaluations = 0;
+      started.proc.stdout?.on("data", (b: Buffer) => {
+        evaluations += (b.toString().match(/evaluated alpha /g) ?? []).length;
+      });
+      const first = fetchAt(started.port, "/readyz");
+      await new Promise((r) => setTimeout(r, 2_500)); // past the memo window, inside the evaluation
+      const second = await fetchAt(started.port, "/readyz");
+      await first;
+      await new Promise((r) => setTimeout(r, 200)); // let the last line reach the pipe
+      assert.equal(second.status, 200);
+      assert.equal(
+        evaluations, 1,
+        `alpha was evaluated ${evaluations} times — the second caller started its own evaluation ` +
+          `instead of sharing the one already in flight`,
       );
     } finally {
       started?.stop();
