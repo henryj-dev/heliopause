@@ -129,9 +129,9 @@ python3 scripts/git-hooks/test-pre-commit.py              # 실패 0 (사람 통
 `if __name__ == "__main__"` 이 파일 중간에 있어서 그 아래 다섯 클래스(라우트 안전 검사
 39개)가 정의조차 되지 않은 채 몇 달을 지났고, 초록불은 그동안 한 번도 흔들리지 않았다
 — 수가 줄어든 게 아니라 센 적이 없어 비교할 기준선이 없었다. 현재 기대값(정책 심링크 연결):
-`npm test` 2,159 + 8 (`@heliopause/manager`) + 240 (`@heliopause/web`) ·
+`npm test` 2,161 + 8 (`@heliopause/manager`) + 240 (`@heliopause/web`) ·
 `test_validate.py` 293 (리눅스에서 실행 293 · macOS 에서 skip 12) · `test_enroll.py` 16.
-그 2,159 는 **이 저장소 2,065(`src` + `examples`) + `policy` 94** 이다. 둘로 나눠 적는 이유는
+그 2,161 은 **이 저장소 2,067(`src` + `examples`) + `policy` 94** 이다. 둘로 나눠 적는 이유는
 바로 아래에 있다 — 뒤의 94 는 이 저장소의 코드를 안 읽는다.
 
 ⚠️ **그 94 중 16 은 지금 실패한다.** 원인은 바로 아래 문단이 설명하는 포크 클론 드리프트이고
@@ -168,7 +168,11 @@ python3 scripts/git-hooks/test-pre-commit.py              # 실패 0 (사람 통
 「두 번째 호출자가 더 오래 걸린다」로 검사했더니 변이가 **살아남았다.** Node 의 ESM 로더가 같은
 specifier(`path?v=stamp`)의 `import()` 를 중복 제거해 **같은 pending promise 를 돌려주므로**,
 호출자가 몇이든 전부 같은 순간에 끝난다. 중복의 실제 비용은 시간이 아니라 그 앞의 일 —
-`sourceStamp` 의 동기 `git` 포크 — 이고, 그건 **횟수로만 보인다**(`evaluated <site>` 로그를 센다).
+`sourceStamp` 의 동기 `git` 포크 — 이고, 그건 **횟수로만 보인다.**
+
+⚠️ 다만 그 둘은 같은 수가 **아니다.** `sourceStamp` 는 캐시 적중을 포함해 `currentSource` 호출마다
+돌고, `evaluated <site>` 로그는 **적중 실패 때만** 나온다. 이 시나리오에서는 우연히 일치하지만,
+세는 것은 「완료된 평가」이지 「git 포크」가 아니다 — 이 기법을 다음에 쓰는 사람이 일반화하면 틀린다.
 
 그리고 그 「횟수를 세는」 판도 처음엔 양쪽 다 빨갰다. 기동 검증이 이미 캐시를 채워 요청 경로에
 공유할 평가가 없었기 때문이고, `utimesSync` 로 스탬프를 움직여야 실제 상황이 된다.

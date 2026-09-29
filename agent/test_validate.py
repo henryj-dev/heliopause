@@ -4074,10 +4074,16 @@ class TestBackfillCurrentAuthorization(unittest.TestCase):
             and any(getattr(t, "id", "") == "record" for t in node.targets)
             and isinstance(node.value, ast.Dict)
         ]
+        # Two messages, because zero and two are different problems and one sentence fits neither.
+        self.assertGreater(
+            len(built), 0,
+            "could not find the `record = {...}` the agent builds — it may no longer be a dict "
+            "literal, and this anchor cannot see anything else",
+        )
         self.assertEqual(
             len(built), 1,
-            f"expected exactly one `record = {{...}}` in the agent, found {len(built)} — this test "
-            f"cannot tell which is the authorization record, so fix this anchor, not the fixture",
+            f"found {len(built)} `record = {{...}}` in the agent — this test cannot tell which is "
+            f"the authorization record, so fix this anchor, not the fixture",
         )
         self.assertEqual(
             set(self.REC), built[0],

@@ -61,6 +61,15 @@ interface Started {
   proc: ChildProcessByStdio<null, Readable, Readable>;
   port: number;
   stop: () => void;
+  /**
+   * Everything the renderer said on stdout up to and including the "listening" line.
+   *
+   * The startup verification logs before the listener exists, so those lines are already consumed by
+   * this harness's own reader by the time `start()` resolves — a test that attaches afterwards sees
+   * none of them. Without this, nothing the process says at startup is assertable at all, which is
+   * how the declared-name caveat shipped with no test.
+   */
+  startupLog: string;
 }
 
 /** Start the renderer and wait for the line that reports the port it actually bound. */
@@ -122,6 +131,7 @@ function start(dir: string, extraEnv: Record<string, string> = {}): Promise<Star
         proc,
         port: Number(m[1]),
         stop: () => proc.kill("SIGKILL"),
+        startupLog: out,
       });
     });
     proc.on("exit", (code) => {
@@ -731,12 +741,58 @@ describe("a site module has to be the site it is declared as", () => {
     writeFileSync(alpha, hang);
     writeFileSync(beta, hang);
     let started: Started | undefined;
+    // Derived from the budget rather than written as a number, so tuning one moves the other. The
+    // threshold sits between one budget and two; measured five runs at 2147–2169ms parallel against
+    // 4119ms serial, so the slack is over a second on a ~150ms fixed cost.
+    const budget = 2_000;
     const began = Date.now();
     try {
-      started = await start(dir, { ...MULTI(sites), HELIOPAUSE_POLICY_STARTUP_BUDGET_MS: "2000" });
+      started = await start(dir, { ...MULTI(sites), HELIOPAUSE_POLICY_STARTUP_BUDGET_MS: String(budget) });
       const took = Date.now() - began;
-      assert.ok(took < 3_500, `startup took ${took}ms — the sites were verified one after another`);
+      assert.ok(
+        took < budget * 1.75,
+        `startup took ${took}ms against a ${budget}ms budget — that is one budget per site, so the ` +
+          `sites were verified one after another`,
+      );
       // And it is listening, which is the point of bounding at all.
+      assert.equal((await fetchAt(started.port, "/healthz")).status, 200);
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("says the declared-name check did not run, whichever way the module failed", { timeout: 30_000 }, async () => {
+    // ## The caveat, and the predicate that only covered half of what needed it
+    //
+    // A site whose module never evaluated was never zone-checked, and the startup block treats a
+    // name/module mismatch as the fault that cannot heal itself. So the line has to say which check
+    // did not run — otherwise its silence is read as a pass.
+    //
+    // 🔴 That caveat was selected by `why.includes("did not finish within")`, which is wrong on both
+    // sides. The zone check runs **after** the import, so it is skipped by every failure at or before
+    // it — and a module that *throws* is the common half, which kept the plain line and left the hole
+    // open on the other path. And the string is `evaluateWithin`'s own wording, so a policy module
+    // could throw that text and choose which sentence an operator reads. There is no condition now.
+    //
+    // Both halves are driven here: one site hangs past its budget, the other throws at import, and
+    // both must carry the caveat. Neither had a test at all — mutating the branch to `if (false)`
+    // left every test green.
+    const { dir, sites, alpha, beta } = twoSites();
+    writeFileSync(alpha, "await new Promise(() => {});\nexport const site = { cfg: {}, hosts: [] };\n");
+    writeFileSync(beta, "throw new Error('beta will not import');\n");
+    let started: Started | undefined;
+    try {
+      started = await start(dir, { ...MULTI(sites), HELIOPAUSE_POLICY_STARTUP_BUDGET_MS: "1000" });
+      const said = started.startupLog;
+      const caveat = /the declared-name check did not run for it/g;
+      assert.equal(
+        (said.match(caveat) ?? []).length, 2,
+        `both failures must carry the caveat — the timeout and the throw:\n${said}`,
+      );
+      assert.match(said, /alpha did not evaluate at startup — the declared-name check did not run/);
+      assert.match(said, /beta did not evaluate at startup — the declared-name check did not run/);
+      // And it did come up, which is the other half: neither failure may be fatal.
       assert.equal((await fetchAt(started.port, "/healthz")).status, 200);
     } finally {
       started?.stop();
@@ -779,9 +835,11 @@ describe("a site module has to be the site it is declared as", () => {
       // startup verification already refused to make — and the test below pins the other half.
       assert.equal(res.status, 200, "one broken site made the whole renderer report unready");
       assert.deepEqual(await res.json(), { ok: true, degraded: true, serving: 1, total: 2 });
-      // The half this test's name promises. `deepEqual` above already rejects an added key, so this
-      // is belt and braces — but it was deleted once for exactly that reason, and then the name was
-      // the only thing left claiming the property. A name is not a check.
+      // Documentation, not coverage — and saying which it is matters. `deepEqual` above already
+      // rejects any added key, so a leak dies there and this line is never the failure; measured by
+      // injecting `names: "alpha,beta"` into the body, which fails on the line above. It is kept
+      // because the property is worth stating at the point it is relied on, not because it catches
+      // anything the previous line would miss.
       const body = await (await fetchAt(started.port, "/readyz")).text();
       assert.ok(!body.includes("alpha") && !body.includes("beta"), `named a site: ${body}`);
     } finally {
@@ -888,15 +946,18 @@ describe("a site module has to be the site it is declared as", () => {
       utimesSync(alpha, later, later);
       // Attached after `start()` resolves, so the startup verification's own evaluations — which
       // happen before "listening" is printed — are not in the count.
-      let evaluations = 0;
-      started.proc.stdout?.on("data", (b: Buffer) => {
-        evaluations += (b.toString().match(/evaluated alpha /g) ?? []).length;
-      });
+      // Accumulated, then matched once. Counting per `data` event would miscount if a chunk ever
+      // split inside the marker — and the direction it would miscount is 2 → 1, a green run against
+      // the bug, which is exactly what this test was rewritten to stop doing. Two short writes are
+      // nowhere near the stream's watermark today, so this is insurance rather than a fix.
+      let out = "";
+      started.proc.stdout?.on("data", (b: Buffer) => { out += b.toString(); });
       const first = fetchAt(started.port, "/readyz");
       await new Promise((r) => setTimeout(r, 2_500)); // past the memo window, inside the evaluation
       const second = await fetchAt(started.port, "/readyz");
       await first;
       await new Promise((r) => setTimeout(r, 200)); // let the last line reach the pipe
+      const evaluations = (out.match(/evaluated alpha /g) ?? []).length;
       assert.equal(second.status, 200);
       assert.equal(
         evaluations, 1,
@@ -969,6 +1030,47 @@ describe("a site module has to be the site it is declared as", () => {
         (await fetchAt(started.port, "/healthz")).status, 200,
         "/healthz went strict — that restarts the pod for a policy fault",
       );
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("answers /source with its own sentence when a module hangs, before the manager gives up", { timeout: 30_000 }, async () => {
+    // ## The route the sentence is for, and it took two tries to actually deliver it
+    //
+    // `/source`'s 503 carries "the policy module could not be evaluated: …", which the console shows
+    // instead of an empty page — and the file says an empty page there reads as "no policy", a
+    // different and much worse claim. Unbounded, a module that never settles produced exactly that
+    // empty page. Bounded at the *same* number as the manager's own `AbortSignal.timeout`
+    // (`HELIOPAUSE_RELAY_TIMEOUT_MS`, default 5000), the client's clock still started first and won
+    // every time — measured at 5005ms against a 7s module, with this side logging afterwards to an
+    // abandoned socket. The budget has to be strictly shorter, which is what `SOURCE_SITE_BUDGET_MS`
+    // derives.
+    //
+    // 🔴 This is one of two changes in `ebba030` that deleted clean — reverting `/source` to an
+    // unbounded `currentSource` left all 26 tests green. The commit that shipped it said, one
+    // paragraph earlier, "a name is not a check".
+    const { dir, sites, beta } = twoSites();
+    writeFileSync(beta, "await new Promise(() => {});\nexport const site = { cfg: {}, hosts: [] };\n");
+    let started: Started | undefined;
+    try {
+      started = await start(dir, { ...MULTI(sites), HELIOPAUSE_POLICY_STARTUP_BUDGET_MS: "1000" });
+      const began = Date.now();
+      // The manager's default abort, applied the way `fetchPolicySource` applies it. The renderer
+      // has to answer inside this or the sentence never reaches anyone.
+      const res = await fetch(`http://127.0.0.1:${started.port}/source?site=beta`, {
+        headers: { authorization: "Bearer test-bearer" },
+        signal: AbortSignal.timeout(5_000),
+      });
+      const took = Date.now() - began;
+      assert.equal(res.status, 503, "a hanging module produced something other than the 503");
+      assert.match(
+        String(((await res.json()) as { error?: string }).error),
+        /the policy module could not be evaluated/,
+        "it answered without the sentence the console shows in place of an empty page",
+      );
+      assert.ok(took < 5_000, `answered at ${took}ms — the client's own timeout would have fired first`);
     } finally {
       started?.stop();
       rmSync(join(dir, ".."), { recursive: true, force: true });

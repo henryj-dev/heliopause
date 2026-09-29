@@ -183,11 +183,28 @@ export const ENV_BOUNDS = {
    * cannot fire and every site still verifies. It bites only on a module that does async work at
    * import, which is the module the bound is for.
    *
-   * The `max` is what makes that unrepresentable. The other half of the fix is being in this table
-   * at all: `env-spec.test.ts` cross-checks scripts and env examples against these names, and a
-   * number read anywhere else is a number that check cannot see.
+   * The `max` is what makes that unrepresentable, and it is the half that matters here.
+   *
+   * ⚠️ **The table's other benefit does not apply to this name, and saying so is the point.**
+   * `env-spec.test.ts` cross-checks these names against five files — two scripts and three
+   * `*.env.example` — and the renderer has none: it is a Deployment, and its environment lives in
+   * manifests outside this repository. So the scan finds nothing for this variable and will keep
+   * finding nothing. Putting it in `manager.env.example` to give the net something to catch would
+   * be worse than the gap, because the manager does not read it. What this entry buys is the bound
+   * and the shared refusal vocabulary, not coverage.
+   *
+   * ## Why 60s and not a round 120s
+   *
+   * The ceiling is a second outage budget, not just a sanity limit. While the renderer is still
+   * verifying, `server.listen` has not run, so **nothing answers — `/healthz` included**, and the
+   * probe watching it is 30s × 3 (cited from the deployment manifests, which this repository cannot
+   * check). A single site allowed 120s is therefore 120s dark against a 90s deadline: the same
+   * crashloop the parallel verification was introduced to remove, re-reachable by one site instead
+   * of three. `120_000` was the first value here and it left exactly that representable, which is
+   * what the sentence above claimed it did not. 60s keeps headroom under the deadline and is still
+   * far longer than any cold import measured.
    */
-  HELIOPAUSE_POLICY_STARTUP_BUDGET_MS: { min: 100, max: 120_000, fallback: 30_000 },
+  HELIOPAUSE_POLICY_STARTUP_BUDGET_MS: { min: 100, max: 60_000, fallback: 30_000 },
 } as const satisfies Record<string, NumberBounds>;
 
 export type BoundedEnvName = keyof typeof ENV_BOUNDS;

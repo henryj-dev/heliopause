@@ -372,11 +372,43 @@ const READY_SITE_BUDGET_MS = 5_000;
 // `Number(...)` guard, which is what it was. That guard admitted `2147483648`, which `setTimeout`
 // clamps to one millisecond: the largest-looking value became the smallest possible budget while
 // the timeout text still quoted what the operator asked for. See the entry in `ENV_BOUNDS`.
-const STARTUP_SITE_BUDGET_MS = boundedInteger(
-  "HELIOPAUSE_POLICY_STARTUP_BUDGET_MS",
-  process.env["HELIOPAUSE_POLICY_STARTUP_BUDGET_MS"],
-  ENV_BOUNDS.HELIOPAUSE_POLICY_STARTUP_BUDGET_MS,
-);
+//
+// 🔴 **A bad value now refuses to start, and the comment this replaced promised it would not.** It
+// said *"a typo in it must not become a second way to lose the renderer"*, and that was written
+// against `NaN` and negatives — which the old guard did handle — not against the garbage that
+// actually got through. Giving up the fallback is the deliberate half of the trade: a value outside
+// the range is a value whose effect the operator cannot predict, and this file's answer to that
+// everywhere else is to refuse rather than to substitute. What is **not** acceptable is refusing
+// badly, which is what the first version of this did — an uncaught `EnvSpecError`, exit 1, and a V8
+// stack naming `env-spec.ts` instead of the manifest line. Wrapped like `port` above, it refuses in
+// this service's own vocabulary with the same exit code as every other refusal here.
+let STARTUP_SITE_BUDGET_MS: number;
+try {
+  STARTUP_SITE_BUDGET_MS = boundedInteger(
+    "HELIOPAUSE_POLICY_STARTUP_BUDGET_MS",
+    process.env["HELIOPAUSE_POLICY_STARTUP_BUDGET_MS"],
+    ENV_BOUNDS.HELIOPAUSE_POLICY_STARTUP_BUDGET_MS,
+  );
+} catch (error) {
+  console.error(`[policy-render] ${(error as Error).message}`);
+  process.exit(2);
+}
+
+/**
+ * The request path's budget, and it must stay **below** the manager's own client timeout.
+ *
+ * `/source`'s 503 carries the sentence the console shows instead of an empty page, and that sentence
+ * only reaches anyone if this side gives up first. At `READY_SITE_BUDGET_MS` it did not: the manager
+ * applies `AbortSignal.timeout(HELIOPAUSE_RELAY_TIMEOUT_MS)` — default 5000, the same number — before
+ * it connects, so its clock always starts first and always wins. Measured against a seven-second
+ * module: the client threw at 5005ms and this process logged its timeout afterwards, to a socket
+ * nobody was reading. The change bought a log line and nothing on the wire, and the comment claiming
+ * otherwise was the third in this PR to conclude the opposite of its code.
+ *
+ * Derived rather than written down, so raising the relay timeout raises this with it and the
+ * relationship cannot drift into equality again.
+ */
+const SOURCE_SITE_BUDGET_MS = Math.floor(ENV_BOUNDS.HELIOPAUSE_RELAY_TIMEOUT_MS.fallback * 0.8);
 
 let readyMemo: {
   /** `null` while in flight — an unsettled answer is shared regardless of age, never expired. */
@@ -445,7 +477,10 @@ function readiness(): Promise<{ serving: number; total: number }> {
   const memo: { settledAt: number | null; answer: typeof answer } = { settledAt: null, answer };
   readyMemo = memo;
   // `void` because `answer` cannot reject — every per-site promise is already caught above — so this
-  // only ever stamps. Guarded on identity so a superseded memo cannot stamp the current one.
+  // only ever stamps. The closure stamps **its own object**, not `readyMemo`, so a superseded memo
+  // can only mark itself and nothing reads it again. (This said "guarded on identity", which named a
+  // `readyMemo === memo` check that is not here and never was; the behaviour was right and the
+  // mechanism described was fiction, which is the worse of the two ways to be wrong in a comment.)
   void answer.then(() => {
     memo.settledAt = Date.now();
   });
@@ -592,13 +627,12 @@ const server = createServer((req, res) => {
       // the manager learns `?site=`, and the console goes down until it is rolled.
       return send(400, { error: `this renderer serves ${sites.length} sites — name one with ?site=: ${named}` });
     }
-    // Bounded for the reason the paragraph below gives. Unbounded, a module that never settles makes
-    // this route answer nothing — and "nothing" is the empty page that comment calls the much worse
-    // claim. The manager does abort its own request (`AbortSignal.timeout`, `HELIOPAUSE_RELAY_TIMEOUT_MS`)
-    // so this was never an unbounded socket in production, but the abort arrives as a client-side
-    // timeout and the renderer never gets to say its sentence. This is the route that sentence is
-    // for, so it is the route that should still be able to send it.
-    void evaluateWithin(site, READY_SITE_BUDGET_MS).then(
+    // Bounded for the reason the paragraph below gives, and bounded **below the caller's own
+    // timeout** — see `SOURCE_SITE_BUDGET_MS`. Unbounded, a module that never settles makes this
+    // route answer nothing, and "nothing" is the empty page that comment calls the much worse claim;
+    // bounded at the same number as the manager's abort, this side loses the race every time and the
+    // sentence still never ships.
+    void evaluateWithin(site, SOURCE_SITE_BUDGET_MS).then(
       (source) => send(200, source),
       (e: Error) => {
         // The manager turns this into a 503 with this sentence in it. An empty page there would read
@@ -640,6 +674,14 @@ const server = createServer((req, res) => {
 // There is no ordering between sites — nothing here reads another site's result — and the same
 // `evaluateWithin` is already used in parallel by `readiness()`. One helper with opposite
 // concurrency in its two callers, and nothing said so.
+//
+// ⚠️ **What did change is what runs before a refusal.** Serially, a mismatch on the first site
+// exited before the later ones were imported; now every declared module's top level executes and
+// only then is the refusal considered. Measured: two misdeclared sites, both modules' side effects
+// observed, then exit 2. That is accepted rather than fixed — running policy code is this process's
+// whole job and `/source` would run all of them the moment it came up — but it is a widening during
+// a boot already known to be misconfigured, and "no ordering between sites" is true of results and
+// says nothing about side effects, which is the only thing that moved.
 const verified = await Promise.all(
   sites.map(async (site) => {
     // Nothing was declared, so there is nothing to contradict.
@@ -663,26 +705,28 @@ for (const failure of verified) {
     console.error(`[policy-render]   a zone's name is the last label of every host id under it — one of these is wrong`);
     process.exit(2);
   }
-  // 🔴 A timeout is not the same silence as a throw, and saying so is the whole of this branch.
+  // 🔴 **Every failure that is not a zone mismatch means the zone check did not run**, and saying so
+  // is the whole of this branch.
   //
-  // The paragraph above splits configuration faults from content faults, and the budget quietly
-  // merged them: a module that times out was never zone-checked, so a *misdeclared* site — the case
-  // the block above says "cannot heal itself" and must refuse — lands here instead of in `exit 2`.
-  // Measured: the same wrong-zone module exits 2 when it imports fast and merely logs when the
-  // budget is short enough to cut it off. An earlier version of this comment claimed the timeout
-  // "lands in the same branch as a throw … which is the right place for it", which is true of a
-  // content fault and false of the one the code was about to mishandle.
+  // The paragraph above splits configuration faults from content faults, and anything that stops the
+  // evaluation quietly merges them: the check happens *after* the import, so a misdeclared site — the
+  // case that block says "cannot heal itself" and must refuse — lands here instead of in `exit 2`
+  // whenever its module fails first. Measured: a wrong-zone module that throws at import logged the
+  // ordinary "did not evaluate" line and the pod came up, no caveat, zone never examined.
+  //
+  // ⚠️ **This was a string match on `"did not finish within"` and that was wrong twice over.** It
+  // covered only the timeout, so a module that throws — the more common half — kept the plain line
+  // and the hole stayed open on the other path. And the string is produced by `evaluateWithin`, so a
+  // policy module could pick which sentence an operator reads by throwing that text itself: log
+  // forgery in the one process whose premise is that it runs hostile code. There is no condition
+  // here now, which is both the correct predicate and nothing for a module to spoof; the `instanceof`
+  // above is the only distinction this catch needs, and it is the idiom the file already had.
   //
   // Not fatal, because a slow-but-correct module must not take the pod down — that is the outage the
-  // fix would manufacture. What changes is that the line says which check did not run, so the
-  // absence is not read as a pass. Containment is unchanged either way: `currentSource` re-checks
-  // the zone on every evaluation, so an unverified site 503s rather than serving the wrong policy.
-  if (why.includes("did not finish within")) {
-    log(`${site.name} did not evaluate at startup — the declared-name check did not run for it, ` +
-      `and it will answer 503 until it does: ${why}`);
-    continue;
-  }
-  log(`${site.name} did not evaluate at startup and will answer 503 until it does: ${why}`);
+  // fix would manufacture. Containment is unchanged either way: `currentSource` re-checks the zone on
+  // every evaluation, so an unverified site 503s rather than serving the wrong policy.
+  log(`${site.name} did not evaluate at startup — the declared-name check did not run for it, ` +
+    `and it will answer 503 until it does: ${why}`);
 }
 
 server.listen(port, hostname, () => {
