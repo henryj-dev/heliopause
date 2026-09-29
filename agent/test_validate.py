@@ -4210,6 +4210,43 @@ class TestBackfillCurrentAuthorization(unittest.TestCase):
         self.assertEqual(err, "", "an adopted authorization did not satisfy its own expiry escape")
         self.assertIsNotNone(fresh)
 
+    def test_a_watermark_written_before_expiresAt_existed_still_arms_the_escape(self):
+        # ## The only shape the fleet is actually in, and the tests above do not have it
+        #
+        # `REC` is used for both sides everywhere else here, so every assertion about the escape
+        # compares a record against *itself*. Production is asymmetric, and measured on all eight
+        # hosts on 2026-09-29 it is asymmetric in exactly one way:
+        #
+        #   adopted `currentAuthorization`  written by the pre-2026-09-29 agent →  9 keys, no expiresAt
+        #   incoming `record`               built by this agent from the payload → 10 keys
+        #
+        # `expiresAt` joined `record` in the same change that added the promotion, so every host that
+        # confirmed before it is carrying the short shape and will carry it until the next publish.
+        # Until then, every reboot recovery on every host depends on those two comparing equal.
+        #
+        # They do, because `_authorization_identity` is an **exclusion** list — it drops `expiresAt`
+        # and keeps whatever else exists. Written the other way, as the enumeration it started as,
+        # the nine-key value would compare unequal to the ten-key one and **every rebooted host
+        # would be refused** — which is the 2026-09-28 incident, reproduced by a field addition.
+        #
+        # Key sets compared across `1be2cdb` (the build the fleet ran) and `0e2a6ef`: `expiresAt`
+        # added, nothing removed or renamed. That is what makes the exclusion sufficient rather than
+        # lucky, and it is why this test pins the shapes and not just the outcome.
+        short = {k: v for k, v in self.REC.items() if k != "expiresAt"}
+        self.assertNotIn("expiresAt", short)
+        self.assertIn("expiresAt", self.REC, "the fixture stopped being the long shape")
+        hp.save_state(self.state(authorizationWatermark=short, pendingAuthorization=short))
+        hp.backfill_current_authorization()
+        adopted = hp.load_state()["currentAuthorization"]
+        self.assertEqual(adopted, short, "the backfill reshaped the record instead of adopting it")
+
+        fresh, err = _REAL_ACCEPT_AUTHORIZATION(dict(self.REC), {}, True)
+        self.assertEqual(
+            err, "",
+            "a host whose watermark predates expiresAt cannot re-apply after a reboot",
+        )
+        self.assertIsNotNone(fresh)
+
     def test_without_adopting_the_same_record_is_still_refused(self):
         # The known negative for the case above. Without it that assertion is equally satisfied by an
         # escape that lets every expired authorization through, which is the refusal this whole
