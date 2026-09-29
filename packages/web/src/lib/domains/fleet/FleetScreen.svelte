@@ -6,7 +6,7 @@
   import { chromeFreshness } from "$lib/shell/freshness.svelte";
   import { chromePrefs } from "$lib/shell/prefs.svelte";
   import { ageLabel } from "$lib/age";
-  import { agentBuildSplit,
+  import { agentBuildLines, hostsOnBuild,
     answeredVpcNames, fleetListing, fleetSummary, hostMatches, hostRowClass, hostsOnVpc, hostStateChips,
     membershipPodCount, routesView, vpcLabel, vpcTone, wantedGeneration, whyBits, workloadChip,
   } from "./present";
@@ -93,13 +93,42 @@
     on 2026-09-29 the third was false for a day while the first two were true and every screen was
     green. The value that says so has travelled from every host since 2026-09-03; nothing drew it.
   -->
-  {@const agents = agentBuildSplit(site.hosts)}
-  {#if agents.builds.length > 1}
-    <p class="banner warn">
-      {t(prefs.lang, "m.agentBuildSplit", { n: agents.builds.length, hosts: site.hosts.length })}
-    </p>
-  {:else if agents.unknown > 0 && agents.builds.length > 0}
-    <p class="banner hatch">{t(prefs.lang, "m.agentBuildSilent", { n: agents.unknown })}</p>
+  {@const agents = agentBuildLines(site.hosts)}
+  {#if agents.split}
+    <!--
+      `hosts` counts the hosts that *answered*, not every host. "2 builds across 8 hosts" when only
+      two answered reads as a fleet split down the middle; the silent six are their own sentence
+      below.
+    -->
+    <div class="banner warn">
+      <div class="lead">
+        {t(prefs.lang, "m.agentBuildSplit", {
+          n: agents.split.builds.length, hosts: agents.split.answered,
+        })}
+      </div>
+      <!--
+        Named, not just counted. The neighbouring mechanism for the same question — `relay.ts`'s
+        agent-version concern — pushes `host: reason` into `site.problems`, because an operator told
+        "two builds exist" has no path from there to which host except a shell loop. The minority
+        list is short by construction, which is why naming it is cheap here and a hex column is not.
+      -->
+      {#each agents.split.builds as build (build)}
+        <div>
+          · <span class="mono">{build.slice(0, 12)}</span>
+          {hostsOnBuild(site.hosts, build).join(", ")}
+        </div>
+      {/each}
+    </div>
+  {/if}
+  <!--
+    Independent of the split line, not an `{:else if}`. As a chained branch this was dead in the one
+    state that matters most: no host reporting at all (`builds: []`, `unknown: 8`) rendered nothing,
+    which is indistinguishable from one build everywhere — the exact reading `agentBuildSplit` keeps
+    apart and `present.test.ts` asserts it keeps apart. Reachable after any relay restart, since
+    relay status is memory-only and every host reads `null` until it beats again.
+  -->
+  {#if agents.silent !== null}
+    <p class="banner warn hatch">{t(prefs.lang, "m.agentBuildSilent", { n: agents.silent })}</p>
   {/if}
 
   <div class="vpc-strip">

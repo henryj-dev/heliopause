@@ -134,11 +134,52 @@ export function fleetSummary(site: SiteView): { problems: number; generations: s
  *
  * `unknown` counts hosts that reported nothing — either older than the field or not reporting at
  * all. Kept apart from the builds because "did not say" is not a third version.
+ *
+ * ## It is self-attested, so it is a rollout signal and not an integrity control
+ *
+ * The digest is computed by the agent over its own file and sent in its own heartbeat. Nothing else
+ * measures it, so an agent that has been replaced can report whatever digest it likes, and a fleet
+ * showing one build everywhere is evidence that every host *claims* the same source — not proof of
+ * it. What the field is honest about is the case it was added for: an unmodified agent that a rollout
+ * has not reached yet, which has no reason to lie and every reason to differ.
+ *
+ * Saying so here because the banner reads like verification and is not. Integrity of what a host
+ * enforces rests on the signed artifact path — `currentAuthorization`, the trust digest, the key ids
+ * — none of which this value touches.
  */
 export function agentBuildSplit(hosts: readonly SiteHost[]): { builds: string[]; unknown: number } {
   const builds = [...new Set(hosts.map((h) => h.agentBuild).filter((b): b is string => Boolean(b)))];
   builds.sort();
   return { builds, unknown: hosts.filter((h) => !h.agentBuild).length };
+}
+
+/**
+ * Which agent-build lines the fleet screen should draw.
+ *
+ * ## Why this is a function and not two `{#if}`s
+ *
+ * It was two, chained — `{#if split}{:else if unknown > 0 && builds.length > 0}`. That second
+ * condition made the silent line dead in the one state it exists for: **no host reporting at all**
+ * (`builds: []`, `unknown: 8`) rendered nothing, which on the page is indistinguishable from one
+ * build everywhere. `agentBuildSplit` keeps those apart and a test asserts it does; the template
+ * threw it away, and no test could see that because nothing here runs the template.
+ *
+ * So the decision moves out of the markup, where it can be asserted. The two lines are independent:
+ * a fleet can be both split and partly silent, and that is two facts, not a choice between them.
+ */
+export function agentBuildLines(
+  hosts: readonly SiteHost[],
+): { split: { builds: string[]; answered: number } | null; silent: number | null } {
+  const { builds, unknown } = agentBuildSplit(hosts);
+  return {
+    split: builds.length > 1 ? { builds, answered: hosts.length - unknown } : null,
+    silent: unknown > 0 ? unknown : null,
+  };
+}
+
+/** The hosts reporting one agent build, so a split can name them instead of only counting them. */
+export function hostsOnBuild(hosts: readonly SiteHost[], build: string): string[] {
+  return hosts.filter((h) => h.agentBuild === build).map((h) => h.host).sort();
 }
 
 export function vpcTone(vpc: SiteView["vpcs"][number], hosts: readonly SiteHost[]): "ok" | "warn" | "bad" {
