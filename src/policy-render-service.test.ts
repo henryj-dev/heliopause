@@ -714,15 +714,120 @@ describe("a site module has to be the site it is declared as", () => {
     try {
       started = await start(dir, MULTI(sites));
       const res = await fetchAt(started.port, "/readyz");
-      // 200 with one of two. Refusing here would let a broken `dev.ts` take prod's and util's
-      // consoles down, which is the trade the startup verification already refused to make — and
-      // the test above pins the other half of it.
+      // 200 with one of two, and `degraded` carrying the part the status code cannot. Refusing here
+      // would let a broken `dev.ts` take prod's and util's consoles down, which is the trade the
+      // startup verification already refused to make — and the test below pins the other half.
       assert.equal(res.status, 200, "one broken site made the whole renderer report unready");
-      assert.deepEqual(await res.json(), { ok: true, serving: 1, total: 2 });
-      // Site names are zone names — that is why `/sites` sits behind the bearer. A health signal
-      // that leaks them would put the fleet's zone names on an unauthenticated endpoint.
-      const body = await (await fetchAt(started.port, "/readyz")).text();
-      assert.ok(!body.includes("alpha") && !body.includes("beta"), `named a site: ${body}`);
+      assert.deepEqual(await res.json(), { ok: true, degraded: true, serving: 1, total: 2 });
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a caller without the bearer, because reaching it makes this process do work", async () => {
+    // ## The assertion that was missing, and why its absence was invisible
+    //
+    // This route was unauthenticated on the argument that counts leak nothing. Counts do leak
+    // nothing — but `currentSource` calls `sourceStamp` → `policyHead`, which runs **two synchronous
+    // `execFileSync("git", …)` per site before its own cache is consulted**. A review measured
+    // 42.7 ms each and held `/healthz` — this pod's *liveness* probe — above a second with thirty
+    // concurrent unauthenticated requests. That is kubelet killing the container on demand, at
+    // `replicas: 1` with no surge pod.
+    //
+    // 🔴 **And the whole suite stayed green when the gate was added**, because `fetchAt` always sends
+    // `Bearer test-bearer`. Every assertion about this route was made by an authenticated caller, so
+    // the unauthenticated property — the one that mattered — was never once exercised. Hence the bare
+    // `fetch`: it is the only call in this file that proves anything about a caller without a token.
+    const { dir, sites } = twoSites();
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      const bare = await fetch(`http://127.0.0.1:${started.port}/readyz`);
+      assert.equal(bare.status, 401, "an unauthenticated caller could make this process fork git");
+      const wrong = await fetch(`http://127.0.0.1:${started.port}/readyz`, {
+        headers: { authorization: "Bearer not-the-token" },
+      });
+      assert.equal(wrong.status, 401);
+      // The gate is the point, but it must not have gated the answer away from a real caller.
+      assert.equal((await fetchAt(started.port, "/readyz")).status, 200);
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("answers from the tree as it is now, not from how it was at startup", async () => {
+    // ## The property the route argues for at length and nothing checked
+    //
+    // Both other tests break their modules *before* `start()`, so the startup answer and the live
+    // answer are identical and a snapshot frozen at boot would satisfy them. That matters because a
+    // site is fixed — or broken — by a git-sync every two minutes, and an answer remembered from
+    // startup would be the past wearing the present's clothes.
+    //
+    // The memo window is deliberately short for the same reason, so this also pins that it is a
+    // window and not a lifetime: the second reading has to arrive after it lapses.
+    const { dir, sites, beta } = twoSites();
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      assert.deepEqual(
+        await (await fetchAt(started.port, "/readyz")).json(),
+        { ok: true, degraded: false, serving: 2, total: 2 },
+      );
+      // Break it after the process is up, and move the mtime so the stamp changes — `utimesSync`
+      // because two writes inside one millisecond are indistinguishable to the stamp.
+      writeFileSync(beta, "throw new Error('beta broke after startup');\n");
+      const later = new Date(Date.now() + 5_000);
+      utimesSync(beta, later, later);
+      await new Promise((r) => setTimeout(r, 2_100)); // the memo window, plus a margin
+      assert.deepEqual(
+        await (await fetchAt(started.port, "/readyz")).json(),
+        { ok: true, degraded: true, serving: 1, total: 2 },
+        "the answer was remembered from startup instead of read from the tree",
+      );
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  // ## Why the abort below, and not just a test timeout
+  //
+  // Without the route's budget this does not fail, it **hangs** — and a hang in CI is a job timeout
+  // with no failing test name, which reads as infrastructure rather than as this defect. A
+  // `{ timeout }` on the test is not enough: measured here, it marks the test failed and the runner
+  // still does not exit, because the held socket keeps the server's loop alive and `finally` never
+  // reaches `stop()`. Aborting the request is what lets the failure land *and* the process end.
+  it("answers even when a site module never settles", { timeout: 20_000 }, async () => {
+    // ## The state this route exists to report, arriving as silence
+    //
+    // A policy module is attacker-reachable code that runs at import (see this file's header on the
+    // C1 finding). `await new Promise(() => {})` at its top level never settles, and the first draft
+    // of this route had no bound: `Promise.all` never resolved, `send` was never called, and the
+    // socket stayed open. A review reproduced 80 held sockets from 40 requests, with `/healthz` green
+    // throughout — "up but serving nothing" reported as a hang, which a monitor cannot tell from a
+    // network fault and which is strictly less informative than the 503 the route was built to send.
+    //
+    // A site that cannot answer inside its budget is not serving. That is not an approximation.
+    // 🔴 And it takes the process down harder at startup than at request time. Unbounded, the
+    // verification loop's own `await` never returns, `server.listen` is never reached, and the
+    // renderer answers *nothing* — not even `/healthz`. That is what this test found first: it failed
+    // with "the renderer exited with 13 before listening", which was the bug and not the test. The
+    // startup budget is lowered here only so this does not cost thirty seconds.
+    const { dir, sites, beta } = twoSites();
+    writeFileSync(beta, "await new Promise(() => {});\nexport const site = { cfg: {}, hosts: [] };\n");
+    let started: Started | undefined;
+    try {
+      started = await start(dir, { ...MULTI(sites), HELIOPAUSE_POLICY_STARTUP_BUDGET_MS: "1500" });
+      const res = await fetch(`http://127.0.0.1:${started.port}/readyz`, {
+        headers: { authorization: "Bearer test-bearer" },
+        // Longer than the 5s per-site budget the route is supposed to honour, short enough that a
+        // route which honours nothing fails here instead of outliving the suite.
+        signal: AbortSignal.timeout(10_000),
+      });
+      assert.equal(res.status, 200, "alpha was serving, so this must be up and degraded");
+      assert.deepEqual(await res.json(), { ok: true, degraded: true, serving: 1, total: 2 });
     } finally {
       started?.stop();
       rmSync(join(dir, ".."), { recursive: true, force: true });
@@ -742,7 +847,7 @@ describe("a site module has to be the site it is declared as", () => {
       started = await start(dir, MULTI(sites));
       const res = await fetchAt(started.port, "/readyz");
       assert.equal(res.status, 503, "a renderer serving nothing reported itself ready");
-      assert.deepEqual(await res.json(), { ok: false, serving: 0, total: 2 });
+      assert.deepEqual(await res.json(), { ok: false, degraded: true, serving: 0, total: 2 });
       assert.equal(
         (await fetchAt(started.port, "/healthz")).status, 200,
         "/healthz went strict — that restarts the pod for a policy fault",

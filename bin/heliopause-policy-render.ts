@@ -350,6 +350,81 @@ async function currentSource(site: { name: string | null; path: string }): Promi
 }
 
 /**
+ * How long one readiness answer stands, and how long a single site gets to produce one.
+ *
+ * The memo window is what keeps `/readyz` O(1) under repetition: `currentSource` runs two
+ * synchronous `git` calls per site before it ever reaches its own cache, so an ungated loop over
+ * this route is a loop of `execFileSync` on the only event loop this process has. Two seconds is far
+ * below the policy checkout's own sync interval, so nothing observable is lost.
+ *
+ * The per-site budget exists because a policy module is attacker-reachable code that runs at import.
+ * `await new Promise(() => {})` at its top level never settles, and without a bound the whole route
+ * never answers: the socket stays open, `/healthz` stays green, and the state this endpoint was
+ * built to report arrives as **silence** — strictly worse than the 503 it exists to send. A site
+ * that cannot answer inside the budget is not serving, which is not an approximation.
+ */
+const READY_MEMO_MS = 2_000;
+const READY_SITE_BUDGET_MS = 5_000;
+// Larger than the request-path budget: this is the first, cold import of each module, and being slow
+// at boot is not the failure being bounded here — never settling is. Overridable because a test
+// cannot spend thirty seconds proving the process still comes up, and because a site with a very
+// large policy tree is the one deployment that might legitimately need longer. Malformed or
+// non-positive values fall back rather than refusing to start: this is a bound on a pathological
+// case, and a typo in it must not become a second way to lose the renderer.
+const STARTUP_SITE_BUDGET_MS = (() => {
+  const given = Number(process.env["HELIOPAUSE_POLICY_STARTUP_BUDGET_MS"]);
+  return Number.isFinite(given) && given > 0 ? given : 30_000;
+})();
+
+let readyMemo: { at: number; answer: Promise<{ serving: number; total: number }> } | null = null;
+
+/**
+ * `currentSource`, or a rejection once the budget is spent. Never hangs.
+ *
+ * Used by the readiness route *and* by the startup verification, because the unbounded wait is worse
+ * at startup: a module that never settles there means `server.listen` is never reached, so the
+ * process answers nothing at all — not even `/healthz` — and the only evidence is a pod that never
+ * becomes ready. A test for the route found that by failing with "the renderer exited with 13 before
+ * listening", which is the shape of the bug rather than a flaw in the test.
+ */
+function evaluateWithin(
+  site: { name: string | null; path: string },
+  budgetMs: number,
+): Promise<PolicySource> {
+  return new Promise<PolicySource>((resolve, reject) => {
+    // ## Deliberately **not** `unref`'d, and the first draft was
+    //
+    // At startup this is awaited at the module's top level. An `unref`'d timer does not hold the
+    // event loop open, so with the only other pending work being an import that never settles, Node
+    // finds nothing to do and exits **13** — "unsettled top-level await" — before the budget can
+    // fire. The bound was there and could not reach: the process still answered nothing, which is
+    // the exact failure it was added to prevent, arriving through the mechanism meant to prevent it.
+    //
+    // Holding the loop open costs at most one budget, and the timer is cleared on every normal path,
+    // so a fast answer leaves nothing behind.
+    const timer = setTimeout(
+      () => reject(new Error(`evaluation did not finish within ${budgetMs}ms`)),
+      budgetMs,
+    );
+    void currentSource(site).then(
+      (source) => { clearTimeout(timer); resolve(source); },
+      (e: unknown) => { clearTimeout(timer); reject(e as Error); },
+    );
+  });
+}
+
+/** Whether each site can be evaluated right now, bounded and memoised. Never rejects. */
+function readiness(): Promise<{ serving: number; total: number }> {
+  const now = Date.now();
+  if (readyMemo && now - readyMemo.at < READY_MEMO_MS) return readyMemo.answer;
+  const answer = Promise.all(
+    sites.map((site) => evaluateWithin(site, READY_SITE_BUDGET_MS).then(() => true, () => false)),
+  ).then((results) => ({ serving: results.filter(Boolean).length, total: results.length }));
+  readyMemo = { at: now, answer };
+  return answer;
+}
+
+/**
  * Constant-time, and length-independent — a plain `===` on a bearer leaks its prefix by timing.
  *
  * There is no "no token configured" branch any more. It read `if (!token) return true;`, which is
@@ -377,10 +452,25 @@ const server = createServer((req, res) => {
   const url = new URL(req.url ?? "/", "http://placeholder");
 
   // Unchanged on purpose. It answers "the listener is up" and nothing else, because it is wired to
-  // this pod's **liveness** probe as well as its readiness one (measured 2026-09-29: liveness period
-  // 30s × 3, readiness 10s × 3). Making this one strict would restart the pod for a policy problem,
-  // and a policy tree that cannot be cloned does not become clonable by restarting — it becomes a
-  // crashloop. `/readyz` below is the strict one, and it is deliberately not a probe.
+  // this pod's **liveness** probe as well as its readiness one — liveness period 30s × 3, readiness
+  // 10s × 3, `replicas: 1`, `strategy: Recreate`. Those five values are **not in this repository**:
+  // they were read out of the deployment manifests in `stardust-deploy` by the session that owns
+  // them and relayed here on 2026-09-29. Treat them as a citation, not as something this tree can
+  // check — if the manifests move, nothing here goes red.
+  //
+  // Making this one strict would restart the pod for a policy problem, and a policy tree that cannot
+  // be cloned does not become clonable by restarting — it becomes a crashloop. `/readyz` below is
+  // the strict one, and it is deliberately not a probe.
+  //
+  // 🔴 **This endpoint's cheapness is load-bearing, and it is why `/readyz` is gated and memoised.**
+  // Everything here shares one event loop. A route that does synchronous work holds this one up, and
+  // holding it up past `timeoutSeconds` is a liveness failure — so any expensive route is a lever on
+  // this pod's life. `/readyz` reached for `currentSource`, which calls `sourceStamp` → `policyHead`
+  // → two synchronous `execFileSync("git", …)` per site **before** the cache is consulted, and a
+  // review measured 42.7 ms each: thirty concurrent unauthenticated requests held `/healthz` over a
+  // second and would have had kubelet kill the container on demand. The fix this comment is pointing
+  // at is below; the rule it leaves behind is that nothing reachable without the bearer may call
+  // `currentSource` on the request path.
   if (req.method === "GET" && url.pathname === "/healthz") return send(200, { ok: true });
 
   // ## Can this process serve any policy at all?
@@ -390,33 +480,44 @@ const server = createServer((req, res) => {
   // evaluated anything. This is the sentence that tells "up" from "useful".
   //
   // 🔴 **Not wired to a probe, and that is the decision rather than an omission.** The renderer runs
-  // at `replicas: 1` with `strategy: Recreate`, so there is no surge pod: a readiness failure empties
-  // the endpoint list and the manager's `GET /source` stops connecting at all. Compare the two
-  // failures — serving 503 puts "the policy module could not be evaluated: …" on the console, and an
-  // empty endpoint list puts nothing anywhere. **Both are broken; only one of them talks.** The
-  // common cause, the render/clone race, was closed by an init container, so wiring this would trade
-  // information away in the rare case and buy nothing in the common one.
+  // at `replicas: 1` with `strategy: Recreate` (cited, not checkable here — see `/healthz` above), so
+  // there is no surge pod: a readiness failure empties the endpoint list and the manager's
+  // `GET /source` stops connecting at all. Compare the two failures — serving 503 puts "the policy
+  // module could not be evaluated: …" on the console, and an empty endpoint list puts nothing
+  // anywhere. **Both are broken; only one of them talks.** The common cause, the render/clone race,
+  // was closed by an init container on the deployment side, so wiring this would trade information
+  // away in the rare case and buy nothing in the common one.
   //
-  // It earns its place as a value to read — a fleet view, an alert, an operator with curl — and if
-  // the deployment ever runs two replicas, wiring it becomes a pure gain and this comment is where
-  // to start.
+  // **Two replicas would not change that, and an earlier draft of this comment said they would.**
+  // The pods share one policy remote, so a policy fault is *correlated*: both go unready together,
+  // the endpoint list empties anyway, and the outage arrives by the route this paragraph refuses.
+  // Readiness gating pays only for *uncorrelated* per-pod failure — which was the clone race, and
+  // that is already closed. The sentence concluded the opposite of what it reasoned.
   //
-  // **Counts, not names, and unauthenticated.** Site names are zone names, which is why `/sites`
-  // sits behind the bearer; "2 of 3" says everything a health signal needs and names nothing. Which
-  // site is failing is already in this process's log and in `/source`'s own 503.
+  // 🔴 **Behind the bearer, and that is a correction.** It was unauthenticated, on the argument that
+  // counts leak nothing. Counts do leak nothing — but *reaching* this route makes the process do
+  // work, and `/healthz` above explains why work is the thing that must be gated here. `/sites` is
+  // next door for the weaker reason (names); this one is gated for the stronger one. Both controls
+  // are kept rather than one: the file already refuses, at the token check below, to rest on a single
+  // control silently.
   //
-  // Evaluated live rather than remembered from startup. A site that failed to import at boot is
-  // fixed by the next git-sync two minutes later, and one that verified then can break the same way
-  // — an answer cached at startup would be the past wearing the present's clothes, which is the
-  // defect this whole week has been about. The stamp cache makes the unchanged case a `stat`.
+  // **Counts, not names.** Site names are zone names; "2 of 3" says everything a health signal needs
+  // and names nothing. Which site is failing is in this process's log and in `/source`'s own 503.
+  // `ok` and the status code answer different questions on purpose — the code says "can this serve
+  // anything", `degraded` says "is anything dark". A one-VPC outage is the 2026-09-28 shape, and it
+  // must not read as plain green to whatever consumes the status line.
+  //
+  // Evaluated live rather than remembered from startup, within a window: a site that failed to
+  // import at boot is fixed by the next git-sync two minutes later, and one that verified then can
+  // break the same way, so an answer frozen at startup would be the past wearing the present's
+  // clothes. `READY_MEMO_MS` is far shorter than that sync interval, so the answer is live at the
+  // only granularity that exists — and it makes a flood O(1) instead of O(requests × sites × git).
   if (req.method === "GET" && url.pathname === "/readyz") {
-    void Promise.all(
-      sites.map((site) => currentSource(site).then(() => true, () => false)),
-    ).then((results) => {
-      const serving = results.filter(Boolean).length;
-      // One site is enough. Refusing while two of three work would let a bad `dev.ts` take prod's and
-      // util's consoles down — the same trade the startup verification below already refused to make.
-      send(serving > 0 ? 200 : 503, { ok: serving > 0, serving, total: results.length });
+    if (!bearerOk(req.headers.authorization)) return send(401, { error: "bad or missing bearer" });
+    void readiness().then(({ serving, total }) => {
+      // One site is enough to be *up*. Refusing while two of three work would let a bad `dev.ts` take
+      // prod's and util's consoles down — the trade the startup verification below already refused.
+      send(serving > 0 ? 200 : 503, { ok: serving > 0, degraded: serving < total, serving, total });
     });
     return;
   }
@@ -493,7 +594,13 @@ const server = createServer((req, res) => {
 for (const site of sites) {
   if (site.name === null) continue; // Nothing was declared, so there is nothing to contradict.
   try {
-    const source = await currentSource(site);
+    // Bounded, and the budget is generous because a cold first import of a real policy module is
+    // slower than any later one. What it rules out is not slowness but a module that never settles:
+    // unbounded, `server.listen` below is never reached and the process answers nothing at all, so a
+    // single `await new Promise(() => {})` in a policy commit takes the console down harder than a
+    // module that throws. Timing out lands in the same branch as a throw — logged, and that site
+    // answers 503 until it evaluates — which is the right place for it.
+    const source = await evaluateWithin(site, STARTUP_SITE_BUDGET_MS);
     log(`verified ${site.name} — ${source.site.hosts?.length ?? 0} hosts`);
   } catch (e) {
     const why = (e as Error).message;

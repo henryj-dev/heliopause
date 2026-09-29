@@ -4027,14 +4027,51 @@ class TestBackfillCurrentAuthorization(unittest.TestCase):
     something already on disk.
     """
 
+    # ## The whole record, and a test below checks that "whole" is still true
+    #
+    # This held six keys while the production record holds ten — `target`, `host`, `planHash` and
+    # `bundleHash` were missing. They are not decoration: `_authorization_identity` keeps every field
+    # it is not told to drop, so a fixture without them cannot tell a correct comparison from one
+    # that silently ignores four fields, and the comment on the escape test claimed to be pinning
+    # shapes while pinning one key out of ten.
+    #
+    # `target` and `host` are the two that matter most and the two most easily left out, because they
+    # are **not from the signed payload** — `heliopause-pull.py:181-182` reads `HELIOPAUSE_TARGET` and
+    # `HELIOPAUSE_HOST_ID`/`gethostname()`. A fixture that hardcodes them describes a host whose
+    # environment cannot change, which is not the fleet: a VPC rename changes `HELIOPAUSE_TARGET` on
+    # every host in it. `TestReplayWatermark.RECORD` takes them from `hp` for that reason and this
+    # follows it.
     REC = {
         "authorizedAt": "2026-08-15T00:05:00.000Z",
         "expiresAt": "2026-08-16T00:05:00.000Z",
         "payloadHash": "sha256:" + "a" * 64,
         "keyId": "sha256:" + "b" * 64,
         "authorizationMode": "two-person",
+        "target": hp.TARGET,
+        "host": hp.HOST_ID,
+        "planHash": "sha256:" + "c" * 64,
+        "bundleHash": "sha256:" + "d" * 64,
         "generation": "g-live",
     }
+
+    def test_the_fixture_is_the_record_the_agent_actually_builds(self):
+        # Derived from the agent's own source, not asserted as a number. A count would let a renamed
+        # field through, and a hand-written list would be the same fixture drift one layer up. When
+        # `record` gains or loses a field, this fails on the commit that does it rather than on the
+        # day someone wonders why a comparison never catches anything.
+        source = pathlib.Path(hp.__file__).read_text()
+        built = None
+        for node in ast.walk(ast.parse(source)):
+            if (isinstance(node, ast.Assign)
+                    and any(getattr(t, "id", "") == "record" for t in node.targets)
+                    and isinstance(node.value, ast.Dict)):
+                built = {k.value for k in node.value.keys if isinstance(k, ast.Constant)}
+        self.assertIsNotNone(built, "could not find the `record = {...}` the agent builds")
+        self.assertEqual(
+            set(self.REC), built,
+            "the fixture no longer has the shape the agent builds, so every identity comparison "
+            "in this class is comparing something the program never produces",
+        )
 
     def state(self, **over):
         # `pendingAuthorization` carries the same record, because that is the only shape a real host
@@ -4231,10 +4268,15 @@ class TestBackfillCurrentAuthorization(unittest.TestCase):
         #
         # Key sets compared across `1be2cdb` (the build the fleet ran) and `0e2a6ef`: `expiresAt`
         # added, nothing removed or renamed. That is what makes the exclusion sufficient rather than
-        # lucky, and it is why this test pins the shapes and not just the outcome.
+        # lucky.
+        #
+        # The shapes are pinned by `test_the_fixture_is_the_record_the_agent_actually_builds`, not
+        # here. This comment used to claim it pinned them itself while asserting one key out of ten,
+        # against a fixture that then had six — the shape claim and the fixture disagreed and nothing
+        # could notice, which is this file's own recurring defect committed in a test about it.
         short = {k: v for k, v in self.REC.items() if k != "expiresAt"}
         self.assertNotIn("expiresAt", short)
-        self.assertIn("expiresAt", self.REC, "the fixture stopped being the long shape")
+        self.assertEqual(len(short), len(self.REC) - 1, "expiresAt was not in the fixture to remove")
         hp.save_state(self.state(authorizationWatermark=short, pendingAuthorization=short))
         hp.backfill_current_authorization()
         adopted = hp.load_state()["currentAuthorization"]

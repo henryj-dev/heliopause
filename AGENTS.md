@@ -129,9 +129,9 @@ python3 scripts/git-hooks/test-pre-commit.py              # 실패 0 (사람 통
 `if __name__ == "__main__"` 이 파일 중간에 있어서 그 아래 다섯 클래스(라우트 안전 검사
 39개)가 정의조차 되지 않은 채 몇 달을 지났고, 초록불은 그동안 한 번도 흔들리지 않았다
 — 수가 줄어든 게 아니라 센 적이 없어 비교할 기준선이 없었다. 현재 기대값(정책 심링크 연결):
-`npm test` 2,153 + 8 (`@heliopause/manager`) + 240 (`@heliopause/web`) ·
-`test_validate.py` 292 (리눅스에서 실행 292 · macOS 에서 skip 12) · `test_enroll.py` 16.
-그 2,153 은 **이 저장소 2,059(`src` + `examples`) + `policy` 94** 이다. 둘로 나눠 적는 이유는
+`npm test` 2,156 + 8 (`@heliopause/manager`) + 240 (`@heliopause/web`) ·
+`test_validate.py` 293 (리눅스에서 실행 293 · macOS 에서 skip 12) · `test_enroll.py` 16.
+그 2,156 은 **이 저장소 2,062(`src` + `examples`) + `policy` 94** 이다. 둘로 나눠 적는 이유는
 바로 아래에 있다 — 뒤의 94 는 이 저장소의 코드를 안 읽는다.
 
 ⚠️ **그 94 중 16 은 지금 실패한다.** 원인은 바로 아래 문단이 설명하는 포크 클론 드리프트이고
@@ -157,6 +157,17 @@ python3 scripts/git-hooks/test-pre-commit.py              # 실패 0 (사람 통
 고 읽으면 안 된다 — 그 86개는 다른 클론의 렌더러를 검사한 것이다. 위의 「`policy/` 가 없으면
 조용히 좁아진다」와 같은 함정의 한 겹 아래다. 고치려면 그 포크 클론을 최신화해야 하고, 그것은
 이 저장소에서 할 일이 아니다.
+
+⚠️ **macOS 에 `timeout` 이 없다.** 2026-09-29 실측: 변이가 테스트를 **행**으로 만드는지 보려고
+`timeout 90 node --test …` 를 두 번 썼고, 두 번 다 `exit 127`(command not found)로 **테스트가 아예
+안 돌았다.** grep 에 아무것도 안 걸리니 출력이 비었고, 그걸 하마터면 「변이했는데 조용하다」로
+읽을 뻔했다 — 초록도 빨강도 아닌 것을 확인으로 읽는, 이 파일이 계속 경고하는 그 모양이다.
+`gtimeout`(coreutils)을 쓰거나, 백그라운드로 돌리고 결과를 읽을 것.
+
+⚠️ **행은 빨강이 아니다.** 테스트가 실패 대신 매달리면 CI 는 실패한 테스트 이름 없이 잡 타임아웃을
+내고, 그건 인프라 문제로 읽힌다. `node:test` 의 `{ timeout }` 만으로는 부족하다 — 테스트는 실패로
+표시되는데 열린 소켓이 서버 루프를 붙들어 `finally` 의 정리에 도달하지 못하고 **러너가 종료되지
+않는다**(같은 날 실측). 매달릴 수 있는 요청에는 `AbortSignal.timeout(...)` 을 같이 걸 것.
 
 ⚠️ 훅 검사 7종은 `refs/remotes/origin/HEAD` 를 필요로 한다. `git clone` 은 그것을 쓰지만
 `actions/checkout` 은 안 쓴다 — 그래서 CI 쪽 job 이 먼저 `git symbolic-ref` 로 세운다.
