@@ -697,6 +697,62 @@ describe("a site module has to be the site it is declared as", () => {
     }
   });
 
+  it("says how many sites it can actually serve, and says nothing when asked how", async () => {
+    // ## `2/2 Running` while serving nothing
+    //
+    // That was a real state on 2026-09-29: the pod was Ready, `/healthz` answered `{ok:true}`, and
+    // all three sites were 503 because the render raced its own policy checkout. Nothing in the
+    // cluster could tell that apart from a healthy pod, and a person opening the console was the
+    // only repair.
+    //
+    // `/readyz` is that missing sentence. It is **not** wired to a probe — see the route's own
+    // comment for why replicas=1 + Recreate makes wiring it a net loss of information — so this
+    // asserts the value, which is the whole of what it is for.
+    const { dir, sites, beta } = twoSites();
+    writeFileSync(beta, "throw new Error('beta does not load');\n");
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      const res = await fetchAt(started.port, "/readyz");
+      // 200 with one of two. Refusing here would let a broken `dev.ts` take prod's and util's
+      // consoles down, which is the trade the startup verification already refused to make — and
+      // the test above pins the other half of it.
+      assert.equal(res.status, 200, "one broken site made the whole renderer report unready");
+      assert.deepEqual(await res.json(), { ok: true, serving: 1, total: 2 });
+      // Site names are zone names — that is why `/sites` sits behind the bearer. A health signal
+      // that leaks them would put the fleet's zone names on an unauthenticated endpoint.
+      const body = await (await fetchAt(started.port, "/readyz")).text();
+      assert.ok(!body.includes("alpha") && !body.includes("beta"), `named a site: ${body}`);
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("reports unready only when it can serve nothing, and stays alive saying so", async () => {
+    // The state the endpoint exists for. Both modules throw, so there is no policy to serve at all
+    // — and `/healthz` must still answer 200, because it is this pod's **liveness** probe: a policy
+    // tree that will not load does not become loadable by restarting the process, it becomes a
+    // crashloop. The split between the two endpoints is the point, so it is asserted together.
+    const { dir, sites, alpha, beta } = twoSites();
+    writeFileSync(alpha, "throw new Error('alpha does not load');\n");
+    writeFileSync(beta, "throw new Error('beta does not load');\n");
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      const res = await fetchAt(started.port, "/readyz");
+      assert.equal(res.status, 503, "a renderer serving nothing reported itself ready");
+      assert.deepEqual(await res.json(), { ok: false, serving: 0, total: 2 });
+      assert.equal(
+        (await fetchAt(started.port, "/healthz")).status, 200,
+        "/healthz went strict — that restarts the pod for a policy fault",
+      );
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
   it("keeps serving its siblings when one module will not import", async () => {
     // Refusing to start on a module that throws would mean a git-sync landing a broken file takes
     // every other VPC's console down at the next pod restart — an outage manufactured by the fix.

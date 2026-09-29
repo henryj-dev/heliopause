@@ -376,7 +376,50 @@ const server = createServer((req, res) => {
 
   const url = new URL(req.url ?? "/", "http://placeholder");
 
+  // Unchanged on purpose. It answers "the listener is up" and nothing else, because it is wired to
+  // this pod's **liveness** probe as well as its readiness one (measured 2026-09-29: liveness period
+  // 30s × 3, readiness 10s × 3). Making this one strict would restart the pod for a policy problem,
+  // and a policy tree that cannot be cloned does not become clonable by restarting — it becomes a
+  // crashloop. `/readyz` below is the strict one, and it is deliberately not a probe.
   if (req.method === "GET" && url.pathname === "/healthz") return send(200, { ok: true });
+
+  // ## Can this process serve any policy at all?
+  //
+  // `2/2 Running` with every site answering 503 was a real state on 2026-09-29, and nothing in the
+  // cluster could say so: `/healthz` returns `{ok:true}` from a listener that has never successfully
+  // evaluated anything. This is the sentence that tells "up" from "useful".
+  //
+  // 🔴 **Not wired to a probe, and that is the decision rather than an omission.** The renderer runs
+  // at `replicas: 1` with `strategy: Recreate`, so there is no surge pod: a readiness failure empties
+  // the endpoint list and the manager's `GET /source` stops connecting at all. Compare the two
+  // failures — serving 503 puts "the policy module could not be evaluated: …" on the console, and an
+  // empty endpoint list puts nothing anywhere. **Both are broken; only one of them talks.** The
+  // common cause, the render/clone race, was closed by an init container, so wiring this would trade
+  // information away in the rare case and buy nothing in the common one.
+  //
+  // It earns its place as a value to read — a fleet view, an alert, an operator with curl — and if
+  // the deployment ever runs two replicas, wiring it becomes a pure gain and this comment is where
+  // to start.
+  //
+  // **Counts, not names, and unauthenticated.** Site names are zone names, which is why `/sites`
+  // sits behind the bearer; "2 of 3" says everything a health signal needs and names nothing. Which
+  // site is failing is already in this process's log and in `/source`'s own 503.
+  //
+  // Evaluated live rather than remembered from startup. A site that failed to import at boot is
+  // fixed by the next git-sync two minutes later, and one that verified then can break the same way
+  // — an answer cached at startup would be the past wearing the present's clothes, which is the
+  // defect this whole week has been about. The stamp cache makes the unchanged case a `stat`.
+  if (req.method === "GET" && url.pathname === "/readyz") {
+    void Promise.all(
+      sites.map((site) => currentSource(site).then(() => true, () => false)),
+    ).then((results) => {
+      const serving = results.filter(Boolean).length;
+      // One site is enough. Refusing while two of three work would let a bad `dev.ts` take prod's and
+      // util's consoles down — the same trade the startup verification below already refused to make.
+      send(serving > 0 ? 200 : 503, { ok: serving > 0, serving, total: results.length });
+    });
+    return;
+  }
 
   // Behind the bearer, beside `/source` rather than beside `/healthz`: the site names are the
   // fleet's zone names, which is the same class of information the payload carries.
@@ -429,7 +472,7 @@ const server = createServer((req, res) => {
     return;
   }
 
-  return send(404, { error: "this service answers GET /source, GET /sites and GET /healthz" });
+  return send(404, { error: "this service answers GET /source, GET /sites, GET /healthz and GET /readyz" });
 });
 
 // ## Is each module the site it is declared as? Checked before anything is served.
