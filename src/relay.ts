@@ -545,10 +545,24 @@ export function fleetView(
     // **Reported here because the agent alone cannot say it.** The fix is the agent's — promotion,
     // plus a startup backfill for hosts already confirmed — and both are pointless unheard: an agent
     // whose disk refuses the write logs one line into one host's journal. This is the sentence that
-    // reaches the operator, and it is also how a rollout is watched. The agent lives outside the
-    // manager image and is rolled one host at a time, so on merge this lights up for every host and
-    // each deploy puts one out. A shell loop over eight hosts answers the same question once; this
-    // answers it every fleet view.
+    // reaches the operator, and it is also how a rollout is watched: eight hosts lit is the correct
+    // pre-deployment state, and each agent deploy puts one out. A shell loop over eight hosts answers
+    // that once; this answers it every fleet view, and it is the only thing that tells "the file
+    // arrived and the state write was refused" from "the file arrived".
+    //
+    // ⚠️ **This line does not arrive with the manager image, and the first draft of this comment said
+    // it did.** `src/` exists in two places: inside the manager image, and under `/opt/heliopause/src`
+    // on the three gateways — where `heliopause-relay.service` runs it from `bin/heliopause-relay.ts`.
+    // `fleetView` is called from this file's own `/status` route, the manager *fetches* that view
+    // (`getFleetView` → `relayCall<FleetView>(…, "/status")`) and computes no `problems` of its own,
+    // and it imports only `peerCN` and the types from here. So the copy in the image never runs this,
+    // and the sentence exists once `scripts/deploy-fleet.sh relay <gw>` has run for all three — which
+    // is *before* the agent rollout this watches, not after it.
+    //
+    // Worth the paragraph because it is the same mistake twice in one day, one layer apart: the
+    // promotion fix was merged and its image rolled while `agent/` — outside the image — stayed three
+    // weeks old, and then this was written as though the relay were inside it. "The code is in the
+    // image" is not an answer to "which process runs it" when there are two copies.
     //
     // Two conditions, and the second is the one that keeps it honest:
     //
