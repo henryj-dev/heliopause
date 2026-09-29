@@ -4017,6 +4017,257 @@ class TestRelayRequestDeadline(unittest.TestCase):
         )
 
 
+class TestBackfillCurrentAuthorization(unittest.TestCase):
+    """A host that confirmed under an older build adopts the authorization it is already enforcing.
+
+    Promotion happens at confirmation, and a host that is already `confirmed` never confirms again —
+    so deploying the promotion fix alone leaves every existing host with `currentAuthorization:
+    None` for as long as its generation stands. The alternative to this is publishing a fresh
+    generation to every VPC, which costs a two-person approval and an OTP per site to write down
+    something already on disk.
+    """
+
+    REC = {
+        "authorizedAt": "2026-08-15T00:05:00.000Z",
+        "expiresAt": "2026-08-16T00:05:00.000Z",
+        "payloadHash": "sha256:" + "a" * 64,
+        "keyId": "sha256:" + "b" * 64,
+        "authorizationMode": "two-person",
+        "generation": "g-live",
+    }
+
+    def state(self, **over):
+        # `pendingAuthorization` carries the same record, because that is the only shape a real host
+        # has: `accept_artifact_authorization` writes both fields to the same value in the same
+        # mutator and nothing else writes either. Leaving it `None` built a state the program cannot
+        # produce — and worse, it hid what this function is: `confirm()`'s promotion line with
+        # `confirm()`'s precondition reconstructed from state instead of witnessed.
+        return {**hp._EMPTY_STATE, "authorizationWatermark": self.REC,
+                "pendingAuthorization": self.REC,
+                "generation": "g-live", "state": "confirmed", **over}
+
+    # Every value the agent ever writes into a `state` field, read out of the agent. Four shapes
+    # because the value reaches the field four ways: assigned directly, sitting in `_EMPTY_STATE`,
+    # returned as the middle of an apply triple, or chosen by the rollback ternary. The host and
+    # workload halves share the vocabulary, so a workload-only value swept here is extra coverage
+    # rather than noise.
+    _STATE_PATTERNS = (
+        r'\["state"\]\s*=\s*"([a-z-]+)"',
+        r'"state":\s*"([a-z-]+)"',
+        r'return \w+, "([a-z-]+)",',
+        r'"([a-z-]+)" if \w+ else',
+    )
+
+    def state_vocabulary(self):
+        source = pathlib.Path(hp.__file__).read_text()
+        found = set()
+        for pattern in self._STATE_PATTERNS:
+            found |= set(re.findall(pattern, source))
+        return found
+
+    def test_adopts_the_watermark_when_the_three_conditions_hold(self):
+        hp.save_state(self.state())
+        hp.backfill_current_authorization()
+        self.assertEqual(hp.load_state()["currentAuthorization"], self.REC)
+
+    def test_leaves_a_host_that_already_named_one(self):
+        # Idempotence, and more: a later authorization must not be overwritten by an earlier
+        # watermark on a restart. Running this twice must be the same as running it once.
+        later = {**self.REC, "generation": "g-live", "payloadHash": "sha256:" + "f" * 64}
+        hp.save_state(self.state(currentAuthorization=later))
+        hp.backfill_current_authorization()
+        self.assertEqual(hp.load_state()["currentAuthorization"], later)
+
+    def test_leaves_every_state_that_is_not_confirmed(self):
+        # The vocabulary is **derived from the agent's own source**, not listed here. Written by hand
+        # it read `("pending", "rolled-back", "rollback-failed", "none")` and missed `prepared`,
+        # `unsupported` and `rollback-incident` — three of the eight, and `prepared` is the one that
+        # matters most: it means the side effect may not have happened yet, which is the furthest a
+        # host can be from "what the watermark authorized is what is running".
+        #
+        # Deriving it means a ninth state joins this sweep on the commit that introduces it, instead
+        # of on the day somebody notices.
+        #
+        # ⚠️ **Single-point mutation cannot make this red.** `confirmed` is checked twice — in the
+        # mutator and in the early `load_state()` read that exists to avoid rewriting the file — so
+        # loosening either alone leaves the other doing the work. Measured 2026-09-29: relaxing the
+        # mutator's guard to admit `prepared` kept all 292 green; relaxing both failed here. Anyone
+        # verifying this check has to mutate both, or they will read a green as "the test is dead".
+        states = self.state_vocabulary()
+        self.assertIn("confirmed", states, "the regexes stopped matching the assignments")
+        self.assertGreaterEqual(len(states), 8, f"vocabulary shrank to {sorted(states)}")
+        for state in sorted(states - {"confirmed"}):
+            hp.save_state(self.state(state=state))
+            hp.backfill_current_authorization()
+            self.assertIsNone(
+                hp.load_state()["currentAuthorization"], f"adopted while {state}",
+            )
+
+    def test_adopts_when_only_the_workload_half_rolled_back(self):
+        # Deliberate, documented, and pinned here so it stays a decision. The pair `state: confirmed`
+        # + `workloadState: rolled-back` has its own line on the fleet screen, so a host really sits
+        # in it, and in it the nftables ruleset is exactly what the watermark authorized. Both readers
+        # of `currentAuthorization` ask about the host half; withholding the field here would leave a
+        # host whose firewall is correct unable to name its own authorization.
+        hp.save_state(self.state(workloadState="rolled-back"))
+        hp.backfill_current_authorization()
+        self.assertEqual(hp.load_state()["currentAuthorization"], self.REC)
+
+    def test_a_watermark_that_is_not_a_record_is_ignored_rather_than_crashing(self):
+        # The `isinstance` guard. The state file is a file — an operator's script, a truncated write
+        # or a hand edit can leave a string or a list where the record was. `.get` on those raises,
+        # and this runs before the first heartbeat, so the raise is a host that never comes up rather
+        # than a host missing one field.
+        for junk in ("g-live", [], 0, True):
+            hp.save_state(self.state(authorizationWatermark=junk))
+            hp.backfill_current_authorization()
+            self.assertIsNone(
+                hp.load_state()["currentAuthorization"], f"adopted from {junk!r}",
+            )
+
+    def test_the_watermark_cannot_move_under_a_confirmed_generation(self):
+        # ## The invariant this function's safety rests on, and it is in another function
+        #
+        # The dangerous adopt writes a mode the kernel never had: a host enforcing a break-glass
+        # apply takes a later two-person record for the *same* generation, and `artifact_trust_report`
+        # then reports `two-person` — the alarm silenced by the field meant to describe it.
+        #
+        # It cannot happen, and the reason is not in `backfill_current_authorization`:
+        # `handle_reply` returns on "confirmed and the table is present" **before** `fetch_artifact`,
+        # so the one call to `accept_artifact_authorization` is unreachable for a generation this host
+        # already holds. Both halves of that sentence are asserted, because an invariant borrowed from
+        # another function is the kind that rots without anything going red.
+        source = pathlib.Path(hp.__file__).read_text()
+        body = source[source.index("def handle_reply("):source.index("def handle_reply_safely(")]
+        guard = body.index('if wanted == st["generation"] and st["state"] == "confirmed":')
+        accept = body.index("accept_artifact_authorization(record, watch, expired)")
+        self.assertLess(
+            guard, accept,
+            "the confirmed early return no longer precedes the authorization acceptance, so a "
+            "re-authorization of a generation already in force can move the watermark",
+        )
+        self.assertIn("fetch_artifact()", body[guard:accept], "the fetch left the guarded region")
+        # And nothing else advances the watermark. One caller is what makes the ordering above a
+        # complete argument rather than a statement about one path among several.
+        calls = [
+            line for line in source.splitlines()
+            if "accept_artifact_authorization(" in line
+            and not line.lstrip().startswith(("#", "*"))
+            and "def accept_artifact_authorization" not in line
+        ]
+        self.assertEqual(len(calls), 1, f"the watermark has more than one writer: {calls}")
+
+    def test_leaves_a_host_whose_watermark_names_another_generation(self):
+        # The watermark moves when an authorization is *accepted*, which is before the apply settles.
+        # So a host can hold a watermark for a generation it never finished applying, while still
+        # enforcing the previous one. The two records then describe different moments.
+        hp.save_state(self.state(generation="g-other"))
+        hp.backfill_current_authorization()
+        self.assertIsNone(hp.load_state()["currentAuthorization"])
+
+    def test_does_nothing_with_no_watermark_at_all(self):
+        hp.save_state(self.state(authorizationWatermark=None))
+        hp.backfill_current_authorization()
+        self.assertIsNone(hp.load_state()["currentAuthorization"])
+
+    def test_says_it_could_not_persist_rather_than_claiming_it_did(self):
+        # ## The failure this function's own logging was built to prevent, inverted
+        #
+        # The adopt line used to be emitted from inside the mutator, before the durable write was
+        # attempted, and the `saved` result was discarded. A host with a full or read-only
+        # `/var/lib` — the state a host in trouble is already in — printed the success line while its
+        # state file kept `None`. An operator reading eight journals after a rollout would count
+        # eight adopts and have seven.
+        #
+        # Every other durable write in the agent fails closed on `saved`. This is the established
+        # pattern for testing that, from `TestReplayWatermark`.
+        hp.save_state(self.state())
+        real = hp._save_state_unlocked
+        hp._save_state_unlocked = lambda st: False
+        lines = []
+        real_log = hp.log
+        hp.log = lambda *a, **k: lines.append(a[0] if a else "")
+        try:
+            hp.backfill_current_authorization()
+        finally:
+            hp._save_state_unlocked, hp.log = real, real_log
+        said = " ".join(lines)
+        self.assertIn("cannot persist", said, "a refused write was reported as an adopt")
+        self.assertNotIn("adopted the authorization", said)
+        # And the disk is unchanged, so the next boot tries again rather than believing it is done.
+        self.assertIsNone(hp.load_state()["currentAuthorization"])
+
+    def test_the_adopted_record_arms_the_expiry_escape(self):
+        # ## The whole point, end to end
+        #
+        # Adopting is only worth doing if it makes the expired-but-confirmed case work — that is the
+        # path a rebooted host takes when its table is gone, and the one `gw-01.prod-icn-vtr` could
+        # not take on 2026-09-28. Asserting the field is populated says nothing about that on its
+        # own; this drives the real decision function afterwards.
+        hp.save_state(self.state())
+        hp.backfill_current_authorization()
+        fresh, err = _REAL_ACCEPT_AUTHORIZATION(dict(self.REC), {}, True)
+        self.assertEqual(err, "", "an adopted authorization did not satisfy its own expiry escape")
+        self.assertIsNotNone(fresh)
+
+    def test_without_adopting_the_same_record_is_still_refused(self):
+        # The known negative for the case above. Without it that assertion is equally satisfied by an
+        # escape that lets every expired authorization through, which is the refusal this whole
+        # mechanism exists to make survivable rather than to remove.
+        hp.save_state(self.state())
+        fresh, err = _REAL_ACCEPT_AUTHORIZATION(dict(self.REC), {}, True)
+        self.assertIsNone(fresh)
+        self.assertIn("expired", err)
+
+
+class TestStartupCallsTheBackfill(unittest.TestCase):
+    """`main()` actually calls `backfill_current_authorization()`.
+
+    🔴 **Measured: without this, deleting the call from `main()` left the whole suite green.** Seven
+    tests pinned every decision the function makes and none pinned that it runs — and the function
+    reaches the fleet only through `main()`, so a green suite meant nothing about whether eight hosts
+    would ever execute it.
+
+    That is the failure class this repository documents at length: five test classes sat undefined for
+    months behind a green light, because the count was never compared. `TestSignedArtifactSeam` is the
+    established answer — parse the source and assert the call, because a call that is not made is an
+    absence and no behavioural assertion can see one.
+    """
+
+    def _main_calls(self):
+        tree = ast.parse(Path(hp.__file__).read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "main":
+                return [
+                    n.func.id for n in ast.walk(node)
+                    if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                ]
+        return None
+
+    def test_main_calls_the_backfill_before_the_recovery_paths(self):
+        calls = self._main_calls()
+        self.assertIsNotNone(calls, "main() is not a plain function any more — this check is blind")
+        self.assertIn(
+            "backfill_current_authorization", calls,
+            "main() does not adopt the authorization already in force; every host keeps None",
+        )
+        # Before recovery, and the ordering comment at the call site says why that is not
+        # load-bearing today and what would make it so. Pinned anyway: if a recovery path ever
+        # produces `confirmed`, this assertion is the thing that has to be revisited deliberately
+        # rather than a position that quietly stopped mattering.
+        self.assertLess(
+            calls.index("backfill_current_authorization"), calls.index("recover_commitment"),
+            "the backfill moved after a recovery path — see the comment at the call site",
+        )
+
+    def test_the_check_can_fail(self):
+        # The known positive. Without it, both assertions above are satisfied by a parser that
+        # returned every name in the file, or by one that found `main` and read nothing.
+        calls = self._main_calls()
+        self.assertIn("recover_commitment", calls)
+        self.assertNotIn("thisFunctionDoesNotExist", calls)
+
+
 class TestStateSchemaHasBothHalves(unittest.TestCase):
     """Every key in `_EMPTY_STATE` is written somewhere and read somewhere.
 

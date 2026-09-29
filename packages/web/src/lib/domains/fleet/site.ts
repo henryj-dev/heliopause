@@ -58,6 +58,17 @@ export interface SiteHost {
    * Changes to our table the agent did not make. `null` = did not report; `[]` = watched, none.
    */
   intrusions: HostIntrusion[] | null;
+  /**
+   * Digest of the agent source this host is running (`_agent_build()` — the script hashes itself).
+   *
+   * `null` is "did not say", which an agent older than 2026-09-03 is. **Not `agentVersion`**: that
+   * is a string somebody maintains by hand, and the case it cannot see is the one that matters —
+   * code changing without the version moving, because there was no reason for it to move. The agent
+   * has carried this since it was added and the relay and the manager have both passed it along;
+   * nothing drew it, so on 2026-09-29 eight hosts ran a three-week-old build and every screen was
+   * silent about it while the value sat one step away.
+   */
+  agentBuild: string | null;
   /** Ports another table redirects inbound. `null` = did not report; `[]` = looked, none. */
   publishedPorts: string[] | null;
   /**
@@ -244,6 +255,7 @@ function readHost(value: unknown): SiteHost | null {
     workload: readWorkload(value.workload),
     unexpectedFilters: readStringListOrNull(value.unexpectedFilters),
     intrusions: readIntrusions(value.intrusions),
+    agentBuild: typeof value.agentBuild === "string" ? value.agentBuild : null,
     publishedPorts: readStringListOrNull(value.publishedPorts),
     routes: readRoutes(value.routes),
   };

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { answeredVpcNames, fleetListing, fleetSummary, hostMatches, hostStateChips, routesView, whyBits, vpcLabel, vpcTone, workloadChip } from "./present.ts";
+import { agentBuildLines, agentBuildSplit, hostsOnBuild, answeredVpcNames, fleetListing, fleetSummary, hostMatches, hostStateChips, routesView, whyBits, vpcLabel, vpcTone, workloadChip } from "./present.ts";
 // `SiteHost` comes from `./site.ts`; `present.ts` imports it but does not re-export it, so this
 // used to be `type SiteHost` on the line above and was simply broken. Nothing said so: this
 // workspace's tests were outside every tsconfig, and `node --test` strips types rather than
@@ -22,6 +22,7 @@ const host = (over: Partial<SiteHost> = {}): SiteHost => ({
   workload: null,
   unexpectedFilters: [],
   intrusions: [],
+  agentBuild: null,
   publishedPorts: [],
   routes: [],
   ...over,
@@ -279,5 +280,94 @@ describe("the routes cell", () => {
       hosts: [host({ routes: [dhcp, staticRoute] })],
     });
     assert.equal(summary.problems, 0);
+  });
+});
+
+describe("which agent build the fleet is running", () => {
+  it("says one build when a rollout landed everywhere", () => {
+    const split = agentBuildSplit([host({ agentBuild: "aaa" }), host({ agentBuild: "aaa" })]);
+    assert.deepEqual(split, { builds: ["aaa"], unknown: 0 });
+  });
+
+  it("says two when it did not", () => {
+    // 2026-09-29: a fix merged, an image rolled, and eight hosts kept the agent they had — the image
+    // carries `src/` and `bin/` and the agent lives in `agent/`. This is the shape that would have
+    // said so, from a value every host had already been sending.
+    const split = agentBuildSplit([
+      host({ agentBuild: "new" }), host({ agentBuild: "old" }), host({ agentBuild: "old" }),
+    ]);
+    assert.deepEqual(split.builds, ["new", "old"], "a partial rollout read as agreement");
+  });
+
+  it("counts a host that did not say apart from a version of its own", () => {
+    // An agent older than the field, or one not reporting at all. Folding it in with the builds
+    // would make one silent host look like a second rollout, and a fleet of silent hosts look like
+    // agreement.
+    const split = agentBuildSplit([host({ agentBuild: "aaa" }), host({ agentBuild: null })]);
+    assert.deepEqual(split, { builds: ["aaa"], unknown: 1 });
+  });
+
+  it("says nothing about an empty fleet rather than claiming agreement", () => {
+    assert.deepEqual(agentBuildSplit([]), { builds: [], unknown: 0 });
+  });
+});
+
+describe("which hosts are on which agent build", () => {
+  it("names them, sorted, so a split can be acted on", () => {
+    // Counting is not actionable: an operator told "2 builds across 8 hosts" has no path from there
+    // to which host except a shell loop. `relay.ts` names the host for the neighbouring concern and
+    // this matches it.
+    const hosts = [
+      host({ host: "k3s-01.dev", agentBuild: "new" }),
+      host({ host: "gw-01.dev", agentBuild: "old" }),
+      host({ host: "mailer-01.dev", agentBuild: "old" }),
+    ];
+    assert.deepEqual(hostsOnBuild(hosts, "old"), ["gw-01.dev", "mailer-01.dev"]);
+    assert.deepEqual(hostsOnBuild(hosts, "new"), ["k3s-01.dev"]);
+  });
+
+  it("returns nothing for a build no host reports, rather than everything", () => {
+    assert.deepEqual(hostsOnBuild([host({ agentBuild: "a" })], "b"), []);
+    // And a host that said nothing is not on every build.
+    assert.deepEqual(hostsOnBuild([host({ agentBuild: null })], "a"), []);
+  });
+});
+
+describe("which agent-build lines the screen draws", () => {
+  it("🔴 says something when no host reports a build at all", () => {
+    // The regression. This was `{:else if unknown > 0 && builds.length > 0}` in the template, so the
+    // all-silent fleet rendered **nothing** — indistinguishable on the page from one build
+    // everywhere, which is the exact reading `agentBuildSplit` exists to keep apart. Reachable after
+    // any relay restart: relay status is memory-only, so every host reads `null` until it beats
+    // again. No test could see it while the decision lived in the markup.
+    const lines = agentBuildLines([host({ agentBuild: null }), host({ agentBuild: null })]);
+    assert.equal(lines.split, null);
+    assert.equal(lines.silent, 2, "a fleet that said nothing was drawn as agreement");
+  });
+
+  it("draws both lines when a fleet is split and partly silent", () => {
+    // Two facts, not a choice between them. As chained branches the silent hosts were never
+    // mentioned whenever a split existed — the state where both matter most.
+    const lines = agentBuildLines([
+      host({ agentBuild: "new" }), host({ agentBuild: "old" }), host({ agentBuild: null }),
+    ]);
+    assert.deepEqual(lines.split, { builds: ["new", "old"], answered: 2 });
+    assert.equal(lines.silent, 1);
+  });
+
+  it("counts the hosts that answered, not every host", () => {
+    // "2 builds across 8 hosts" when two answered reads as a fleet split down the middle.
+    const hosts = [host({ agentBuild: "a" }), host({ agentBuild: "b" }),
+                   ...Array.from({ length: 6 }, () => host({ agentBuild: null }))];
+    assert.equal(agentBuildLines(hosts).split?.answered, 2);
+  });
+
+  it("stays quiet when one build reached everything", () => {
+    const lines = agentBuildLines([host({ agentBuild: "a" }), host({ agentBuild: "a" })]);
+    assert.deepEqual(lines, { split: null, silent: null });
+  });
+
+  it("says nothing about an empty fleet", () => {
+    assert.deepEqual(agentBuildLines([]), { split: null, silent: null });
   });
 });

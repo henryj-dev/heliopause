@@ -528,6 +528,58 @@ export function fleetView(
       );
     }
 
+    // ## A host enforcing a ruleset it cannot name
+    //
+    // The line above compares `=== "break-glass"`, so a host whose `currentAuthorizationMode` is
+    // `null` reads as *not* break-glass — which is the reassuring answer, and it is not an answer at
+    // all. That is the same shape as the four silences 2026-09-28 turned up: a comparison whose
+    // absent case falls on the calm side.
+    //
+    // It was the whole fleet's state, not an edge. `confirm()` never promoted `pendingAuthorization`
+    // into `currentAuthorization` until 2026-09-29, so every host was enforcing an authorization it
+    // could not name, and two mechanisms were dark because of it: the expired-but-confirmed re-apply
+    // escape (`accept_artifact_authorization` compares against `currentAuthorization`, so a `null`
+    // refuses every re-apply — how `gw-01.prod-icn-vtr` came to hold zero nft rules with public v6:22
+    // answering for 39 hours) and the break-glass alarm above.
+    //
+    // **Reported here because the agent alone cannot say it.** The fix is the agent's — promotion,
+    // plus a startup backfill for hosts already confirmed — and both are pointless unheard: an agent
+    // whose disk refuses the write logs one line into one host's journal. This is the sentence that
+    // reaches the operator, and it is also how a rollout is watched: eight hosts lit is the correct
+    // pre-deployment state, and each agent deploy puts one out. A shell loop over eight hosts answers
+    // that once; this answers it every fleet view, and it is the only thing that tells "the file
+    // arrived and the state write was refused" from "the file arrived".
+    //
+    // ⚠️ **This line does not arrive with the manager image, and the first draft of this comment said
+    // it did.** `src/` exists in two places: inside the manager image, and under `/opt/heliopause/src`
+    // on the three gateways — where `heliopause-relay.service` runs it from `bin/heliopause-relay.ts`.
+    // `fleetView` is called from this file's own `/status` route, the manager *fetches* that view
+    // (`getFleetView` → `relayCall<FleetView>(…, "/status")`) and computes no `problems` of its own,
+    // and it imports only `peerCN` and the types from here. So the copy in the image never runs this,
+    // and the sentence exists once `scripts/deploy-fleet.sh relay <gw>` has run for all three — which
+    // is *before* the agent rollout this watches, not after it.
+    //
+    // Worth the paragraph because it is the same mistake twice in one day, one layer apart: the
+    // promotion fix was merged and its image rolled while `agent/` — outside the image — stayed three
+    // weeks old, and then this was written as though the relay were inside it. "The code is in the
+    // image" is not an answer to "which process runs it" when there are two copies.
+    //
+    // Two conditions, and the second is the one that keeps it honest:
+    //
+    //   · `artifactTrust` **present** — absent means an agent that never sent the object, which is
+    //     "did not say" and not "cannot name". Same distinction `agentBuildSplit` draws for builds,
+    //     and collapsing it would turn a reporting gap into an alarm about the firewall.
+    //   · a generation applied — a host that has applied nothing has no authorization to name, and
+    //     saying otherwise would make the line fire loudest on the hosts it has nothing to say about.
+    const trust = st?.artifactTrust;
+    if (trust && trust.currentAuthorizationMode === null && st?.generation !== null) {
+      problems.push(
+        `${host}: enforcing generation ${st?.generation} but cannot name the authorization for it — ` +
+          `an expired authorization can never be re-applied on this host, and a break-glass one ` +
+          `would not be reported`,
+      );
+    }
+
     // Silence is its own failure. A host that stopped heartbeating is not applying policy and is
     // not reporting drift either, so it looks healthy in every other field.
     //

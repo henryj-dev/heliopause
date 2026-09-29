@@ -1920,6 +1920,123 @@ def _clear_commitment(st):
     st["rollbackAt"] = None
 
 
+def backfill_current_authorization():
+    """Name the authorization this host is already enforcing, when an older build never did.
+
+    ## Why a host needs this at all
+
+    `confirm()` promotes `pendingAuthorization` into `currentAuthorization`, and that line did not
+    exist until 2026-09-29. So every host that confirmed under an older build is enforcing a ruleset
+    whose authorization it cannot name — `currentAuthorization` is `None` and nothing will fill it,
+    because promotion happens at confirmation and a host that is already `confirmed` never confirms
+    again.
+
+    Deploying the fix alone therefore changes nothing on those hosts: the code is new and the state
+    is not. What they would need instead is a fresh generation published to every VPC, which costs a
+    two-person approval and an OTP per site for a field that could be derived from what is already on
+    disk.
+
+    ## Why the watermark is the right value, and not a guess
+
+    `authorizationWatermark` is the last authorization this host *accepted* — written durably before
+    any kernel change, by the same function that refuses replays. When all three conditions below
+    hold, that record is the authorization for exactly what is running:
+
+      · `currentAuthorization` is absent — nothing to contradict
+      · `state` is `confirmed` — the apply settled. **Not "a ruleset is in force"**: an nftables
+        table lives in kernel memory and a reboot destroys it while this field still says
+        `confirmed` (see the re-apply path that exists for exactly that). The host this function is
+        for is often in precisely that state. What `confirmed` buys here is narrower and enough —
+        the last apply reached agreement, so the watermark is not describing an apply still in
+        flight or one that was reverted.
+      · the watermark names the generation the state names — the two agree on *which* ruleset
+
+    Any one of them failing means the two records describe different moments, and then this does
+    nothing. In particular a `rolled-back` or `pending` host is left alone: what it is enforcing is
+    not what the watermark last authorized.
+
+    ## Why the mode cannot be wrong, and where that rests
+
+    The dangerous version of this function writes an `authorizationMode` the running ruleset never
+    had: a host enforcing a break-glass apply, adopting a later two-person record for the same
+    generation, and so reporting `two-person` through `artifact_trust_report` — the alarm silenced by
+    the thing meant to describe it. That needs the watermark to move while the state stays
+    `confirmed`, and **it cannot, for a reason outside this function**: `handle_reply` returns on
+    `wanted == st["generation"] and st["state"] == "confirmed"` with the table present, *before*
+    `fetch_artifact()`, so the single call to `accept_artifact_authorization` is never reached for a
+    generation this host already holds. When the table is absent it does fall through — and then it
+    applies and `confirm()` promotes the record it actually applied, so this function finds
+    `currentAuthorization` already set and does nothing. Every other outcome of that path leaves a
+    state this refuses.
+
+    That is an invariant of another function, so it is the kind that rots silently. `TestBackfill…`
+    pins both halves of it — the ordering inside `handle_reply`, and that the acceptance has exactly
+    one caller — and those assertions are the reason this docstring is allowed to claim it.
+
+    ## The workload half is deliberately not consulted
+
+    `state: confirmed` with `workloadState: rolled-back` adopts, and should. The screen has a line
+    for that pair (`m.hostOkWorkloadRolled`), so it is a state a host really sits in, and in it the
+    nftables ruleset *is* what the watermark authorized. `currentAuthorization`'s two readers — the
+    expiry escape and the trust report — both ask about the host half; gating on the workload half
+    would withhold the field from a host whose firewall is exactly as authorized.
+
+    ## What it is not
+
+    Not a migration of stored shapes — nothing is rewritten, one absent field is filled from another
+    field beside it. And not a way to accept an authorization that was never accepted: the watermark
+    only exists because `accept_artifact_authorization` wrote it, having verified the signature
+    first.
+    """
+    adopted = {"generation": None}
+
+    def mutate(st):
+        if st.get("currentAuthorization") is not None:
+            return
+        if st.get("state") != "confirmed":
+            return
+        prior = st.get("authorizationWatermark")
+        if not isinstance(prior, dict):
+            return
+        gen = prior.get("generation")
+        # `is None` as well as the comparison: two absent generations are not a match. Unreachable
+        # through the program — only `confirm()` writes `confirmed` and it cannot without a
+        # generation — but the state file is something an operator's script reads and may truncate,
+        # and `None == None` would adopt into a host that names nothing.
+        if gen is None or gen != st.get("generation"):
+            return
+        st["currentAuthorization"] = prior
+        adopted["generation"] = gen
+
+    # Read first, so the common case — every host, every boot after the first — does not rewrite and
+    # fsync the file the rollback commitment lives in for nothing. `update_state` always saves, even
+    # when the mutator touched nothing, and that write also bumps an mtime an operator's script may
+    # key on.
+    settled = load_state()
+    if settled.get("currentAuthorization") is not None or settled.get("state") != "confirmed":
+        return
+    fresh, saved = update_state(mutate)
+    if adopted["generation"] is None:
+        return
+    # ## Said only after the write landed, and said either way
+    #
+    # This logged from inside the mutator and ignored `saved`, which made the line announce an adopt
+    # the disk may have refused: a host with a full or read-only `/var/lib` — the state a host in
+    # trouble is already in — printed the success line while its state file kept `None`. An operator
+    # reading eight journals after a rollout would count eight adopts and have seven.
+    #
+    # That is this function's own stated failure inverted. The point of logging here is that silence
+    # cannot be told from a host the rollout missed; speech that cannot be told from a host it
+    # reached is the same defect wearing the other sign. Every other durable write in this file fails
+    # closed on `saved` (`accept_artifact_authorization`, `confirm`, `_persist_commitment`) and this
+    # one now says which of the two happened.
+    if saved:
+        log(f"adopted the authorization already in force for generation {adopted['generation']}")
+    else:
+        log(f"cannot persist the adopted authorization for generation {adopted['generation']}; "
+            f"this host still cannot name what it is enforcing")
+
+
 def recover_commitment():
     """Re-arm or fire a rollback left behind by a previous process. Called once, before heartbeating.
 
@@ -5076,6 +5193,20 @@ def main():
     # Before the first heartbeat, and before the monitor. If the previous process left an
     # unconfirmed apply that severed the relay path, heartbeating first would block for the HTTP
     # timeout while a deadline this host owes went unhonoured.
+    # ## Order is not load-bearing here, and the reason is worth keeping
+    #
+    # An earlier comment said "before the recovery paths, because they may change `state`", which is
+    # an argument for running *after* them, not before — going first would mean acting on a reading
+    # about to be invalidated. It is neither: no recovery path can produce `confirmed` or move a host
+    # out of it. `recover_commitment` returns unless the state is `prepared`/`pending`/
+    # `rollback-failed`, all of which this refuses; `recover_workload_commitment` touches only
+    # workload fields; `reconcile_recovered_commitments` acts only on host-failed or host-live, and
+    # `confirmed` is in neither. `state = "confirmed"` is written in exactly one place, `confirm()`.
+    #
+    # So this runs first only because it is cheap and reads settled state. **If a recovery path ever
+    # produces `confirmed`, this call has to move below it** — that is the invariant to check, not
+    # the position.
+    backfill_current_authorization()
     recover_commitment()
     # Same reasoning for the workload half, and it needs its own call because the two commitments have
     # separate deadlines. A no-op on every host that is not the applier.

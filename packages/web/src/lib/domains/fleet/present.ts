@@ -113,6 +113,75 @@ export function fleetSummary(site: SiteView): { problems: number; generations: s
   };
 }
 
+/**
+ * How many distinct agent builds the fleet is running, and how many hosts could not say.
+ *
+ * ## Why the split matters rather than the digest
+ *
+ * `agentBuild` is the agent's own source hashed by itself, added 2026-09-03 for a case a version
+ * string cannot see: code changing without `AGENT_VERSION` moving, because nothing an agent and a
+ * relay must agree on changed. It has travelled from the host through the relay to the manager ever
+ * since. **Nothing drew it.**
+ *
+ * What that cost, measured 2026-09-29: a fix was merged, an image rolled, and eight hosts kept
+ * running a three-week-old agent — the image carries `src/` and `bin/`, and the agent lives in
+ * `agent/`. Every screen was green. The value that would have said so was one step away the whole
+ * time.
+ *
+ * A digest in a column would not have helped either; nobody compares sixteen hex characters across
+ * eight rows. **The finding is the disagreement**: one build across the fleet is a rollout that
+ * landed, two is a rollout that is partway, and that is a sentence rather than a value.
+ *
+ * `unknown` counts hosts that reported nothing — either older than the field or not reporting at
+ * all. Kept apart from the builds because "did not say" is not a third version.
+ *
+ * ## It is self-attested, so it is a rollout signal and not an integrity control
+ *
+ * The digest is computed by the agent over its own file and sent in its own heartbeat. Nothing else
+ * measures it, so an agent that has been replaced can report whatever digest it likes, and a fleet
+ * showing one build everywhere is evidence that every host *claims* the same source — not proof of
+ * it. What the field is honest about is the case it was added for: an unmodified agent that a rollout
+ * has not reached yet, which has no reason to lie and every reason to differ.
+ *
+ * Saying so here because the banner reads like verification and is not. Integrity of what a host
+ * enforces rests on the signed artifact path — `currentAuthorization`, the trust digest, the key ids
+ * — none of which this value touches.
+ */
+export function agentBuildSplit(hosts: readonly SiteHost[]): { builds: string[]; unknown: number } {
+  const builds = [...new Set(hosts.map((h) => h.agentBuild).filter((b): b is string => Boolean(b)))];
+  builds.sort();
+  return { builds, unknown: hosts.filter((h) => !h.agentBuild).length };
+}
+
+/**
+ * Which agent-build lines the fleet screen should draw.
+ *
+ * ## Why this is a function and not two `{#if}`s
+ *
+ * It was two, chained — `{#if split}{:else if unknown > 0 && builds.length > 0}`. That second
+ * condition made the silent line dead in the one state it exists for: **no host reporting at all**
+ * (`builds: []`, `unknown: 8`) rendered nothing, which on the page is indistinguishable from one
+ * build everywhere. `agentBuildSplit` keeps those apart and a test asserts it does; the template
+ * threw it away, and no test could see that because nothing here runs the template.
+ *
+ * So the decision moves out of the markup, where it can be asserted. The two lines are independent:
+ * a fleet can be both split and partly silent, and that is two facts, not a choice between them.
+ */
+export function agentBuildLines(
+  hosts: readonly SiteHost[],
+): { split: { builds: string[]; answered: number } | null; silent: number | null } {
+  const { builds, unknown } = agentBuildSplit(hosts);
+  return {
+    split: builds.length > 1 ? { builds, answered: hosts.length - unknown } : null,
+    silent: unknown > 0 ? unknown : null,
+  };
+}
+
+/** The hosts reporting one agent build, so a split can name them instead of only counting them. */
+export function hostsOnBuild(hosts: readonly SiteHost[], build: string): string[] {
+  return hosts.filter((h) => h.agentBuild === build).map((h) => h.host).sort();
+}
+
 export function vpcTone(vpc: SiteView["vpcs"][number], hosts: readonly SiteHost[]): "ok" | "warn" | "bad" {
   if (!vpc.ok) return "bad";
   return hosts.some((host) => host.vpc === vpc.name && hostHasProblem(host)) ? "warn" : "ok";

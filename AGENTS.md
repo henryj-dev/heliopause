@@ -129,9 +129,9 @@ python3 scripts/git-hooks/test-pre-commit.py              # 실패 0 (사람 통
 `if __name__ == "__main__"` 이 파일 중간에 있어서 그 아래 다섯 클래스(라우트 안전 검사
 39개)가 정의조차 되지 않은 채 몇 달을 지났고, 초록불은 그동안 한 번도 흔들리지 않았다
 — 수가 줄어든 게 아니라 센 적이 없어 비교할 기준선이 없었다. 현재 기대값(정책 심링크 연결):
-`npm test` 2,148 + 8 (`@heliopause/manager`) + 229 (`@heliopause/web`) ·
-`test_validate.py` 278 (리눅스에서 실행 278 · macOS 에서 skip 12) · `test_enroll.py` 16.
-그 2,148 은 **이 저장소 2,054(`src` + `examples`) + `policy` 94** 이다. 둘로 나눠 적는 이유는
+`npm test` 2,151 + 8 (`@heliopause/manager`) + 240 (`@heliopause/web`) ·
+`test_validate.py` 291 (리눅스에서 실행 291 · macOS 에서 skip 12) · `test_enroll.py` 16.
+그 2,151 은 **이 저장소 2,057(`src` + `examples`) + `policy` 94** 이다. 둘로 나눠 적는 이유는
 바로 아래에 있다 — 뒤의 94 는 이 저장소의 코드를 안 읽는다.
 
 ⚠️ **그 94 중 16 은 지금 실패한다.** 원인은 바로 아래 문단이 설명하는 포크 클론 드리프트이고
