@@ -331,7 +331,8 @@ export function collectPolicySource(input: {
       // back, so a resolver returning a circular object or a `BigInt` passed startup verification
       // and then threw in the renderer's serialiser — on the **first request**, in the request
       // handler, which is an uncaught exception and a full outage for every co-served site. Both
-      // measured, both live in the deployed renderer. Crossing here means the same mistake is a 503
+      // measured here, and confirmed in the running image by the cluster's operator, who found the
+      // same `services[ref] = hit` beside a `site` that does cross. Crossing here means the mistake is a 503
       // for the one site whose module made it, because this function runs inside that site's `try`.
       if (hit) services[ref] = toWire(hit) as ServiceSelector;
     }

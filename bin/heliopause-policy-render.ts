@@ -11,8 +11,19 @@
 //
 // So the execution moves to a process with nothing in it. This one holds a policy checkout and no
 // credential, answers exactly one question, and answers it in JSON. A hostile commit still runs —
-// there is no way to render a program without running it — but it runs somewhere it can only reach
-// the policy it came from.
+// there is no way to render a program without running it — but it runs where the blast radius is a
+// rendered answer rather than a console, a credential and a fleet.
+//
+// ⚠️ **It is not confined to the policy it came from, and this file used to say it was.** A module is
+// evaluated by `import()` in this process's own realm, so it shares every intrinsic and every
+// prototype with the other sites served here. The tests below prove it: a module that poisons
+// `Object.prototype` makes a *different*, correct site answer 503, and that is asserted as the
+// expected result because it is what the code does. Per-site isolation would mean a separate realm —
+// a `worker_thread` or a `vm` context — and that is not what this is.
+//
+// What the captures and guards below buy is that one module's mistake is a 503 rather than an exit:
+// the process stays up and the sites that still evaluate keep serving. That is a smaller claim than
+// the one this paragraph made, and it is the one the tests actually hold.
 //
 // ## What keeps that true
 //
@@ -30,6 +41,7 @@
 import { createServer } from "node:http";
 import { registerHooks } from "node:module";
 import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
+import type { Dirent } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { timingSafeEqual } from "node:crypto";
@@ -138,7 +150,8 @@ const RealError = Error;
 // import cleanly, passes startup verification, answers `/healthz` 200 — and then throws with nothing
 // from this file on the stack. The default action for that is to exit, so the pod died **after** both
 // probes had passed, which at `replicas: 1` with `Recreate` is every co-served console dark on a
-// crashloop driven by a config commit. Measured, and live in the deployed renderer.
+// crashloop driven by a config commit. Measured against `origin/main` of this repository — not
+// against the running image, whose tag is a sha from the other repository and does not resolve here.
 //
 // Staying up is the better trade: one module's delayed mistake should not be a fleet outage, and the
 // sites that do evaluate keep serving. The cost is real and deliberate — a genuine fault in *this*
@@ -579,10 +592,24 @@ const cached = new Map<string, { stamp: string; source: PolicySource }>();
  * that could not see a change to `policies.json`. A path that does not exist contributes `-`, so
  * its appearance and disappearance both move the key.
  */
-/** How many neighbouring files the stamp will read before it gives up and stamps the count. */
+/** How many neighbouring files the stamp will read before it gives up on a complete one. */
 const STAMP_FILE_CAP = 400;
 
-function sourceStamp(sitePath: string): string {
+/**
+ * A value for the import specifier when there is no stamp, distinct on every call.
+ *
+ * ES modules are cached by URL, so the `?v=` has to move or a re-evaluation is not one. With no
+ * stamp there is nothing to derive it from, and the answer is not cached either — so a fresh counter
+ * is exactly right here and would be exactly wrong anywhere the result is kept.
+ */
+let uncachedEvaluations = 0;
+const uncachedStamp = (): string => `uncached-${(uncachedEvaluations += 1)}`;
+
+/**
+ * `null` means **no complete stamp**, which the caller must read as "do not cache this answer".
+ * Returning a placeholder instead is what froze the key above the cap.
+ */
+function sourceStamp(sitePath: string): string | null {
   const head = policyHead(sitePath);
   const dir = dirname(resolve(sitePath));
   const mtime = (p: string): string => {
@@ -598,27 +625,51 @@ function sourceStamp(sitePath: string): string {
   // `import "./helper.ts"` was in none of them, so breaking only the helper left the cache answering
   // **200 with the last good payload** for a site that no longer evaluates — not an outage, a screen
   // that lies about what is deployed, which the comment above `cached` says must never happen.
-  // Measured, and live in the deployed renderer.
+  // Measured here, and confirmed in the running image by the cluster's operator, who read its
+  // `heliopause-policy-render.ts` and found no `readdirSync` — the stamp there is the entry module,
+  // the allowlisted files and the sha, and nothing else.
   //
   // The whole directory rather than a dependency graph: Node exposes no import graph for an evaluated
   // module, and policy modules keep their helpers beside them. A helper **outside** this directory is
-  // still invisible to the stamp — that is the known remaining gap, not an oversight. Bounded because
-  // this runs on every request: a directory larger than the cap stamps its size instead, which still
-  // moves when files are added or removed.
+  // still invisible to the stamp — the known remaining gap, not an oversight.
+  //
+  // ## Two things the first version of this got wrong, both found by an audit
+  //
+  // It called `readdirSync(dir, { recursive: true })` and `break`'d at the cap. That bounds the array
+  // it builds and **not the walk**: the recursive form returns a materialised array, so the whole tree
+  // is read before the loop sees its first entry. The walk below is explicit and stops.
+  //
+  // And above the cap it substituted the literal `over-400`, a constant — so a tree larger than the cap
+  // had a stamp that could never move, and the cache served its first answer forever. That is exactly
+  // the defect the neighbour scan exists to fix, reintroduced inside the fix. Above the cap this now
+  // refuses to produce a stamp at all and the caller does not cache, which costs an evaluation per
+  // request and cannot serve a stale one.
+  //
+  // @see src/policy-render-service.test.ts "keeps noticing edits in a tree larger than the scan cap"
   const neighbours: string[] = [];
-  try {
-    for (const entry of readdirSync(dir, { withFileTypes: true, recursive: true })) {
+  let overflowed = false;
+  const stack = [dir];
+  walk: while (stack.length > 0) {
+    const here = stack.pop() as string;
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(here, { withFileTypes: true, encoding: "utf8" }) as Dirent[];
+    } catch {
+      // Unreadable directory: the entry module's own mtime below still moves the key.
+      continue;
+    }
+    for (const entry of entries) {
+      if (neighbours.length >= STAMP_FILE_CAP) { overflowed = true; break walk; }
+      const full = join(here, entry.name);
+      if (entry.isDirectory()) { stack.push(full); continue; }
       if (!entry.isFile()) continue;
       if (!/\.(ts|mts|cts|js|mjs|cjs|json)$/.test(entry.name)) continue;
-      neighbours.push(join(entry.parentPath, entry.name));
-      if (neighbours.length > STAMP_FILE_CAP) break;
+      neighbours.push(full);
     }
-  } catch {
-    // Unreadable directory: the entry module's own mtime below still moves the key.
   }
+  if (overflowed) return null;
   neighbours.sort();
-  const scanned =
-    neighbours.length > STAMP_FILE_CAP ? `over-${STAMP_FILE_CAP}` : neighbours.map(mtime).join(",");
+  const scanned = neighbours.map(mtime).join(",");
   const files = [sitePath, ...allowPaths.map((p) => resolve(dir, p))].map(mtime).join(",");
   // The path is in the key, not only in the `Map` bucket it is stored under. Two modules in one
   // directory share a git sha and an allowlist, so the rest of this string is identical for both —
@@ -637,13 +688,20 @@ function hostIdsOf(site: ScreenSite): string[] {
 
 async function currentSource(site: { name: string | null; path: string }): Promise<PolicySource> {
   const { name, path: sitePath } = site;
+  // `null` when the tree is larger than the scan cap and the stamp cannot be complete. `evaluated`
+  // does not store an answer under a null stamp, so nothing in the map ever carries one and this
+  // comparison is already false for it. An explicit `stamp === null` check here was written first and
+  // deleted: reverting it changed no test, because the store is where the decision belongs.
   const stamp = sourceStamp(sitePath);
   const hit = cached.get(sitePath);
   if (hit && hit.stamp === stamp) return hit.source;
+  if (stamp === null) {
+    log(`${name ?? label}: more than ${STAMP_FILE_CAP} files beside the module — evaluating without caching`);
+  }
   // Before the import, so the hook above knows which tree this evaluation may version.
   policyRoots.add(`${pathToFileURL(realpathSync(dirname(resolve(sitePath)))).pathname}/`);
   // The import specifier still needs a value that moves, and `stamp` is not URL-safe.
-  const mod = (await import(`${pathToFileURL(sitePath).href}?v=${encodeURIComponent(stamp)}`)) as {
+  const mod = (await import(`${pathToFileURL(sitePath).href}?v=${encodeURIComponent(stamp ?? uncachedStamp())}`)) as {
     site?: ScreenSite;
   };
   if (!mod.site) throw new RealError(`${sitePath} does not export \`site\``);
@@ -698,7 +756,7 @@ async function currentSource(site: { name: string | null; path: string }): Promi
 /** The half of `currentSource` that runs once the zone check has passed. Separated so the caller can
  *  tell a failure here — where the check ran — from one before it. */
 async function evaluated(
-  input: { site: ScreenSite; name: string | null; sitePath: string; stamp: string },
+  input: { site: ScreenSite; name: string | null; sitePath: string; stamp: string | null },
 ): Promise<PolicySource> {
   const { site: siteValue, name, sitePath, stamp } = input;
   const source = collectPolicySource({
@@ -713,7 +771,16 @@ async function evaluated(
     label: name ?? label,
     ...(name === null ? {} : { siteName: name }),
   });
-  cached.set(sitePath, { stamp, source });
+  // ## `null` means the stamp could not be complete, so this answer must not be kept
+  //
+  // A stored entry whose key cannot be invalidated is the stale answer the key exists to prevent.
+  // This guard was first written one call up, where `stamp` had already been replaced by a
+  // substitute and so was never `null` — dead, and reverting it changed no test. What was actually
+  // preventing the stale answer was that the substitute never matched a later lookup, which is a
+  // property nobody wrote down and nothing asserted.
+  //
+  // @see src/policy-render-service.test.ts "keeps noticing edits in a tree larger than the scan cap"
+  if (stamp !== null) cached.set(sitePath, { stamp, source });
   log(`evaluated ${name ?? label} at ${source.head.sha ?? "unknown"}${source.head.dirty ? " (dirty)" : ""}`);
   return source;
 }
@@ -842,7 +909,8 @@ let readyMemo: {
  * preempt synchronous code. `while (true) {}` at a policy module's top level blocks the event loop,
  * so the callback that would reject never runs: measured, the process stays alive and answers
  * nothing at all — no listener if it happens at startup, and no `/healthz` either way, so the
- * liveness probe kills the pod and the next one does the same. Live in the deployed renderer too.
+ * liveness probe kills the pod and the next one does the same. Measured against `origin/main` of
+ * this repository; not separately checked in the running image.
  *
  * There is no fix for this in the same realm, which is why the sentence is a warning rather than a
  * TODO: interrupting the module means evaluating it somewhere with its own event loop — a
@@ -979,7 +1047,8 @@ function bearerOk(header: string | undefined): boolean {
 // `Object.defineProperty(Object.prototype, "toJSON", { value() { throw … } })` in a policy module
 // made every response throw — inside the request handler, which is an uncaught exception, so
 // **exit 1 on the first request**, `/healthz` included. Capturing the function closed nothing here:
-// the hook is on the value, not on the global. Measured, and live in the deployed renderer.
+// the hook is on the value, not on the global. Measured here, and confirmed in the running image by
+// the cluster's operator: its `send` serialises unguarded and its `/healthz` goes through it.
 //
 // Two answers. `/healthz` gets a body that was serialised when this file was written, so the liveness
 // probe never calls a serialiser at all. Everything else goes through a `send` that falls back to a
@@ -1012,11 +1081,25 @@ const server = createServer((req, res) => {
     res.end(text);
   };
   const send = (code: number, body: unknown): void => {
-    let text: string;
+    let text: unknown;
     try {
       text = toJson(body);
     } catch {
       log(`a response body could not be serialised — answering ${code >= 400 ? code : 500} without it`);
+      raw(code >= 400 ? code : 500, unserialisableBody());
+      return;
+    }
+    // ## Not throwing is not the same as producing a body
+    //
+    // `JSON.stringify` calls the `toJSON` it finds on the value, and an inherited one that **returns
+    // `undefined`** makes it return `undefined` rather than raise — so the `catch` above never ran and
+    // `res.end(undefined)` went out as a **200 with an empty body** under a JSON content type. The
+    // manager then parses nothing and has no error to report. The guard above was written for a
+    // throwing hook and the type annotation here said `string`, which was how it read as impossible.
+    //
+    // @see src/policy-render-service.test.ts "answers nothing rather than an empty body"
+    if (typeof text !== "string") {
+      log(`a response body serialised to ${typeof text} — answering ${code >= 400 ? code : 500} without it`);
       raw(code >= 400 ? code : 500, unserialisableBody());
       return;
     }

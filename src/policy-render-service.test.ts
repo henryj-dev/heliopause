@@ -76,6 +76,14 @@ interface Started {
    * how the declared-name caveat shipped with no test.
    */
   startupLog: string;
+  /**
+   * Everything said on stdout **so far**, including after startup.
+   *
+   * `startupLog` is frozen at the "listening" line, so a line the renderer logs while serving a
+   * request was unassertable — which is how a bound whose only visible effect is a log line had no
+   * test. The reader stays attached; this reads what it has accumulated.
+   */
+  output: () => string;
 }
 
 /** Start the renderer and wait for the line that reports the port it actually bound. */
@@ -138,6 +146,7 @@ function start(dir: string, extraEnv: Record<string, string> = {}): Promise<Star
         port: Number(m[1]),
         stop: () => proc.kill("SIGKILL"),
         startupLog: out,
+        output: () => out,
       });
     });
     proc.on("exit", (code) => {
@@ -1031,8 +1040,9 @@ export const site = {
     // bearer check. One unauthenticated `GET //[` from anything that could reach the port took the pod
     // down, and at `replicas: 1` with `Recreate` every zone's console went with it.
     //
-    // Unchanged from `origin/main`, so it is live in the deployed renderer rather than something this
-    // branch introduced. `//[::1`, `//%` and `http://[` do the same.
+    // Unchanged from `origin/main` of this repository, so it predates this branch rather than being
+    // introduced by it. That is a statement about this repository; the running image is built from
+    // another one, and its tag does not resolve here. `//[::1`, `//%` and `http://[` do the same.
     const { dir, sites } = twoSites();
     let started: Started | undefined;
     try {
@@ -1125,6 +1135,106 @@ throw new Error("an ordinary content fault");
       );
       assert.match(started.startupLog, /beta .*did not evaluate at startup/);
       assert.equal((await fetchAt(started.port, "/source?site=alpha")).status, 200);
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("answers nothing rather than an empty body", { timeout: 30_000 }, async () => {
+    // ## Not throwing is not the same as producing a body
+    //
+    // The serialisation guard was written for a `toJSON` that throws. An inherited one that **returns
+    // `undefined`** does not throw: `JSON.stringify` returns `undefined`, the `catch` never runs, and
+    // `res.end(undefined)` goes out as a **200 with an empty body** under `application/json`. The
+    // manager parses nothing and has no error to report — the quietest possible failure, and the
+    // declared `let text: string` is why it read as impossible.
+    //
+    // Found by an independent audit of this branch. `/healthz` is unaffected either way: it answers a
+    // constant that was serialised when the file was written, which is asserted here so that staying
+    // 200 is a checked property and not a coincidence.
+    const { dir, sites, beta } = twoSites();
+    writeFileSync(
+      beta,
+      'Object.defineProperty(Object.prototype, "toJSON", { value() { return undefined; }, configurable: true });\n' +
+        'throw new Error("bad beta");\n',
+    );
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      const port = started.port;
+      const deadline = (): RequestInit => ({ signal: AbortSignal.timeout(10_000) });
+      const healthz = await fetchAt(port, "/healthz", deadline());
+      assert.equal(healthz.status, 200, "the liveness probe stopped answering");
+      assert.deepEqual(await healthz.json(), { ok: true }, "/healthz went through the serialiser");
+      for (const path of ["/source?site=alpha", "/source?site=beta", "/readyz"]) {
+        const res = await fetchAt(port, path, deadline());
+        const text = await res.text();
+        assert.notEqual(text, "", `${path}: an empty body went out with ${res.status}`);
+        assert.notEqual(res.status, 200, `${path}: an unserialisable answer was reported as success`);
+        assert.equal(
+          (JSON.parse(text) as { error?: string }).error, "the answer could not be serialised",
+          `${path}: the body is not the stated fallback`,
+        );
+      }
+      assert.equal((await fetchAt(port, "/healthz", deadline())).status, 200, "healthz after");
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("keeps noticing edits in a tree larger than the scan cap", { timeout: 60_000 }, async () => {
+    // ## A placeholder above the cap is a key that cannot move
+    //
+    // The neighbour scan was bounded by `break`ing at a cap and stamping the literal `over-400` when
+    // it was hit. Two defects in one: `readdirSync(dir, { recursive: true })` returns a **materialised
+    // array**, so the whole tree is walked before the loop sees an entry and the `break` bounds
+    // nothing; and a constant placeholder never changes, so a tree above the cap had a stamp that
+    // could not move and the cache served its first answer forever — the exact failure the scan was
+    // added to fix, reintroduced inside the fix. Found by an independent audit.
+    //
+    // Above the cap there is now no stamp, and no stamp means no caching: an evaluation per request,
+    // which is slower and cannot be stale. This asserts the second edit is seen, which is what the
+    // placeholder made impossible.
+    const { dir, sites, beta } = twoSites();
+    const filler = join(dir, "filler");
+    mkdirSync(filler);
+    for (let i = 0; i < 420; i += 1) writeFileSync(join(filler, `f${i}.ts`), `export const n${i} = ${i};\n`);
+    const marker = (value: string): string => `export const site = {
+  cfg: { hookPolicy: { input: "drop", output: "accept" } },
+  hosts: [{ id: "gw-01.beta", stage: "canary", items: [] }],
+  objects: [{ id: "ao-beta", kind: "address", name: "${value}",
+              members: [{ kind: "cidr", value: "10.0.0.0/8" }] }],
+};
+`;
+    writeFileSync(beta, marker("first"));
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      const port = started.port;
+      const named = async (): Promise<unknown> => {
+        const r = await fetchAt(port, "/source?site=beta", { signal: AbortSignal.timeout(20_000) });
+        assert.equal(r.status, 200, "beta lost");
+        return ((await r.json()) as { site?: { objects?: { name?: unknown }[] } })
+          .site?.objects?.[0]?.name;
+      };
+      assert.equal(await named(), "first", "the fixture's marker is not where this test reads it");
+      writeFileSync(beta, marker("second"));
+      const later = new Date(Date.now() + 5_000);
+      utimesSync(beta, later, later);
+      assert.equal(
+        await named(), "second",
+        "an edit went unseen above the scan cap — the stamp stopped moving and the cache answered",
+      );
+      // And the overflow path is what answered. Without this the bound is untestable here: a
+      // *complete* stamp also sees the edit, so removing the cap makes this assertion pass and only
+      // the cost worse. This is the line that says the cap was reached and the answer was not cached.
+      assert.match(
+        started.output(), /more than 400 files beside the module — evaluating without caching/,
+        "the scan never overflowed, so this test is about a tree that fits and not about the cap",
+      );
+      assert.equal((await fetchAt(port, "/source?site=alpha")).status, 200, "alpha lost");
     } finally {
       started?.stop();
       rmSync(join(dir, ".."), { recursive: true, force: true });
@@ -1233,8 +1343,8 @@ throw new Error("an ordinary content fault");
     // A policy module's `import "./helper.ts"` was in none of the stamp's inputs — entry module,
     // allowlisted files, git sha — so breaking only the helper left the cache answering **200 with the
     // last good payload** for a site that no longer evaluates. Not an outage: a screen that lies about
-    // what is deployed, which is what the comment above `cached` says must never happen. Measured, and
-    // live in the deployed renderer.
+    // what is deployed, which is what the comment above `cached` says must never happen. Measured here,
+    // and confirmed in the running image by the cluster's operator, who found no `readdirSync` in it.
     //
     // A helper *outside* the module's directory is still invisible to the stamp. That is a stated gap,
     // not a claim this test covers.
