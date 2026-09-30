@@ -40,6 +40,14 @@ import { buildId } from "./build-id.ts";
 import { generationLabel, policyCommits, policyHead, readCoverageProbes } from "./policy-screen.ts";
 import type { RepoFacts, ScreenSite } from "./policy-screen.ts";
 
+// Captured before anything a policy module could replace — see the block at the `toWire` call.
+// The **functions**, detached. Writing the body as `JSON.parse(JSON.stringify(v))` would capture
+// nothing: an arrow body resolves `JSON` when it runs, which is after the module has been imported.
+// Neither of these reads `this`.
+const parseJson = JSON.parse;
+const writeJson = JSON.stringify;
+const toWire = <T>(value: T): unknown => parseJson(writeJson(value)) as unknown;
+
 /** Bumped when a field changes meaning. A mismatch is refused rather than guessed at. */
 export const POLICY_SOURCE_SCHEMA = 1;
 
@@ -332,7 +340,20 @@ export function collectPolicySource(input: {
   // `JSON.parse(JSON.stringify())` rather than a spread: it is the wire, applied here, so a field
   // that cannot survive the crossing fails in the process that owns the mistake instead of arriving
   // as a silently missing table three seconds later in the manager's log.
-  const wire = JSON.parse(JSON.stringify({ ...site, resolveService: undefined })) as ScreenSite;
+  //
+  // ⚠️ `toWire`, not `JSON`. `site` came from a module the renderer evaluated with `import()`, which
+  // runs it in the renderer's **own realm** — so `globalThis.JSON = { stringify() { throw 1; } }` is
+  // two tokens in a policy commit, and this line runs for **every** site. Measured: one hostile module
+  // made a different, correct site answer 503 after the renderer had already captured its own `JSON`,
+  // because the crossing is here. Captured at module load, which is before the renderer's first
+  // dynamic import.
+  //
+  // This is a patch on a measured path, not a boundary. Every module the renderer imports resolves its
+  // intrinsics at call time, so the general claim "a policy module cannot reach another site" is not
+  // true and must not be written down. The boundary would be evaluating policy in a separate realm.
+  //
+  // @see src/policy-render-service.test.ts "survives a module that replaces the globals it will be described with"
+  const wire = toWire({ ...site, resolveService: undefined }) as ScreenSite;
 
   const head = policyHead(sitePath);
   // A checkout with a `.git` and no answer from git is a different state from no checkout, and the

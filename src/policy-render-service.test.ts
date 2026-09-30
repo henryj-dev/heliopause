@@ -1131,6 +1131,109 @@ throw new Error("an ordinary content fault");
     }
   });
 
+  it("survives a module that replaces the globals it will be described with", { timeout: 60_000 }, async () => {
+    // ## The value was read carefully and then handed to a constructor the module owned
+    //
+    // `import()` evaluates a policy module in this process's own realm, so a module can assign to
+    // `globalThis.Error`. Every guard in the renderer reads the thrown value defensively and then builds
+    // an `Error` to carry it — which called the module's function. `asError` does that inside
+    // `evaluateWithin`'s rejection handler, the one point every module failure funnels through, and a
+    // throw in a rejection handler is an unhandled rejection: **exit 1 in the startup loop, before
+    // `server.listen`**, so a crashloop and every co-served console dark at `replicas: 1`/`Recreate`.
+    //
+    // The handler's comment already described that mechanism. It did not close this door, because the
+    // comment was about the thrown *value* being unreadable and this is the *constructor* being
+    // replaced — the same "one of two sites" shape this file keeps recording, one abstraction up.
+    //
+    // Reaching a listener is the assertion in every shape. The other three are here because they are
+    // the same idea through different globals, and they were already survivable — so this test is also
+    // the record that they were checked rather than assumed.
+    const shapes: Record<string, string> = {
+      replacesError: 'globalThis.Error = function () { throw 1; };\nthrow "plain";\n',
+      replacesString:
+        'globalThis.String = function () { throw 1; };\nthrow { toString() { throw 1; } };\n',
+      poisonsObjectPrototype:
+        'Object.defineProperty(Object.prototype, "message", { get() { throw new Error("proto trap"); }, configurable: true });\nthrow Object.create(Object.prototype);\n',
+      replacesSetTimeout: 'globalThis.setTimeout = function () { throw 1; };\nthrow "plain";\n',
+      // `send` serialises every response and the readiness memo reads the clock, so these two reach
+      // `/healthz` and `/readyz` rather than `/source`. Both are asserted below for that reason.
+      replacesJson: 'globalThis.JSON = { stringify() { throw 1; }, parse() { throw 1; } };\nthrow "plain";\n',
+      replacesDate: 'globalThis.Date = function () { throw 1; };\nthrow "plain";\n',
+      // The budget timer builds an `Error` too, and only a module that **hangs** reaches it. Without
+      // the capture this throws inside a `setTimeout` callback, which is an uncaught exception rather
+      // than a rejection — still exit 1, by a third door. The budgets are lowered below so that six
+      // shapes and one hang fit in the test's own deadline.
+      hangsAndReplacesError:
+        'globalThis.Error = function () { throw 1; };\nawait new Promise(() => {});\n',
+    };
+    for (const [name, body] of Object.entries(shapes)) {
+      const { dir, sites, beta } = twoSites();
+      writeFileSync(beta, body);
+      // `HELIOPAUSE_POLICY_ALLOW_PATHS` is what makes `sourceStamp` coerce an mtime, which is one of
+      // the two shared `String` calls; the fixture already writes a `policies.json` for it to find.
+      // With the default budgets a hanging module would hold startup for 30s per shape.
+      const env = {
+        ...MULTI(sites),
+        HELIOPAUSE_POLICY_ALLOW_PATHS: "policies.json",
+        HELIOPAUSE_POLICY_STARTUP_BUDGET_MS: "700",
+        HELIOPAUSE_POLICY_SOURCE_BUDGET_MS: "700",
+      };
+      let started: Started | undefined;
+      try {
+        started = await start(dir, env);
+        const port = started.port;
+        assert.match(
+          started.startupLog, /beta .*did not evaluate at startup/,
+          `${name}: the failure was not reported`,
+        );
+        // An explicit deadline on every call. A held socket keeps the `node:test` runner alive even
+        // with `{timeout}` on the test, so a run that never finishes is not a red — it is nothing.
+        const deadline = () => ({ signal: AbortSignal.timeout(10_000) });
+        assert.equal(
+          (await fetchAt(port, "/source?site=alpha", deadline())).status, 200,
+          `${name}: alpha lost`,
+        );
+        assert.equal(
+          (await fetchAt(port, "/source?site=beta", deadline())).status, 503,
+          `${name}: no 503`,
+        );
+        // `/healthz` needs the serialiser and nothing else; `/readyz` needs the clock as well. Alpha
+        // still evaluates, so readiness is 200 and degraded rather than 503.
+        assert.equal((await fetchAt(port, "/healthz", deadline())).status, 200, `${name}: healthz`);
+        const ready = await fetchAt(port, "/readyz", deadline());
+        assert.equal(ready.status, 200, `${name}: readyz`);
+        assert.deepEqual(await ready.json(), { ok: true, degraded: true, serving: 1, total: 2 }, name);
+        // Again, immediately: the memo compares `Date.now()` to when it settled, so the clock is only
+        // read on a second request inside the window. One call leaves that capture untested.
+        const memoised = await fetchAt(port, "/readyz", deadline());
+        assert.equal(memoised.status, 200, `${name}: memoised readyz`);
+        assert.deepEqual(await memoised.json(), { ok: true, degraded: true, serving: 1, total: 2 }, name);
+        if (name === "replacesString") {
+          // The second shared `String` call is inside `sourceStamp`'s `try`/`catch`, so a replaced
+          // coercion throws nothing — it makes **every** mtime component `"-"`. The stamp then stops
+          // moving and the cache serves whatever loaded first, which is the stale-on-error cache the
+          // comment above `cached` says must not exist. So the consequence to assert is not a status
+          // code: it is whether an edit to a *different*, healthy site is still seen.
+          const named = async (): Promise<unknown> => {
+            const r = await fetchAt(port, "/source?site=alpha", deadline());
+            assert.equal(r.status, 200, "alpha lost while checking the stamp");
+            return ((await r.json()) as { site?: { objects?: { name?: unknown }[] } })
+              .site?.objects?.[0]?.name;
+          };
+          assert.equal(await named(), "alpha", "the fixture's marker is not where this test reads it");
+          const alphaPath = join(dir, "alpha.ts");
+          writeFileSync(alphaPath, readFileSync(alphaPath, "utf8").replace('"alpha"', '"alpha-edited"'));
+          const later = new Date(Date.now() + 5_000);
+          utimesSync(alphaPath, later, later);
+          assert.equal(await named(), "alpha-edited", "the stamp stopped moving — a stale policy is served");
+        }
+      } finally {
+        started?.stop();
+        rmSync(join(dir, ".."), { recursive: true, force: true });
+      }
+    }
+  });
+
   it("classifies without walking a prototype chain a module controls", { timeout: 30_000 }, async () => {
     // ## Two classifications, and only one of them had been fixed
     //

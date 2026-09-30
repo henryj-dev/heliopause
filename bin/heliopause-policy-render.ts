@@ -109,6 +109,53 @@ const OUR_ZONE_MISMATCHES = new WeakSet<ZoneMismatchError>();
 const zoneMismatchIsOurs = WeakSet.prototype.has.bind(OUR_ZONE_MISMATCHES) as (e: object) => boolean;
 const rememberOurZoneMismatch = WeakSet.prototype.add.bind(OUR_ZONE_MISMATCHES) as (e: object) => unknown;
 
+// ## The value was guarded; the constructor used to describe it was not
+//
+// A policy module is evaluated by `import()` in **this process's own realm** — the same `globalThis` —
+// so `globalThis.Error = function () { throw 1; };` is two tokens that replace the constructor every
+// later `new Error(...)` resolves. The guards below all read the thrown value carefully and then build
+// an `Error` to carry it, which called the module's function instead.
+//
+// Where that lands is the whole severity. `asError` runs inside `evaluateWithin`'s rejection handler,
+// the single point every module failure funnels through, and a throw inside a rejection handler is an
+// unhandled rejection: **exit 1 during the startup loop, before `server.listen`.** Measured — a module
+// that replaces `Error` and then throws a string takes the process down at boot, so it restarts and
+// does it again. At `replicas: 1` with `Recreate` that is every co-served site's console dark on a
+// crashloop, the same outage `asError` was added to prevent, reached through `asError` itself. The
+// handler's own comment describes this mechanism and did not close it, because the comment was about
+// the *value* being unreadable and this is the *constructor* being replaced.
+//
+// Captured here, before the first dynamic import, for the reason the block above gives. `extends Error`
+// needs no capture: the superclass is resolved when the class definition is evaluated, which is also
+// before any import, so `ZoneCheckedError` and `ZoneMismatchError` already hold the real one.
+//
+// @see src/policy-render-service.test.ts "survives a module that replaces the globals it will be described with"
+const RealError = Error;
+
+// The same capture, for the same reason, on the coercion two shared paths use. `globalThis.String =
+// function () { throw 1; };` in one module made **another site** answer 503: `sourceStamp` and
+// `hostIds` run for every site, so a module that replaces `String` un-serves the modules it does not
+// own, and the log says only that they failed to evaluate. Measured. That is quieter than the crash
+// above and worse — a correct prod policy stops rendering because a dev commit is hostile or broken.
+//
+// Not substituted inside `reasonOf` and `asError`: those calls are already wrapped in the `try`/`catch`
+// that exists for a value whose coercion throws, so a replaced `String` lands in the same fallback.
+// `boundedInteger`'s runs before the first import, where nothing has been replaced yet.
+const toText = String;
+
+// And the rest of what a shared path resolves at call time. `evaluateWithin` arms a timer for **every**
+// site, so `globalThis.setTimeout = function () { throw 1; };` in one module throws inside the
+// `new Promise` executor of another site's evaluation — measured, alpha answered 503 because beta was
+// hostile. `send` serialises every response including `/healthz`, and the readiness memo reads the
+// clock, so a replaced `JSON` or `Date` is the same reach by a different name.
+//
+// Captured rather than each call being wrapped: a `try` around a timer that was replaced still has no
+// timer, and the point is that the module never gets to participate in another site's request at all.
+const arm = setTimeout;
+const disarm = clearTimeout;
+const readClock = Date.now;
+const toJson = JSON.stringify;
+
 // ## The same treatment for "the zone check had already passed"
 //
 // That fact was carried by `error instanceof ZoneCheckedError`, and `instanceof` walks a prototype
@@ -223,7 +270,7 @@ function asError(thrown: unknown): Error {
   } catch {
     described = `a ${typeof thrown} that cannot be described`;
   }
-  return new Error(`policy module threw a non-error value: ${described}`);
+  return new RealError(`policy module threw a non-error value: ${described}`);
 }
 
 class ZoneCheckedError extends Error {
@@ -487,7 +534,7 @@ function sourceStamp(sitePath: string): string {
   const dir = dirname(resolve(sitePath));
   const mtime = (p: string): string => {
     try {
-      return String(statSync(p).mtimeMs);
+      return toText(statSync(p).mtimeMs);
     } catch {
       return "-";
     }
@@ -505,7 +552,7 @@ function sourceStamp(sitePath: string): string {
 /** The host ids a rendered site declares, for the zone check. */
 function hostIdsOf(site: ScreenSite): string[] {
   const hosts = (site as { hosts?: readonly { id?: unknown }[] }).hosts ?? [];
-  return hosts.map((h) => String(h?.id ?? "")).filter(Boolean);
+  return hosts.map((h) => toText(h?.id ?? "")).filter(Boolean);
 }
 
 async function currentSource(site: { name: string | null; path: string }): Promise<PolicySource> {
@@ -519,7 +566,7 @@ async function currentSource(site: { name: string | null; path: string }): Promi
   const mod = (await import(`${pathToFileURL(sitePath).href}?v=${encodeURIComponent(stamp)}`)) as {
     site?: ScreenSite;
   };
-  if (!mod.site) throw new Error(`${sitePath} does not export \`site\``);
+  if (!mod.site) throw new RealError(`${sitePath} does not export \`site\``);
   // ## Checked on every evaluation, not only at startup
   //
   // Startup is where a wrong manifest is caught while somebody is watching, but a module that threw
@@ -728,12 +775,12 @@ function evaluateWithin(
     //
     // Holding the loop open costs at most one budget, and the timer is cleared on every normal path,
     // so a fast answer leaves nothing behind.
-    const timer = setTimeout(
-      () => reject(new Error(`evaluation did not finish within ${budgetMs}ms`)),
+    const timer = arm(
+      () => reject(new RealError(`evaluation did not finish within ${budgetMs}ms`)),
       budgetMs,
     );
     void currentSource(site).then(
-      (source) => { clearTimeout(timer); resolve(source); },
+      (source) => { disarm(timer); resolve(source); },
       // `asError`, not a cast. `throw null` in a policy module rejected the import with `null`,
       // which `/source`'s handler then read `.message` off — a `TypeError` in a rejection handler,
       // so an unhandled rejection, so **exit 1 on the first request**. The startup loop had its own
@@ -742,7 +789,13 @@ function evaluateWithin(
       // `currentSource` comes through here, which is why the normalisation belongs here and not at
       // the four places that read `.message` — the same "second path a per-call-site fix forgets"
       // this file noted about `console.error` one commit earlier, repeated.
-      (e: unknown) => { clearTimeout(timer); reject(asError(e)); },
+      // A throw *in this handler* is an unhandled rejection, so the process would be gone — which is
+      // exactly what a module that replaced `globalThis.Error` achieved through `asError`, measured as
+      // exit 1 during the startup loop. The fix is that `asError` cannot throw: every inspection in it
+      // is wrapped, `typeof` has no trap, and the constructor is captured before the first import. A
+      // `try` here as well was written and then deleted — no mutation could make it fire, and a guard
+      // no test can reach also hides the code it wraps from single-point mutation.
+      (e: unknown) => { disarm(timer); reject(asError(e)); },
     );
   });
 }
@@ -764,7 +817,7 @@ function evaluateWithin(
  * the only kind that can be stale.
  */
 function readiness(): Promise<{ serving: number; total: number }> {
-  if (readyMemo && (readyMemo.settledAt === null || Date.now() - readyMemo.settledAt < READY_MEMO_MS)) {
+  if (readyMemo && (readyMemo.settledAt === null || readClock() - readyMemo.settledAt < READY_MEMO_MS)) {
     return readyMemo.answer;
   }
   const answer = Promise.all(
@@ -778,7 +831,7 @@ function readiness(): Promise<{ serving: number; total: number }> {
   // `readyMemo === memo` check that is not here and never was; the behaviour was right and the
   // mechanism described was fiction, which is the worse of the two ways to be wrong in a comment.)
   void answer.then(() => {
-    memo.settledAt = Date.now();
+    memo.settledAt = readClock();
   });
   return answer;
 }
@@ -799,7 +852,7 @@ function bearerOk(header: string | undefined): boolean {
 
 const server = createServer((req, res) => {
   const send = (code: number, body: unknown): void => {
-    const text = JSON.stringify(body);
+    const text = toJson(body);
     res.writeHead(code, {
       "content-type": "application/json; charset=utf-8",
       "cache-control": "no-store",
@@ -929,7 +982,7 @@ const server = createServer((req, res) => {
       // 404 and not a fallback. Answering a name this process does not serve with the site it
       // happens to hold is the whole of the 2026-09-28 incident, reproduced inside the renderer by a
       // typo instead of by a manifest.
-      if (!site) return send(404, { error: `no site named ${JSON.stringify(asked)} here — this renderer serves ${named}` });
+      if (!site) return send(404, { error: `no site named ${toJson(asked)} here — this renderer serves ${named}` });
     } else if (sites.length === 1) {
       // The old manager's request, and the single-site deployment's. Unchanged.
       site = sites[0]!;
