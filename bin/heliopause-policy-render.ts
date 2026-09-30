@@ -109,6 +109,21 @@ const OUR_ZONE_MISMATCHES = new WeakSet<ZoneMismatchError>();
 const zoneMismatchIsOurs = WeakSet.prototype.has.bind(OUR_ZONE_MISMATCHES) as (e: object) => boolean;
 const rememberOurZoneMismatch = WeakSet.prototype.add.bind(OUR_ZONE_MISMATCHES) as (e: object) => unknown;
 
+// ## The same treatment for "the zone check had already passed"
+//
+// That fact was carried by `error instanceof ZoneCheckedError`, and `instanceof` walks a prototype
+// chain — so an `Error` wrapped in a revoked `Proxy.revocable` made the classification itself throw
+// (`TypeError: Cannot perform 'getPrototypeOf' on a proxy that has been revoked`) at startup, before
+// the listener existed. Measured. The previous round guarded the `instanceof` inside `asError` and left
+// this one, which is the same fix applied to one of two sites.
+//
+// Membership rather than a guarded `instanceof`, so there is no prototype walk to trap at all, and so
+// both classifications in this file work the same way. Bound here, before the first dynamic import,
+// for the reason the block above gives.
+const OUR_ZONE_CHECKED = new WeakSet<object>();
+const zoneCheckedIsOurs = WeakSet.prototype.has.bind(OUR_ZONE_CHECKED) as (e: object) => boolean;
+const rememberZoneChecked = WeakSet.prototype.add.bind(OUR_ZONE_CHECKED) as (e: object) => unknown;
+
 /** A zone mismatch this process found. Registered so `foundHere` can recognise it later. */
 function ownZoneMismatch(message: string): ZoneMismatchError {
   const error = new ZoneMismatchError(message);
@@ -185,7 +200,7 @@ function asError(thrown: unknown): Error {
   // Returned as it is, deliberately. An earlier version rebuilt the error around a safely-read
   // message, and that breaks two things that key on the **object**: `foundHere`'s `WeakSet`, which is
   // how a zone mismatch this process built is told from one a module threw, and the
-  // `instanceof ZoneCheckedError` branch, which is how a content fault past the zone check is told
+  // `ZoneCheckedError` membership set, which is how a content fault past the zone check is told
   // from one before it. A rebuilt error is in neither, so both silently reclassify. (That version also
   // compared `message === source.message` to skip the rebuild in the common case, which read the
   // getter a **second** time outside the guard and threw — the defect, inside its own fix.)
@@ -215,7 +230,14 @@ class ZoneCheckedError extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
     this.name = "ZoneCheckedError";
+    rememberZoneChecked(this);
   }
+}
+
+/** Whether this process wrapped `error` after the zone check passed. */
+function zoneWasChecked(error: unknown): boolean {
+  if (error === null || (typeof error !== "object" && typeof error !== "function")) return false;
+  return zoneCheckedIsOurs(error);
 }
 
 const env = (name: string, fallback?: string): string => {
@@ -532,7 +554,13 @@ async function currentSource(site: { name: string | null; path: string }): Promi
     // Only ours passes through. A `ZoneMismatchError` reaching here came from the module -- the
     // class is shared, so its type says nothing about who built it -- and that is a content fault.
     if (foundHere(e)) throw e;
-    throw new ZoneCheckedError(asError(e).message, { cause: e });
+    // `reasonOf`, not `asError(e).message`. `asError` returns an `Error` unchanged — deliberately,
+    // because identity is what the membership checks key on — so a throwing `.message` getter survived
+    // it and threw *here*, before the wrapper existed. The failure then propagated unclassified and the
+    // startup loop reported that the declared-name check had not run, on a site where it had. Same
+    // getter, same line of reasoning as the four interpolation points; this was the fifth and it was
+    // missed because it reads the message to *build* a message rather than to print one.
+    throw new ZoneCheckedError(reasonOf(e), { cause: e });
   }
 }
 
@@ -1013,7 +1041,7 @@ for (const failure of verified) {
   // Not fatal, because a slow-but-correct module must not take the pod down — that is the outage the
   // fix would manufacture. Containment is unchanged either way: `currentSource` re-checks the zone on
   // every evaluation, so an unverified site 503s rather than serving the wrong policy.
-  if (error instanceof ZoneCheckedError) {
+  if (zoneWasChecked(error)) {
     // The check ran and passed; what failed is the module's content. Same non-fatal outcome, and the
     // operator is pointed at the policy commit rather than at a Deployment that is correct.
     log(`${site.name} is the site it is declared as, but did not evaluate at startup and will ` +

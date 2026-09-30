@@ -1131,6 +1131,99 @@ throw new Error("an ordinary content fault");
     }
   });
 
+  it("classifies without walking a prototype chain a module controls", { timeout: 30_000 }, async () => {
+    // ## Two classifications, and only one of them had been fixed
+    //
+    // Whether the declared-name check had already passed was carried by
+    // `error instanceof ZoneCheckedError`. `instanceof` walks a prototype chain, so an `Error` handed
+    // back inside a revoked `Proxy.revocable` made the classification itself throw —
+    // `TypeError: Cannot perform 'getPrototypeOf' on a proxy that has been revoked` — at startup,
+    // before the listener existed. The round before guarded the `instanceof` inside `asError` and left
+    // this one: the same fix applied to one of two sites, which is the shape this file keeps finding.
+    //
+    // ⚠️ **This test does not prove the membership change, and saying so matters.** Reverting the
+    // classification to `instanceof ZoneCheckedError` leaves all of these green — measured. The reason
+    // is that `asError` in `evaluateWithin` normalises a revoked proxy into a plain `Error` this
+    // process owns *before* the classification runs, so no proxy reaches it today. The reviewer that
+    // found it said as much: their reproduction was of the extracted code, with full-service
+    // verification deferred.
+    //
+    // The change is kept anyway, because the alternative is to rely on `asError` running first on
+    // every path that reaches a classification — which is the "another layer catches it" argument this
+    // file distrusts everywhere else. What this test pins is the property that matters to an operator:
+    // a module that hands back an error resisting inspection does not take the other zones down.
+    const shapes: Record<string, string> = {
+      revokedProxyAroundError:
+        '(() => { const r = Proxy.revocable(new Error("wrapped"), {}); r.revoke(); return r.proxy; })()',
+      prototypeTrapAroundError:
+        'new Proxy(new Error("wrapped"), { getPrototypeOf() { throw new Error("trap"); } })',
+    };
+    for (const [name, expr] of Object.entries(shapes)) {
+      const { dir, sites, beta } = twoSites();
+      writeFileSync(beta, `throw ${expr};\n`);
+      let started: Started | undefined;
+      try {
+        // Reaching a listener at all is the assertion: unguarded, `start()` throws "exited with 1".
+        started = await start(dir, MULTI(sites));
+        assert.match(
+          started.startupLog, /beta .*did not evaluate at startup/,
+          `${name}: the failure was not reported`,
+        );
+        assert.equal((await fetchAt(started.port, "/source?site=alpha")).status, 200, `${name}: alpha lost`);
+        assert.equal((await fetchAt(started.port, "/source?site=beta")).status, 503, `${name}: no 503`);
+      } finally {
+        started?.stop();
+        rmSync(join(dir, ".."), { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("does not blame the declared name when an unreadable error comes from past the check", { timeout: 30_000 }, async () => {
+    // ## The fifth `.message` read, missed because it builds a message rather than printing one
+    //
+    // `ZoneCheckedError` is constructed from the failure's message, and that construction used
+    // `asError(e).message`. `asError` returns an `Error` unchanged — on purpose, because the membership
+    // checks key on identity — so a throwing `.message` getter survived it and threw *there*, before
+    // the wrapper existed. The failure then propagated unclassified, and the startup loop reported that
+    // the declared-name check had not run for a site where it had: an operator sent to edit a
+    // Deployment that is correct.
+    //
+    // The four interpolation points were converted to `reasonOf` in the previous round; this one reads
+    // the message to *build* a message, which is why it was not among them.
+    //
+    // The throw has to come from past the zone check, so it is `resolveService` — reached because
+    // `site.workload` holds a `{kind, value}` pair — rather than the module's top level.
+    const { dir, sites, beta } = twoSites();
+    writeFileSync(beta, `export const site = {
+  cfg: { hookPolicy: { input: "drop", output: "accept" } },
+  hosts: [{ id: "gw-01.beta", stage: "canary", items: [] }],
+  workload: [{ kind: "service", value: "kube-system/coredns" }],
+  resolveService() {
+    const e = new Error("x");
+    Object.defineProperty(e, "message", { get() { throw new Error("message trap"); } });
+    throw e;
+  },
+};
+`);
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      const said = started.startupLog;
+      assert.match(
+        said, /beta is the site it is declared as, but did not evaluate/,
+        `a content fault past the zone check was blamed on the declared name:\n${said}`,
+      );
+      assert.doesNotMatch(
+        said, /beta did not evaluate at startup — the declared-name check did not run/,
+        "it told the operator to check a name that had already been checked",
+      );
+      assert.equal((await fetchAt(started.port, "/source?site=beta")).status, 503);
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
   it("starts when every name matches its module — the known positive", async () => {
     // Without this, the refusal above is equally satisfied by a renderer that never starts.
     const { dir, sites } = twoSites();
