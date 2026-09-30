@@ -356,6 +356,70 @@ describe("the renderer answers with a policy the manager can parse", () => {
     }
   });
 
+  it("renders an edit reached through a subdirectory, and keeps one copy of each policy module", async () => {
+    // The first fix versioned an import only when it sat under the *importing* module's directory.
+    // Found by an independent review (2026-09-30): `sub/a.ts` importing `../up.json` or
+    // `../other/data.json` still got the pod-start copy, and `../class.ts` loaded twice — versioned
+    // from the root, unversioned from `sub/` — so `instanceof` went false on the first evaluation,
+    // which it had not been before the fix. No policy tree had a subdirectory yet; this is the day
+    // one appears.
+    const dir = checkout();
+    let started: Started | undefined;
+    try {
+      mkdirSync(join(dir, "sub"));
+      mkdirSync(join(dir, "other"));
+      const write = (tag: string) => {
+        writeFileSync(join(dir, "up.json"), JSON.stringify({ tag }));
+        writeFileSync(join(dir, "other", "data.json"), JSON.stringify({ tag }));
+      };
+      write("before");
+      writeFileSync(join(dir, "class.ts"), "export class Local {}\n");
+      writeFileSync(
+        join(dir, "sub", "a.ts"),
+        `import up from "../up.json" with { type: "json" };
+         import other from "../other/data.json" with { type: "json" };
+         import { Local } from "../class.ts";
+         export const made = new Local();
+         export const tags = up.tag + "-" + other.tag;\n`,
+      );
+      writeFileSync(
+        join(dir, "site.ts"),
+        `import { made, tags } from "./sub/a.ts";
+         import { Local } from "./class.ts";
+         export const site = {
+           cfg: { hookPolicy: { input: "drop", output: "accept" } },
+           hosts: [{ id: "h1", stage: "canary", items: [] }],
+           objects: [{ id: "ao-" + tags, kind: "address", name: String(made instanceof Local),
+                       members: [{ kind: "cidr", value: "10.0.0.0/8" }] }],
+         };\n`,
+      );
+      const pinned = 1_700_000_000;
+      utimesSync(join(dir, "site.ts"), pinned, pinned);
+      utimesSync(join(dir, "policies.json"), pinned, pinned);
+      started = await start(dir);
+      const read = async () => {
+        const s = parsePolicySource(await (await fetchSource(started!.port)).json());
+        const o = (s.site as { objects?: { id: string; name: string }[] }).objects?.[0];
+        return { id: o?.id, identity: o?.name };
+      };
+      assert.deepEqual(await read(), { id: "ao-before-before", identity: "true" });
+
+      write("after");
+      // Only an allowed path moves the stamp; the two imported files are not in it, which is the
+      // ordinary case — a commit moves the sha. Touching policies.json stands in for that.
+      utimesSync(join(dir, "policies.json"), pinned + 1, pinned + 1);
+      utimesSync(join(dir, "site.ts"), pinned, pinned);
+      assert.deepEqual(
+        await read(),
+        { id: "ao-after-after", identity: "true" },
+        "an import reached through a subdirectory stayed stale, or a policy module loaded twice",
+      );
+    } finally {
+      started?.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("reports a broken policy module instead of serving a stale one", async () => {
     // A cache that keeps the last policy that evaluated is a screen that lies about what is
     // deployed, and it lies most convincingly right after somebody breaks the policy.
