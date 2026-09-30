@@ -1955,23 +1955,53 @@ def backfill_current_authorization():
     nothing. In particular a `rolled-back` or `pending` host is left alone: what it is enforcing is
     not what the watermark last authorized.
 
-    ## Why the mode cannot be wrong, and where that rests
+    ## 🔴 The mode can be wrong, and this says exactly when
 
     The dangerous version of this function writes an `authorizationMode` the running ruleset never
-    had: a host enforcing a break-glass apply, adopting a later two-person record for the same
-    generation, and so reporting `two-person` through `artifact_trust_report` — the alarm silenced by
-    the thing meant to describe it. That needs the watermark to move while the state stays
-    `confirmed`, and **it cannot, for a reason outside this function**: `handle_reply` returns on
-    `wanted == st["generation"] and st["state"] == "confirmed"` with the table present, *before*
-    `fetch_artifact()`, so the single call to `accept_artifact_authorization` is never reached for a
-    generation this host already holds. When the table is absent it does fall through — and then it
-    applies and `confirm()` promotes the record it actually applied, so this function finds
-    `currentAuthorization` already set and does nothing. Every other outcome of that path leaves a
-    state this refuses.
+    had: a host enforcing a break-glass apply adopts a later two-person record for the same
+    generation, and `artifact_trust_report` then reports `two-person` — the alarm silenced by the
+    thing meant to describe it.
 
-    That is an invariant of another function, so it is the kind that rots silently. `TestBackfill…`
-    pins both halves of it — the ordering inside `handle_reply`, and that the acceptance has exactly
-    one caller — and those assertions are the reason this docstring is allowed to claim it.
+    **This docstring used to argue that could not happen, and the argument was wrong.** It said
+    `handle_reply` returns on "confirmed with the table present" before `fetch_artifact()`, so the
+    acceptance is unreachable for a generation the host already holds. That early return has a second
+    exit condition the argument never counted — `_workload_objects_missing`, added by the same change
+    — so a confirmed host whose workload objects were deleted falls straight through to the
+    acceptance. The test standing behind the claim compared two `str.index` positions in this file's
+    own source, and source order was never what was wrong.
+
+    What is actually established, by tests that drive the path rather than read it:
+
+    · With `currentAuthorization` **set**, the failure does not occur. The acceptance moves the
+      watermark before any apply — deliberate, it is replay protection — but a workload apply that
+      fails leaves `host_result` false, so no state is written and `confirm()` never runs. The field
+      keeps naming what the kernel is enforcing, and this function returns on its first line.
+      Every host in the fleet is in this state.
+
+    · With the field **absent**, the adoption takes the watermark, including a record accepted after
+      the apply that is actually in force. Measured. There is no fix inside this function: the
+      watermark and `pendingAuthorization` are written together by the acceptance, so after one they
+      agree with each other and with nothing else, and telling two authorizations of the same
+      generation apart needs the record the apply ran under — which is the field that is missing.
+
+    ## The residual, and why it is accepted rather than closed
+
+    Refusing an ambiguous adoption would leave every legacy host permanently unnamed, which means
+    publishing a fresh generation to every VPC at two-person approval plus an OTP per site — the cost
+    this function exists to avoid. So the adoption stays, and the log line says what it knows rather
+    than what would be reassuring.
+
+    The pair this needs — `state == "confirmed"` with no `currentAuthorization` — is one **this
+    program does not write**: `confirm()` sets the state and promotes the record in the same
+    `update_state` mutator, and the acceptance writes the watermark and the pending record together.
+    Both are asserted behaviourally below.
+
+    ⚠️ **That is an argument, not a proof.** It says nothing about a state file written from outside:
+    an operator's script, or an **older agent** — `_load_state_unlocked` rebuilds the dict from its
+    own `_EMPTY_STATE`, so a build that predates this field drops it on its next write, and a rollback
+    followed by a roll-forward is an ordinary deploy operation. In that window the pair exists and the
+    adoption is a guess. The previous version of this docstring was also an argument, presented as a
+    fact, and it was wrong.
 
     ## The workload half is deliberately not consulted
 
@@ -2031,7 +2061,11 @@ def backfill_current_authorization():
     # closed on `saved` (`accept_artifact_authorization`, `confirm`, `_persist_commitment`) and this
     # one now says which of the two happened.
     if saved:
-        log(f"adopted the authorization already in force for generation {adopted['generation']}")
+        log(
+            f"adopted the watermark authorization for generation {adopted['generation']} — "
+            "migration best-effort, not checked against the record the running ruleset was applied "
+            "under"
+        )
     else:
         log(f"cannot persist the adopted authorization for generation {adopted['generation']}; "
             f"this host still cannot name what it is enforcing")

@@ -4334,37 +4334,252 @@ class TestBackfillCurrentAuthorization(unittest.TestCase):
                 hp.load_state()["currentAuthorization"], f"adopted from {junk!r}",
             )
 
-    def test_the_watermark_cannot_move_under_a_confirmed_generation(self):
-        # ## The invariant this function's safety rests on, and it is in another function
+    def test_a_re_authorization_that_fails_to_apply_does_not_become_the_adopted_one(self):
+        # ## What this replaces, and why the old one could not fail
         #
-        # The dangerous adopt writes a mode the kernel never had: a host enforcing a break-glass
-        # apply takes a later two-person record for the *same* generation, and `artifact_trust_report`
-        # then reports `two-person` — the alarm silenced by the field meant to describe it.
+        # This was a test that read `heliopause-pull.py` as text and asserted
+        # `body.index(guard) < body.index(accept)` — the confirmed early return appears before the
+        # acceptance. That assertion is true, and the invariant it was standing in for is not: the
+        # early return has **exit conditions the docstring's argument never counted**. It returns only
+        # when the nftables table is present *and* `_workload_objects_missing` is empty, and the
+        # workload half of that condition was added by the same change that wrote the argument. So a
+        # confirmed host whose workload objects were deleted falls through to `fetch_artifact()` and
+        # reaches `accept_artifact_authorization` for a generation it already holds — which is exactly
+        # what the ordering was cited to prove impossible. Source order was preserved the whole time.
         #
-        # It cannot happen, and the reason is not in `backfill_current_authorization`:
-        # `handle_reply` returns on "confirmed and the table is present" **before** `fetch_artifact`,
-        # so the one call to `accept_artifact_authorization` is unreachable for a generation this host
-        # already holds. Both halves of that sentence are asserted, because an invariant borrowed from
-        # another function is the kind that rots without anything going red.
-        source = pathlib.Path(hp.__file__).read_text()
-        body = source[source.index("def handle_reply("):source.index("def handle_reply_safely(")]
-        guard = body.index('if wanted == st["generation"] and st["state"] == "confirmed":')
-        accept = body.index("accept_artifact_authorization(record, watch, expired)")
-        self.assertLess(
-            guard, accept,
-            "the confirmed early return no longer precedes the authorization acceptance, so a "
-            "re-authorization of a generation already in force can move the watermark",
+        # An invariant borrowed from another function does rot silently. Reading that function's text
+        # is not how you notice: the text is what stayed right.
+        #
+        # ## What this asserts instead
+        #
+        # Drive it. A host confirmed on `g1` under a **break-glass** authorization, its workload
+        # objects gone from the cluster, is offered a **two-person** re-authorization of that same
+        # generation, and the workload apply fails. The acceptance moves the watermark before any
+        # apply — that is deliberate and is replay protection — so the question is only ever what
+        # `currentAuthorization` says afterwards, because that is the field
+        # `artifact_trust_report` reads and the break-glass alarm reports from.
+        #
+        # If it ends up naming `two-person`, a host enforcing a break-glass ruleset reports the
+        # alarm's own silence. That is the failure this whole class exists to prevent.
+        enforced = {**self.REC, "authorizationMode": "break-glass", "generation": "g1"}
+        offered = {
+            **self.REC, "authorizationMode": "two-person", "generation": "g1",
+            "authorizedAt": "2026-08-15T00:30:00.000Z",
+            "payloadHash": "sha256:" + "e" * 64,
+        }
+        artifact = {"schemaVersion": hp.SCHEMA_VERSION, "generation": "g1", "rulesetHash": "sha256:old"}
+
+        real = (
+            hp.apply_artifact, hp.fetch_artifact, hp.apply_workload,
+            hp._host_observation_report, hp.verify_artifact_envelope,
+            hp.accept_artifact_authorization, hp._workload_report,
+            hp._preflight_host_artifact,
         )
-        self.assertIn("fetch_artifact()", body[guard:accept], "the fetch left the guarded region")
-        # And nothing else advances the watermark. One caller is what makes the ordering above a
-        # complete argument rather than a statement about one path among several.
-        calls = [
-            line for line in source.splitlines()
-            if "accept_artifact_authorization(" in line
-            and not line.lstrip().startswith(("#", "*"))
-            and "def accept_artifact_authorization" not in line
+        # 🔴 The host preflight has to **pass**. Without this the first version of this test took a
+        # different branch entirely — `host_result = host_doc is None` is True when the preflight
+        # *fails*, so the state was written as `unsupported` and `apply_workload` never ran. It was
+        # green, and it was green about a scenario nobody asked about. The branch this test is for is
+        # the one where the host half is fine and the **workload** half fails, which is the only one
+        # that leaves the state untouched.
+        hp._preflight_host_artifact = lambda a: ({"nftables": ""}, 30, None)
+        hp.fetch_artifact = lambda: {"payload": "signed"}
+        hp.verify_artifact_envelope = lambda envelope, now=None: (artifact, dict(offered), {}, False)
+        # The real acceptance. `setUp` does not stub it in this class, but say so rather than rely on
+        # it: a sibling class's stub accepts everything, and two tests were meaningless under it.
+        # Probed, not just installed. The first version of this test passed while the path bailed
+        # out before ever getting here — visible only in a log line, which is not an assertion. If
+        # the fall-through stops reaching the acceptance, this test must fail rather than quietly
+        # stop testing anything.
+        reached = {"accept": 0}
+
+        def probed_accept(record, watch, expired):
+            reached["accept"] += 1
+            return _REAL_ACCEPT_AUTHORIZATION(record, watch, expired)
+
+        hp.accept_artifact_authorization = probed_accept
+        # The table is present. The **workload** objects are not, which is the condition that makes
+        # the early return fall through for a generation already in force.
+        hp._host_observation_report = lambda: {
+            "observed": [], "detail": "", "foreignFilters": [], "publishedPorts": [],
+        }
+        hp._workload_report = lambda st=None: {"workload": {"observed": []}}
+        hp.apply_workload = lambda a: (False, "failed", "admission webhook rejected the object")
+        hp.apply_artifact = lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("the host half must not be applied when the workload half failed"),
+        )
+        try:
+            hp.save_state({
+                **hp._EMPTY_STATE,
+                "generation": "g1", "state": "confirmed", "artifactHash": "sha256:old",
+                "workloadState": "confirmed",
+                "workloadApplied": [{"ref": "util/hp-dev-p700"}],
+                "currentAuthorization": dict(enforced),
+                "pendingAuthorization": dict(enforced),
+                "authorizationWatermark": dict(enforced),
+            })
+            hp.handle_reply(hp.load_state(), {
+                "schemaVersion": hp.SCHEMA_VERSION, "generation": "g1", "gate": {"open": True},
+            })
+            # And then a restart, which is where the adoption would happen.
+            hp.backfill_current_authorization()
+        finally:
+            (
+                hp.apply_artifact, hp.fetch_artifact, hp.apply_workload,
+                hp._host_observation_report, hp.verify_artifact_envelope,
+                hp.accept_artifact_authorization, hp._workload_report,
+                hp._preflight_host_artifact,
+            ) = real
+
+        # ⚠️ **Single-point mutation cannot make this red.** Two checks stand between the moved
+        # watermark and the adoption, and they are not duplicates: the one inside `mutate` reads the
+        # state being written, and the `settled` one re-reads fresh to avoid a pointless `fsync` that
+        # would bump an mtime an operator's script keys on. Remove either alone and this stays green;
+        # remove both and two tests here fail. Measured — so a reader who mutates one and sees green
+        # is looking at an overlap, not at a dead line.
+        st = hp.load_state()
+        self.assertEqual(
+            reached["accept"], 1,
+            "the confirmed early return did not fall through, so this test exercised nothing — "
+            "the scenario it is about is that missing workload objects let it through",
+        )
+        # The dangerous half did happen: the watermark now names the offered record, which is the
+        # replay protection working as designed and is why the question is only about the field
+        # below.
+        self.assertEqual(
+            (st.get("authorizationWatermark") or {}).get("authorizationMode"), "two-person",
+            "the acceptance did not advance the watermark, so the scenario did not occur",
+        )
+        self.assertEqual(
+            (st.get("currentAuthorization") or {}).get("authorizationMode"), "break-glass",
+            "the host reports an authorization mode its running ruleset never had — "
+            f"currentAuthorization={st.get('currentAuthorization')}",
+        )
+        self.assertEqual(
+            st.get("state"), "confirmed",
+            "the fixture no longer reproduces the state the adoption reads",
+        )
+
+    def test_an_absent_field_adopts_a_record_the_ruleset_was_never_applied_under(self):
+        # ## The residual, measured rather than argued
+        #
+        # The test above runs the whole sequence with `currentAuthorization` **set**, which is every
+        # host in the fleet, and the defence holds: the promotion never runs, so the field keeps
+        # naming what the kernel is enforcing. This runs the identical sequence with the field
+        # **absent** — the one pair the program does not write itself, and that a state file rewritten
+        # from outside produces. An older agent is the realistic writer: `_load_state_unlocked`
+        # rebuilds the dict from its own `_EMPTY_STATE`, so a build that predates this field drops it
+        # on its next write.
+        #
+        # What this asserts is the current behaviour **and names it a hole**, because the information
+        # needed to close it is not on the host: the watermark and `pendingAuthorization` are written
+        # together by the acceptance, so after one they agree with each other and with nothing else.
+        # Distinguishing two authorizations of the same generation needs the record the apply ran
+        # under, which is the field that is missing. Anything the backfill does here is a guess.
+        #
+        # So the test exists to make the guess visible and to fail the day someone changes it — if
+        # the adoption is ever made to refuse, this test is the one that has to be rewritten, and
+        # rewriting it is where the decision gets made rather than discovered.
+        enforced = {**self.REC, "authorizationMode": "break-glass", "generation": "g1"}
+        offered = {
+            **self.REC, "authorizationMode": "two-person", "generation": "g1",
+            "authorizedAt": "2026-08-15T00:30:00.000Z",
+            "payloadHash": "sha256:" + "e" * 64,
+        }
+        artifact = {"schemaVersion": hp.SCHEMA_VERSION, "generation": "g1", "rulesetHash": "sha256:old"}
+
+        real = (
+            hp.apply_artifact, hp.fetch_artifact, hp.apply_workload,
+            hp._host_observation_report, hp.verify_artifact_envelope,
+            hp.accept_artifact_authorization, hp._workload_report,
+            hp._preflight_host_artifact,
+        )
+        hp.fetch_artifact = lambda: {"payload": "signed"}
+        hp.verify_artifact_envelope = lambda envelope, now=None: (artifact, dict(offered), {}, False)
+        hp.accept_artifact_authorization = _REAL_ACCEPT_AUTHORIZATION
+        hp._host_observation_report = lambda: {
+            "observed": [], "detail": "", "foreignFilters": [], "publishedPorts": [],
+        }
+        hp._workload_report = lambda st=None: {"workload": {"observed": []}}
+        hp._preflight_host_artifact = lambda a: ({"nftables": ""}, 30, None)
+        hp.apply_workload = lambda a: (False, "failed", "admission webhook rejected the object")
+        hp.apply_artifact = lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("the host half must not be applied when the workload half failed"),
+        )
+        try:
+            # `currentAuthorization` is absent. Everything else is the state of a host enforcing
+            # `enforced`, including the watermark that authorized it.
+            hp.save_state({
+                **hp._EMPTY_STATE,
+                "generation": "g1", "state": "confirmed", "artifactHash": "sha256:old",
+                "workloadState": "confirmed",
+                "workloadApplied": [{"ref": "util/hp-dev-p700"}],
+                "pendingAuthorization": dict(enforced),
+                "authorizationWatermark": dict(enforced),
+            })
+            hp.handle_reply(hp.load_state(), {
+                "schemaVersion": hp.SCHEMA_VERSION, "generation": "g1", "gate": {"open": True},
+            })
+            hp.backfill_current_authorization()
+        finally:
+            (
+                hp.apply_artifact, hp.fetch_artifact, hp.apply_workload,
+                hp._host_observation_report, hp.verify_artifact_envelope,
+                hp.accept_artifact_authorization, hp._workload_report,
+                hp._preflight_host_artifact,
+            ) = real
+
+        st = hp.load_state()
+        self.assertEqual(st.get("state"), "confirmed", "the fixture no longer reproduces the pair")
+        self.assertEqual(
+            (st.get("currentAuthorization") or {}).get("authorizationMode"), "two-person",
+            "the adoption stopped taking the watermark — if that was deliberate, this test is the "
+            "record of the behaviour it replaced and should be rewritten to say the new rule",
+        )
+        # And that is the hole, in one sentence a reader cannot miss: the kernel holds `break-glass`.
+        self.assertNotEqual(
+            (st.get("currentAuthorization") or {}).get("authorizationMode"),
+            enforced["authorizationMode"],
+            "the adoption now agrees with the enforced ruleset, which would mean the hole is closed",
+        )
+
+    def test_the_confirmed_state_and_the_promotion_are_written_together(self):
+        # The precondition for a wrong adoption is `state == "confirmed"` with no
+        # `currentAuthorization`. Through the program that pair cannot be written, because `confirm()`
+        # sets both in one `update_state` mutator — so this asserts the pair rather than the two
+        # lines' positions in the file, which is the mistake the test above replaced.
+        #
+        # This is the load-bearing half of the argument the docstring is allowed to make. It says
+        # nothing about a state file rewritten from outside: an operator's script, or an **older
+        # agent**, which drops keys it does not know because `_load_state_unlocked` rebuilds the dict
+        # from its own `_EMPTY_STATE`. That residual is stated in the docstring rather than claimed
+        # away.
+        source = pathlib.Path(hp.__file__).read_text()
+        confirmed_writes = [
+            n for n, line in enumerate(source.splitlines(), 1)
+            if 'fresh["state"] = "confirmed"' in line
         ]
-        self.assertEqual(len(calls), 1, f"the watermark has more than one writer: {calls}")
+        self.assertEqual(
+            len(confirmed_writes), 1,
+            f"more than one place writes the confirmed state: lines {confirmed_writes}",
+        )
+        promotions = [
+            n for n, line in enumerate(source.splitlines(), 1)
+            if 'fresh["currentAuthorization"] = fresh.get("pendingAuthorization")' in line
+        ]
+        self.assertEqual(len(promotions), 1, f"the promotion moved or multiplied: {promotions}")
+        # Same function, and the behavioural check below is what makes that mean anything.
+        self.assertLess(
+            abs(promotions[0] - confirmed_writes[0]), 60,
+            "the confirmed write and the promotion are no longer in the same mutator",
+        )
+        # Behavioural: accepting an authorization writes the watermark **and** the pending record
+        # together, so a confirm that follows always has something to promote.
+        hp.save_state({**hp._EMPTY_STATE, "generation": "g-live", "state": "pending"})
+        fresh, err = _REAL_ACCEPT_AUTHORIZATION(dict(self.REC), {}, False)
+        self.assertIsNotNone(fresh, f"the fixture no longer accepts: {err}")
+        saved = hp.load_state()
+        self.assertEqual(saved["pendingAuthorization"], self.REC)
+        self.assertEqual(saved["authorizationWatermark"], self.REC)
 
     def test_leaves_a_host_whose_watermark_names_another_generation(self):
         # The watermark moves when an authorization is *accepted*, which is before the apply settles.
