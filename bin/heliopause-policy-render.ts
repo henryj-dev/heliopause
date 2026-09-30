@@ -970,7 +970,19 @@ function bearerOk(header: string | undefined): boolean {
 //
 // @see src/policy-render-service.test.ts "answers /healthz when the module poisoned serialisation"
 const HEALTHZ_BODY = '{"ok":true}';
-const UNSERIALISABLE_BODY = '{"error":"the answer could not be serialised"}';
+// ## The fallback carries `faults` too, because a field that vanishes is read as a zero
+//
+// This was a constant without it. So under a poisoned `toJSON` — the one condition that reaches this
+// body — `/readyz` answered with no `faults` key at all, and an operator checking that field sees
+// nothing and concludes there are none. The absence appeared precisely where something was wrong.
+// Reported by the operator of the cluster this serves, who had just been bitten by reading a table's
+// zero rows as "verified".
+//
+// Built by concatenation rather than `toJson`: interpolating a **number primitive** uses the spec's
+// Number::toString, not `Number.prototype.toString`, so a module cannot hook it — which matters
+// because the only way to get here is a module having hooked something.
+const unserialisableBody = (): string =>
+  '{"error":"the answer could not be serialised","faults":' + faults + "}";
 
 const server = createServer((req, res) => {
   const raw = (code: number, text: string): void => {
@@ -987,7 +999,7 @@ const server = createServer((req, res) => {
       text = toJson(body);
     } catch {
       log(`a response body could not be serialised — answering ${code >= 400 ? code : 500} without it`);
-      raw(code >= 400 ? code : 500, UNSERIALISABLE_BODY);
+      raw(code >= 400 ? code : 500, unserialisableBody());
       return;
     }
     raw(code, text);

@@ -1207,13 +1207,15 @@ throw new Error("an ordinary content fault");
           faults?: number;
           error?: string;
         };
+        // `faults` is required in **every** shape, the unserialisable fallback included. A field that
+        // is present most of the time and absent under one condition gets its absence read as a zero,
+        // and that condition is the one where serialisation is broken — so it must carry the count too.
+        assert.equal(
+          typeof ready.faults, "number",
+          `${shape.name}: readiness did not report a fault count`,
+        );
         if (shape.name === "poisonedToJSON") {
           assert.equal(ready.error, "the answer could not be serialised", `${shape.name}: readyz body`);
-        } else {
-          assert.equal(
-            typeof ready.faults, "number",
-            `${shape.name}: readiness does not report a fault count`,
-          );
         }
         if (shape.name === "lateThrowFromModuleTimer") {
           assert.ok((ready.faults ?? 0) > 0, `${shape.name}: the fault was swallowed silently`);
