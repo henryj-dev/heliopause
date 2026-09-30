@@ -42,7 +42,45 @@ import { installCliLanguage } from "../src/operator-i18n.ts";
 
 installCliLanguage();
 
-const log = (m: string): void => console.log(`[policy-render] ${m}`);
+/**
+ * One line, always, with this service's prefix on it.
+ *
+ * ## 🔴 The flattening is the security control, not tidiness
+ *
+ * Almost everything logged here ends up interpolating a message from a **policy module**, which is
+ * the untrusted code this whole process exists to contain — `${e.message}` on the request path, the
+ * startup failure line, and the zone refusal, whose text is built from host ids the module itself
+ * declares. A newline in any of those is a new log line with this prefix on it. Reproduced: a module
+ * throwing `"boom\n[policy-render] verified beta — 12 hosts"` printed a forged **`verified`** line —
+ * the positive signal an operator scans for — and the pod then came up looking clean.
+ *
+ * That was open the whole time, and the commit before this one declared it closed while changing
+ * nothing about it: it removed a *predicate* a module could choose between two true sentences with,
+ * and called the result "nothing for a module to spoof" with the stronger forgery still live. The
+ * claim was the defect. The bound is here rather than at each call site so that a call site added
+ * later cannot forget it, and so the claim has one place to be true.
+ *
+ * `⏎` rather than a space so a flattened multi-line error is still readable as one, and a cap
+ * because a module can also throw a megabyte.
+ */
+const oneLine = (m: string): string => m.replace(/[\r\n]+/g, " ⏎ ").slice(0, 2_000);
+const log = (m: string): void => console.log(`[policy-render] ${oneLine(m)}`);
+
+/**
+ * A failure that happened **after** the declared-name check ran and passed.
+ *
+ * Its whole job is to be `instanceof`-able. The startup verification says "the declared-name check
+ * did not run" on a failure, and that is true of an import that threw, a missing export or a
+ * timeout — and false of anything `collectPolicySource` raises, which is reached only past the
+ * check. Selecting on the message text got this wrong in both directions on successive commits;
+ * carrying the fact with the error is what stops there being a third way to get it wrong.
+ */
+class ZoneCheckedError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "ZoneCheckedError";
+  }
+}
 
 const env = (name: string, fallback?: string): string => {
   const v = process.env[name] ?? fallback;
@@ -332,8 +370,37 @@ async function currentSource(site: { name: string | null; path: string }): Promi
   // is the right shape — the module is present and this process will not vouch for it.
   const wrongZone = name === null ? null : zoneMismatch({ target: name, hostIds: hostIdsOf(mod.site) });
   if (wrongZone) throw new ZoneMismatchError(wrongZone);
+  // ## Everything past this point has been zone-checked, and the caller needs to know that
+  //
+  // The startup verification logs "the declared-name check did not run" on any failure that is not a
+  // `ZoneMismatchError`. That was right for the failures above — the import, the missing export, a
+  // timeout — and **wrong for everything below**, which happens only after the check ran and passed.
+  // `collectPolicySource` has three reachable throw paths, all from the module: a `JSON.stringify`
+  // over a site with a cycle, a `BigInt`, or a throwing `toJSON`; the module's own `resolveService`
+  // being called; and `Object.values` over a throwing getter. Reproduced with an ordinary accidental
+  // cycle: a correctly-declared site printed "the declared-name check did not run for it", sending
+  // an operator to edit a Deployment that was right.
+  //
+  // That is the round-three defect inverted — it under-claimed, this over-claimed — and the reason
+  // both happened is that the distinction was being inferred from where the failure came from rather
+  // than carried with it. Wrapping is what carries it, and `instanceof` is unspoofable by a module
+  // in a way the message text never was.
+  try {
+    return await evaluated({ mod, name, sitePath, stamp });
+  } catch (e) {
+    if (e instanceof ZoneMismatchError) throw e; // cannot happen here, but never reclassify one
+    throw new ZoneCheckedError((e as Error).message, { cause: e });
+  }
+}
+
+/** The half of `currentSource` that runs once the zone check has passed. Separated so the caller can
+ *  tell a failure here — where the check ran — from one before it. */
+async function evaluated(
+  input: { mod: { site?: ScreenSite }; name: string | null; sitePath: string; stamp: string },
+): Promise<PolicySource> {
+  const { mod, name, sitePath, stamp } = input;
   const source = collectPolicySource({
-    site: mod.site, sitePath, allowPaths,
+    site: mod.site!, sitePath, allowPaths,
     // ## The label follows the site once there is more than one
     //
     // `HELIOPAUSE_POLICY_LABEL` is one value for the process, and the console prints it as "which
@@ -364,8 +431,10 @@ async function currentSource(site: { name: string | null; path: string }): Promi
  * that cannot answer inside the budget is not serving, which is not an approximation.
  */
 const READY_MEMO_MS = 2_000;
-const READY_SITE_BUDGET_MS = 5_000;
-// Larger than the request-path budget: this is the first, cold import of each module, and being slow
+// Larger than the two request-path budgets **at their defaults** — not by construction; `min: 100`
+// lets an operator set this below either of them, and nothing here stops that because a small startup
+// budget is a legitimate choice for a small tree. What the default expresses is that this is the
+// first, cold import of each module, and being slow
 // at boot is not the failure being bounded here — never settling is.
 //
 // Through `boundedInteger` like every other number this file reads, and **not** through a local
@@ -395,20 +464,68 @@ try {
 }
 
 /**
- * The request path's budget, and it must stay **below** the manager's own client timeout.
+ * The request path's budget, which has to stay **below the manager's own client timeout**.
  *
  * `/source`'s 503 carries the sentence the console shows instead of an empty page, and that sentence
- * only reaches anyone if this side gives up first. At `READY_SITE_BUDGET_MS` it did not: the manager
- * applies `AbortSignal.timeout(HELIOPAUSE_RELAY_TIMEOUT_MS)` — default 5000, the same number — before
- * it connects, so its clock always starts first and always wins. Measured against a seven-second
- * module: the client threw at 5005ms and this process logged its timeout afterwards, to a socket
- * nobody was reading. The change bought a log line and nothing on the wire, and the comment claiming
- * otherwise was the third in this PR to conclude the opposite of its code.
+ * only reaches anyone if this side gives up first. At `READY_SITE_BUDGET_MS` it did not — that is
+ * 5000, and so is the manager's `AbortSignal.timeout(HELIOPAUSE_RELAY_TIMEOUT_MS)` default, applied
+ * before it connects, so the caller's clock always started first.
  *
- * Derived rather than written down, so raising the relay timeout raises this with it and the
- * relationship cannot drift into equality again.
+ * ⚠️ **This was then `Math.floor(ENV_BOUNDS.HELIOPAUSE_RELAY_TIMEOUT_MS.fallback * 0.8)` with a
+ * comment claiming "raising the relay timeout raises this with it". That coupling does not exist.**
+ * The manager's timeout is a value in the *manager's* environment; what this read was a compile-time
+ * default, so nothing an operator sets moves this number — including setting that very variable here,
+ * measured. A reader would have gone looking for a lever that is wired to nothing.
+ *
+ * It is an env of its own now, so an operator who lowers one can lower the other. That is a knob, not
+ * a guarantee: the only correct form is the caller sending its deadline and this side budgeting
+ * against what it was told, which is a change to two services and is not in this one.
  */
-const SOURCE_SITE_BUDGET_MS = Math.floor(ENV_BOUNDS.HELIOPAUSE_RELAY_TIMEOUT_MS.fallback * 0.8);
+let SOURCE_SITE_BUDGET_MS: number;
+try {
+  SOURCE_SITE_BUDGET_MS = boundedInteger(
+    "HELIOPAUSE_POLICY_SOURCE_BUDGET_MS",
+    process.env["HELIOPAUSE_POLICY_SOURCE_BUDGET_MS"],
+    ENV_BOUNDS.HELIOPAUSE_POLICY_SOURCE_BUDGET_MS,
+  );
+} catch (error) {
+  console.error(`[policy-render] ${oneLine((error as Error).message)}`);
+  process.exit(2);
+}
+
+// ## Why these two are asserted and `port` is not
+//
+// `port` is read in straight-line code, so TypeScript's definite-assignment analysis covers it: soften
+// `process.exit(2)` to `process.exitCode = 2` and the compiler says `TS2454: used before being
+// assigned`. Both budgets are read **only inside closures**, and TS does not run that analysis into a
+// closure — demonstrated on a minimal file, the `port` shape errors and the closure shape does not.
+// The same softening would leave these `undefined`, and `setTimeout(fn, undefined)` fires at **1ms**
+// with the message reading `did not finish within undefinedms`: round two's silent-1ms budget,
+// restored, with no compiler signal and a message that names the bug. Cheap insurance for a failure
+// whose only symptom is a number.
+// Declared after the assertion below would be neater, but it has to follow `SOURCE_SITE_BUDGET_MS`
+// and the compiler is emphatic about that — this line read above its source for one revision and
+// `tsc` gave both `TS2448` and `TS2454` immediately. That is the straight-line protection the two
+// budgets above do **not** get, since they are only read inside closures; the contrast is the reason
+// the loop below exists at all.
+//
+// Same number as `/source`, and for the same reason rather than by coincidence. This was a literal
+// `5_000` — the relay timeout's own default — which is precisely the collision `/source` was changed
+// to avoid, left sitting on the neighbouring route. Nothing polls `/readyz` today, so there is no
+// live victim; but `readiness()` waits on every site, so the first thing that polls it with the relay
+// timeout inherits the identical race. Fixing one route and leaving its neighbour is how the same
+// defect gets rediscovered.
+const READY_SITE_BUDGET_MS = SOURCE_SITE_BUDGET_MS;
+
+for (const [name, value] of [
+  ["HELIOPAUSE_POLICY_STARTUP_BUDGET_MS", STARTUP_SITE_BUDGET_MS],
+  ["HELIOPAUSE_POLICY_SOURCE_BUDGET_MS", SOURCE_SITE_BUDGET_MS],
+] as const) {
+  if (!Number.isInteger(value)) {
+    console.error(`[policy-render] refusing to start: ${name} resolved to ${String(value)}, not an integer`);
+    process.exit(2);
+  }
+}
 
 let readyMemo: {
   /** `null` while in flight — an unsettled answer is shared regardless of age, never expired. */
@@ -701,30 +818,39 @@ for (const failure of verified) {
   const { site, error } = failure;
   const why = error.message;
   if (error instanceof ZoneMismatchError) {
-    console.error(`[policy-render] refusing to start: ${site.name} is declared for ${site.path}, but ${why}`);
+    // `oneLine` here too: `why` is built from host ids the policy module declares, so it carries the
+    // same forgery channel as any other module-supplied text. `console.error` does not go through
+    // `log`, which is exactly the kind of second path a per-call-site fix forgets.
+    console.error(`[policy-render] ${oneLine(`refusing to start: ${site.name} is declared for ${site.path}, but ${why}`)}`);
     console.error(`[policy-render]   a zone's name is the last label of every host id under it — one of these is wrong`);
     process.exit(2);
   }
-  // 🔴 **Every failure that is not a zone mismatch means the zone check did not run**, and saying so
-  // is the whole of this branch.
+  // 🔴 **Whether the declared-name check ran is carried by the error's class, not guessed from it.**
   //
   // The paragraph above splits configuration faults from content faults, and anything that stops the
-  // evaluation quietly merges them: the check happens *after* the import, so a misdeclared site — the
-  // case that block says "cannot heal itself" and must refuse — lands here instead of in `exit 2`
-  // whenever its module fails first. Measured: a wrong-zone module that throws at import logged the
-  // ordinary "did not evaluate" line and the pod came up, no caveat, zone never examined.
+  // evaluation merges them: the check happens *after* the import, so a misdeclared site — the case
+  // that block says "cannot heal itself" and must refuse — lands here instead of in `exit 2` whenever
+  // its module fails first. That silence must not read as a pass, which is what the caveat is for.
   //
-  // ⚠️ **This was a string match on `"did not finish within"` and that was wrong twice over.** It
-  // covered only the timeout, so a module that throws — the more common half — kept the plain line
-  // and the hole stayed open on the other path. And the string is produced by `evaluateWithin`, so a
-  // policy module could pick which sentence an operator reads by throwing that text itself: log
-  // forgery in the one process whose premise is that it runs hostile code. There is no condition
-  // here now, which is both the correct predicate and nothing for a module to spoof; the `instanceof`
-  // above is the only distinction this catch needs, and it is the idiom the file already had.
+  // ⚠️ **This predicate has been wrong twice, once in each direction, and both times because it was
+  // inferred instead of carried.** First it was `why.includes("did not finish within")`: that covered
+  // only the timeout, so a module that *throws* — the commoner half — kept the plain line and the
+  // hole stayed open, and the string was `evaluateWithin`'s own wording, so a module could choose
+  // which sentence an operator read. Removing the condition fixed that and broke the other side:
+  // `collectPolicySource` runs only *past* the check, so a correctly-declared site with an ordinary
+  // `JSON.stringify` cycle was told its declared name might be wrong. `ZoneCheckedError` ends the
+  // guessing — the fact travels with the failure, and there is no third category to get wrong.
   //
   // Not fatal, because a slow-but-correct module must not take the pod down — that is the outage the
   // fix would manufacture. Containment is unchanged either way: `currentSource` re-checks the zone on
   // every evaluation, so an unverified site 503s rather than serving the wrong policy.
+  if (error instanceof ZoneCheckedError) {
+    // The check ran and passed; what failed is the module's content. Same non-fatal outcome, and the
+    // operator is pointed at the policy commit rather than at a Deployment that is correct.
+    log(`${site.name} is the site it is declared as, but did not evaluate at startup and will ` +
+      `answer 503 until it does: ${why}`);
+    continue;
+  }
   log(`${site.name} did not evaluate at startup — the declared-name check did not run for it, ` +
     `and it will answer 503 until it does: ${why}`);
 }

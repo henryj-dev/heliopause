@@ -200,11 +200,36 @@ export const ENV_BOUNDS = {
    * probe watching it is 30s × 3 (cited from the deployment manifests, which this repository cannot
    * check). A single site allowed 120s is therefore 120s dark against a 90s deadline: the same
    * crashloop the parallel verification was introduced to remove, re-reachable by one site instead
-   * of three. `120_000` was the first value here and it left exactly that representable, which is
-   * what the sentence above claimed it did not. 60s keeps headroom under the deadline and is still
-   * far longer than any cold import measured.
+   * of three. `120_000` was the first value here: it did make the 1 ms clamp unrepresentable, which is
+   * all the sentence above claims, and it left the **dark window past the liveness deadline**
+   * representable, which is a second thing a ceiling here has to rule out. Two jobs, one number; the
+   * first value only did the first. 60s keeps headroom under the deadline and is still far longer than
+   * any cold import measured.
    */
   HELIOPAUSE_POLICY_STARTUP_BUDGET_MS: { min: 100, max: 60_000, fallback: 30_000 },
+
+  /**
+   * How long one policy module gets on the **request** path before `/source` answers 503.
+   *
+   * 🔴 **It exists because the relationship it needs cannot be expressed as a constant.** `/source`'s
+   * 503 carries the sentence the console shows in place of an empty page, and that sentence only
+   * reaches anyone if this side gives up before its caller does. The caller is the manager, whose
+   * clock is `HELIOPAUSE_RELAY_TIMEOUT_MS` — **in the manager's own environment**, which this process
+   * cannot read. Deriving from that variable's `fallback` looked like a coupling and is not one: an
+   * operator who sets the manager to 2000 gets a renderer still budgeting 4000, which is the defect
+   * the derivation was written to remove, reachable again. Measured: client abort at 2007ms with the
+   * renderer logging its own timeout at 4000ms, to a socket nobody was reading.
+   *
+   * So the honest shape is a knob with a default that matches the common case, and an operator who
+   * moves one moves both. The real fix is for the caller to send its deadline and for this side to
+   * budget against what it was told — a header, backward compatible the way `?site=` is — and that is
+   * a change to two services, deliberately not smuggled in here.
+   *
+   * The default is 80% of `HELIOPAUSE_RELAY_TIMEOUT_MS`'s own default, which is where the margin
+   * comes from: measured 4040ms against a 5000ms client, ~960ms of slack, with the synchronous `git`
+   * calls inside the budget window rather than before it.
+   */
+  HELIOPAUSE_POLICY_SOURCE_BUDGET_MS: { min: 100, max: 60_000, fallback: 4_000 },
 } as const satisfies Record<string, NumberBounds>;
 
 export type BoundedEnvName = keyof typeof ENV_BOUNDS;

@@ -29,6 +29,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parsePolicySource } from "./policy-source.ts";
+// Imported so the budget assertions derive both sides from the same table the renderer reads, rather
+// than restating numbers that would then have to be kept in step by hand.
+import { ENV_BOUNDS } from "./env-spec.ts";
 
 const BIN = fileURLToPath(new URL("../bin/heliopause-policy-render.ts", import.meta.url));
 
@@ -800,6 +803,78 @@ describe("a site module has to be the site it is declared as", () => {
     }
   });
 
+  it("does not blame the declared name when the check ran and the content failed", { timeout: 30_000 }, async () => {
+    // ## The caveat's other side, and the reason it is now carried rather than inferred
+    //
+    // `collectPolicySource` runs **after** the zone check has passed, so anything it throws is a
+    // content fault on a correctly-declared site. Made unconditional, the caveat told those sites
+    // "the declared-name check did not run for it" — sending an operator to edit a Deployment that is
+    // right while a `JSON.stringify` failure in the policy repo sits untouched. Reproduced with an
+    // ordinary accidental cycle, which is the likeliest way to reach it.
+    //
+    // So the predicate has been wrong in both directions on successive commits — first a string match
+    // that covered only timeouts, then no condition at all — and both times because it was inferred
+    // from the failure rather than carried with it. `ZoneCheckedError` carries it. This test is the
+    // half that was blind: the neighbouring one drives a hang and an import throw, both of which fail
+    // *before* the check, so it stayed green through the over-claim.
+    const { dir, sites, alpha } = twoSites();
+    writeFileSync(alpha, `${readFileSync(alpha, "utf8")}
+const cycle = {};
+cycle.parentOfItself = cycle;
+site.hosts[0].notes = cycle;
+`);
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      const said = started.startupLog;
+      assert.match(
+        said, /alpha is the site it is declared as, but did not evaluate at startup/,
+        `a content fault past the zone check was reported as a possible naming fault:\n${said}`,
+      );
+      assert.doesNotMatch(
+        said, /alpha did not evaluate at startup — the declared-name check did not run/,
+        "it blamed the declared name for a failure that happened after the name was checked",
+      );
+      // beta is untouched, so the positive half must still be there — otherwise this passes against a
+      // renderer that stopped verifying anything.
+      assert.match(said, /verified beta — /);
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("cannot be made to forge a log line by a policy module", { timeout: 30_000 }, async () => {
+    // ## The claim the previous commit shipped without a test
+    //
+    // It removed a predicate a module could choose between two true sentences with and called the
+    // result "nothing for a module to spoof" — while `${error.message}` was still interpolated
+    // verbatim. A module throwing `"boom\n[policy-render] verified beta — 12 hosts"` printed a forged
+    // **`verified`** line, the positive signal an operator scans for, and the pod came up looking
+    // clean. That is a strictly stronger forgery than the one removed: the predicate let a module pick
+    // between true sentences, this let it manufacture a false one.
+    //
+    // Every "this is now closed" sentence needs one of these or it does not ship — that is the rule
+    // four rounds of review produced, and this is the first test written to it.
+    const { dir, sites, beta } = twoSites();
+    writeFileSync(
+      beta,
+      'throw new Error("boom\\n[policy-render] verified beta — 12 hosts\\n[policy-render] evaluated beta at deadbee");\n',
+    );
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      const said = started.startupLog;
+      assert.doesNotMatch(said, /^\[policy-render\] verified beta — 12 hosts$/m, "a module forged a verified line");
+      assert.doesNotMatch(said, /^\[policy-render\] evaluated beta at deadbee$/m, "a module forged an evaluated line");
+      // The text still has to reach the operator — flattened, not dropped.
+      assert.match(said, /boom ⏎ \[policy-render\] verified beta/, "the message was lost instead of flattened");
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
   it("starts when every name matches its module — the known positive", async () => {
     // Without this, the refusal above is equally satisfied by a renderer that never starts.
     const { dir, sites } = twoSites();
@@ -1056,12 +1131,17 @@ describe("a site module has to be the site it is declared as", () => {
     let started: Started | undefined;
     try {
       started = await start(dir, { ...MULTI(sites), HELIOPAUSE_POLICY_STARTUP_BUDGET_MS: "1000" });
+      // Both numbers derived, so widening the renderer's budget or narrowing the caller's goes red
+      // here rather than silently removing the margin.
+      const clientAbort = ENV_BOUNDS.HELIOPAUSE_RELAY_TIMEOUT_MS.fallback;
+      const budget = ENV_BOUNDS.HELIOPAUSE_POLICY_SOURCE_BUDGET_MS.fallback;
+      assert.ok(budget < clientAbort, `the renderer's ${budget}ms budget is not under the caller's ${clientAbort}ms`);
       const began = Date.now();
-      // The manager's default abort, applied the way `fetchPolicySource` applies it. The renderer
-      // has to answer inside this or the sentence never reaches anyone.
+      // The manager's default abort, applied the way `fetchPolicySource` applies it. The renderer has
+      // to answer inside this or the sentence never reaches anyone.
       const res = await fetch(`http://127.0.0.1:${started.port}/source?site=beta`, {
         headers: { authorization: "Bearer test-bearer" },
-        signal: AbortSignal.timeout(5_000),
+        signal: AbortSignal.timeout(clientAbort),
       });
       const took = Date.now() - began;
       assert.equal(res.status, 503, "a hanging module produced something other than the 503");
@@ -1070,7 +1150,14 @@ describe("a site module has to be the site it is declared as", () => {
         /the policy module could not be evaluated/,
         "it answered without the sentence the console shows in place of an empty page",
       );
-      assert.ok(took < 5_000, `answered at ${took}ms — the client's own timeout would have fired first`);
+      // ⚠️ The margin, not the fact of answering. `took < clientAbort` cannot fail: reaching this line
+      // at all means `fetch` resolved, and `AbortSignal.timeout` guarantees that happened under the
+      // abort — so the old assertion had no detection power and one flake mode. Halfway between the
+      // budget and the abort is a threshold a 4999ms budget would miss and this one catches.
+      assert.ok(
+        took < (budget + clientAbort) / 2,
+        `answered at ${took}ms against a ${budget}ms budget and a ${clientAbort}ms caller — the margin is gone`,
+      );
     } finally {
       started?.stop();
       rmSync(join(dir, ".."), { recursive: true, force: true });
