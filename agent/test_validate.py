@@ -549,6 +549,160 @@ class TestRestartWhilePending(unittest.TestCase):
                              "the commitment was erased — a restart now would strand the host")
         self.assertIsNotNone(saved["rollbackAt"])
 
+    def test_an_expired_authorization_still_re_applies_when_the_table_is_gone(self):
+        """The whole escape, end to end, which neither half tested on its own.
+
+        ## Why this was the gap
+
+        `test_a_confirmed_generation_is_reapplied_when_the_table_is_gone` drives the re-apply, but its
+        `fetch_artifact` returns an **unsigned** dict, so `verify_artifact_envelope` and
+        `accept_artifact_authorization` never run — the expiry question is not asked.
+        `TestBackfillCurrentAuthorization` asks it, but by calling
+        `accept_artifact_authorization` directly, so the apply never happens.
+
+        Between them sat the scenario the whole mechanism exists for and nothing exercised: a host
+        that rebooted, lost its table, and holds an authorization past `expiresAt`. That is what
+        `gw-01.prod-icn-vtr` was on 2026-09-28 — nft 0 lines with public v6:22 answering for 39
+        hours, because the escape did not exist and the re-apply was refused.
+
+        It has still never run in production. Measured 2026-09-30 with the peer session: the fleet
+        spent about eleven hours holding expired authorizations and **nothing needed a re-apply** —
+        no reboot, no drift, `lastRefusal` empty on all eight. So the escape was in place and
+        untested by events, which makes this test the only evidence that it works at all. That is
+        the reason it is written as the full path rather than another unit.
+
+        `verify_artifact_envelope` is stubbed to report a validly signed artifact whose window has
+        closed — that is the one thing a test cannot produce honestly, since real signing needs the
+        signing key. Everything after it is the real code: the real
+        `accept_artifact_authorization`, the real `handle_reply`, the real decision to re-apply.
+        """
+        seen = {}
+
+        def fake_apply(artifact, validated=None):
+            seen["generation"] = artifact.get("generation")
+            return True, "pending", ""
+
+        record = {
+            "authorizedAt": "2026-09-28T14:54:06.273Z",
+            "expiresAt": "2026-09-29T14:54:06.273Z",   # closed, and this is the real fleet's window
+            "payloadHash": "sha256:" + "a" * 64,
+            "keyId": "sha256:" + "b" * 64,
+            "authorizationMode": "solo-otp",
+            "target": hp.TARGET,
+            "host": hp.HOST_ID,
+            "planHash": "sha256:" + "c" * 64,
+            "bundleHash": "sha256:" + "d" * 64,
+            "generation": "g1",
+        }
+        artifact = {
+            "generation": "g1", "ruleset": VALID, "rulesetHash": VALID_HASH,
+            "confirmTimeoutSec": hp.NFT_CONFIRM_MIN_SEC,
+        }
+
+        real_apply, real_fetch = hp.apply_artifact, hp.fetch_artifact
+        real_report, real_verify = hp._host_observation_report, hp.verify_artifact_envelope
+        hp.apply_artifact = fake_apply
+        hp.fetch_artifact = lambda: {"payload": "signed"}
+        # 🔴 **The real acceptance, restored explicitly.** This class's `setUp` calls
+        # `stub_artifact_verification()`, which replaces `accept_artifact_authorization` with
+        # `lambda …: ({}, "")` — it always accepts — so both of these tests were meaningless until
+        # this line: the positive one passed because nothing could refuse, and the negative one
+        # failed for the same reason. The negative is what caught it, which is the whole argument for
+        # writing one.
+        real_accept = hp.accept_artifact_authorization
+        hp.accept_artifact_authorization = _REAL_ACCEPT_AUTHORIZATION
+        # A validly signed artifact whose window has closed. The fourth value is `expired`.
+        hp.verify_artifact_envelope = lambda envelope: (artifact, dict(record), {}, True)
+        hp._host_observation_report = lambda: {
+            "observed": None, "detail": "table inet heliopause is absent",
+            "foreignFilters": [], "publishedPorts": [],
+        }
+        try:
+            # The state a rebooted host is in after the backfill has run: confirmed, on g1, with the
+            # authorization it is enforcing finally named.
+            hp.save_state({**hp._EMPTY_STATE, "generation": "g1", "state": "confirmed",
+                           "referenceHash": "sha256:old",
+                           "currentAuthorization": dict(record),
+                           "pendingAuthorization": dict(record),
+                           "authorizationWatermark": dict(record)})
+            hp.handle_reply(hp.load_state(), {"schemaVersion": hp.SCHEMA_VERSION,
+                                              "generation": "g1", "gate": {"open": True}})
+        finally:
+            hp.apply_artifact, hp.fetch_artifact = real_apply, real_fetch
+            hp._host_observation_report, hp.verify_artifact_envelope = real_report, real_verify
+            hp.accept_artifact_authorization = real_accept
+
+        self.assertEqual(
+            seen.get("generation"), "g1",
+            "an expired-but-adopted authorization did not re-apply — this is the 39-hour exposure",
+        )
+        self.assertIsNone(
+            hp.load_state().get("lastRefusal"),
+            "it refused instead of taking the escape, and recorded the refusal",
+        )
+
+    def test_the_same_host_is_refused_when_nothing_was_adopted(self):
+        """The known negative, and without it the test above proves nothing.
+
+        An escape that lets *every* expired authorization through is not an escape, it is the removal
+        of the expiry check. The only difference between this and the case above is
+        `currentAuthorization`, which is exactly what the backfill writes.
+        """
+        seen = {}
+        record = {
+            "authorizedAt": "2026-09-28T14:54:06.273Z",
+            "expiresAt": "2026-09-29T14:54:06.273Z",
+            "payloadHash": "sha256:" + "a" * 64,
+            "keyId": "sha256:" + "b" * 64,
+            "authorizationMode": "solo-otp",
+            "target": hp.TARGET,
+            "host": hp.HOST_ID,
+            "planHash": "sha256:" + "c" * 64,
+            "bundleHash": "sha256:" + "d" * 64,
+            "generation": "g1",
+        }
+        artifact = {
+            "generation": "g1", "ruleset": VALID, "rulesetHash": VALID_HASH,
+            "confirmTimeoutSec": hp.NFT_CONFIRM_MIN_SEC,
+        }
+        real_apply, real_fetch = hp.apply_artifact, hp.fetch_artifact
+        real_report, real_verify = hp._host_observation_report, hp.verify_artifact_envelope
+        def fake_apply(artifact, validated=None):
+            seen["ran"] = True
+            return True, "pending", ""
+
+        hp.apply_artifact = fake_apply
+        hp.fetch_artifact = lambda: {"payload": "signed"}
+        # 🔴 **The real acceptance, restored explicitly.** This class's `setUp` calls
+        # `stub_artifact_verification()`, which replaces `accept_artifact_authorization` with
+        # `lambda …: ({}, "")` — it always accepts — so both of these tests were meaningless until
+        # this line: the positive one passed because nothing could refuse, and the negative one
+        # failed for the same reason. The negative is what caught it, which is the whole argument for
+        # writing one.
+        real_accept = hp.accept_artifact_authorization
+        hp.accept_artifact_authorization = _REAL_ACCEPT_AUTHORIZATION
+        hp.verify_artifact_envelope = lambda envelope: (artifact, dict(record), {}, True)
+        hp._host_observation_report = lambda: {
+            "observed": None, "detail": "table inet heliopause is absent",
+            "foreignFilters": [], "publishedPorts": [],
+        }
+        try:
+            hp.save_state({**hp._EMPTY_STATE, "generation": "g1", "state": "confirmed",
+                           "referenceHash": "sha256:old",
+                           "currentAuthorization": None,
+                           "authorizationWatermark": dict(record)})
+            hp.handle_reply(hp.load_state(), {"schemaVersion": hp.SCHEMA_VERSION,
+                                              "generation": "g1", "gate": {"open": True}})
+        finally:
+            hp.apply_artifact, hp.fetch_artifact = real_apply, real_fetch
+            hp._host_observation_report, hp.verify_artifact_envelope = real_report, real_verify
+            hp.accept_artifact_authorization = real_accept
+
+        self.assertNotIn("ran", seen, "an expired authorization applied with nothing adopted")
+        refusal = hp.load_state().get("lastRefusal")
+        self.assertIsNotNone(refusal, "it refused and told nobody — the silence fixed in #57")
+        self.assertIn("expired", refusal["reason"])
+
     def test_a_confirmed_generation_is_reapplied_when_the_table_is_gone(self):
         """A reboot destroys the table but not the state file, and the agent must notice.
 
