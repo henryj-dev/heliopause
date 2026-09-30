@@ -741,6 +741,15 @@ export const MESSAGES = {
   "m.enabled": { en: "enabled", ko: "활성" },
   "m.portsEmpty": { en: "empty = all ports", ko: "비우면 모든 포트" },
   "m.addRule": { en: "add rule", ko: "규칙 추가" },
+  "m.addDevice": { en: "add device", ko: "기기 추가" },
+  "m.editDevice": { en: "edit {name}", ko: "{name} 편집" },
+  // Names the address, not only the device: two machines legitimately share one name, and the
+  // address is what a rule matched on. Deleting a row revokes an approval and narrows every rule
+  // scoped to that person through `ao-operators`.
+  "m.deleteDeviceConfirm": {
+    en: "revoke {name} ({addr})? rules scoped to this person stop matching it",
+    ko: "{name} ({addr}) 승인을 취소할까요? 이 사람에게 걸린 규칙이 더는 이 주소를 받지 않습니다",
+  },
   "m.editRule": { en: "edit rule · {id}", ko: "규칙 수정 · {id}" },
   "m.modalSub": { en: "the fleet stays as it is until this is written to a branch", ko: "브랜치에 쓰기 전까지 함대는 그대로다" },
   "m.deleteConfirm": {
@@ -885,6 +894,15 @@ export const MESSAGES = {
   "ed.denyMode": {"en":"deny mode","ko":"거부 방식"},
   "ed.priority": {"en":"priority","ko":"우선순위"},
   "ed.placements": {"en":"placements JSON","ko":"배치 JSON"},
+  "ed.deviceIdHint": {
+    en: "Cloudflare assigns this; the drift check joins on it",
+    ko: "Cloudflare 가 배정한다 — 드리프트 검사가 이 값으로 대조한다",
+  },
+  "ed.deviceNotes": { en: "why this device is approved", ko: "이 기기를 승인한 이유" },
+  "ed.deviceNotesHint": {
+    en: "Optional. Most rows need no argument; clearing this removes the field",
+    ko: "비워도 된다. 대부분은 이유가 필요 없고, 비우면 항목이 지워진다",
+  },
   "ed.save": {"en":"validate & save","ko":"검증 후 저장"},
   "ed.hint": {"en":"Select a policy row by entering its id, or edit an existing id.","ko":"id를 입력해 정책을 고르거나, 있는 id를 고칩니다."},
   "ed.proposeHeading": {"en":"propose rendered policy","ko":"렌더된 정책 제안"},

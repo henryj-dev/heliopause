@@ -6,6 +6,8 @@
   import { whoQuery } from "$lib/shell/who.svelte";
   import WriteDialog from "$lib/shell/WriteDialog.svelte";
   import { writeAsk } from "$lib/shell/write-ask.svelte";
+  import DeviceTable from "./DeviceTable.svelte";
+  import { readDeviceDoc, writeDeviceDoc, type DeviceDoc } from "./devices";
   import RuleTable from "./RuleTable.svelte";
   import type { PolicyEdit } from "./screen";
   import { readPolicyDoc, rulesWithoutNotes, writePolicyDoc, type PolicyDoc } from "./rules";
@@ -45,6 +47,31 @@
   let tableDirty = $state(false);
   let files = $state<Record<string, string>>(initialFiles);
   let servedFiles = $state<Record<string, string>>({ ...initialFiles });
+
+  // Files in `edit.more` that the device table can paint, keyed by path.
+  //
+  // A textarea is the honest default for a file nothing understands, so this only replaces it where a
+  // document actually parses — a `devices.json` the table would mangle stays editable as text, with
+  // the reason shown. The regex matches the basename so the policy repository can move the file
+  // without this going quiet.
+  const DEVICE_FILE = /(^|\/)devices\.json$/;
+  const deviceDocs = $state<Record<string, DeviceDoc>>(untrack(() => {
+    const out: Record<string, DeviceDoc> = {};
+    for (const file of edit.more) {
+      if (!DEVICE_FILE.test(file.path)) continue;
+      const read = readDeviceDoc(initialFiles[file.path] ?? file.content);
+      if (read.ok) out[file.path] = read.doc;
+    }
+    return out;
+  }));
+
+  // The table mutates its document in place; this is what turns that into a pending save. Without it
+  // the edit would be visible and unsaveable — `dirtyPaths` compares `files` against what was served.
+  function markDeviceFile(path: string): void {
+    const doc = deviceDocs[path];
+    if (!doc) return;
+    files = { ...files, [path]: writeDeviceDoc(doc) };
+  }
   let branch = $state("");
   let lastCommit = $state("");
   let prUrl = $state("");
@@ -268,15 +295,19 @@
           <span class="dim"> · {t(prefs.lang, "file.dirty")}</span>
         {/if}
       </h3>
-      <textarea
-        value={files[file.path] ?? file.content}
-        rows="14"
-        spellcheck="false"
-        aria-label={file.path}
-        oninput={(e) => {
-          files = { ...files, [file.path]: e.currentTarget.value };
-        }}
-      ></textarea>
+      {#if deviceDocs[file.path]}
+        <DeviceTable doc={deviceDocs[file.path]} mark={() => markDeviceFile(file.path)} />
+      {:else}
+        <textarea
+          value={files[file.path] ?? file.content}
+          rows="14"
+          spellcheck="false"
+          aria-label={file.path}
+          oninput={(e) => {
+            files = { ...files, [file.path]: e.currentTarget.value };
+          }}
+        ></textarea>
+      {/if}
       <p class="act">
         <button type="button" disabled={busy !== ""} onclick={() => saveFile(file.path)}>
           {t(prefs.lang, "m.savePath", { path: file.path })}
