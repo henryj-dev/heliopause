@@ -92,9 +92,11 @@ export interface PolicySource {
 /**
  * Project a site into one row per policy.
  *
- * Ordered by `priority` then `id`, which is the order the renderer evaluates them in once a chain
- * defaults to deny. Showing them in module order instead would let a reader conclude the wrong thing
- * about which rule wins.
+ * Ordered by `priority` then `id`. **That is a display order, not the evaluation order** — this
+ * comment said otherwise until 2026-09-30, and nothing in either renderer reads `priority`. The host
+ * layer (`nft.ts`) places every deny before every allow, and within each keeps the order the site
+ * wires them in; the workload layer has no order at all, because a Cilium deny beats every allow. A
+ * reader who believed the old sentence would change a priority to move a rule and see nothing move.
  *
  * A policy appearing on several hosts is **one row**, not one per host. The question this table
  * answers is "what does this rule do", and the hosts are its answer, not its identity.

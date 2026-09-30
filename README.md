@@ -413,6 +413,18 @@ reporting only the silence would lose it. `maintenance` outranks silence because
 person wrote on purpose — but stays below drift and rollback, which are evidence the host itself
 produced.
 
+**`confirmed` says the host kept what it was given — not that what it was given is what you
+meant.** On 2026-09-30 three rules added from the console were published as a new generation,
+every target host confirmed it, and none of the three was in any ruleset: the renderer had served
+the new commit's id over the old commit's rules. Every status in this system was honest, and every
+one of them was green. So a change is checked twice, at two different layers:
+
+- **before approving**, that the plan's diff contains the change — the plan is the last point where
+  the rendered result, rather than the source, is in front of a person;
+- **after confirming**, that the rule is on the host (`nft list table inet heliopause`) or,
+  better, that the traffic it exists for now passes. The ruleset shows what was rendered; the
+  traffic shows what is enforced.
+
 </details>
 
 ---
