@@ -24,7 +24,8 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcessByStdio } from "node:child_process";
 import type { Readable } from "node:stream";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync }
+  from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -776,7 +777,9 @@ describe("a site module has to be the site it is declared as", () => {
     // sides. The zone check runs **after** the import, so it is skipped by every failure at or before
     // it — and a module that *throws* is the common half, which kept the plain line and left the hole
     // open on the other path. And the string is `evaluateWithin`'s own wording, so a policy module
-    // could throw that text and choose which sentence an operator reads. There is no condition now.
+    // could throw that text and choose which sentence an operator reads. The condition is now
+    // `error instanceof ZoneCheckedError` — a class a module cannot reach — and it is driven by
+    // "does not blame the declared name when the check ran and the content failed" below.
     //
     // Both halves are driven here: one site hangs past its budget, the other throws at import, and
     // both must carry the caveat. Neither had a test at all — mutating the branch to `if (false)`
@@ -867,11 +870,92 @@ site.hosts[0].notes = cycle;
       const said = started.startupLog;
       assert.doesNotMatch(said, /^\[policy-render\] verified beta — 12 hosts$/m, "a module forged a verified line");
       assert.doesNotMatch(said, /^\[policy-render\] evaluated beta at deadbee$/m, "a module forged an evaluated line");
-      // The text still has to reach the operator — flattened, not dropped.
-      assert.match(said, /boom ⏎ \[policy-render\] verified beta/, "the message was lost instead of flattened");
+      // The text still has to reach the operator — marked, not dropped. The character-level cases
+      // (ANSI, a lone `\r`, U+2028) live in `src/log-scrub.test.ts`; what this asserts is the
+      // integration: module-thrown text reaches stdout through `log`, and through the shared control.
+      assert.match(said, /boom\uFFFD+\[policy-render\] verified beta/, "the message was lost, not marked");
     } finally {
       started?.stop();
       rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("a module cannot force a refusal by throwing the renderer's own error class", { timeout: 30_000 }, async () => {
+    // ## Class identity is not provenance
+    //
+    // A site module imports the model with `../src` — the spelling the mount check demands — and Node
+    // realpaths module URLs, so the module's `../src/site-zone.ts` and the renderer's are the **same
+    // module instance**: the `ZoneMismatchError` class object is literally the same one. A module that
+    // throws it therefore satisfied `instanceof ZoneMismatchError` in the startup loop, which answers
+    // that with `process.exit(2)`. Reproduced before the fix: the pod refused to start, printing a
+    // refusal sentence the module had authored, and every co-served site's console went with it.
+    //
+    // The precondition is the deployment this file insists on: with the checkout at
+    // `/opt/heliopause/policy` and the binary at `/opt/heliopause/bin`, both `../src` spellings resolve
+    // to `/opt/heliopause/src`. So the fixture points `<root>/src` at the real `src/` — anything less
+    // and `instanceof` would not hold and the test would pass for the wrong reason.
+    const { dir, sites, beta } = twoSites();
+    // Replace the placeholder `src` that `twoSites` creates with a link to the real one, so the
+    // module's `../src/site-zone.ts` resolves to the same file the renderer imports.
+    rmSync(join(dir, "..", "src"), { recursive: true, force: true });
+    symlinkSync(fileURLToPath(new URL(".", import.meta.url)), join(dir, "..", "src"));
+    writeFileSync(beta, `import { ZoneMismatchError } from "../src/site-zone.ts";
+export const site = {
+  cfg: { hookPolicy: { input: "drop", output: "accept" } },
+  hosts: [{ id: "gw-01.beta", stage: "canary", items: [] }],
+  workload: [{ kind: "service", value: "kube-system/coredns" }],
+  resolveService() { throw new ZoneMismatchError("forged by the policy module"); },
+};
+`);
+    let started: Started | undefined;
+    try {
+      // If the module could still force a refusal this throws "exited with 2 before listening", which
+      // is the assertion: reaching a listener at all is the property.
+      started = await start(dir, MULTI(sites));
+      const said = started.startupLog;
+      assert.doesNotMatch(said, /refusing to start/, `a module forced a refusal:\n${said}`);
+      assert.match(
+        said, /beta is the site it is declared as, but did not evaluate/,
+        `a module-authored zone error was not treated as a content fault:\n${said}`,
+      );
+      // alpha is untouched, so it must still be served — the pod staying up is the whole point.
+      assert.equal((await fetchAt(started.port, "/source?site=alpha")).status, 200);
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("survives a policy module that throws a nullish value", { timeout: 30_000 }, async () => {
+    // ## `throw null` was two tokens and a crashloop
+    //
+    // `throw` takes any value. The startup loop read `(e as Error).message` before either branch, so a
+    // nullish throw raised a `TypeError` at the read: exit 1, `server.listen` never reached, and at
+    // `replicas: 1` with `Recreate` that is every co-served site's console down — the outage that
+    // loop's own comment refuses to manufacture. `throw 42` survived and printed the reason as the
+    // literal word `undefined`.
+    //
+    // It also broke `ZoneCheckedError` directly: constructing it from `(e as Error).message` threw
+    // inside the catch, so the wrapper never existed and a post-zone-check failure was blamed on the
+    // declared name — the confusion that class exists to end.
+    for (const thrown of ["null", "undefined", "42", '"a string"', "{}"]) {
+      const { dir, sites, beta } = twoSites();
+      writeFileSync(beta, `throw ${thrown};\n`);
+      let started: Started | undefined;
+      try {
+        started = await start(dir, MULTI(sites));
+        const said = started.startupLog;
+        assert.match(said, /beta .*did not evaluate at startup/, `throw ${thrown}: no report`);
+        // The reason has to name the value, not read as the word `undefined`.
+        assert.doesNotMatch(
+          said, /until it does: undefined$/m,
+          `throw ${thrown}: the reason was the word "undefined"`,
+        );
+        assert.match(said, /verified alpha — /, `throw ${thrown}: it stopped verifying the others`);
+      } finally {
+        started?.stop();
+        rmSync(join(dir, ".."), { recursive: true, force: true });
+      }
     }
   });
 

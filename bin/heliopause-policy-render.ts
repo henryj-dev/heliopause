@@ -33,6 +33,7 @@ import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { timingSafeEqual } from "node:crypto";
+import { oneLine } from "../src/log-scrub.ts";
 import { boundedInteger, ENV_BOUNDS, parsePolicySites } from "../src/env-spec.ts";
 import { zoneMismatch, ZoneMismatchError } from "../src/site-zone.ts";
 import { armedReasons } from "../src/policy-render-guard.ts";
@@ -45,25 +46,10 @@ installCliLanguage();
 /**
  * One line, always, with this service's prefix on it.
  *
- * ## 🔴 The flattening is the security control, not tidiness
- *
- * Almost everything logged here ends up interpolating a message from a **policy module**, which is
- * the untrusted code this whole process exists to contain — `${e.message}` on the request path, the
- * startup failure line, and the zone refusal, whose text is built from host ids the module itself
- * declares. A newline in any of those is a new log line with this prefix on it. Reproduced: a module
- * throwing `"boom\n[policy-render] verified beta — 12 hosts"` printed a forged **`verified`** line —
- * the positive signal an operator scans for — and the pod then came up looking clean.
- *
- * That was open the whole time, and the commit before this one declared it closed while changing
- * nothing about it: it removed a *predicate* a module could choose between two true sentences with,
- * and called the result "nothing for a module to spoof" with the stronger forgery still live. The
- * claim was the defect. The bound is here rather than at each call site so that a call site added
- * later cannot forget it, and so the claim has one place to be true.
- *
- * `⏎` rather than a space so a flattened multi-line error is still readable as one, and a cap
- * because a module can also throw a megabyte.
+ * `oneLine` is the shared control in `src/log-scrub.ts`; see its doc for what it covers and — more
+ * importantly — for what it cannot: a policy module shares this process's stdout, so it can write a
+ * byte-identical line without passing through here at all. This bounds the *interpolation* channel.
  */
-const oneLine = (m: string): string => m.replace(/[\r\n]+/g, " ⏎ ").slice(0, 2_000);
 const log = (m: string): void => console.log(`[policy-render] ${oneLine(m)}`);
 
 /**
@@ -75,6 +61,60 @@ const log = (m: string): void => console.log(`[policy-render] ${oneLine(m)}`);
  * check. Selecting on the message text got this wrong in both directions on successive commits;
  * carrying the fact with the error is what stops there being a third way to get it wrong.
  */
+/**
+ * A zone mismatch **this process** found, as opposed to one handed to it.
+ *
+ * ## Class identity is not provenance, and `instanceof` was treated as if it were
+ *
+ * A policy module can `import { ZoneMismatchError } from "../src/site-zone.ts"` -- the exact spelling
+ * the mount check above demands of a site module -- and Node's resolver realpaths by default, so the
+ * module's `../src/site-zone.ts` and this file's are the **same module instance** and the class object
+ * is literally the same. A `ZoneMismatchError` thrown by a module therefore satisfies
+ * `instanceof ZoneMismatchError` here, and the startup loop turned that into `process.exit(2)` with a
+ * refusal sentence the module wrote. Reproduced: a `resolveService` that throws one takes the pod down
+ * and prints `refusing to start: beta is declared for ..., but forged from resolveService via ../src`.
+ *
+ * The precondition is not exotic -- it is the layout this file insists on. With the checkout mounted at
+ * `/opt/heliopause/policy` and the binary at `/opt/heliopause/bin`, both `../src` spellings resolve to
+ * `/opt/heliopause/src`. So one line in a policy commit could take every co-served site's console down,
+ * which is the outage the startup block spends a paragraph refusing to manufacture.
+ *
+ * This subclass is declared here and exported nowhere, so a module has no way to obtain it. A
+ * module-authored `ZoneMismatchError` is now an ordinary content fault: wrapped as `ZoneCheckedError`,
+ * logged, that site answers 503, and the pod stays up.
+ *
+ * @see src/policy-render-service.test.ts "a module cannot force a refusal by throwing the renderer's
+ *      own error class"
+ */
+class OwnZoneMismatchError extends ZoneMismatchError {}
+
+/**
+ * Whatever was thrown, as an `Error`.
+ *
+ * ## `throw null` in a policy commit was a crashloop
+ *
+ * `throw` takes any value, and a policy module is code this process runs on purpose without trusting
+ * it. `(e as Error).message` on a nullish throw raises a `TypeError` **at the read**, so the startup
+ * loop died before `server.listen` — exit 1, no listener, and at `replicas: 1` with `Recreate` that is
+ * every co-served site's console down, which is precisely the outage the loop's own comment says must
+ * never be manufactured. Two tokens in a policy repo. `throw 42` survived and printed the reason as
+ * the literal word `undefined`.
+ *
+ * It also broke the fix directly above it: `new ZoneCheckedError((e as Error).message)` threw *inside
+ * the catch*, so the wrapper was never constructed and a post-zone-check failure fell into the branch
+ * that blames the declared name — the exact confusion `ZoneCheckedError` exists to end.
+ *
+ * Normalised once, where the value is caught, rather than at each read. There were four reads.
+ *
+ * @see src/policy-render-service.test.ts "survives a policy module that throws a nullish value"
+ */
+function asError(thrown: unknown): Error {
+  if (thrown instanceof Error) return thrown;
+  // `String(thrown)` and not `JSON.stringify`: the latter is `undefined` for a function and throws on
+  // a circular object, which would put the read back where it started.
+  return new Error(`policy module threw a non-error value: ${String(thrown)}`);
+}
+
 class ZoneCheckedError extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
@@ -150,7 +190,7 @@ const sites: { name: string | null; path: string }[] = (() => {
     try {
       return parsePolicySites(many).map((s) => ({ name: s.name, path: resolve(s.path) }));
     } catch (e) {
-      console.error(`[policy-render] refusing to start: ${(e as Error).message}`);
+      console.error(`[policy-render] ${oneLine(`refusing to start: ${asError(e).message}`)}`);
       process.exit(2);
     }
   }
@@ -369,7 +409,7 @@ async function currentSource(site: { name: string | null; path: string }): Promi
   // holds; the startup one is the one that is loud. Throwing here surfaces as the 503 below, which
   // is the right shape — the module is present and this process will not vouch for it.
   const wrongZone = name === null ? null : zoneMismatch({ target: name, hostIds: hostIdsOf(mod.site) });
-  if (wrongZone) throw new ZoneMismatchError(wrongZone);
+  if (wrongZone) throw new OwnZoneMismatchError(wrongZone);
   // ## Everything past this point has been zone-checked, and the caller needs to know that
   //
   // The startup verification logs "the declared-name check did not run" on any failure that is not a
@@ -386,21 +426,26 @@ async function currentSource(site: { name: string | null; path: string }): Promi
   // than carried with it. Wrapping is what carries it, and `instanceof` is unspoofable by a module
   // in a way the message text never was.
   try {
-    return await evaluated({ mod, name, sitePath, stamp });
+    // The narrowed value, not `mod` plus a `!` at the use. The guard above is twenty lines from the use
+    // and the compiler cannot see across the call, so an assertion there rested on an accident:
+    // deleting the guard reported `TS2345` at an unrelated line, and adding `!` there too went silent.
+    return await evaluated({ site: mod.site, name, sitePath, stamp });
   } catch (e) {
-    if (e instanceof ZoneMismatchError) throw e; // cannot happen here, but never reclassify one
-    throw new ZoneCheckedError((e as Error).message, { cause: e });
+    // Only ours passes through. A `ZoneMismatchError` reaching here came from the module -- the
+    // class is shared, so its type says nothing about who built it -- and that is a content fault.
+    if (e instanceof OwnZoneMismatchError) throw e;
+    throw new ZoneCheckedError(asError(e).message, { cause: e });
   }
 }
 
 /** The half of `currentSource` that runs once the zone check has passed. Separated so the caller can
  *  tell a failure here — where the check ran — from one before it. */
 async function evaluated(
-  input: { mod: { site?: ScreenSite }; name: string | null; sitePath: string; stamp: string },
+  input: { site: ScreenSite; name: string | null; sitePath: string; stamp: string },
 ): Promise<PolicySource> {
-  const { mod, name, sitePath, stamp } = input;
+  const { site: siteValue, name, sitePath, stamp } = input;
   const source = collectPolicySource({
-    site: mod.site!, sitePath, allowPaths,
+    site: siteValue, sitePath, allowPaths,
     // ## The label follows the site once there is more than one
     //
     // `HELIOPAUSE_POLICY_LABEL` is one value for the process, and the console prints it as "which
@@ -808,7 +853,7 @@ const verified = await Promise.all(
       log(`verified ${site.name} — ${source.site.hosts?.length ?? 0} hosts`);
       return null;
     } catch (e) {
-      return { site, error: e as Error };
+      return { site, error: asError(e) };
     }
   }),
 );
@@ -817,7 +862,7 @@ for (const failure of verified) {
   if (!failure) continue;
   const { site, error } = failure;
   const why = error.message;
-  if (error instanceof ZoneMismatchError) {
+  if (error instanceof OwnZoneMismatchError) {
     // `oneLine` here too: `why` is built from host ids the policy module declares, so it carries the
     // same forgery channel as any other module-supplied text. `console.error` does not go through
     // `log`, which is exactly the kind of second path a per-call-site fix forgets.
@@ -838,8 +883,8 @@ for (const failure of verified) {
   // hole stayed open, and the string was `evaluateWithin`'s own wording, so a module could choose
   // which sentence an operator read. Removing the condition fixed that and broke the other side:
   // `collectPolicySource` runs only *past* the check, so a correctly-declared site with an ordinary
-  // `JSON.stringify` cycle was told its declared name might be wrong. `ZoneCheckedError` ends the
-  // guessing — the fact travels with the failure, and there is no third category to get wrong.
+  // `JSON.stringify` cycle was told its declared name might be wrong. `ZoneCheckedError` carries the
+  // fact with the failure instead of inferring it from the message.
   //
   // Not fatal, because a slow-but-correct module must not take the pod down — that is the outage the
   // fix would manufacture. Containment is unchanged either way: `currentSource` re-checks the zone on
@@ -869,4 +914,10 @@ server.listen(port, hostname, () => {
   // `/readyz` joined this set in the commit that gated it, and this line did not follow. It is what
   // an operator reads in `kubectl logs` to learn what needs a token.
   log("bearer required on GET /source, GET /sites and GET /readyz");
+  // Printed because a knob nobody can observe is a knob nobody can trust. `SOURCE_SITE_BUDGET_MS` has
+  // to sit under the manager's own `HELIOPAUSE_RELAY_TIMEOUT_MS` and this process cannot read that
+  // variable — it lives in another Deployment — so the operator is the one holding the relationship.
+  // Without this line the only way to see which value took effect was to induce the timeout it exists
+  // to prevent.
+  log(`budgets: ${SOURCE_SITE_BUDGET_MS}ms per site on request, ${STARTUP_SITE_BUDGET_MS}ms at startup`);
 });
