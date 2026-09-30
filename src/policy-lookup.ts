@@ -429,7 +429,10 @@ export function lookupPolicies(
 
   // Deny first, then by priority. Not cosmetic: on the workload layer a deny beats every allow and no
   // later rule can carve an exception out of it, so a reader scanning from the top meets the rule that
-  // actually decides. The host layer is ordered by priority, which is why that is the second key.
+  // actually decides. The host layer renders the same way — every deny before every allow (`nft.ts`)
+  // — so deny-first is the order both layers decide in. `priority` after it is only a stable,
+  // author-chosen tie-break for reading: no renderer reads it, and this comment used to say the host
+  // layer was ordered by it.
   const order = (a: LookupHit, b: LookupHit): number =>
     (a.action === b.action ? 0 : a.action === "deny" ? -1 : 1) || a.priority - b.priority;
   matches.sort(order);
