@@ -183,6 +183,24 @@ const disarm = clearTimeout;
 const readClock = Date.now;
 const toJson = JSON.stringify;
 
+// ## ⚠️ What this does **not** do, stated because leaving it implied is the same silence
+//
+// The substitutions above are the call sites that were *measured* to reach another site or the
+// process. Nothing stops the next edit from adding a bare `JSON.stringify(`, `String(` or
+// `setTimeout(` on a shared path, and the tests will not catch it: they exercise the shapes known
+// today, and a new unguarded call is only reachable by a shape nobody has written yet.
+//
+// A check over this file's source text would find it, and that is deliberately not here: `AGENTS.md`
+// records three separate times that asserting on source text in this repo missed the thing it was
+// written for, and the test file's own preamble says the same. So this is a gap held open on purpose,
+// not an oversight — and it is a second reason the captures are a patch on measured paths rather than
+// a boundary. Evaluating policy in its own realm removes the whole class, including this.
+//
+// Until then, the rule for anyone editing this file: an intrinsic resolved at call time on a path
+// more than one site reaches must use the captured name. Ask what the operation looks up **on the
+// value** as well — `JSON.stringify` calls an inherited `toJSON`, resolving a promise reads an
+// inherited `then`, and capturing the global closes neither.
+
 // ## The same treatment for "the zone check had already passed"
 //
 // That fact was carried by `error instanceof ZoneCheckedError`, and `instanceof` walks a prototype
