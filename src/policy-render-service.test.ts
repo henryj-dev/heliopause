@@ -23,6 +23,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcessByStdio } from "node:child_process";
+// `fetch` will not send a malformed request target, so one test speaks HTTP directly.
+import { connect } from "node:net";
 import type { Readable } from "node:stream";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync }
   from "node:fs";
@@ -1014,6 +1016,115 @@ export const site = {
       // Still alive, and still serving its sibling — the property the exit-1 crash destroyed.
       assert.equal((await fetchAt(started.port, "/source?site=alpha")).status, 200);
       assert.equal((await fetchAt(started.port, "/healthz")).status, 200);
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("answers 400 to a request target it cannot parse, and keeps serving", { timeout: 30_000 }, async () => {
+    // ## The worst thing seven review rounds found, and it was there the whole time
+    //
+    // `new URL("//[", "http://placeholder")` throws `ERR_INVALID_URL`: `//` makes the target
+    // protocol-relative, so `[` begins an IPv6 host and fails. The request handler is a synchronous
+    // `createServer` callback, so the throw was uncaught — **exit 1** — and it happened *before* the
+    // bearer check. One unauthenticated `GET //[` from anything that could reach the port took the pod
+    // down, and at `replicas: 1` with `Recreate` every zone's console went with it.
+    //
+    // Unchanged from `origin/main`, so it is live in the deployed renderer rather than something this
+    // branch introduced. `//[::1`, `//%` and `http://[` do the same.
+    const { dir, sites } = twoSites();
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      const port = started.port;
+      const raw = (target: string): Promise<string> => new Promise((resolve) => {
+        const sock = connect(port, "127.0.0.1", () => {
+          sock.write(`GET ${target} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n`);
+        });
+        let buf = "";
+        sock.on("data", (d: Buffer) => { buf += d.toString(); });
+        sock.on("close", () => resolve(buf.split("\r\n")[0] ?? ""));
+        sock.on("error", () => resolve("socket error"));
+        setTimeout(() => { sock.destroy(); resolve("timeout"); }, 4_000);
+      });
+      for (const target of ["//[", "//[::1", "//%"]) {
+        assert.match(await raw(target), /^HTTP\/1\.1 400 /, `${target} did not get a 400`);
+      }
+      // Still alive and still answering — the property the uncaught throw destroyed.
+      assert.equal((await fetchAt(port, "/healthz")).status, 200);
+      assert.equal((await fetchAt(port, "/source?site=alpha")).status, 200);
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("survives a module whose error resists being read", { timeout: 30_000 }, async () => {
+    // ## Three shapes that each ended the process, all in the error-handling path itself
+    //
+    // - **A thrown Proxy with a `getPrototypeOf` trap.** `thrown instanceof Error` walks the prototype
+    //   chain, so the classification in `asError` ran the trap and threw — inside a rejection handler
+    //   that had already cleared its timer, so nothing caught it. A revoked Proxy does the same with
+    //   `TypeError: Cannot perform 'getPrototypeOf' on a proxy that has been revoked`.
+    // - **An `Error` whose `.message` getter throws.** `asError` returned `Error` instances unchanged,
+    //   so the getter survived to the log line and the 503 body, outside every guard.
+    //
+    // Each of these is a normal-looking configuration mistake away from a real one: a getter that
+    // reads something undefined, a Proxy left revoked by a helper. The fix is that conversion reads
+    // the message once, into a string this process owns.
+    const shapes: Record<string, string> = {
+      proxyPrototype: 'new Proxy({}, { getPrototypeOf() { throw new Error("trap"); } })',
+      revokedProxy: '(() => { const r = Proxy.revocable({}, {}); r.revoke(); return r.proxy; })()',
+      unreadableMessage:
+        '(() => { const e = new Error("x"); Object.defineProperty(e, "message", ' +
+        '{ get() { throw new Error("message trap"); } }); return e; })()',
+    };
+    for (const [name, expr] of Object.entries(shapes)) {
+      const { dir, sites, beta } = twoSites();
+      writeFileSync(beta, `throw ${expr};\n`);
+      let started: Started | undefined;
+      try {
+        started = await start(dir, MULTI(sites));
+        assert.match(
+          started.startupLog, /beta .*did not evaluate at startup/,
+          `${name}: it did not report the failure`,
+        );
+        // The request path too, since that is where the previous round's fix did not reach.
+        assert.equal((await fetchAt(started.port, "/source?site=beta")).status, 503, `${name}: no 503`);
+        assert.equal((await fetchAt(started.port, "/source?site=alpha")).status, 200, `${name}: alpha lost`);
+        assert.equal((await fetchAt(started.port, "/healthz")).status, 200, `${name}: process gone`);
+      } finally {
+        started?.stop();
+        rmSync(join(dir, ".."), { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("keeps its provenance check working when a module patches WeakSet", { timeout: 30_000 }, async () => {
+    // ## The set was unreachable; the lookup was not
+    //
+    // `foundHere` called `OUR_ZONE_MISMATCHES.has(...)`, which resolves `has` on `WeakSet.prototype`
+    // at call time. A configuration module runs in this realm, so
+    // `WeakSet.prototype.has = () => true` in one made every error look like one this process built —
+    // turning an ordinary content fault into `exit 2` with a refusal nobody configured. Measured.
+    //
+    // Binding `has` before the first `import()` is what makes the set's unreachability the only thing
+    // that matters, and this drives it: the module patches the prototype *and* throws an ordinary
+    // error, which must still be a content fault.
+    const { dir, sites, beta } = twoSites();
+    writeFileSync(beta, `WeakSet.prototype.has = () => true;
+throw new Error("an ordinary content fault");
+`);
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      assert.doesNotMatch(
+        started.startupLog, /refusing to start/,
+        `a patched WeakSet forced a refusal:\n${started.startupLog}`,
+      );
+      assert.match(started.startupLog, /beta .*did not evaluate at startup/);
+      assert.equal((await fetchAt(started.port, "/source?site=alpha")).status, 200);
     } finally {
       started?.stop();
       rmSync(join(dir, ".."), { recursive: true, force: true });

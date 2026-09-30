@@ -98,17 +98,32 @@ const log = (m: string): void => console.log(`[policy-render] ${oneLine(m)}`);
  *      own error class"
  */
 const OUR_ZONE_MISMATCHES = new WeakSet<ZoneMismatchError>();
+// ## Bound before any policy module is imported
+//
+// `foundHere` called `OUR_ZONE_MISMATCHES.has(...)`, which looks the method up on
+// `WeakSet.prototype` **at call time** — and a policy module runs in this realm, so
+// `WeakSet.prototype.has = () => true` in one makes every error look like ours. Measured: it turned an
+// ordinary content fault into `exit 2` with a refusal nobody configured. The set is unreachable to a
+// module, but the *lookup* was not; capturing it here, before the first `import()`, is what makes the
+// unreachability of the set the only thing that matters.
+const zoneMismatchIsOurs = WeakSet.prototype.has.bind(OUR_ZONE_MISMATCHES) as (e: object) => boolean;
+const rememberOurZoneMismatch = WeakSet.prototype.add.bind(OUR_ZONE_MISMATCHES) as (e: object) => unknown;
 
 /** A zone mismatch this process found. Registered so `foundHere` can recognise it later. */
 function ownZoneMismatch(message: string): ZoneMismatchError {
   const error = new ZoneMismatchError(message);
-  OUR_ZONE_MISMATCHES.add(error);
+  rememberOurZoneMismatch(error);
   return error;
 }
 
 /** Whether this process constructed `error`. Unspoofable because the set is unreachable. */
 function foundHere(error: unknown): error is ZoneMismatchError {
-  return error instanceof Error && OUR_ZONE_MISMATCHES.has(error as ZoneMismatchError);
+  // No `instanceof` here. It cannot help — membership already implies this process built the object —
+  // and it can hurt: `instanceof` runs a Proxy's `getPrototypeOf` trap, so the check meant to
+  // establish provenance could itself throw. `typeof` is enough to keep the bound `has` from being
+  // handed a primitive.
+  if (error === null || (typeof error !== "object" && typeof error !== "function")) return false;
+  return zoneMismatchIsOurs(error);
 }
 
 /**
@@ -131,8 +146,52 @@ function foundHere(error: unknown): error is ZoneMismatchError {
  *
  * @see src/policy-render-service.test.ts "survives a policy module that throws a nullish value"
  */
+/**
+ * An error's message, or a stand-in — never a throw.
+ *
+ * `.message` is an ordinary property and a configuration module can make it a getter that throws.
+ * Measured: an `Error` with such a getter reached the log line and the 503 body, where the interpolation
+ * threw outside every guard and the process exited. That is a getter away from an ordinary mistake — a
+ * property that reads something undefined during construction.
+ *
+ * Used at every place a caught value's message is interpolated. There are four, which is why this is a
+ * function rather than a `try` at each one.
+ *
+ * @see src/policy-render-service.test.ts "survives a module whose error resists being read"
+ */
+function reasonOf(error: unknown): string {
+  try {
+    const message = (error as { message?: unknown } | null)?.message;
+    return typeof message === "string" ? message : String(message);
+  } catch {
+    return "an error whose message cannot be read";
+  }
+}
+
 function asError(thrown: unknown): Error {
-  if (thrown instanceof Error) return thrown;
+  // ## Even the classification can throw
+  //
+  // `thrown instanceof Error` walks the prototype chain, which runs a Proxy's `getPrototypeOf` trap
+  // — so a thrown `new Proxy({}, { getPrototypeOf() { throw … } })` made **this line** throw, and a
+  // revoked Proxy raised `TypeError: Cannot perform 'getPrototypeOf' on a proxy that has been
+  // revoked`. Both landed in a rejection handler that had already cleared its timer, so the process
+  // exited. The guard below covers the classification for that reason and not for tidiness.
+  let isError: boolean;
+  try {
+    isError = thrown instanceof Error;
+  } catch {
+    isError = false;
+  }
+  // Returned as it is, deliberately. An earlier version rebuilt the error around a safely-read
+  // message, and that breaks two things that key on the **object**: `foundHere`'s `WeakSet`, which is
+  // how a zone mismatch this process built is told from one a module threw, and the
+  // `instanceof ZoneCheckedError` branch, which is how a content fault past the zone check is told
+  // from one before it. A rebuilt error is in neither, so both silently reclassify. (That version also
+  // compared `message === source.message` to skip the rebuild in the common case, which read the
+  // getter a **second** time outside the guard and threw — the defect, inside its own fix.)
+  //
+  // Reading the message safely belongs at the point of reading. `reasonOf` below does that.
+  if (isError) return thrown as Error;
   // ## The coercion is the part a module attacks next
   //
   // `String(thrown)` is not safe on a value a policy module chose. Measured, four of five hostile
@@ -227,7 +286,7 @@ const sites: { name: string | null; path: string }[] = (() => {
     try {
       return parsePolicySites(many).map((s) => ({ name: s.name, path: resolve(s.path) }));
     } catch (e) {
-      console.error(`[policy-render] ${oneLine(`refusing to start: ${asError(e).message}`)}`);
+      console.error(`[policy-render] ${oneLine(`refusing to start: ${reasonOf(e)}`)}`);
       process.exit(2);
     }
   }
@@ -721,7 +780,24 @@ const server = createServer((req, res) => {
     res.end(text);
   };
 
-  const url = new URL(req.url ?? "/", "http://placeholder");
+  // ## 🔴 A request target this cannot parse used to end the process
+  //
+  // `new URL("//[", "http://placeholder")` throws `ERR_INVALID_URL` — `//` makes it
+  // protocol-relative, so `[` is read as the start of an IPv6 host and fails. This callback is
+  // synchronous, so the throw left `createServer` uncaught: **exit 1**. Before authentication, so
+  // `curl 'http://host:9099//['` from anything that could reach the port took the pod down, and at
+  // `replicas: 1` with `Recreate` every zone's console went with it. Also `//[::1`, `//%` and
+  // `http://[`. Measured on Node 26.4.0; the line is unchanged from `origin/main`, so this is live
+  // today rather than something this branch introduced.
+  //
+  // A malformed target is a client error, so it gets 400 and the process keeps serving.
+  let url: URL;
+  try {
+    url = new URL(req.url ?? "/", "http://placeholder");
+  } catch {
+    // No detail echoed back: the input is the caller's and there is nothing here worth quoting.
+    return send(400, { error: "unparseable request target" });
+  }
 
   // Unchanged on purpose. It answers "the listener is up" and nothing else, because it is wired to
   // this pod's **liveness** probe as well as its readiness one — liveness period 30s × 3, readiness
@@ -846,8 +922,9 @@ const server = createServer((req, res) => {
       (e: Error) => {
         // The manager turns this into a 503 with this sentence in it. An empty page there would read
         // as "no policy", which is a different and much worse claim than "the policy will not load".
-        log(`evaluation failed: ${e.message}`);
-        send(503, { error: `the policy module could not be evaluated: ${e.message}` });
+        const why = reasonOf(e);
+        log(`evaluation failed: ${why}`);
+        send(503, { error: `the policy module could not be evaluated: ${oneLine(why)}` });
       },
     );
     return;
@@ -908,7 +985,7 @@ const verified = await Promise.all(
 for (const failure of verified) {
   if (!failure) continue;
   const { site, error } = failure;
-  const why = error.message;
+  const why = reasonOf(error);
   if (foundHere(error)) {
     // `oneLine` here too: `why` is built from host ids the policy module declares, so it carries the
     // same forgery channel as any other module-supplied text. `console.error` does not go through
