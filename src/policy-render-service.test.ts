@@ -1131,6 +1131,141 @@ throw new Error("an ordinary content fault");
     }
   });
 
+  it("stays up when a module breaks in a way no guard had named", { timeout: 90_000 }, async () => {
+    // ## Five shapes the tenth round's captures did not cover, all measured live in `origin/main`
+    //
+    // The captures closed globals being *replaced*. These are the same realm reached differently, and
+    // each of them exited 1 rather than answering 503 for the one site whose module was wrong:
+    //
+    //   - `resolveService` returning a circular object or a `BigInt`: `collectPolicySource` stored the
+    //     resolver's answer without passing it through the wire crossing, so it passed startup
+    //     verification and threw in the renderer's serialiser on the **first request**.
+    //   - a throwing `Object.prototype.toJSON`: `JSON.stringify` calls a `toJSON` it *finds on the
+    //     value*, inherited included, so capturing the function closed nothing — every response threw,
+    //     `/healthz` with it.
+    //   - a throwing `Object.prototype.then` getter: resolving a promise with an object reads `.then`
+    //     off it. `Promise.all` resolves its result array, so the throw landed outside every per-site
+    //     `catch`. `origin/main` survives this with a 503 and this branch did not, which made it the
+    //     one finding of the six that this branch had **introduced**.
+    //   - a module's own `setTimeout` callback throwing after its import resolved: nothing from this
+    //     file is on that stack, so the default action exited — **after** both probes had passed.
+    //
+    // The expectation per shape differs on purpose. A resolver fault is one site's; poisoning a
+    // prototype breaks every module's render, so every site answering 503 is the correct answer and
+    // not a regression. What no shape may do is take the process or `/healthz` down.
+    const resolver = (body: string): string => `export const site = {
+  cfg: { hookPolicy: { input: "drop", output: "accept" } },
+  hosts: [{ id: "gw-01.beta", stage: "canary", items: [] }],
+  workload: [{ kind: "service", value: "kube-system/coredns" }],
+  resolveService() { ${body} },
+};
+`;
+    const shapes: { name: string; body: string; beta: number; alpha: number }[] = [
+      { name: "circularResolverResult", body: resolver("const hit = {}; hit.self = hit; return hit;"), beta: 503, alpha: 200 },
+      { name: "bigintResolverResult", body: resolver("return { port: 1n };"), beta: 503, alpha: 200 },
+      {
+        name: "poisonedToJSON",
+        body: 'Object.defineProperty(Object.prototype, "toJSON", { value() { throw new Error("bad serializer"); }, configurable: true });\nthrow new Error("bad beta");\n',
+        beta: 503, alpha: 503,
+      },
+      {
+        name: "poisonedThen",
+        body: 'Object.defineProperty(Object.prototype, "then", { get() { throw new Error("broken then"); }, configurable: true });\nthrow new Error("bad beta");\n',
+        beta: 503, alpha: 503,
+      },
+      {
+        name: "lateThrowFromModuleTimer",
+        body:
+          'setTimeout(() => { throw new Error("late config failure"); }, 400);\n' +
+          'export const site = {\n' +
+          '  cfg: { hookPolicy: { input: "drop", output: "accept" } },\n' +
+          '  hosts: [{ id: "gw-01.beta", stage: "canary", items: [] }],\n' +
+          '};\n',
+        beta: 200, alpha: 200,
+      },
+    ];
+    for (const shape of shapes) {
+      const { dir, sites, beta } = twoSites();
+      writeFileSync(beta, shape.body);
+      let started: Started | undefined;
+      try {
+        started = await start(dir, MULTI(sites));
+        const port = started.port;
+        const deadline = (): RequestInit => ({ signal: AbortSignal.timeout(10_000) });
+        assert.equal((await fetchAt(port, "/healthz", deadline())).status, 200, `${shape.name}: healthz`);
+        assert.equal((await fetchAt(port, "/source?site=alpha", deadline())).status, shape.alpha, `${shape.name}: alpha`);
+        assert.equal((await fetchAt(port, "/source?site=beta", deadline())).status, shape.beta, `${shape.name}: beta`);
+        // The late throw fires at 400ms, so this is the assertion that shape exists for: a pod that
+        // passed both probes and then died is the worst shape operationally, because it looks healthy.
+        await new Promise((r) => setTimeout(r, 900));
+        assert.equal((await fetchAt(port, "/healthz", deadline())).status, 200, `${shape.name}: healthz after`);
+        // `/readyz` reports the swallowed fault rather than hiding it — except under a poisoned
+        // `toJSON`, where the readiness body cannot be serialised either and the literal fallback goes
+        // out instead. That is the correct answer there, so the shape asserts the fallback rather than
+        // a count it could not have carried.
+        const ready = (await (await fetchAt(port, "/readyz", deadline())).json()) as {
+          faults?: number;
+          error?: string;
+        };
+        if (shape.name === "poisonedToJSON") {
+          assert.equal(ready.error, "the answer could not be serialised", `${shape.name}: readyz body`);
+        } else {
+          assert.equal(
+            typeof ready.faults, "number",
+            `${shape.name}: readiness does not report a fault count`,
+          );
+        }
+        if (shape.name === "lateThrowFromModuleTimer") {
+          assert.ok((ready.faults ?? 0) > 0, `${shape.name}: the fault was swallowed silently`);
+        }
+      } finally {
+        started?.stop();
+        rmSync(join(dir, ".."), { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("stops serving a cached answer when a file the module imports breaks", { timeout: 30_000 }, async () => {
+    // ## The stamp read the entry module, not what the entry module imports
+    //
+    // A policy module's `import "./helper.ts"` was in none of the stamp's inputs — entry module,
+    // allowlisted files, git sha — so breaking only the helper left the cache answering **200 with the
+    // last good payload** for a site that no longer evaluates. Not an outage: a screen that lies about
+    // what is deployed, which is what the comment above `cached` says must never happen. Measured, and
+    // live in the deployed renderer.
+    //
+    // A helper *outside* the module's directory is still invisible to the stamp. That is a stated gap,
+    // not a claim this test covers.
+    const { dir, sites, beta } = twoSites();
+    const helper = join(dir, "helper.ts");
+    writeFileSync(helper, 'export const mark = "first";\n');
+    writeFileSync(beta, `import { mark } from "./helper.ts";
+export const site = {
+  cfg: { hookPolicy: { input: "drop", output: "accept" } },
+  hosts: [{ id: "gw-01.beta", stage: "canary", items: [] }],
+  objects: [{ id: "ao-beta", kind: "address", name: mark,
+              members: [{ kind: "cidr", value: "10.0.0.0/8" }] }],
+};
+`);
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      const port = started.port;
+      assert.equal((await fetchAt(port, "/source?site=beta")).status, 200, "the good answer was not served");
+      writeFileSync(helper, 'throw new Error("helper broke");\n');
+      const later = new Date(Date.now() + 5_000);
+      utimesSync(helper, later, later);
+      assert.equal(
+        (await fetchAt(port, "/source?site=beta")).status, 503,
+        "a stale 200 was served for a site whose helper no longer evaluates",
+      );
+      assert.equal((await fetchAt(port, "/source?site=alpha")).status, 200, "alpha lost");
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
   it("survives a module that replaces the globals it will be described with", { timeout: 60_000 }, async () => {
     // ## The value was read carefully and then handed to a constructor the module owned
     //
@@ -1202,12 +1337,12 @@ throw new Error("an ordinary content fault");
         assert.equal((await fetchAt(port, "/healthz", deadline())).status, 200, `${name}: healthz`);
         const ready = await fetchAt(port, "/readyz", deadline());
         assert.equal(ready.status, 200, `${name}: readyz`);
-        assert.deepEqual(await ready.json(), { ok: true, degraded: true, serving: 1, total: 2 }, name);
+        assert.deepEqual(await ready.json(), { ok: true, degraded: true, serving: 1, total: 2, faults: 0 }, name);
         // Again, immediately: the memo compares `Date.now()` to when it settled, so the clock is only
         // read on a second request inside the window. One call leaves that capture untested.
         const memoised = await fetchAt(port, "/readyz", deadline());
         assert.equal(memoised.status, 200, `${name}: memoised readyz`);
-        assert.deepEqual(await memoised.json(), { ok: true, degraded: true, serving: 1, total: 2 }, name);
+        assert.deepEqual(await memoised.json(), { ok: true, degraded: true, serving: 1, total: 2, faults: 0 }, name);
         if (name === "replacesString") {
           // The second shared `String` call is inside `sourceStamp`'s `try`/`catch`, so a replaced
           // coercion throws nothing — it makes **every** mtime component `"-"`. The stamp then stops
@@ -1361,7 +1496,7 @@ throw new Error("an ordinary content fault");
       // would let a broken `dev.ts` take prod's and util's consoles down, which is the trade the
       // startup verification already refused to make — and the test below pins the other half.
       assert.equal(res.status, 200, "one broken site made the whole renderer report unready");
-      assert.deepEqual(await res.json(), { ok: true, degraded: true, serving: 1, total: 2 });
+      assert.deepEqual(await res.json(), { ok: true, degraded: true, serving: 1, total: 2, faults: 0 });
       // Documentation, not coverage — and saying which it is matters. `deepEqual` above already
       // rejects any added key, so a leak dies there and this line is never the failure; measured by
       // injecting `names: "alpha,beta"` into the body, which fails on the line above. It is kept
@@ -1423,7 +1558,7 @@ throw new Error("an ordinary content fault");
       started = await start(dir, MULTI(sites));
       assert.deepEqual(
         await (await fetchAt(started.port, "/readyz")).json(),
-        { ok: true, degraded: false, serving: 2, total: 2 },
+        { ok: true, degraded: false, serving: 2, total: 2, faults: 0 },
       );
       // Break it after the process is up, and move the mtime so the stamp changes — `utimesSync`
       // because two writes inside one millisecond are indistinguishable to the stamp.
@@ -1433,7 +1568,7 @@ throw new Error("an ordinary content fault");
       await new Promise((r) => setTimeout(r, 2_100)); // the memo window, plus a margin
       assert.deepEqual(
         await (await fetchAt(started.port, "/readyz")).json(),
-        { ok: true, degraded: true, serving: 1, total: 2 },
+        { ok: true, degraded: true, serving: 1, total: 2, faults: 0 },
         "the answer was remembered from startup instead of read from the tree",
       );
     } finally {
@@ -1532,7 +1667,7 @@ throw new Error("an ordinary content fault");
         signal: AbortSignal.timeout(10_000),
       });
       assert.equal(res.status, 200, "alpha was serving, so this must be up and degraded");
-      assert.deepEqual(await res.json(), { ok: true, degraded: true, serving: 1, total: 2 });
+      assert.deepEqual(await res.json(), { ok: true, degraded: true, serving: 1, total: 2, faults: 0 });
     } finally {
       started?.stop();
       rmSync(join(dir, ".."), { recursive: true, force: true });
@@ -1552,7 +1687,7 @@ throw new Error("an ordinary content fault");
       started = await start(dir, MULTI(sites));
       const res = await fetchAt(started.port, "/readyz");
       assert.equal(res.status, 503, "a renderer serving nothing reported itself ready");
-      assert.deepEqual(await res.json(), { ok: false, degraded: true, serving: 0, total: 2 });
+      assert.deepEqual(await res.json(), { ok: false, degraded: true, serving: 0, total: 2, faults: 0 });
       assert.equal(
         (await fetchAt(started.port, "/healthz")).status, 200,
         "/healthz went strict — that restarts the pod for a policy fault",

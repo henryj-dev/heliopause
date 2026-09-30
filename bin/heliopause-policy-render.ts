@@ -29,8 +29,8 @@
 
 import { createServer } from "node:http";
 import { registerHooks } from "node:module";
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { timingSafeEqual } from "node:crypto";
 import { oneLine } from "../src/log-scrub.ts";
@@ -55,7 +55,7 @@ const log = (m: string): void => console.log(`[policy-render] ${oneLine(m)}`);
 /**
  * A failure that happened **after** the declared-name check ran and passed.
  *
- * Its whole job is to be `instanceof`-able. The startup verification says "the declared-name check
+ * Its whole job is to be **distinguishable**. The startup verification says "the declared-name check
  * did not run" on a failure, and that is true of an import that threw, a missing export or a
  * timeout — and false of anything `collectPolicySource` raises, which is reached only past the
  * check. Selecting on the message text got this wrong in both directions on successive commits;
@@ -131,6 +131,33 @@ const rememberOurZoneMismatch = WeakSet.prototype.add.bind(OUR_ZONE_MISMATCHES) 
 //
 // @see src/policy-render-service.test.ts "survives a module that replaces the globals it will be described with"
 const RealError = Error;
+
+// ## A module's callback outlives the handler that was watching its import
+//
+// `setTimeout(() => { throw new Error("late") }, 500)` at a policy module's top level resolves its
+// import cleanly, passes startup verification, answers `/healthz` 200 — and then throws with nothing
+// from this file on the stack. The default action for that is to exit, so the pod died **after** both
+// probes had passed, which at `replicas: 1` with `Recreate` is every co-served console dark on a
+// crashloop driven by a config commit. Measured, and live in the deployed renderer.
+//
+// Staying up is the better trade: one module's delayed mistake should not be a fleet outage, and the
+// sites that do evaluate keep serving. The cost is real and deliberate — a genuine fault in *this*
+// file no longer crashes loudly either — so it is not swallowed: every one is logged and counted, and
+// the count is on `/readyz`, where an operator polling readiness sees it without reading logs.
+//
+// Installed before the first dynamic import, like the captures above.
+//
+// @see src/policy-render-service.test.ts "keeps serving when a module's own callback throws later"
+let faults = 0;
+for (const signal of ["uncaughtException", "unhandledRejection"] as const) {
+  process.on(signal, (thrown: unknown) => {
+    faults += 1;
+    // `oneLine` and `reasonOf`: the text can come from a policy module, so it carries the same
+    // forgery and unreadability channels as any other module-supplied string.
+    console.error(`[policy-render] ${oneLine(`${signal} #${faults} — the process is staying up: ${reasonOf(thrown)}`)}`);
+    console.error(`[policy-render]   this cannot be attributed to one site; check /readyz and the policy commits`);
+  });
+}
 
 // The same capture, for the same reason, on the coercion two shared paths use. `globalThis.String =
 // function () { throw 1; };` in one module made **another site** answer 503: `sourceStamp` and
@@ -523,12 +550,20 @@ if (!token) {
 const cached = new Map<string, { stamp: string; source: PolicySource }>();
 
 /**
- * Everything that can change what `/source` should answer, in one string.
+ * What can change what `/source` should answer, in one string — as much of it as this can see.
+ *
+ * Not "everything", which is what this claimed. It reads the entry module, the allowlisted files, the
+ * git sha and the entry module's neighbours; a file the module imports from **outside** its directory
+ * is invisible, and breaking one leaves the cache answering 200 with the last good payload. The
+ * neighbour scan was added because the narrower version had that failure for any `./helper.ts`.
  *
  * Read the mtimes of the allowed files too, not just the module: the whole defect above was a key
  * that could not see a change to `policies.json`. A path that does not exist contributes `-`, so
  * its appearance and disappearance both move the key.
  */
+/** How many neighbouring files the stamp will read before it gives up and stamps the count. */
+const STAMP_FILE_CAP = 400;
+
 function sourceStamp(sitePath: string): string {
   const head = policyHead(sitePath);
   const dir = dirname(resolve(sitePath));
@@ -539,6 +574,33 @@ function sourceStamp(sitePath: string): string {
       return "-";
     }
   };
+  // ## The entry module is not the only file that changes what it evaluates to
+  //
+  // This read the entry module, the allowlisted files and the git sha. A policy module's own
+  // `import "./helper.ts"` was in none of them, so breaking only the helper left the cache answering
+  // **200 with the last good payload** for a site that no longer evaluates — not an outage, a screen
+  // that lies about what is deployed, which the comment above `cached` says must never happen.
+  // Measured, and live in the deployed renderer.
+  //
+  // The whole directory rather than a dependency graph: Node exposes no import graph for an evaluated
+  // module, and policy modules keep their helpers beside them. A helper **outside** this directory is
+  // still invisible to the stamp — that is the known remaining gap, not an oversight. Bounded because
+  // this runs on every request: a directory larger than the cap stamps its size instead, which still
+  // moves when files are added or removed.
+  const neighbours: string[] = [];
+  try {
+    for (const entry of readdirSync(dir, { withFileTypes: true, recursive: true })) {
+      if (!entry.isFile()) continue;
+      if (!/\.(ts|mts|cts|js|mjs|cjs|json)$/.test(entry.name)) continue;
+      neighbours.push(join(entry.parentPath, entry.name));
+      if (neighbours.length > STAMP_FILE_CAP) break;
+    }
+  } catch {
+    // Unreadable directory: the entry module's own mtime below still moves the key.
+  }
+  neighbours.sort();
+  const scanned =
+    neighbours.length > STAMP_FILE_CAP ? `over-${STAMP_FILE_CAP}` : neighbours.map(mtime).join(",");
   const files = [sitePath, ...allowPaths.map((p) => resolve(dir, p))].map(mtime).join(",");
   // The path is in the key, not only in the `Map` bucket it is stored under. Two modules in one
   // directory share a git sha and an allowlist, so the rest of this string is identical for both —
@@ -546,7 +608,7 @@ function sourceStamp(sitePath: string): string {
   // stamp for `alpha.ts` and `beta.ts` can be byte-identical, and then a cache that keys on the
   // stamp alone answers one site's request with the other's policy. Belt and braces on purpose: the
   // bucket and the stamp each encode the site, so a mistake in either is caught by the other.
-  return `${sitePath}:${head.sha ?? "nogit"}:${head.dirty ? "dirty" : "clean"}:${files}`;
+  return `${sitePath}:${head.sha ?? "nogit"}:${head.dirty ? "dirty" : "clean"}:${files}:${scanned}`;
 }
 
 /** The host ids a rendered site declares, for the zone check. */
@@ -591,7 +653,11 @@ async function currentSource(site: { name: string | null; path: string }): Promi
   // than carried with it. Wrapping is what carries it. Note the distinction from the zone brand above:
   // `ZoneCheckedError` is declared here and a module has no reason to construct one, but if it did,
   // the consequence is a *milder* log line — whereas forging the zone error escalated to `exit 2`,
-  // which is why that one needed a `WeakSet` and this one does not.
+  // which is why the zone brand needed a `WeakSet` first. This one has the same treatment now: an
+  // `instanceof` walks a prototype chain, and a module handing back a revoked `Proxy` made the
+  // classification itself throw. Two rounds of this file said "and this one does not" after the
+  // `WeakSet` had already been added to both — the code moved and the sentence explaining why it
+  // needn't stayed.
   try {
     // The narrowed value, not `mod` plus a `!` at the use. The guard above is twenty lines from the use
     // and the compiler cannot see across the call, so an assertion there rested on an accident:
@@ -752,7 +818,21 @@ let readyMemo: {
 } | null = null;
 
 /**
- * `currentSource`, or a rejection once the budget is spent. Never hangs.
+ * `currentSource`, or a rejection once the budget is spent.
+ *
+ * ⚠️ **Not "never hangs", which is what this said.** The budget is a timer, and a timer cannot
+ * preempt synchronous code. `while (true) {}` at a policy module's top level blocks the event loop,
+ * so the callback that would reject never runs: measured, the process stays alive and answers
+ * nothing at all — no listener if it happens at startup, and no `/healthz` either way, so the
+ * liveness probe kills the pod and the next one does the same. Live in the deployed renderer too.
+ *
+ * There is no fix for this in the same realm, which is why the sentence is a warning rather than a
+ * TODO: interrupting the module means evaluating it somewhere with its own event loop — a
+ * `worker_thread` or a `vm` context. That is also the boundary the intrinsic captures above are
+ * explicitly *not*. The budget still does what it says for a module that hangs **asynchronously**,
+ * which is the common case and the one the test covers.
+ *
+ * @see src/policy-render-service.test.ts "answers even when a site module never settles"
  *
  * Used by the readiness route *and* by the startup verification, because the unbounded wait is worse
  * at startup: a module that never settles there means `server.listen` is never reached, so the
@@ -780,6 +860,9 @@ function evaluateWithin(
       budgetMs,
     );
     void currentSource(site).then(
+      // No `try` around `resolve`. Resolving an object does read `.then` off it, and a module can
+      // make that throw — but `currentSource` resolves its own object first, so its promise rejects
+      // and this handler is never entered. Written, then deleted when no mutation could make it fire.
       (source) => { disarm(timer); resolve(source); },
       // `asError`, not a cast. `throw null` in a policy module rejected the import with `null`,
       // which `/source`'s handler then read `.message` off — a `TypeError` in a rejection handler,
@@ -801,7 +884,12 @@ function evaluateWithin(
 }
 
 /**
- * Whether each site can be evaluated right now, bounded and memoised. Never rejects.
+ * Whether each site can be evaluated right now, bounded and memoised.
+ *
+ * This said "never rejects", which was true of the per-site failures it was written for — each one is
+ * caught below — and false of the collection. Resolving the answer reads a `then` a policy module can
+ * poison, so `/readyz` handles a rejection as well as an answer; without that it was exit 1 on the
+ * readiness probe, i.e. on a schedule.
  *
  * ## The window runs from when the answer *settled*, not from when it started
  *
@@ -820,19 +908,36 @@ function readiness(): Promise<{ serving: number; total: number }> {
   if (readyMemo && (readyMemo.settledAt === null || readClock() - readyMemo.settledAt < READY_MEMO_MS)) {
     return readyMemo.answer;
   }
-  const answer = Promise.all(
-    sites.map((site) => evaluateWithin(site, READY_SITE_BUDGET_MS).then(() => true, () => false)),
-  ).then((results) => ({ serving: results.filter(Boolean).length, total: results.length }));
+  // Not `Promise.all`: it resolves an array, and an array inherits a `then` a policy module can
+  // poison — see the startup loop. The per-site promises resolve booleans, which are primitives and
+  // run no thenable check at all, so only the collection had to change. Started before any is
+  // awaited, as before.
+  const started = sites.map((site) => evaluateWithin(site, READY_SITE_BUDGET_MS).then(() => true, () => false));
+  const answer = (async () => {
+    let serving = 0;
+    for (const one of started) if (await one) serving += 1;
+    // A plain object, deliberately. Resolving it reads `.then`, which a module can poison, and a
+    // `__proto__: null` literal here would dodge that — but `/readyz` already answers the resulting
+    // rejection, so both together meant reverting either one left every test green. One guard, the
+    // general one, is worth more than two that hide each other from a mutation check.
+    return { serving, total: started.length };
+  })();
   const memo: { settledAt: number | null; answer: typeof answer } = { settledAt: null, answer };
   readyMemo = memo;
-  // `void` because `answer` cannot reject — every per-site promise is already caught above — so this
-  // only ever stamps. The closure stamps **its own object**, not `readyMemo`, so a superseded memo
-  // can only mark itself and nothing reads it again. (This said "guarded on identity", which named a
-  // `readyMemo === memo` check that is not here and never was; the behaviour was right and the
-  // mechanism described was fiction, which is the worse of the two ways to be wrong in a comment.)
-  void answer.then(() => {
+  // Both handlers, not just one. Every per-site promise is caught above, so `answer` rejects only if
+  // the collection itself fails — which it can: resolving the answer reads a `then` a module may have
+  // poisoned. With one handler that rejection was unhandled, and a `void`ed unhandled rejection is
+  // exit 1. Stamping on either outcome is also correct: a settled failure is as stale as a settled
+  // success and must not pin the memo open.
+  //
+  // The closure stamps **its own object**, not `readyMemo`, so a superseded memo can only mark itself
+  // and nothing reads it again. (This said "guarded on identity", which named a `readyMemo === memo`
+  // check that is not here and never was; the behaviour was right and the mechanism described was
+  // fiction, which is the worse of the two ways to be wrong in a comment.)
+  const stamp = (): void => {
     memo.settledAt = readClock();
-  });
+  };
+  void answer.then(stamp, stamp);
   return answer;
 }
 
@@ -850,15 +955,42 @@ function bearerOk(header: string | undefined): boolean {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
+// ## Serialising is not safe either, and capturing `JSON.stringify` did not make it safe
+//
+// `JSON.stringify` calls a **`toJSON` method it finds on the value**, inherited included. So
+// `Object.defineProperty(Object.prototype, "toJSON", { value() { throw … } })` in a policy module
+// made every response throw — inside the request handler, which is an uncaught exception, so
+// **exit 1 on the first request**, `/healthz` included. Capturing the function closed nothing here:
+// the hook is on the value, not on the global. Measured, and live in the deployed renderer.
+//
+// Two answers. `/healthz` gets a body that was serialised when this file was written, so the liveness
+// probe never calls a serialiser at all. Everything else goes through a `send` that falls back to a
+// literal: an error code is kept (a 503 stays a 503 and says why it has no body), and a success code
+// becomes 500, because a 200 with a literal body would claim an empty policy is the policy.
+//
+// @see src/policy-render-service.test.ts "answers /healthz when the module poisoned serialisation"
+const HEALTHZ_BODY = '{"ok":true}';
+const UNSERIALISABLE_BODY = '{"error":"the answer could not be serialised"}';
+
 const server = createServer((req, res) => {
-  const send = (code: number, body: unknown): void => {
-    const text = toJson(body);
+  const raw = (code: number, text: string): void => {
     res.writeHead(code, {
       "content-type": "application/json; charset=utf-8",
       "cache-control": "no-store",
       "x-content-type-options": "nosniff",
     });
     res.end(text);
+  };
+  const send = (code: number, body: unknown): void => {
+    let text: string;
+    try {
+      text = toJson(body);
+    } catch {
+      log(`a response body could not be serialised — answering ${code >= 400 ? code : 500} without it`);
+      raw(code >= 400 ? code : 500, UNSERIALISABLE_BODY);
+      return;
+    }
+    raw(code, text);
   };
 
   // ## 🔴 A request target this cannot parse used to end the process
@@ -900,7 +1032,8 @@ const server = createServer((req, res) => {
   // second and would have had kubelet kill the container on demand. The fix this comment is pointing
   // at is below; the rule it leaves behind is that nothing reachable without the bearer may call
   // `currentSource` on the request path.
-  if (req.method === "GET" && url.pathname === "/healthz") return send(200, { ok: true });
+  // Not `send`: the liveness probe must not depend on a serialiser a policy module can hook.
+  if (req.method === "GET" && url.pathname === "/healthz") return raw(200, HEALTHZ_BODY);
 
   // ## Can this process serve any policy at all?
   //
@@ -946,11 +1079,21 @@ const server = createServer((req, res) => {
   // is the one that reached `/healthz`.
   if (req.method === "GET" && url.pathname === "/readyz") {
     if (!bearerOk(req.headers.authorization)) return send(401, { error: "bad or missing bearer" });
-    void readiness().then(({ serving, total }) => {
-      // One site is enough to be *up*. Refusing while two of three work would let a bad `dev.ts` take
-      // prod's and util's consoles down — the trade the startup verification below already refused.
-      send(serving > 0 ? 200 : 503, { ok: serving > 0, degraded: serving < total, serving, total });
-    });
+    void readiness().then(
+      ({ serving, total }) => {
+        // One site is enough to be *up*. Refusing while two of three work would let a bad `dev.ts`
+        // take prod's and util's consoles down — the trade the startup verification below refused.
+        send(serving > 0 ? 200 : 503, { ok: serving > 0, degraded: serving < total, serving, total, faults });
+      },
+      // `readiness` is documented as not rejecting and that was true of the per-site failures it was
+      // written for. It is not true of the collection: a module can poison the `then` that resolving
+      // the answer reads. Without this handler that rejection is unhandled and the process exits 1 —
+      // on `/readyz`, which is the readiness probe, so on a schedule.
+      (e: unknown) => {
+        log(`readiness could not be computed: ${reasonOf(e)}`);
+        send(503, { ok: false, degraded: true, error: "readiness could not be computed", faults });
+      },
+    );
     return;
   }
 
@@ -1049,22 +1192,28 @@ const server = createServer((req, res) => {
 // whole job and `/source` would run all of them the moment it came up — but it is a widening during
 // a boot already known to be misconfigured, and "no ordering between sites" is true of results and
 // says nothing about side effects, which is the only thing that moved.
-const verified = await Promise.all(
-  sites.map(async (site) => {
-    // Nothing was declared, so there is nothing to contradict.
-    if (site.name === null) return null;
-    try {
-      const source = await evaluateWithin(site, STARTUP_SITE_BUDGET_MS);
-      log(`verified ${site.name} — ${source.site.hosts?.length ?? 0} hosts`);
-      return null;
-    } catch (e) {
-      return { site, error: asError(e) };
-    }
-  }),
-);
+// ## Concurrent, but no array is ever resolved
+//
+// This was `await Promise.all(sites.map(...))` with the same per-site `try`, and the `try` did not
+// help: `Promise.all` resolves its **result array**, an array inherits from `Object.prototype`, and
+// a module that poisons `then` makes that resolution throw — outside every per-site handler, so an
+// unhandled rejection at the top level and exit 1 before `server.listen`. Each site's promise is
+// still started before any is awaited, so the imports still overlap; the results are collected by
+// side effect into a plain array this code owns and never hands to a promise.
+const failures: { site: (typeof sites)[number]; error: Error }[] = [];
+const pending = sites.map(async (site) => {
+  // Nothing was declared, so there is nothing to contradict.
+  if (site.name === null) return;
+  try {
+    const source = await evaluateWithin(site, STARTUP_SITE_BUDGET_MS);
+    log(`verified ${site.name} — ${source.site.hosts?.length ?? 0} hosts`);
+  } catch (e) {
+    failures.push({ site, error: asError(e) });
+  }
+});
+for (const one of pending) await one;
 
-for (const failure of verified) {
-  if (!failure) continue;
+for (const failure of failures) {
   const { site, error } = failure;
   const why = reasonOf(error);
   if (foundHere(error)) {

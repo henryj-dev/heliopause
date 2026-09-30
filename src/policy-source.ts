@@ -21,10 +21,16 @@
  *
  * ## What makes that safe rather than merely rearranged
  *
- * Everything in `PolicySource` is JSON. Measured before this file was written: `buildScreen` over the
- * live `dev.ts` produces a **byte-identical** `Screen` before and after `JSON.parse(JSON.stringify())`
- * of the site, and the site has exactly one function-valued field (`resolveService`), which is
- * carried here as a lookup table instead. There is no serialisation gap to paper over.
+ * Everything in `PolicySource` is JSON — because every field is put through the crossing, which is a
+ * property of the code below and not of the shapes a module happens to produce. Measured before this
+ * file was written: `buildScreen` over the live `dev.ts` produces a **byte-identical** `Screen` before
+ * and after `JSON.parse(JSON.stringify())` of the site, and the site has exactly one function-valued
+ * field (`resolveService`), which is carried here as a lookup table instead.
+ *
+ * ⚠️ That table was the exception until round eleven, and the sentence above was false for it: the
+ * resolver's return value was stored as it came back, so a circular object or a `BigInt` from
+ * `resolveService` passed startup verification and threw in the renderer's serialiser on the first
+ * request — an outage, from the one field this paragraph named as handled.
  *
  * The manager then treats this payload the way it treats any request body: untrusted input to
  * validate, not a module to trust. `parsePolicySource` is that check, and the escaping in
@@ -320,7 +326,14 @@ export function collectPolicySource(input: {
       const hit = resolver(ref);
       // Only non-null entries travel — see `PolicySource.services` for why the absence has to stay
       // an absence rather than becoming a `null` the far side reads as an answer.
-      if (hit) services[ref] = hit;
+      //
+      // ⚠️ `toWire`, like `site` below, and for the reason given there. This stored `hit` as it came
+      // back, so a resolver returning a circular object or a `BigInt` passed startup verification
+      // and then threw in the renderer's serialiser — on the **first request**, in the request
+      // handler, which is an uncaught exception and a full outage for every co-served site. Both
+      // measured, both live in the deployed renderer. Crossing here means the same mistake is a 503
+      // for the one site whose module made it, because this function runs inside that site's `try`.
+      if (hit) services[ref] = toWire(hit) as ServiceSelector;
     }
   }
 
