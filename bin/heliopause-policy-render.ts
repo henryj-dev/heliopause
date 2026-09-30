@@ -133,9 +133,23 @@ function foundHere(error: unknown): error is ZoneMismatchError {
  */
 function asError(thrown: unknown): Error {
   if (thrown instanceof Error) return thrown;
-  // `String(thrown)` and not `JSON.stringify`: the latter is `undefined` for a function and throws on
-  // a circular object, which would put the read back where it started.
-  return new Error(`policy module threw a non-error value: ${String(thrown)}`);
+  // ## The coercion is the part a module attacks next
+  //
+  // `String(thrown)` is not safe on a value a policy module chose. Measured, four of five hostile
+  // shapes made **this function** throw: a `toString` that throws, a `Symbol.toPrimitive` that throws,
+  // `Object.create(null)` (two tokens, no `toString` to find), and a Proxy whose `get` trap throws. Any
+  // of them restored the exact crash `asError` exists to prevent, from inside it.
+  //
+  // `typeof` cannot throw — not even through a Proxy, which has no trap for it — so the fallback is
+  // always available. `JSON.stringify` is not an alternative: `undefined` for a function, and it throws
+  // on a cycle, which is where this started.
+  let described: string;
+  try {
+    described = String(thrown);
+  } catch {
+    described = `a ${typeof thrown} that cannot be described`;
+  }
+  return new Error(`policy module threw a non-error value: ${described}`);
 }
 
 class ZoneCheckedError extends Error {

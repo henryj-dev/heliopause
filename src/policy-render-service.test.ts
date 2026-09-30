@@ -945,7 +945,17 @@ export const site = {
     // It also broke `ZoneCheckedError` directly: constructing it from `(e as Error).message` threw
     // inside the catch, so the wrapper never existed and a post-zone-check failure was blamed on the
     // declared name — the confusion that class exists to end.
-    for (const thrown of ["null", "undefined", "42", '"a string"', "{}"]) {
+    // The last four make coercion itself throw, which is what a module reaches for once `null` is
+    // handled: a `toString` that throws, a `Symbol.toPrimitive` that throws, `Object.create(null)`
+    // (no `toString` to find at all), and a Proxy whose `get` trap throws. Measured before the fix,
+    // four of five made `asError` throw — restoring the crash from inside the function that prevents it.
+    for (const thrown of [
+      "null", "undefined", "42", '"a string"', "{}",
+      "{ toString() { throw new Error('nope'); } }",
+      "{ [Symbol.toPrimitive]() { throw new Error('nope'); } }",
+      "Object.create(null)",
+      "new Proxy({}, { get() { throw new Error('nope'); } })",
+    ]) {
       const { dir, sites, beta } = twoSites();
       writeFileSync(beta, `throw ${thrown};\n`);
       let started: Started | undefined;
@@ -953,6 +963,15 @@ export const site = {
         started = await start(dir, MULTI(sites));
         const said = started.startupLog;
         assert.match(said, /beta .*did not evaluate at startup/, `throw ${thrown}: no report`);
+        // Not "the reason says non-error value" for every case: a thrown Proxy never reaches `asError`
+        // as itself. Node's own module machinery touches the rejected value first, its `get` trap
+        // throws, and what arrives here is already an ordinary `Error`. Asserting the message shape
+        // for that case failed against correct behaviour — the property is that the process survives
+        // and reports something an operator can act on, which the per-case checks here cover.
+        assert.doesNotMatch(
+          said, /until it does:\s*$/m,
+          `throw ${thrown}: the report had no reason in it at all`,
+        );
         // The reason has to name the value, not read as the word `undefined`.
         assert.doesNotMatch(
           said, /until it does: undefined$/m,
