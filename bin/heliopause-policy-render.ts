@@ -28,6 +28,7 @@
 // a sidecar cannot be given a different network identity from the process it is isolating.
 
 import { createServer } from "node:http";
+import { registerHooks } from "node:module";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -147,6 +148,44 @@ for (const site of sites) {
     process.exit(2);
   }
 }
+/**
+ * Carry the site module's version onto everything it imports from the policy checkout.
+ *
+ * ⚠ **`?v=` on the site module alone was not enough, and that was wrong for a month.** ES modules
+ * are cached by URL. The moving query re-evaluated `dev.ts`, and `dev.ts` then imported
+ * `./policies.json` — the same URL it had always been — and got the copy read at pod start. The
+ * stamp moved, the generation id moved, `files` (read from disk) moved, and the rules did not.
+ * Found 2026-09-30: three rules added from the console were published, confirmed on every host,
+ * and absent from every ruleset. The console edits `policies.json` and nothing else, so every
+ * console edit took this path.
+ *
+ * So a module that was loaded with a `v` passes it to what it imports from its own directory and
+ * below. The model under `../src` is this image's own code and is not versioned — it does not change
+ * between commits, and re-evaluating it would give each commit its own copy of every class the
+ * manager-facing code compares against.
+ *
+ * The directory is the *parent's*, not the configured site path. Node resolves to the real path, so
+ * a checkout behind a symlink — macOS's `/var` → `/private/var`, or a sync tool's link — resolves
+ * to URLs that a prefix built from the configured path never matches. The first version of this
+ * compared against the configured path and did nothing, silently; the parent's URL is on the same
+ * side of every symlink as its children.
+ */
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    const result = nextResolve(specifier, context);
+    if (!context.parentURL) return result;
+    const parent = new URL(context.parentURL);
+    const v = parent.searchParams.get("v");
+    if (v === null) return result;
+    const url = new URL(result.url);
+    if (url.protocol !== "file:" || url.searchParams.has("v")) return result;
+    const parentDir = parent.pathname.slice(0, parent.pathname.lastIndexOf("/") + 1);
+    if (!url.pathname.startsWith(parentDir)) return result;
+    url.searchParams.set("v", v);
+    return { ...result, url: url.href };
+  },
+});
+
 const allowPaths = (process.env.HELIOPAUSE_POLICY_ALLOW_PATHS ?? "policies.json")
   .split(",")
   .map((s) => s.trim())
@@ -214,7 +253,9 @@ if (!token) {
  * but not in a commit — which is what `dirty` means and what an operator sees mid-edit.
  *
  * The `?v=` on the import specifier is unchanged in purpose: ES modules are cached by URL, so
- * without a moving query a new checkout stays invisible until the process restarts.
+ * without a moving query a new checkout stays invisible until the process restarts. It reaches the
+ * files the module imports only through the resolve hook above — a query on the module alone left
+ * `policies.json` at its pod-start content for a month, under this key and this comment.
  *
  * A stale-on-error cache would be wrong here. If the module throws, the console must say so — a
  * screen that keeps drawing the last policy that worked is a screen that lies about what is

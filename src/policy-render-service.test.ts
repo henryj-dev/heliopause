@@ -306,6 +306,56 @@ describe("the renderer answers with a policy the manager can parse", () => {
     }
   });
 
+  it("renders an edit to a file the site module imports, not only the file's text", async () => {
+    // The test above checks `files["policies.json"]`, which is read from disk on every evaluation —
+    // so it passed while the policy itself stayed stale. The module *imports* that file, and ES
+    // modules are cached by URL: `?v=` on the site module re-evaluated the module and handed it the
+    // JSON it had read at pod start. The key moved, the generation moved, the text on screen moved,
+    // and the rules did not. Found 2026-09-30: three console-added mailer rules published as a new
+    // generation, confirmed on all three hosts, and absent from every ruleset.
+    //
+    // So this asserts on `site` — what the renderer evaluated — and the fixture derives it from the
+    // imported file the way `dev.ts` derives its policies from `policies.json`.
+    const dir = checkout();
+    let started: Started | undefined;
+    try {
+      writeFileSync(join(dir, "policies.json"), '{\n  "schemaVersion": 1,\n  "groups": [],\n  "tag": "before"\n}\n');
+      writeFileSync(
+        join(dir, "site.ts"),
+        `import P from "./policies.json" with { type: "json" };
+         export const site = {
+           cfg: { hookPolicy: { input: "drop", output: "accept" } },
+           hosts: [{ id: "h1", stage: "canary", items: [] }],
+           objects: [{ id: "ao-" + P.tag, kind: "address", name: P.tag, members: [{ kind: "cidr", value: "10.0.0.0/8" }] }],
+         };\n`,
+      );
+      const pinned = 1_700_000_000;
+      const site = join(dir, "site.ts");
+      utimesSync(site, pinned, pinned);
+      utimesSync(join(dir, "policies.json"), pinned, pinned);
+      started = await start(dir);
+      const objectIds = (s: { site: unknown }) => (s.site as { objects?: { id: string }[] }).objects?.map((o) => o.id);
+      const first = parsePolicySource(await (await fetchSource(started.port)).json());
+      assert.deepEqual(objectIds(first), ["ao-before"]);
+
+      writeFileSync(join(dir, "policies.json"), '{\n  "schemaVersion": 1,\n  "groups": [],\n  "tag": "after"\n}\n');
+      // A different whole second, so the stamp moves on the JSON file alone and not on rounding.
+      utimesSync(join(dir, "policies.json"), pinned + 1, pinned + 1);
+      utimesSync(site, pinned, pinned);
+
+      const second = parsePolicySource(await (await fetchSource(started.port)).json());
+      assert.match(second.files["policies.json"] ?? "", /"after"/, "the fixture did not land");
+      assert.deepEqual(
+        objectIds(second),
+        ["ao-after"],
+        "the file on screen changed and the policy rendered from it did not",
+      );
+    } finally {
+      started?.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("reports a broken policy module instead of serving a stale one", async () => {
     // A cache that keeps the last policy that evaluated is a screen that lies about what is
     // deployed, and it lies most convincingly right after somebody breaks the policy.
