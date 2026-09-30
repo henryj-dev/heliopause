@@ -13,7 +13,7 @@
   // Removing a row is how an approval is revoked, and the classic console's comment says what that
   // means: `ao-operators` is the union of a person's devices, so deleting a row narrows every rule
   // scoped to them. The confirmation therefore names the address rather than only the device — two
-  // machines can share a name ("Henryui-MacBookPro.local" appears twice in the account), and the
+  // machines can share a name (a laptop model name appears twice in this account), and the
   // address is what a rule actually matched on.
   //
   // ⚠️ **A row with no `notes` is not a defect.** Most devices need no argument. The three that carry
