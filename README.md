@@ -420,8 +420,14 @@ every target host confirmed it, and none of the three was in any ruleset: the re
 the new commit's id over the old commit's rules. Every status in this system was honest, and every
 one of them was green. So a change is checked twice, at two different layers:
 
-- **before approving**, that the plan's diff contains the change — the plan is the last point where
-  the rendered result, rather than the source, is in front of a person;
+- **before approving**, in the plan card's **per-host table**: for the host the changed rule
+  applies to, the rule count or the ruleset hash differs from the last published plan's, and
+  *show nftables* contains the rule (its comment is `<id> <name>`). The card's other panel —
+  *against what the fleet is running* — is a **source** diff of commits and files. It showed the
+  edit in the incident above, because the edit was in the source; only the per-host table would
+  have shown that the rendered ruleset had not moved. Make the check with a change that alters the
+  rendered output (ports, a source, a destination, a name): editing only `notes` or `priority`
+  leaves the ruleset identical, and a check that cannot fail proves nothing;
 - **after confirming**, that the rule is on the host (`nft list table inet heliopause`) or,
   better, that the traffic it exists for now passes. The ruleset shows what was rendered; the
   traffic shows what is enforced.
