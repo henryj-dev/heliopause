@@ -300,7 +300,8 @@ const publicWeb: Policy = {
 ```
 
 `ports` accepts `"22"`, `"80,443"`, `"1000:2000"`, `"@service-object"`, or `""` for every port.
-`priority` only becomes significant once the chain default is deny. `denyMode` is a *sub-mode* of
+`priority` orders the console's tables and nothing else — no renderer reads it. The host layer puts
+every deny before every allow, each in the order the site wires them. `denyMode` is a *sub-mode* of
 `deny` rather than a third action, so that enforcement layers which can express "block" but not
 "reject" degrade in style instead of in meaning.
 

@@ -29,7 +29,7 @@
 
 import { createServer } from "node:http";
 import { registerHooks } from "node:module";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { timingSafeEqual } from "node:crypto";
@@ -159,28 +159,40 @@ for (const site of sites) {
  * and absent from every ruleset. The console edits `policies.json` and nothing else, so every
  * console edit took this path.
  *
- * So a module that was loaded with a `v` passes it to what it imports from its own directory and
- * below. The model under `../src` is this image's own code and is not versioned — it does not change
- * between commits, and re-evaluating it would give each commit its own copy of every class the
+ * So a module that was loaded with a `v` passes it to what it imports from the policy tree. The
+ * model under `../src` is this image's own code and is not versioned — it does not change between
+ * commits, and re-evaluating it would give each commit its own copy of every class the
  * manager-facing code compares against.
  *
- * The directory is the *parent's*, not the configured site path. Node resolves to the real path, so
- * a checkout behind a symlink — macOS's `/var` → `/private/var`, or a sync tool's link — resolves
- * to URLs that a prefix built from the configured path never matches. The first version of this
- * compared against the configured path and did nothing, silently; the parent's URL is on the same
- * side of every symlink as its children.
+ * The tree is compared by **real path**. Node resolves to the real path, so a checkout behind a
+ * symlink — macOS's `/var` → `/private/var`, or a sync tool's link — resolves to URLs that a prefix
+ * built from the configured path never matches. The first version of this compared against the
+ * configured path and did nothing, silently.
  */
+//
+// ## The boundary is the policy tree, not the importing module's directory
+//
+// The second version keyed on the parent's directory, and an independent review found two holes in
+// it the day after: `sub/a.ts` importing `../up.json` got the pod-start copy, and `../class.ts`
+// loaded twice — versioned from the root, bare from `sub/` — so `instanceof` went false on the
+// first evaluation. One rule closes both: every file under a site module's own directory gets the
+// same `v`, whichever policy module asked for it. `node_modules` is left alone even inside that
+// tree; a package is not policy, and re-evaluating it per commit is a class-identity hazard with
+// no stale-data benefit.
+//
+// The roots are real paths, refreshed each time a site is evaluated (`currentSource`), because the
+// resolver answers in real paths and a checkout can sit behind a link that is re-pointed.
+const policyRoots = new Set<string>();
 registerHooks({
   resolve(specifier, context, nextResolve) {
     const result = nextResolve(specifier, context);
     if (!context.parentURL) return result;
-    const parent = new URL(context.parentURL);
-    const v = parent.searchParams.get("v");
+    const v = new URL(context.parentURL).searchParams.get("v");
     if (v === null) return result;
     const url = new URL(result.url);
     if (url.protocol !== "file:" || url.searchParams.has("v")) return result;
-    const parentDir = parent.pathname.slice(0, parent.pathname.lastIndexOf("/") + 1);
-    if (!url.pathname.startsWith(parentDir)) return result;
+    if (url.pathname.includes("/node_modules/")) return result;
+    if (![...policyRoots].some((root) => url.pathname.startsWith(root))) return result;
     url.searchParams.set("v", v);
     return { ...result, url: url.href };
   },
@@ -305,6 +317,8 @@ async function currentSource(site: { name: string | null; path: string }): Promi
   const stamp = sourceStamp(sitePath);
   const hit = cached.get(sitePath);
   if (hit && hit.stamp === stamp) return hit.source;
+  // Before the import, so the hook above knows which tree this evaluation may version.
+  policyRoots.add(`${pathToFileURL(realpathSync(dirname(resolve(sitePath)))).pathname}/`);
   // The import specifier still needs a value that moves, and `stamp` is not URL-safe.
   const mod = (await import(`${pathToFileURL(sitePath).href}?v=${encodeURIComponent(stamp)}`)) as {
     site?: ScreenSite;
