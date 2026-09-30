@@ -21,7 +21,7 @@ import {
 } from "./devices.ts";
 
 const ROW = {
-  deviceId: "e73e4b57-4ee0-11f1-90c8-1ec42bb3084a",
+  deviceId: "00000000-0000-4000-8000-000000000001",
   deviceName: "a phone",
   userEmail: "someone@example.invalid",
   v4: "10.0.0.1",
