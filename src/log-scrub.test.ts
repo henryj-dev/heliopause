@@ -57,9 +57,12 @@ describe("text from an untrusted party cannot become a second log line", () => {
     assert.equal(oneLine("short", 10), "short", "a short string was touched");
   });
 
-  it("flattens before it slices, so a cut cannot manufacture a line break", () => {
-    // Only one order is safe: slicing first could end a line mid-escape and leave a real newline as
-    // the last character of the output.
+  it("has no line-ending character left in a capped result", () => {
+    // ⚠️ This was "flattens before it slices, so a cut cannot manufacture a line break", and that
+    // reasoning is **wrong**: the substitution is one character for one character, so it commutes
+    // with a code-point truncation. Measured across 20 probes of both orders — 0 differed. The order
+    // in the code is the readable one, not a safety property, and the assertion that remains is the
+    // outcome rather than the invented mechanism.
     assert.doesNotMatch(oneLine("a\nb".repeat(50), 20), ENDS_A_LINE);
   });
 });

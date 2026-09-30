@@ -79,14 +79,37 @@ const log = (m: string): void => console.log(`[policy-render] ${oneLine(m)}`);
  * `/opt/heliopause/src`. So one line in a policy commit could take every co-served site's console down,
  * which is the outage the startup block spends a paragraph refusing to manufacture.
  *
- * This subclass is declared here and exported nowhere, so a module has no way to obtain it. A
- * module-authored `ZoneMismatchError` is now an ordinary content fault: wrapped as `ZoneCheckedError`,
- * logged, that site answers 503, and the pod stays up.
+ * 🔴 **A subclass does not brand it, and that was this file's first answer.** `class Own extends
+ * ZoneMismatchError {}` inherits statics, so `Own[Symbol.hasInstance]` resolves up the chain to
+ * `ZoneMismatchError[Symbol.hasInstance]` — which a module can define, because it holds the same class
+ * object. Measured: after `Object.defineProperty(ZoneMismatchError, Symbol.hasInstance, {value: () =>
+ * true})`, a plainly-constructed error satisfies `instanceof Own`. The brand has to be something a
+ * module cannot name at all.
+ *
+ * A `WeakSet` this module closes over is that: membership is not a property of the error, not on any
+ * prototype, and not reachable through the class. `Symbol.hasInstance`, `setPrototypeOf`, a forged
+ * prototype chain and prototype pollution all move properties around and none of them can add an
+ * entry here. Weak so a refused error is still collectable.
+ *
+ * A module-authored `ZoneMismatchError` is therefore an ordinary content fault: wrapped as
+ * `ZoneCheckedError`, logged, that site answers 503, and the pod stays up.
  *
  * @see src/policy-render-service.test.ts "a module cannot force a refusal by throwing the renderer's
  *      own error class"
  */
-class OwnZoneMismatchError extends ZoneMismatchError {}
+const OUR_ZONE_MISMATCHES = new WeakSet<ZoneMismatchError>();
+
+/** A zone mismatch this process found. Registered so `foundHere` can recognise it later. */
+function ownZoneMismatch(message: string): ZoneMismatchError {
+  const error = new ZoneMismatchError(message);
+  OUR_ZONE_MISMATCHES.add(error);
+  return error;
+}
+
+/** Whether this process constructed `error`. Unspoofable because the set is unreachable. */
+function foundHere(error: unknown): error is ZoneMismatchError {
+  return error instanceof Error && OUR_ZONE_MISMATCHES.has(error as ZoneMismatchError);
+}
 
 /**
  * Whatever was thrown, as an `Error`.
@@ -409,7 +432,7 @@ async function currentSource(site: { name: string | null; path: string }): Promi
   // holds; the startup one is the one that is loud. Throwing here surfaces as the 503 below, which
   // is the right shape — the module is present and this process will not vouch for it.
   const wrongZone = name === null ? null : zoneMismatch({ target: name, hostIds: hostIdsOf(mod.site) });
-  if (wrongZone) throw new OwnZoneMismatchError(wrongZone);
+  if (wrongZone) throw ownZoneMismatch(wrongZone);
   // ## Everything past this point has been zone-checked, and the caller needs to know that
   //
   // The startup verification logs "the declared-name check did not run" on any failure that is not a
@@ -423,8 +446,10 @@ async function currentSource(site: { name: string | null; path: string }): Promi
   //
   // That is the round-three defect inverted — it under-claimed, this over-claimed — and the reason
   // both happened is that the distinction was being inferred from where the failure came from rather
-  // than carried with it. Wrapping is what carries it, and `instanceof` is unspoofable by a module
-  // in a way the message text never was.
+  // than carried with it. Wrapping is what carries it. Note the distinction from the zone brand above:
+  // `ZoneCheckedError` is declared here and a module has no reason to construct one, but if it did,
+  // the consequence is a *milder* log line — whereas forging the zone error escalated to `exit 2`,
+  // which is why that one needed a `WeakSet` and this one does not.
   try {
     // The narrowed value, not `mod` plus a `!` at the use. The guard above is twenty lines from the use
     // and the compiler cannot see across the call, so an assertion there rested on an accident:
@@ -433,7 +458,7 @@ async function currentSource(site: { name: string | null; path: string }): Promi
   } catch (e) {
     // Only ours passes through. A `ZoneMismatchError` reaching here came from the module -- the
     // class is shared, so its type says nothing about who built it -- and that is a content fault.
-    if (e instanceof OwnZoneMismatchError) throw e;
+    if (foundHere(e)) throw e;
     throw new ZoneCheckedError(asError(e).message, { cause: e });
   }
 }
@@ -608,7 +633,15 @@ function evaluateWithin(
     );
     void currentSource(site).then(
       (source) => { clearTimeout(timer); resolve(source); },
-      (e: unknown) => { clearTimeout(timer); reject(e as Error); },
+      // `asError`, not a cast. `throw null` in a policy module rejected the import with `null`,
+      // which `/source`'s handler then read `.message` off — a `TypeError` in a rejection handler,
+      // so an unhandled rejection, so **exit 1 on the first request**. The startup loop had its own
+      // `asError` and survived, which made it worse: the pod passed both probes and died when the
+      // manager asked for policy, so the crashloop was driven by ordinary polling. Every consumer of
+      // `currentSource` comes through here, which is why the normalisation belongs here and not at
+      // the four places that read `.message` — the same "second path a per-call-site fix forgets"
+      // this file noted about `console.error` one commit earlier, repeated.
+      (e: unknown) => { clearTimeout(timer); reject(asError(e)); },
     );
   });
 }
@@ -862,7 +895,7 @@ for (const failure of verified) {
   if (!failure) continue;
   const { site, error } = failure;
   const why = error.message;
-  if (error instanceof OwnZoneMismatchError) {
+  if (foundHere(error)) {
     // `oneLine` here too: `why` is built from host ids the policy module declares, so it carries the
     // same forgery channel as any other module-supplied text. `console.error` does not go through
     // `log`, which is exactly the kind of second path a per-call-site fix forgets.

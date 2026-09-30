@@ -899,7 +899,12 @@ site.hosts[0].notes = cycle;
     // module's `../src/site-zone.ts` resolves to the same file the renderer imports.
     rmSync(join(dir, "..", "src"), { recursive: true, force: true });
     symlinkSync(fileURLToPath(new URL(".", import.meta.url)), join(dir, "..", "src"));
+    // Two ways in, and the second is why the brand is a `WeakSet` rather than a subclass: a subclass
+    // inherits statics, so `Symbol.hasInstance` defined on the shared parent makes `instanceof
+    // <subclass>` answer true for anything. Measured before the fix — a plainly-constructed error
+    // satisfied `instanceof Own`. A module cannot add an entry to a set it cannot name.
     writeFileSync(beta, `import { ZoneMismatchError } from "../src/site-zone.ts";
+Object.defineProperty(ZoneMismatchError, Symbol.hasInstance, { value: () => true, configurable: true });
 export const site = {
   cfg: { hookPolicy: { input: "drop", output: "accept" } },
   hosts: [{ id: "gw-01.beta", stage: "canary", items: [] }],
@@ -920,6 +925,8 @@ export const site = {
       );
       // alpha is untouched, so it must still be served — the pod staying up is the whole point.
       assert.equal((await fetchAt(started.port, "/source?site=alpha")).status, 200);
+      // And beta answers, rather than the request being the thing that kills the process.
+      assert.equal((await fetchAt(started.port, "/source?site=beta")).status, 503);
     } finally {
       started?.stop();
       rmSync(join(dir, ".."), { recursive: true, force: true });
@@ -956,6 +963,41 @@ export const site = {
         started?.stop();
         rmSync(join(dir, ".."), { recursive: true, force: true });
       }
+    }
+  });
+
+  it("answers 503 rather than dying when a nullish throw reaches a request", { timeout: 30_000 }, async () => {
+    // ## The half the startup fix did not cover, and it is the worse half
+    //
+    // `asError` was applied where the startup loop catches, so a module's `throw null` stopped killing
+    // startup — and that made it worse. Measured: the pod came up, `/healthz` answered 200, and the
+    // **first `/source` request** read `.message` off `null` inside a rejection handler, so an
+    // unhandled rejection took the process out with exit 1. It passed both probes and then died when
+    // the manager asked for policy, which is a crashloop driven by ordinary polling.
+    //
+    // The normalisation now sits in `evaluateWithin`'s rejection, which every consumer of
+    // `currentSource` passes through — `/source`, `/readyz` and the startup loop — rather than at the
+    // four places that read `.message`. This file noted that exact "second path a per-call-site fix
+    // forgets" about `console.error` one commit before repeating it.
+    const { dir, sites, beta } = twoSites();
+    writeFileSync(beta, "throw null;\n");
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      assert.equal((await fetchAt(started.port, "/healthz")).status, 200);
+      const res = await fetchAt(started.port, "/source?site=beta");
+      assert.equal(res.status, 503, "a nullish throw did not become a 503");
+      assert.match(
+        String(((await res.json()) as { error?: string }).error),
+        /policy module threw a non-error value: null/,
+        "the reason did not name the value that was thrown",
+      );
+      // Still alive, and still serving its sibling — the property the exit-1 crash destroyed.
+      assert.equal((await fetchAt(started.port, "/source?site=alpha")).status, 200);
+      assert.equal((await fetchAt(started.port, "/healthz")).status, 200);
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
     }
   });
 

@@ -43,8 +43,17 @@ const UNSAFE = new RegExp(`[\\u0000-\\u001F\\u007F-\\u009F${LINE_SEPARATORS}]`, 
 export function oneLine(text: string, max = 2_000): string {
   const flat = text.replace(UNSAFE, "\uFFFD");
   if (flat.length <= max) return flat;
-  // Sliced on a code-point boundary. A plain `slice` can cut a surrogate pair, and the caller's text
-  // is attacker-chosen, so its length is too: a module can pick padding that puts the cut inside an
-  // emoji and get a lone surrogate on the way to the encoder.
-  return [...flat].slice(0, max).join("");
+  // Cut on a code-point boundary: a plain `slice` can split a surrogate pair, and the caller's text is
+  // attacker-chosen, so the length at which the cut lands is too — a module can pick padding that puts
+  // it inside an emoji and get a lone surrogate on the way to the encoder.
+  //
+  // Walked rather than `[...flat].slice(max)`, which built an array of every code point in the input
+  // before throwing nearly all of it away: measured 17ms on a 5MB throw, and a module chooses that
+  // size. This touches `max` code points regardless of how much was thrown.
+  let cut = 0;
+  for (let i = 0; i < max && cut < flat.length; i += 1) {
+    const point = flat.codePointAt(cut);
+    cut += point !== undefined && point > 0xffff ? 2 : 1;
+  }
+  return flat.slice(0, cut);
 }
