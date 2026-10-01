@@ -6,6 +6,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
+  COVERAGE_STALE_SEC,
   coverageRows,
   coverageSummary,
   verdictFor,
@@ -167,9 +168,96 @@ describe("coverageRows", () => {
     assert.equal(rows[0]!.v4.verdict, "pass");
   });
 
+  // The boundary, pinned on both sides. `rollout.test.ts` pins the relay's the same way and for the
+  // same reason: a comparison written `>` and a comparison written `>=` both pass a test that only
+  // probes far from the edge, and the one that is wrong is wrong by exactly one slot.
+  it("does not call a probe stale at the window, and does one second past it", () => {
+    const at = "2026-08-12T11:00:00Z"; // exactly 3600s before NOW
+    const exact = coverageRows([check()], [probe({ at })], { now: NOW, staleAfterSec: 3600 });
+    assert.equal(exact[0]!.v4.ageSec, 3600);
+    assert.equal(exact[0]!.v4.stale, false, "at the window is not yet stale");
+
+    const past = coverageRows([check()], [probe({ at })], { now: NOW, staleAfterSec: 3599 });
+    assert.equal(past[0]!.v4.stale, true, "one second past the window is stale");
+  });
+
+  // The default is what production runs with: no caller passes `staleAfterSec`.
+  it("defaults the window to COVERAGE_STALE_SEC", () => {
+    const justInside = new Date(Date.parse(NOW) - COVERAGE_STALE_SEC * 1000).toISOString();
+    assert.equal(coverageRows([check()], [probe({ at: justInside })], { now: NOW })[0]!.v4.stale, false);
+
+    const justOutside = new Date(Date.parse(NOW) - (COVERAGE_STALE_SEC + 1) * 1000).toISOString();
+    assert.equal(coverageRows([check()], [probe({ at: justOutside })], { now: NOW })[0]!.v4.stale, true);
+  });
+
+  // Two missed slots, not one. The window is derived from the cron, so this is the statement that
+  // breaks if somebody changes one without the other.
+  it("tolerates one missed slot of the four-a-day cadence and not two", () => {
+    const slotSec = 6 * 3600;
+    assert.ok(COVERAGE_STALE_SEC > 2 * slotSec, "one missed slot peaks at two intervals — not stale");
+    assert.ok(COVERAGE_STALE_SEC < 3 * slotSec, "two missed slots reach three intervals — stale");
+  });
+
   it("carries the vantage point onto the cell", () => {
     const rows = coverageRows([check()], [probe({ observedFrom: "github-actions" })], { now: NOW });
     assert.equal(rows[0]!.v4.observedFrom, "github-actions");
+  });
+});
+
+describe("coverageSummary staleness", () => {
+  const reach = (over: Partial<CoverageCheck> = {}): CoverageCheck =>
+    check({ expect: "reach", ...over });
+  const connected = (over: Partial<Probe> = {}): Probe =>
+    probe({ outcome: "connected", ...over });
+
+  it("counts a current pass in passing and not in stale", () => {
+    const s = coverageSummary(
+      coverageRows([reach()], [connected(), connected({ family: "v6", addr: "2001:db8::1" })], { now: NOW }),
+    );
+    assert.equal(s.passing, 1);
+    assert.equal(s.stale, 0);
+  });
+
+  // The defect this field exists for: the cell drew `△ stale` while the banner above it said the
+  // check was passing. A reader skims the banner.
+  it("counts a stale pass in stale and not in passing", () => {
+    const old = "2026-08-11T12:00:00Z"; // a day before NOW
+    const s = coverageSummary(
+      coverageRows(
+        [reach()],
+        [connected({ at: old }), connected({ family: "v6", addr: "2001:db8::1", at: old })],
+        { now: NOW },
+      ),
+    );
+    assert.equal(s.stale, 1);
+    assert.equal(s.passing, 0, "a stale pass must not read as currently passing");
+  });
+
+  it("keeps a failure a failure however old it is", () => {
+    const old = "2026-08-11T12:00:00Z";
+    // `expect: "blocked"` with `connected` is a fail — the rule did not drop the packet.
+    const s = coverageSummary(coverageRows([check()], [connected({ at: old })], { now: NOW }));
+    assert.equal(s.failing, 1);
+    assert.equal(s.stale, 0, "age must not demote a failure out of the count to act on");
+  });
+
+  it("keeps an unmeasured cell unknown rather than stale", () => {
+    const s = coverageSummary(coverageRows([reach()], [], { now: NOW }));
+    assert.equal(s.unknown, 1);
+    assert.equal(s.stale, 0, "never measured and measured a while ago are different statements");
+  });
+
+  // A stale v4 and a current v6 is one check, and the worse of the two decides.
+  it("counts the check as stale when either family is stale", () => {
+    const s = coverageSummary(
+      coverageRows(
+        [reach()],
+        [connected({ at: "2026-08-11T12:00:00Z" }), connected({ family: "v6", addr: "2001:db8::1" })],
+        { now: NOW },
+      ),
+    );
+    assert.equal(s.stale, 1);
+    assert.equal(s.passing, 0);
   });
 });
 

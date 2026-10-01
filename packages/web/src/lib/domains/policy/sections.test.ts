@@ -69,7 +69,7 @@ describe("presentSections", () => {
       // nowhere and was never checked. The assertion below happened to hold either way, which is
       // exactly why nothing surfaced it.
       devices: { rows: [], unapproved: [], compared: false, readAt: null, addressless: 0 },
-      coverage: { rows: [], failing: 0, unknown: 0, passing: 0 },
+      coverage: { rows: [], failing: 0, unknown: 0, passing: 0, stale: 0 },
     })).map((s) => s.id);
     assert.ok(!listed.includes("devices"), "an empty devices object is not a devices table");
     assert.ok(!listed.includes("coverage"), "an empty coverage object is not a coverage table");
