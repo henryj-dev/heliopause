@@ -3442,11 +3442,13 @@ class TestTheApplyPathReadsTheVerifiedArtifact(unittest.TestCase):
     """
 
     class _Claim(str):
-        """The envelope's generation **value**, which records being used.
+        """The envelope's generation **value**, recording the four operations overridden below.
 
         One of two layers. This one survives a read that bypasses the container — `dict.get(env, key)`,
-        `dict.__getitem__`, `pop` — because the thing recorded is the value's own comparison or
-        stringification, which is what a path would have to do to act on it.
+        `dict.__getitem__`, `pop` — **provided the value is then compared, stringified or interpolated.**
+        A path can act on it without any of those: `startswith`, `hash` and `is` all reach past these
+        overrides, which is why the earlier wording here ("what a path would have to do to act on it")
+        was wrong. @see `_Envelope` for the measured table and the known escapes
         """
 
         def __new__(cls, value, uses):
@@ -3476,13 +3478,16 @@ class TestTheApplyPathReadsTheVerifiedArtifact(unittest.TestCase):
     class _Envelope(dict):
         """The container, which records the ways its `generation` can be reached.
 
-        ## What this observes, measured rather than assumed
+        ## What this observes, measured rather than assumed — and the measurement corrected once
 
         The first version intercepted `get` alone and its docstring said it recorded every read. A review
-        found four ways past it in one pass. These are the paths that were then **tried and measured**
-        (2026-10-01), with which layer saw each:
+        found four ways past it in one pass. The replacement came with a table, and **the table was wrong
+        too**: the probe script that produced it compared each retrieved value against a string, so every
+        tick in the value column came from *that* comparison and not from the expression printed beside
+        it. Bare retrieval records nothing. Measured again, with the comparison called out
+        (2026-10-01):
 
-        | access | container | value |
+        | access | container, bare | value, after one `==` |
         |---|---|---|
         | `env.get("generation")` | ✓ | ✓ |
         | `env["generation"]` | ✓ | ✓ |
@@ -3496,11 +3501,28 @@ class TestTheApplyPathReadsTheVerifiedArtifact(unittest.TestCase):
         | `dict.__getitem__(env, ...)` | — | ✓ |
         | `env.pop("generation")` | — | ✓ |
 
-        ⚠️ **Not a completeness claim.** The two layers happen to be complementary across everything
-        tried, and the union is what the assertions read — but a read that neither touches the container
-        through these methods nor compares or stringifies the value is unobserved, and so is anything
-        reaching the dict from C. What the tests may say is "none of the accesses this observes
-        happened", which is weaker than "never read" and is the sentence they now use.
+        The value layer sees exactly the four operations `_Claim` overrides: `__eq__`, `__ne__`,
+        `__str__`, `__format__`. Nothing else.
+
+        ⚠️ **Not a completeness claim, and these are the known ways past it.**
+
+        · A **bare retrieval** that never compares, stringifies or interpolates the value — both columns
+          blank. `dict.get(env, "generation")` on its own is the smallest example.
+        · `startswith` and the other `str` methods, `hash`, and identity (`is`): each can steer a branch
+          without reaching an override. A review built a passing escape from exactly those —
+          `dict.get(…).startswith(…)` guarding a later access — and it is caught now only because the
+          later access touches the container.
+        · Anything reaching the dict from C, which these Python-level overrides cannot see.
+
+        What the tests may therefore say is "none of the accesses this observes happened". That is
+        weaker than "never read", and it is the sentence they use.
+
+        ## Reusing this for the remaining conversions
+
+        One known difference in behaviour, measured: `_Claim` changes comparison dispatch against a
+        **sibling `str` subclass with its own `__eq__`** — `plain == sibling` is False where
+        `claim == sibling` is True. These fixtures compare against plain strings only, so nothing here is
+        affected, but a conversion that compares two subclasses would need to know.
         """
 
         def __init__(self, *a, **kw):
@@ -3652,10 +3674,21 @@ class TestTheApplyPathReadsTheVerifiedArtifact(unittest.TestCase):
                 envelope = self._envelope(envelope_gen)
                 verified = {"generation": verified_gen, "payload": "..."}
                 hp.fetch_artifact = lambda: envelope
-                # 🔑 The counts as the verifier hands back, so the assertion below is about what happened
-                # **after** it. The observer was asserted only on the refusal path before, and a review
-                # inserted `envelope.get("generation")` after a successful verification and watched both
-                # tests stay green: the supported access was unguarded on the path that proceeds.
+                # ## 🔑 Empty on the way in, and empty on the way out
+                #
+                # The counts are captured as the verifier hands back and asserted **empty**, not merely
+                # unchanged. Comparing against the snapshot was the first attempt and it absorbed
+                # whatever happened before the verifier into its own baseline: a review inserted
+                #
+                #     if dict.get(envelope, "generation").startswith("g-wanted"):
+                #         envelope["generation"]
+                #
+                # which made the refusal test red and left **both halves of this one green**.
+                #
+                # ⚠️ The assertion is out here rather than inside the stub on purpose. `handle_reply` calls
+                # the verifier inside `try: … except Exception`, so an `AssertionError` raised in there is
+                # swallowed and reappears as a refusal — the test would then fail, or pass, for a reason
+                # that has nothing to do with the envelope.
                 at_return = {}
 
                 def verify(_e, now=None):
@@ -3666,12 +3699,15 @@ class TestTheApplyPathReadsTheVerifiedArtifact(unittest.TestCase):
                 hp.verify_artifact_envelope = verify
                 self._beat()
                 self.assertEqual(
-                    (envelope.touches, self.value_uses),
-                    (at_return["touches"], at_return["uses"]),
+                    (at_return.get("touches"), at_return.get("uses")), ([], []),
+                    "the envelope was consulted for its generation **before** the verifier returned "
+                    f"one: {at_return}. Nothing upstream of verification is supposed to look at it.",
+                )
+                self.assertEqual(
+                    (envelope.touches, self.value_uses), ([], []),
                     "the envelope was consulted for its generation after the verifier had already "
                     "returned one. Everything downstream is supposed to read the verifier's artifact; "
-                    f"the envelope gained {envelope.touches[len(at_return['touches']):]} and "
-                    f"{self.value_uses[len(at_return['uses']):]}.",
+                    f"the envelope recorded {envelope.touches} and {self.value_uses}.",
                 )
                 if expect_proceed:
                     self.assertIn(
