@@ -1258,6 +1258,104 @@ export const site = {
     }
   });
 
+  it("serves a 200-deep tree under at most 64 descriptors", { timeout: 60_000 }, async () => {
+    // ## Named for what it shows, on the third attempt
+    //
+    // The walk opens a directory handle, reads it, and closes it in a `finally` before opening the next,
+    // so in the implementation descriptor use is constant in the depth of the tree. **This test cannot
+    // see that.** Two earlier names claimed more than it measures:
+    //
+    //   · "holds one directory handle at a time" — an implementation holding two passes just as well.
+    //   · "does not use more descriptors as the tree gets deeper" — a review retained every tenth handle
+    //     and measured peak use going from 3 at depth 20 to 21 at depth 200, while **both** scans still
+    //     succeeded under a 64-handle budget. Growth was present and the test was green.
+    //
+    // What it establishes is the sentence in its name: this tree, this budget, served. That rules out
+    // descriptor use that grows *unboundedly* with depth, which is what a leaked handle per level looks
+    // like, and rules out nothing finer. Each earlier name was the property I wanted rather than the one
+    // being measured — the same substitution this file keeps recording, three times on one line.
+    //
+    // It exists because nothing else asserted any of this: a mutation matrix came back six-for-six red
+    // and none of those six removed the closure, injected a read failure, or counted descriptors. "Six
+    // red" said nothing about resource behaviour at all.
+    //
+    // ## 🔴 And the limit has to be checked, because asking for it can fail
+    //
+    // `ulimit -n 64` fails on a host whose **hard** limit is lower, and the shell then carries on under
+    // whatever the limit already was. If that is 1024, a 200-deep chain proves nothing and this test
+    // passes anyway — a resource assertion that silently stops asserting, which is worse than not having
+    // one. So the child reports the limit it actually runs under and the assertion below requires it to
+    // be no higher than what was asked for. Lower is stricter and fine; higher is a failure.
+    const LIMIT = 64;
+    const DEPTH = 200;
+    let started: { proc: ChildProcessByStdio<null, Readable, Readable>; dir: string } | undefined;
+    const { dir, sites, beta } = twoSites();
+    try {
+      let deep = dir;
+      for (let i = 0; i < DEPTH; i += 1) {
+        deep = join(deep, `d${i}`);
+        mkdirSync(deep);
+      }
+      writeFileSync(join(deep, "leaf.ts"), "export const leaf = 1;\n");
+      writeFileSync(beta, `export const site = {
+  cfg: { hookPolicy: { input: "drop", output: "accept" } },
+  hosts: [{ id: "gw-01.beta", stage: "canary", items: [] }],
+};
+`);
+    // `ulimit` is a shell builtin, so the child is started through `sh`. `exec` keeps the process
+    // identity the harness's reader expects, and `ulimit -n` afterwards prints what was actually
+    // applied — the value the assertion reads, rather than the value that was requested.
+    const proc = spawn("sh", ["-c", `ulimit -n ${LIMIT}; ulimit -n 1>&2; exec "$0" "$@"`, process.execPath, BIN], {
+      env: {
+        PATH: process.env.PATH ?? "",
+        HOME: process.env.HOME ?? "",
+        HELIOPAUSE_POLICY_RENDER_TOKEN: BEARER,
+        HELIOPAUSE_POLICY_RENDER_PORT: "0",
+        HELIOPAUSE_POLICY_RENDER_HOST: "127.0.0.1",
+        ...MULTI(sites),
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    started = { proc, dir };
+    let out = "";
+    let err = "";
+    proc.stdout.on("data", (b: Buffer) => { out += b.toString(); });
+    proc.stderr.on("data", (b: Buffer) => { err += b.toString(); });
+      const port = await new Promise<number>((resolve, reject) => {
+        const fail = setTimeout(() => reject(new Error(`never listened:\n${out}\n${err}`)), 20_000);
+        proc.stdout.on("data", () => {
+          const m = /listening on [^:]+:(\d+)/.exec(out);
+          if (m) { clearTimeout(fail); resolve(Number(m[1])); }
+        });
+        proc.on("exit", (code) => {
+          clearTimeout(fail);
+          reject(new Error(`exited with ${code} before listening:\n${out}\n${err}`));
+        });
+      });
+      // The limit the child is really under, from the child. Asking is not the same as getting.
+      const applied = Number(/^\s*(\d+)\s*$/m.exec(err)?.[1]);
+      assert.ok(
+        Number.isInteger(applied) && applied > 0,
+        `the child did not report its descriptor limit, so this test cannot know what it ran under:\n${err}`,
+      );
+      assert.ok(
+        applied <= LIMIT,
+        `the descriptor limit is ${applied}, not ${LIMIT} or less — \`ulimit\` did not take, so a ` +
+          `${DEPTH}-deep tree proves nothing about descriptor growth and this test was passing for free`,
+      );
+      const res = await fetchAt(port, "/source?site=beta", { signal: AbortSignal.timeout(20_000) });
+      assert.equal(
+        res.status, 200,
+        `a ${DEPTH}-deep tree was not served under a ${applied}-descriptor limit, which is what ` +
+          `descriptor use growing with depth looks like: ${(await res.json() as { error?: string }).error ?? ""}`,
+      );
+      assert.doesNotMatch(out + err, /EMFILE/, "the walk ran out of descriptors");
+    } finally {
+      started?.proc.kill("SIGKILL");
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
   it("refuses a site whose tree it could not finish reading", { timeout: 60_000 }, async () => {
     // ## A directory that cannot be enumerated is not an empty one
     //
@@ -1290,6 +1388,16 @@ export const site = {
       assert.equal(
         refused.status, 503,
         "a site whose directory could not be read was served from a stamp that cannot be complete",
+      );
+      // 🔑 The cause, not the cap. This is what the previous version got wrong: every enumeration
+      // failure was reported as "more than 2000 entries", discarding the `errno` at the only point
+      // that had it.
+      const why = (await refused.json() as { error?: string }).error ?? "";
+      assert.match(why, /could not be read \(EACCES\)/, `the refusal does not name the cause: ${why}`);
+      assert.match(why, /sealed/, "the refusal does not name which directory could not be read");
+      assert.doesNotMatch(
+        why, /more than 2000 entries/,
+        "an unreadable directory was reported as the scan cap being exceeded",
       );
       // The process stays up and the probe answers: a reported configuration fault, not a crashloop.
       assert.equal((await fetchAt(port, "/healthz", deadline())).status, 200, "the process went down");
@@ -1341,11 +1449,15 @@ export const site = {
       const deadline = (): RequestInit => ({ signal: AbortSignal.timeout(20_000) });
       const refused = await fetchAt(port, "/source?site=beta", deadline());
       assert.equal(refused.status, 503, "a site whose tree cannot be stamped was served anyway");
+      const why = (await refused.json() as { error?: string }).error ?? "";
       assert.match(
-        (await refused.json() as { error?: string }).error ?? "",
-        /entries beside .* cannot be noticed/,
+        why, /more than 2000 entries beside it/,
         "the refusal does not say why, so an operator cannot act on it",
       );
+      // And it names *this* cause rather than the other one. Both used to arrive as a bare `null` and
+      // be reported as the cap, so a permissions fault on a four-file directory sent an operator to
+      // look at a limit nowhere near being reached.
+      assert.doesNotMatch(why, /could not be read/, "an overflow was reported as an unreadable directory");
       assert.equal(
         (await fetchAt(port, "/source?site=alpha", deadline())).status, 503,
         "alpha shares this directory, so it shares the refusal — if this is 200 the scan became per-site",
