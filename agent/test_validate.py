@@ -18,6 +18,7 @@ import os
 import pathlib
 import re
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -4862,14 +4863,103 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
     # way `TestRollback` has done since it was written. `tearDown` asserts they came back, because a
     # leak here does not fail this test — it fails a later one, somewhere else, for a reason that will
     # read as unrelated.
-    _RECOVERY_GLOBALS = ("_timer", "_wl_timer", "_backup", "_nft_rollback_owed", "_wl_rollback_owed")
+    # `_route_restore` was missing from this list for a round. The closing assertion compared only the
+    # names it knew, so a probe that seeded the global watched the sweep clear it and still pass.
+    # @see the escape counter below, which is the part that does not depend on this list being right
+    # Distinctive, so a clobber shows up as a difference rather than as one empty list for another.
+    _ROUTE_SENTINEL = [{"spec": {"dst": "203.0.113.0/24"}, "before": None}]
+
+    # Functions whose module state this sweep disturbs: the three recovery entry points, and the rollback
+    # paths they call. `_recovery_globals_in_source` reads their `global` declarations.
+    _RECOVERY_FUNCTIONS = (
+        "recover_commitment", "recover_workload_commitment", "reconcile_recovered_commitments",
+        "rollback", "rollback_workload", "rollback_generation",
+    )
+
+    @classmethod
+    def _recovery_globals_in_source(cls):
+        """Every module global the recovery paths declare they write, read out of the agent.
+
+        The hand-written `_RECOVERY_GLOBALS` cannot be the expectation for a test of itself: the closing
+        comparison builds both of its sides from that tuple, so deleting a name from it deletes the name
+        from the expectation too. `_route_restore` was missing for two rounds and every mutation of the
+        list stayed green for exactly that reason.
+
+        Reading the source here derives an expectation; it does not assert a property about the text. Same
+        technique as `state_vocabulary`, and the same payoff — a seventh recovery global joins this check
+        on the commit that adds it.
+        """
+        source = pathlib.Path(hp.__file__).read_text().split("\n")
+        found = set()
+        inside = None
+        for line in source:
+            for name in cls._RECOVERY_FUNCTIONS:
+                if line.startswith(f"def {name}("):
+                    inside = name
+            if inside and line and not line[0].isspace() and not line.startswith("def "):
+                inside = None
+            if inside and line.strip().startswith("global "):
+                for part in line.strip()[len("global "):].split(","):
+                    part = part.strip()
+                    if part.startswith("_"):
+                        found.add(part)
+        return found
+
+    _RECOVERY_GLOBALS = (
+        "_timer", "_wl_timer", "_backup", "_nft_rollback_owed", "_wl_rollback_owed", "_route_restore",
+    )
 
     def _isolate_recovery(self):
         self._saved_globals = {n: getattr(hp, n) for n in self._RECOVERY_GLOBALS}
         if not hasattr(self, "_timers_seen"):
             self._timers_seen = []
+        if not hasattr(self, "escapes"):
+            self.escapes = []
         self._real_nft = hp._nft_apply_json
         self._real_kubectl = hp.kubectl
+        # The third boundary: `rollback` restores the route plan through `_restore_routes` → `_ip_route`
+        # → `subprocess.run(["ip", "route", …])` (`heliopause-pull.py:1746`). Stubbed with the real
+        # `(rc, stderr)` shape, and the sweep drives it — see the route sentinel below and the assertion
+        # that it was driven, which is what keeps this stub from being a line nothing reaches.
+        self._real_ip_route = hp._ip_route
+        # Accumulated across cases, like `escapes`: the assertion that this boundary was reached runs
+        # after the loop, and a per-case list would show it only the last case's calls.
+        if not hasattr(self, "route_calls"):
+            self.route_calls = []
+        hp._ip_route = lambda args: (self.route_calls.append(args), (1, "no boundary in tests"))[1]
+        # ## 🔑 Count the escapes rather than enumerate the boundaries
+        #
+        # Two rounds of this helper named the boundaries it knew and missed one each time: first kubectl
+        # beside nftables, then `ip route` (`heliopause-pull.py:1746`) and the `kubectl proxy` that
+        # `_delete_workload_object` launches directly (`:2916`, with its own Unix socket at `:2881`).
+        # Adding a third and fourth stub makes the same bet that lost twice — that the list is complete
+        # because the author thought about it.
+        #
+        # So every way out of this process is intercepted for the duration and counted: a fifth boundary
+        # added later fails this test instead of reaching a machine. `socket.socket` is included because
+        # the proxy path does not shell out to reach the cluster, it opens a socket.
+        # @see the zero-escape assertion at the end of
+        #      test_no_recovery_path_can_write_the_confirmed_state
+        self._real_procs = (subprocess.run, subprocess.Popen, socket.socket)
+
+        # Each refusal is shaped like the failure production can already hand the caller, not an
+        # exception of the test's own invention: `subprocess.run` answers a non-zero `CompletedProcess`,
+        # and `Popen`/`socket.socket` raise `OSError`, which `_delete_workload_object` already catches
+        # (`heliopause-pull.py:2917`). Inert rather than fatal, so the sweep finishes and the assertion
+        # at the end reports **every** escape — raising stopped at the first and hid the rest.
+        def record_run(*args, **_kw):
+            self.escapes.append(("subprocess.run", args[0] if args else None))
+            return subprocess.CompletedProcess(args[0] if args else [], 1, "", "no boundary in tests")
+
+        def record_raise(kind):
+            def call(*args, **_kw):
+                self.escapes.append((kind, args[0] if args else None))
+                raise OSError("no boundary in tests")
+            return call
+
+        subprocess.run = record_run
+        subprocess.Popen = record_raise("subprocess.Popen")
+        socket.socket = record_raise("socket.socket")
         # Inert failure on both boundaries: every kernel write and every cluster call is refused, so no
         # recovery path can change this machine or any cluster it can see.
         #
@@ -4889,6 +4979,19 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         hp._backup = hp._NO_BACKUP
         hp._nft_rollback_owed = None
         hp._wl_rollback_owed = None
+        # A sentinel, not `[]`, and it does two jobs.
+        #
+        # One: `recover_commitment` clobbers this global unconditionally (`heliopause-pull.py:2113`), so
+        # starting at `[]` would leave it `[]` either way and the closing restoration assertion would
+        # pass whether or not this name is in `_RECOVERY_GLOBALS` — which is how it was green with the
+        # name missing for a round.
+        #
+        # Two: it stands in for a route plan an earlier apply left in this process, which is how the
+        # no-backup branch (`:2103`) reaches `_restore_routes` — that branch rolls back and returns
+        # *before* `:2113` runs, so the plan survives into the restore. That is the only way these three
+        # functions reach the route boundary, and it took the escape counter to find it: reading the code
+        # I concluded twice that nothing could.
+        hp._route_restore = list(self._ROUTE_SENTINEL)
 
     def _restore_recovery(self):
         # 🔴 **Cancel, then record — restoring alone is not enough.** Writing the saved `None` back over
@@ -4904,6 +5007,8 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
                 self._timers_seen.append(live)
         hp._nft_apply_json = self._real_nft
         hp.kubectl = self._real_kubectl
+        hp._ip_route = self._real_ip_route
+        subprocess.run, subprocess.Popen, socket.socket = self._real_procs
         for name, value in self._saved_globals.items():
             setattr(hp, name, value)
 
@@ -4939,11 +5044,20 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         hp.load_artifact_trust = lambda: {
             "managerKeyIds": ["sha256:" + "a" * 64], "breakGlassKeyIds": [], "trustDigest": "sha256:t",
         }
-        # 🔑 **The probe is on the last thing the prelude does.** It used to be on
+        # 🔑 **The probe is on the monitor start, which is past every recovery call.** It used to be on
         # `recover_commitment`, and a review placed `return 0` immediately after that call and watched
         # this test stay green — workload recovery, reconciliation and the monitor start all come after
-        # it. `monitor_loop` is the final step before the heartbeat loop, so reaching it is what "the
-        # prelude ran to the end" can mean here. The thread is joined below so nothing outlives the test.
+        # it.
+        #
+        # ⚠️ It does **not** prove the whole prelude ran: `failures = 0` sits between the monitor start
+        # and the heartbeat loop (`heliopause-pull.py:5261`), and a `return 0` before that assignment
+        # keeps this green. The earlier version of this comment claimed the end of the prelude, which
+        # was the same overclaim this test was written to remove. What it proves is that every recovery
+        # call ran, which is what the adoption assertion needs.
+        #
+        # The stub sets an `Event` and the test waits up to five seconds on it — a wait, not a join. If
+        # the monitor never runs, the wait expires and the count assertion **fails**; it does not pass
+        # quietly.
         monitor_started = threading.Event()
 
         def monitor():
@@ -5021,38 +5135,66 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         failed = sorted({"rolled-back", "rollback-failed", "rollback-incident"} & states)
         self.assertTrue(live and failed, "the live/failed partitions are empty — vocabulary changed")
 
-        deadline = time.time() + 300
+        # Two clocks, not one. Every fixture used to carry a future deadline, and a reviewer wrote
+        # `confirmed` into the already-expired branches (`heliopause-pull.py:2128` for the host half,
+        # `:3449` for the workload half) and watched this test stay green. The deadline is part of the
+        # state the path reads, so pinning it swept half the paths.
+        LIVE = time.time() + 300
+        EXPIRED = time.time() - 300
         cases = []
         # `recover_commitment`: entered on a live host half. Both with a recorded backup and without,
         # because the without case is the one that reaches for the kernel.
         for state in live:
-            cases.append(("recover_commitment", hp.recover_commitment, {
-                "state": state, "pendingBackup": {"elements": []}, "rollbackAt": deadline,
-            }))
-            cases.append(("recover_commitment (no backup)", hp.recover_commitment, {
-                "state": state, "pendingBackup": None, "rollbackAt": deadline,
+            for when, clock in (("live", LIVE), ("expired", EXPIRED)):
+                cases.append((f"recover_commitment ({when} deadline)", hp.recover_commitment, {
+                    "state": state, "pendingBackup": {"elements": []}, "rollbackAt": clock,
+                }))
+                cases.append((f"recover_commitment (no backup, {when})", hp.recover_commitment, {
+                    "state": state, "pendingBackup": None, "rollbackAt": clock,
+                }))
+        # ## 🔴 The route plan does not survive a restart — an agent defect, measured here
+        #
+        # The cases below carry no `pendingRoutes`, and not because the fixture would be awkward: **the
+        # state file cannot hold the field at all.** `apply_routes` writes `st["pendingRoutes"]`
+        # (`heliopause-pull.py:1910`) and rollback writes it again on the failed path (`:2234`), but
+        # `pendingRoutes` is **not in `_EMPTY_STATE`**, and `_load_state_unlocked` rebuilds the document
+        # from `_EMPTY_STATE`'s keys (`:3762`). Measured 2026-10-01: saving a state carrying a plan and
+        # loading it back gives `None`, so the recovery read at `:2112` always sees `None` and the
+        # restart recovery its comment describes does not happen. Reported separately — it is an agent
+        # behaviour change, not a test change.
+        #
+        # The in-process path does work, and the sweep drives it through the no-backup branch with the
+        # route sentinel. See `_isolate_recovery`.
+        for when, clock in (("live", LIVE), ("expired", EXPIRED)):
+            cases.append((f"recover_commitment (backup, {when})", hp.recover_commitment, {
+                "state": "prepared", "pendingBackup": {"elements": []}, "rollbackAt": clock,
             }))
         # `recover_workload_commitment`: needs a deadline **and** applied objects, which is what the
         # first version was missing.
         for wl in live:
-            cases.append(("recover_workload_commitment", hp.recover_workload_commitment, {
-                "state": "pending", "workloadState": wl, "workloadRollbackAt": deadline,
-                "workloadApplied": [{"ref": "util/hp-dev-p700"}], "workloadGeneration": "g-live",
-            }))
+            for when, clock in (("live", LIVE), ("expired", EXPIRED)):
+                cases.append((
+                    f"recover_workload_commitment ({when} deadline)", hp.recover_workload_commitment, {
+                        "state": "pending", "workloadState": wl, "workloadRollbackAt": clock,
+                        "workloadApplied": [{"ref": "util/hp-dev-p700"}],
+                        "workloadGeneration": "g-live",
+                    }))
         # `reconcile_recovered_commitments`: both branches, which need the halves to **differ**.
         for host, wl in ((failed[0], "confirmed"),):
             cases.append(("reconcile_recovered_commitments", hp.reconcile_recovered_commitments, {
                 "state": host, "workloadState": wl, "workloadGeneration": "g-live",
-                "workloadApplied": [{"ref": "util/hp-dev-p700"}], "workloadRollbackAt": deadline,
+                "workloadApplied": [{"ref": "util/hp-dev-p700"}], "workloadRollbackAt": LIVE,
             }))
         for host in live:
             cases.append(("reconcile_recovered_commitments (host live)",
                           hp.reconcile_recovered_commitments, {
                 "state": host, "workloadState": failed[0], "workloadGeneration": "g-live",
-                "workloadApplied": [{"ref": "util/hp-dev-p700"}], "workloadRollbackAt": deadline,
+                "workloadApplied": [{"ref": "util/hp-dev-p700"}], "workloadRollbackAt": LIVE,
             }))
 
-        for name, fn, over in cases:
+        for case in cases:
+            name, fn, over = case[0], case[1], case[2]
+            seed_routes = case[3] if len(case) > 3 else None
             with self.subTest(path=name, state=over.get("state"), workload=over.get("workloadState")):
                 self.assertNotEqual(
                     over.get("state"), "confirmed",
@@ -5062,6 +5204,9 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
                 self._isolate_recovery()
                 try:
                     hp.save_state({**hp._EMPTY_STATE, "generation": "g-live", **over})
+                    if seed_routes is not None:
+                        # What an apply earlier in this same process would have left behind.
+                        hp._route_restore = list(seed_routes)
                     # Not wrapped in a bare `except`. A path that raises on a state it is supposed to
                     # handle is a finding, and swallowing it hid both that and a broken fixture.
                     fn()
@@ -5083,6 +5228,11 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         # The sweep does arm timers — `recover_workload_commitment` arms one from these fixtures — so
         # this is not a vacuous check, and a `cancel()` that stopped happening makes it red.
         self.assertTrue(self._timers_seen, "no timer was armed, so this check proved nothing")
+        self.assertTrue(
+            self.route_calls,
+            "no case reached the route boundary, so stubbing `_ip_route` and saving `_route_restore` "
+            "are both lines that could be deleted with this test still green",
+        )
         for armed in self._timers_seen:
             armed.join(2)
             self.assertFalse(
@@ -5091,6 +5241,24 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
                 "the reference; the thread would have called a rollback after this class put the real "
                 "kubectl back.",
             )
+        # 🔑 The list of globals is checked against the agent, not against itself. Built from
+        # `_RECOVERY_GLOBALS` on both sides, this comparison passed with `_route_restore` missing.
+        derived = self._recovery_globals_in_source()
+        self.assertIn("_route_restore", derived, "the `global` scan stopped matching the recovery paths")
+        self.assertGreaterEqual(len(derived), 6, f"the scan found only {sorted(derived)}")
+        self.assertEqual(
+            derived - set(self._RECOVERY_GLOBALS), set(),
+            "the recovery paths write module globals this sweep neither resets nor restores. A name "
+            "missing here does not fail this test — it fails a later one, for a reason that will read "
+            "as unrelated. Add it to _RECOVERY_GLOBALS.",
+        )
+        # 🔑 Nothing left this process. This is the assertion that does not depend on the boundary list
+        # above being complete, which is why it exists: two rounds of that list were wrong.
+        self.assertEqual(
+            self.escapes, [],
+            f"a recovery path reached outside this process {len(self.escapes)} time(s): {self.escapes}. "
+            "Stub that boundary in _isolate_recovery, or the sweep is driving the machine it runs on.",
+        )
         self.assertEqual(
             {n: getattr(hp, n) for n in self._RECOVERY_GLOBALS}, self._saved_globals,
             "the sweep did not put the recovery globals back — a leak here does not fail this test, it "
