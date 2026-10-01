@@ -4908,15 +4908,23 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
     def snapshot(cls, **spec):
         """What the agent would have persisted as `previous`, through the real cleaning function.
 
-        🔴 **Built by hand once, and the hand-made one broke the test it was in.** `previous` carried
-        `resourceVersion`, which `_clean_workload_object` (`heliopause-pull.py:2670`) does not keep — so
-        `_clean_workload_object(current) == previous` could never hold, whatever the rest of the snapshot
-        said. The comment next to it claimed the *description* was what kept the already-safe shortcut
-        (`:3068`) out of the way; a review reverted the description change and the shortcut still ran zero
-        times. The fixture was a shape production cannot write, which is the fifth of those found in this
-        file, and it made a true-sounding comment describe a mechanism that was not operating.
+        🔴 **Twice this fixture made the already-safe shortcut (`:3067-3068`) unreachable for a reason the
+        comment beside it did not name.**
+
+        First it carried `resourceVersion`, which `_clean_workload_object` (`heliopause-pull.py:2670`) does
+        not keep, so `_clean_workload_object(current) == previous` could not hold whatever else the
+        snapshot said. Building it through the real cleaner fixed that — and then `**spec` **replaced** the
+        whole spec, so the "earlier revision" snapshot silently lost `ingress` and `enableDefaultDeny`, and
+        the shortcut was dodged by the missing keys rather than by the changed description. A review
+        reverted only the description both times and the replace kept running.
+
+        So `spec` **merges** now. The description is the only difference, which is what the sweep's comment
+        claims, and reverting it is what makes the shortcut take the record.
         """
-        return hp._clean_workload_object({**cls.owned_object(), **({"spec": spec} if spec else {})})
+        obj = cls.owned_object()
+        if spec:
+            obj["spec"] = {**obj["spec"], **spec}
+        return hp._clean_workload_object(obj)
 
     def _isolate_recovery(self, succeed=False, cluster_answer="absent"):
         """Stub the four boundaries and pin the globals. `succeed` makes the boundaries report success.
@@ -5219,8 +5227,10 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
             # them at zero while the delete and the replace ran — the same blind spot as the round before,
             # one level in. Each entry below is the record and cluster answer that reaches exactly one.
             identical = self.snapshot()
-            earlier = self.snapshot(description="an earlier revision",
-                                    endpointSelector=cnp()["spec"]["endpointSelector"])
+            # The description is the **only** difference from what is in the cluster. Nothing else may
+            # differ, or the shortcut is dodged by that instead and this case stops being about the
+            # replace — which is what happened twice. @see `snapshot`
+            earlier = self.snapshot(description="an earlier revision")
             other_uid = {**identical, "metadata": {**identical["metadata"], "uid": "99999999-" + "0" * 27}}
             owned_record = {"ref": self.REF, "cluster": "dev", "uid": self.UID}
             for label, record, answer in (
@@ -5317,6 +5327,9 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
                     "replaced": len(self.replace_calls) - before[1],
                     "logged": self.logged[before[2]:],
                     "settled": "rolled-back" in wl_values[1:],
+                    # Recorded because the already-safe witness cannot be told from the missing-object
+                    # shortcut without it: both settle while touching nothing and logging nothing.
+                    "answer": case.get("cluster_answer", "absent"),
                 }
                 for seq, bucket in ((0, host_transitions), (1, workload_transitions)):
                     values = [write[seq] for write in during]
@@ -5375,20 +5388,25 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         # The two branches an absent object cannot reach. Without these, "the workload success tail runs"
         # was satisfied by nine settlements that all took the missing-object shortcut, and `confirmed`
         # written at either branch survived.
-        # ## Nine branch witnesses — a hand-written list, and it says so
+        # ## Ten branch witnesses — a hand-written list, and it says so
         #
-        # Twice now a branch was opened and the neighbouring ones left at zero: first the whole workload
+        # Twice a branch was opened and the neighbouring ones left at zero: first the whole workload
         # success path, then six refusals between the read and the restore. Each line below is a witness
-        # that one branch ran, so adding a case that stops reaching one fails here instead of quietly
-        # shrinking the sweep.
+        # that one branch ran, so a case that stops reaching one fails here instead of quietly shrinking
+        # the sweep.
         #
-        # ⚠️ **This is nine branches I went and read, not "the branches".** A tenth added to the loop is
-        # invisible to this check, exactly as the seventh was before a review counted them. The device
-        # that tried to claim completeness instead of listing was removed in an earlier round for being
-        # wrong about its own scope; this one only claims the nine it names.
+        # ⚠️ **These are ten branches I went and read, not "the branches".** A review counted the loop and
+        # found **five more at zero** — a legacy record (`heliopause-pull.py:3048`), an invalid reference
+        # (`:3052`), a read failure (`:3056`), an exception from the cleaner (`:3069-3070`), and an
+        # exhausted replacement budget (`:3099`). Writing `confirmed` into any of those is still green.
+        # Deliberately out of scope here and filed as henryj-dev/heliopause#80; saying the list is partial
+        # is not the same as the holes not being there.
         #
-        # Five of them are refusals that change no state and call no boundary, so their witness is the
-        # sentence the agent logs. Four are observable as boundary calls.
+        # The device that claimed completeness instead of listing was removed in an earlier round for
+        # being wrong about its own scope. This one claims the ten it names.
+        #
+        # Five are refusals that change no state and call no boundary, so their witness is the sentence the
+        # agent logs. Five are observable as boundary calls or settlement.
         witnesses = {
             "delete (:3088)": bool(self.delete_calls),
             "replace (:3102)": bool(self.replace_calls),
@@ -5410,14 +5428,24 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
             "prior snapshot uid mismatch (:3093)": any(
                 "prior snapshot UID mismatch" in line for line in self.logged
             ),
-            # The already-safe shortcut leaves no trace of its own — it continues without an incident and
-            # without touching a boundary — so the witness is the case that reaches it having settled
-            # while deleting nothing, replacing nothing and logging no incident. The first version of
-            # this line asserted `_clean_workload_object(current) == snapshot()`, which is a property of
-            # these fixtures and says nothing about whether the loop ran: a tautology inside the device
-            # built to catch tautologies.
-            "already safe (:3068)": any(
-                ev["settled"] and not ev["deleted"] and not ev["replaced"]
+            # ## The already-safe shortcut, and the two wrong witnesses it had first
+            #
+            # It leaves no trace of its own: it continues without an incident and without touching a
+            # boundary. So the witness is the case that reaches it having settled while deleting nothing,
+            # replacing nothing and logging no incident —
+            #
+            # 🔴 **and having been answered `owned`.** Without that last clause a review flipped those two
+            # cases to `absent`, `:3067-3068` ran **zero** times, and all 299 tests still passed: the
+            # missing-object shortcut (`:3058-3059`) settles while touching nothing too, so it satisfied
+            # the same evidence. The object had to be *there* for the shortcut being named to be the one
+            # that skipped it.
+            #
+            # (An earlier version asserted `_clean_workload_object(current) == snapshot()`, a property of
+            # these fixtures that says nothing about whether the loop ran — a tautology inside the device
+            # built to catch tautologies. Three of these witnesses have now needed narrowing.)
+            "already safe (:3067-3068)": any(
+                ev["answer"] == "owned"
+                and ev["settled"] and not ev["deleted"] and not ev["replaced"]
                 and not any("left untouched" in line for line in ev["logged"])
                 for name, ev in evidence.items() if "already safe" in name
             ),
