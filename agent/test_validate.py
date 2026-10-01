@@ -4836,9 +4836,17 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
     would ever execute it.
 
     That is the failure class this repository documents at length: five test classes sat undefined for
-    months behind a green light, because the count was never compared. `TestSignedArtifactSeam` is the
-    established answer — parse the source and assert the call, because a call that is not made is an
-    absence and no behavioural assertion can see one.
+    months behind a green light, because the count was never compared.
+
+    ⚠️ **This docstring used to end by arguing for the approach these tests replaced** — "parse the source
+    and assert the call, because a call that is not made is an absence and no behavioural assertion can
+    see one." A review left `return 0` above the parsed call and watched that assertion stay true, which
+    is the whole reason the tests below drive `main()` instead. An absence **is** visible behaviourally:
+    the four-call count in `test_main_adopts_the_authorization_before_it_starts_beating` fails when any of
+    them is deleted from `main()`.
+
+    What remains of the parsing approach is one tripwire, named as one, for the call **order** — the
+    position is not the invariant, and the test next to it says what is.
     """
 
     def _main_calls(self):
@@ -4896,8 +4904,24 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
                 setattr(self, name, [])
         rc = 0 if succeed else 1
         hp._nft_apply_json = lambda doc: (self.nft_calls.append(doc), (rc, "stubbed: no kernel here"))[1]
+        # ## Why success is `NotFound` here rather than `rc=0` with an empty body
+        #
+        # `rc=0, ""` is not a success kubectl can produce: `_read_workload_object` parses stdout as JSON
+        # (`heliopause-pull.py:2597`), so an empty body is an unparseable read, it goes on the retryable
+        # list, and `_restore_workload_objects` returns false before any restore or settlement runs. The
+        # first version of this stub did exactly that, and a review measured the workload settlement
+        # branch reached **zero** times while `rollback_workload` was entered eighteen.
+        #
+        # An object that is already gone is what a restart recovery actually finds when the previous
+        # process removed it: `rc != 0` with `not found` in stderr, which `:2593` reads as `missing` and
+        # skips cleanly, leaving nothing retryable. `rc=0` with a real object instead would need the
+        # ownership fields and a `cluster` in the rollback record, and these fixtures carry neither — a
+        # different test's subject.
+        # @see the workload-settlement assertion at the end of this test
+        wl_ok = (1, "", 'Error from server (NotFound): ciliumnetworkpolicies.cilium.io "x" not found')
         hp.kubectl = lambda args, stdin=None, timeout_sec=None: (
-            self.kubectl_calls.append(args), (rc, "", "stubbed: no cluster here"))[1]
+            self.kubectl_calls.append(args),
+            wl_ok if succeed else (1, "", "stubbed: no cluster here"))[1]
         hp._ip_route = lambda args: (self.route_calls.append(args), (rc, "stubbed: no routes here"))[1]
         # 🔑 Every durable write, not the state the file happens to end on. `_save_state_unlocked` is the
         # one place both `save_state` and `update_state` commit through, so recording there sees each
@@ -4907,7 +4931,7 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         self._real_commit = hp._save_state_unlocked
 
         def commit(st):
-            self.states_written.append(st.get("state"))
+            self.states_written.append((st.get("state"), st.get("workloadState")))
             return self._real_commit(st)
 
         hp._save_state_unlocked = commit
@@ -5018,9 +5042,16 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         self.assertEqual(
             {k: reached.get(k) for k in ("recover", "recover_workload", "reconcile", "monitor")},
             {"recover": 1, "recover_workload": 1, "reconcile": 1, "monitor": 1},
-            "the startup did not make every recovery call and then start the monitor, so this test "
-            "cannot say the adoption happened during a startup that got that far",
+            "the startup did not make every recovery call and reach the monitor, so this test cannot "
+            "say the adoption happened during a startup that got that far",
         )
+        # ⚠️ **Counts, not order.** This says each of the four ran exactly once; it does not say they ran
+        # in the order `main()` lists them, and a review measured that: moving the monitor above the
+        # backfill, or swapping the two recovery calls, keeps this green. An earlier version of the
+        # message said "and then start the monitor", which reads as a sequence this does not check.
+        # Calling one of them twice **is** caught, by the count.
+        # @see test_the_backfill_still_precedes_the_recovery_paths for the one ordering claim that is
+        #      pinned, and why it is a tripwire rather than the invariant
         self.assertEqual(
             hp.load_state()["currentAuthorization"], TestBackfillCurrentAuthorization.REC,
             "main() did not adopt the authorization already in force — every host keeps None",
@@ -5060,6 +5091,14 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
 
         LIVE = time.time() + 300
         EXPIRED = time.time() - 300
+        # Writes made by the paths, with each case's own fixture save left out. The outcome assertions at
+        # the end read this and never `states_written`, which the fixtures are in.
+        recovery_writes = []
+        # Changes a path made, as `(before, after)`. The outcome assertions read these rather than the
+        # written values, because a write records the document's whole `state` field whether the path
+        # changed it or not — and the fixtures start at the very values being looked for.
+        host_transitions = []
+        workload_transitions = []
         cases = []
         for succeed in (False, True):
             for state in live:
@@ -5078,8 +5117,11 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
             # save writes the field into the JSON; the next load drops it. So
             # `recover_commitment`'s recovery read (`:2112`) always sees `None`, and the restart
             # recovery its comment describes does not happen. The in-process path still works, which
-            # is what the route sentinel stands in for. Reported separately — an agent behaviour
-            # change, not a test change.
+            # is what the route sentinel stands in for.
+            #
+            # Filed as henryj-dev/heliopause#71 — an agent behaviour change, not a test change, so it
+            # is not fixed here. The earlier wording said "reported separately" when the only report
+            # was a chat message, which is the same shape of claim this test exists to remove.
             for wl in live:
                 for when, clock in (("live", LIVE), ("expired", EXPIRED)):
                     cases.append({
@@ -5131,11 +5173,31 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
                             "so the check below would pass whatever the path did",
                 )
                 # 🔑 Every value written, not the one the file ended on. The first write is this case's
-                # own fixture; everything after it came from the path.
+                # own fixture; everything after it came from the path. `by_recovery` is what the
+                # assertions below use, never `states_written`, for the reason in the next comment.
+                by_recovery = during[1:]
+                recovery_writes.extend(by_recovery)
+                # ## 🔴 A written value is not a produced value
+                #
+                # The recorder captures the whole document's `state` at each commit, so a path that
+                # writes any field at all records whatever `state` already held. Most fixtures here start
+                # at `prepared`/`pending`/**`rollback-failed`**, so "`rollback-failed` appears in the
+                # recovery writes" was true even when every boundary succeeded — measured, `for succeed in
+                # (True,)` stayed green a second time, after the fixture **save** had already been
+                # excluded. The fixture's value had come back through the document instead.
+                #
+                # So the outcome assertions read transitions: a pair whose two halves differ, which only
+                # a path that changed the field can produce.
+                for seq, bucket in ((0, host_transitions), (1, workload_transitions)):
+                    values = [write[seq] for write in during]
+                    bucket.extend(
+                        (before, after)
+                        for before, after in zip(values, values[1:]) if before != after
+                    )
                 self.assertNotIn(
-                    "confirmed", during[1:],
+                    "confirmed", [host for host, _wl in by_recovery],
                     f"{case['name']} wrote 'confirmed' at some point during recovery (writes: "
-                    f"{during[1:]}). The backfill runs before these paths and would adopt a watermark "
+                    f"{by_recovery}). The backfill runs before these paths and would adopt a watermark "
                     "against a state about to change — move the call below them, which is what the "
                     "comment at the call site says to do.",
                 )
@@ -5145,16 +5207,35 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         # Not a completeness claim about boundaries — the list is written by hand and says so. This is
         # the weaker and checkable thing: a stub nothing reaches is a line that could be deleted with
         # every test still green, and three such lines have already been found in this file.
-        # Both boundary outcomes ran. `rolled-back` is written only when the restore reports success and
-        # `rollback-failed` only when it does not, so requiring both says the sweep covered both without
-        # asserting anything about the loop that produces them. Measured: dropping the succeeding half
-        # left every other assertion in this test green.
+        # ## Both boundary outcomes ran — counted from recovery writes only
+        #
+        # ⚠️ **This asserted against `states_written` once, and the fixtures satisfied it.** Forty-four
+        # cases *start* at `rollback-failed`, each fixture save records that, and so "both outcomes
+        # appeared" held even with every boundary succeeding: measured, `for succeed in (True,)` stayed
+        # green. The same test sliced the fixture write off for the `confirmed` check one line above and
+        # not here — the trap avoided in one assertion and walked into in the next.
+        #
+        # `recovery_writes` excludes each case's own fixture save, so these two states can only come from
+        # a path. `rolled-back` needs the restore to report success and `rollback-failed` needs it to
+        # fail, which is what makes the pair say both halves of the sweep ran.
+        produced = [after for _before, after in host_transitions]
         for expected in ("rolled-back", "rollback-failed"):
             self.assertIn(
-                expected, self.states_written,
-                f"no case ever reached {expected!r}, so one of the two boundary outcomes was never run "
-                "— with only failures, rollback's successful tail does not execute",
+                expected, produced,
+                f"no recovery path ever changed the host state **to** {expected!r}, so one of the two "
+                "boundary outcomes was never run — with only failures, rollback's successful tail does "
+                f"not execute. Transitions seen: {sorted(set(host_transitions))}",
             )
+        # The workload half settles separately, and its success needs a readable answer from the cluster
+        # boundary: with an unparseable one the objects stay on the retryable list and the settlement
+        # below is skipped. Measured — the branch was entered zero times while `rollback_workload` ran
+        # eighteen, and a `confirmed` written at the settlement survived.
+        self.assertIn(
+            "rolled-back", [after for _before, after in workload_transitions],
+            "no recovery path ever changed the workload state to 'rolled-back', so the workload success "
+            "tail did not run — check what the cluster stub answers when it is meant to succeed. "
+            f"Transitions seen: {sorted(set(workload_transitions))}",
+        )
         self.assertTrue(self.nft_calls, "no case reached the kernel boundary")
         self.assertTrue(self.route_calls, "no case reached the route boundary")
         self.assertTrue(self.kubectl_calls, "no case reached the cluster boundary")
