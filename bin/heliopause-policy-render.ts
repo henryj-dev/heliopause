@@ -40,8 +40,7 @@
 
 import { createServer } from "node:http";
 import { registerHooks } from "node:module";
-import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
-import type { Dirent } from "node:fs";
+import { existsSync, opendirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { timingSafeEqual } from "node:crypto";
@@ -654,9 +653,12 @@ function sourceStamp(sitePath: string): string | null {
   // attempts at this line, each worse than the last, and the thing that settled it was counting the
   // entries in an actual checkout instead of reasoning about a plausible one.
   //
-  // What is skipped is not part of any module graph: dot-directories and `node_modules`. A module that
-  // imports out of one of those is invisible to the stamp, which is the same class of gap as a helper
-  // outside the directory and is stated in the same breath.
+  // What is skipped is **dot-directories and `node_modules`**, and a module importing out of one of
+  // those is invisible to the stamp — the same class of gap as a helper outside the directory, stated in
+  // the same breath. This did say the skipped paths are "not part of any module graph", which is not
+  // true of `.generated/` or a vendored directory and was never true of a dot-**file**: the first
+  // version of the predicate ran before the directory check and hid `./.helper.ts` too, which is a legal
+  // import the resolve hook versions. Directories only, for that reason.
   //
   // `withFileTypes` reports a symlink as a symlink rather than as what it points at, so
   // `isDirectory()` is false for one and this walk never follows them. That is what makes a cycle
@@ -668,22 +670,56 @@ function sourceStamp(sitePath: string): string | null {
   const stack = [dir];
   walk: while (stack.length > 0) {
     const here = stack.pop() as string;
-    let entries: Dirent[];
+    // ## `opendirSync`, not `readdirSync`, and the cap is why
+    //
+    // `readdirSync` materialises **every** entry of a directory before the loop sees the first one, so
+    // the cap bounded the entries this loop processed and not the entries the process allocated. One
+    // very wide directory therefore still cost its full enumeration synchronously, which is time
+    // `/healthz` spends waiting on a request for a different site. A handle read one entry at a time
+    // makes the cap mean what it says.
+    let handle: ReturnType<typeof opendirSync>;
     try {
-      entries = readdirSync(here, { withFileTypes: true, encoding: "utf8" }) as Dirent[];
+      handle = opendirSync(here);
     } catch {
-      // Unreadable directory: the entry module's own mtime below still moves the key.
-      continue;
+      // ## 🔴 A directory that cannot be read is not an empty one
+      //
+      // This used to `continue`, which treated a refused enumeration as "nothing here" and returned a
+      // **complete** stamp. A directory can deny enumeration while still allowing a known filename to
+      // be opened, so a helper stays importable and becomes unstampable at the same instant — and this
+      // function's whole job is to notice when it changes. Fail-open, in the one place that must not.
+      //
+      // Refusing instead is consistent with the overflow below: no complete stamp, no answer. It does
+      // mean a permissions fault anywhere under the policy directory refuses every site sharing it,
+      // which is loud — and the alternative is a console that keeps drawing a policy nobody can
+      // invalidate.
+      return null;
     }
-    for (const entry of entries) {
-      visited += 1;
-      if (visited > STAMP_SCAN_CAP) { overflowed = true; break walk; }
-      const full = join(here, entry.name);
-      if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
-      if (entry.isDirectory()) { stack.push(full); continue; }
-      if (!entry.isFile()) continue;
-      if (!/\.(ts|mts|cts|js|mjs|cjs|json)$/.test(entry.name)) continue;
-      neighbours.push(full);
+    try {
+      for (;;) {
+        const entry = handle.readSync();
+        if (entry === null) break;
+        visited += 1;
+        if (visited > STAMP_SCAN_CAP) { overflowed = true; break walk; }
+        // Directories only. The first version of this line skipped **any** entry whose name began with
+        // a dot, which hid `./.helper.ts` as well as `./.git/` — a legal import that the resolve hook
+        // versions and this stamp could not see change. Inside the scanned directory, which made it a
+        // new defect rather than the stated gap about helpers outside it.
+        if (entry.isDirectory()) {
+          if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
+          stack.push(join(here, entry.name));
+          continue;
+        }
+        if (!entry.isFile()) continue;
+        if (!/\.(ts|mts|cts|js|mjs|cjs|json)$/.test(entry.name)) continue;
+        neighbours.push(join(here, entry.name));
+      }
+    } finally {
+      // `break walk` leaves through here too, which is the case that would otherwise leak the handle.
+      try {
+        handle.closeSync();
+      } catch {
+        // Already closed, or the directory went away mid-walk. Neither changes the stamp.
+      }
     }
   }
   if (overflowed) return null;
@@ -709,17 +745,23 @@ async function currentSource(site: { name: string | null; path: string }): Promi
   const { name, path: sitePath } = site;
   // ## 🔴 No complete stamp is a refusal, and the first version of this served instead
   //
-  // `null` means the tree has more entries than the scan cap, so a change cannot be noticed. The first
-  // fix here evaluated anyway and skipped the cache, minting a fresh `?v=` per request so the
-  // re-evaluation was a real one. That leaks: ES modules are keyed by URL and never evicted, and a
+  // `null` means the tree has more entries than the scan cap, so a change cannot be noticed. An earlier
+  // version of this evaluated anyway and skipped the cache, minting a fresh `?v=` per request so the
+  // re-evaluation was a real one — that code is gone, and this paragraph is why it is not coming
+  // back. It leaks: ES modules are keyed by URL and never evicted, and a
   // measured 7.32 KiB is retained per distinct URL (Node 26.4, after a forced GC; 4,000 imports of one
   // URL retain nothing). At one poll every few seconds that is hundreds of megabytes a day and then an
   // OOM kill, which at `replicas: 1` takes every co-served console with it.
   //
   // So the defect that fix introduced was worse than the one it closed — a stale policy against no
   // policy at all. Refusing is the third option and the right one: this site answers 503 and says why,
-  // its neighbours are unaffected, nothing new enters the module registry, and a tree this large is a
-  // configuration an operator can fix or a cap they can raise.
+  // nothing new enters the module registry, and a tree this large is a configuration an operator can
+  // fix or a cap they can raise.
+  //
+  // ⚠️ **Its neighbours are not unaffected, and this line used to say they were.** The scan is of the
+  // directory, so every site whose module sits in it reaches the same verdict — and in the fleet all
+  // three do. An overflow is therefore every console, not one. That is the price of refusing, and it is
+  // why the cap sits far above a measured checkout rather than near it.
   const stamp = sourceStamp(sitePath);
   const hit = cached.get(sitePath);
   if (hit && hit.stamp === stamp) return hit.source;

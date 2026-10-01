@@ -26,8 +26,9 @@ import { spawn, type ChildProcessByStdio } from "node:child_process";
 // `fetch` will not send a malformed request target, so one test speaks HTTP directly.
 import { connect } from "node:net";
 import type { Readable } from "node:stream";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync }
-  from "node:fs";
+import {
+  chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1196,20 +1197,37 @@ throw new Error("an ordinary content fault");
     // Nothing in this suite could have caught it, because `twoSites()` builds a directory with no
     // `.git` in it. That is the whole reason this test exists: the fixture was more forgiving than the
     // world, and every assertion about the cap was made against the forgiving one.
-    const { dir, sites } = twoSites();
-    // Two thousand entries under dot-directories and `node_modules` — more than the cap on its own.
-    for (const hidden of [".git", ".github", "node_modules"]) {
+    const { dir, sites, beta } = twoSites();
+    // 🔑 **Each skip has to be enough on its own.** The first fixture put 700 files in each of three
+    // hidden directories, so removing dot-skipping exposed 1,400 and removing `node_modules`-skipping
+    // exposed 700 — both under the 2,000 cap, so either mutation survived and the test held up neither
+    // rule. Each directory now carries more than the cap by itself.
+    for (const hidden of [".git", "node_modules"]) {
       const sub = join(dir, hidden);
       mkdirSync(sub);
-      for (let i = 0; i < 700; i += 1) writeFileSync(join(sub, `o${i}.ts`), `export const n${i} = ${i};\n`);
+      for (let i = 0; i < 2_100; i += 1) writeFileSync(join(sub, `o${i}.ts`), `export const n${i} = ${i};\n`);
     }
+    // And a dot-**file** the module actually imports. The predicate skipped any entry whose name began
+    // with a dot, before the directory check, so this helper was importable, versioned by the resolve
+    // hook, and invisible to the stamp — a stale payload for a change inside the scanned directory. The
+    // assertion that catches it is the edit below, not the status code.
+    writeFileSync(join(dir, ".helper.ts"), 'export const mark = "first";\n');
+    writeFileSync(beta, `import { mark } from "./.helper.ts";
+export const site = {
+  cfg: { hookPolicy: { input: "drop", output: "accept" } },
+  hosts: [{ id: "gw-01.beta", stage: "canary", items: [] }],
+  objects: [{ id: "ao-beta", kind: "address", name: mark,
+              members: [{ kind: "cidr", value: "10.0.0.0/8" }] }],
+};
+`);
     let started: Started | undefined;
     try {
       started = await start(dir, MULTI(sites));
+      const port = started.port;
       const deadline = (): RequestInit => ({ signal: AbortSignal.timeout(20_000) });
       for (const site of ["alpha", "beta"]) {
         assert.equal(
-          (await fetchAt(started.port, `/source?site=${site}`, deadline())).status, 200,
+          (await fetchAt(port, `/source?site=${site}`, deadline())).status, 200,
           `${site} was refused because of files a module graph cannot reach`,
         );
       }
@@ -1217,7 +1235,67 @@ throw new Error("an ordinary content fault");
         started.output(), /entries beside/,
         "the scan overflowed on an ordinary checkout",
       );
+      // The dot-file half: a helper whose name begins with a dot is imported, so a change to it has to
+      // move the stamp. Skipping dot-*entries* rather than dot-*directories* makes this answer "first"
+      // forever while the module says "second".
+      const named = async (): Promise<unknown> => {
+        const r = await fetchAt(port, "/source?site=beta", deadline());
+        assert.equal(r.status, 200, "beta lost");
+        return ((await r.json()) as { site?: { objects?: { name?: unknown }[] } })
+          .site?.objects?.[0]?.name;
+      };
+      assert.equal(await named(), "first", "the fixture's marker is not where this test reads it");
+      writeFileSync(join(dir, ".helper.ts"), 'export const mark = "second";\n');
+      const later = new Date(Date.now() + 5_000);
+      utimesSync(join(dir, ".helper.ts"), later, later);
+      assert.equal(
+        await named(), "second",
+        "a dot-file the module imports is invisible to the stamp, so its edit was never seen",
+      );
     } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a site whose tree it could not finish reading", { timeout: 60_000 }, async () => {
+    // ## A directory that cannot be enumerated is not an empty one
+    //
+    // The walk caught the failure and continued, which made an unreadable directory contribute nothing
+    // and the stamp come back **complete**. The two are different states and only one of them is safe
+    // to cache: a directory can deny enumeration while still allowing a known filename to be opened, so
+    // a helper stays importable and becomes unstampable at the same instant. Fail-open, in the function
+    // whose only job is to notice change. Found by a third review of these twenty lines.
+    //
+    // Refusing is consistent with the overflow: no complete stamp, no answer. It does mean a permissions
+    // fault anywhere under the policy directory refuses every site sharing it, which is the same shared
+    // blast radius the overflow has and is stated at the code.
+    if (process.getuid?.() === 0) {
+      // root ignores the mode bits, so there is no unreadable directory to make. Said rather than
+      // skipped silently: a test that quietly does nothing is the shape this file keeps recording.
+      console.log("skipped: running as root, which can read a 0o000 directory");
+      return;
+    }
+    const { dir, sites } = twoSites();
+    const sealed = join(dir, "sealed");
+    mkdirSync(sealed);
+    writeFileSync(join(sealed, "helper.ts"), 'export const mark = "first";\n');
+    chmodSync(sealed, 0o000);
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      const port = started.port;
+      const deadline = (): RequestInit => ({ signal: AbortSignal.timeout(20_000) });
+      const refused = await fetchAt(port, "/source?site=beta", deadline());
+      assert.equal(
+        refused.status, 503,
+        "a site whose directory could not be read was served from a stamp that cannot be complete",
+      );
+      // The process stays up and the probe answers: a reported configuration fault, not a crashloop.
+      assert.equal((await fetchAt(port, "/healthz", deadline())).status, 200, "the process went down");
+    } finally {
+      // Before `rmSync`, or the cleanup cannot enter it either.
+      chmodSync(sealed, 0o700);
       started?.stop();
       rmSync(join(dir, ".."), { recursive: true, force: true });
     }
