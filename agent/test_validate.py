@@ -4367,7 +4367,15 @@ class TestBackfillCurrentAuthorization(unittest.TestCase):
             "authorizedAt": "2026-08-15T00:30:00.000Z",
             "payloadHash": "sha256:" + "e" * 64,
         }
-        artifact = {"schemaVersion": hp.SCHEMA_VERSION, "generation": "g1", "rulesetHash": "sha256:old"}
+        # `workload` is present because the scenario is a workload apply that fails. Without it the real
+        # `apply_workload` returns `(True, None, "")` at its first branch and never attempts one — so an
+        # artifact without it describes a situation the stub below contradicts, and un-stubbing would
+        # silently change what these tests are about. `{"applier": …}` is the minimal accepted shape, the
+        # same one `TestCrossLayerOrdering` uses when it stubs this function.
+        artifact = {
+            "schemaVersion": hp.SCHEMA_VERSION, "generation": "g1", "rulesetHash": "sha256:old",
+            "workload": {"applier": hp.HOST_ID},
+        }
 
         real = (
             hp.apply_artifact, hp.fetch_artifact, hp.apply_workload,
@@ -4423,9 +4431,21 @@ class TestBackfillCurrentAuthorization(unittest.TestCase):
         # return and watched both tests stay green.
         def failing_workload(a: object) -> tuple[bool, str, str]:
             reached["workload"] = reached.get("workload", 0) + 1
-            return (False, "failed", "admission webhook rejected the object")
+            # 🔴 `"rolled-back"`, not `"failed"`. `apply_workload` returns `None`, `"unsupported"`,
+            # `"pending"` or `"rolled-back"` and nothing else, and an admission rejection is
+            # `"rolled-back"` because that path rolls the cluster back before returning
+            # (`heliopause-pull.py:3302`). `"failed"` was invented here, this test asserted it, and the
+            # branch in `record_result` that preserves an already-settled rollback was therefore never
+            # the one under test. Found by a review that corrected the value and watched both tests fail.
+            return (False, "rolled-back", "kubectl rejected the workload document: admission webhook denied")
 
         hp.apply_workload = failing_workload
+        # `record_result` suppresses the workload write when a rollback for this generation is already
+        # owed or settled, so the expectation below depends on that not being the case. Pinned rather
+        # than assumed: a sibling test leaving this set would otherwise turn these assertions into a
+        # measurement of test ordering.
+        real_owed = hp._wl_rollback_owed
+        hp._wl_rollback_owed = None
         hp.apply_artifact = lambda *a, **k: (_ for _ in ()).throw(
             AssertionError("the host half must not be applied when the workload half failed"),
         )
@@ -4451,6 +4471,7 @@ class TestBackfillCurrentAuthorization(unittest.TestCase):
                 hp.accept_artifact_authorization, hp._workload_report,
                 hp._preflight_host_artifact,
             ) = real
+            hp._wl_rollback_owed = real_owed
 
         # ⚠️ **Single-point mutation cannot make this red.** Two checks stand between the moved
         # watermark and the adoption, and they are not duplicates: the one inside `mutate` reads the
@@ -4496,10 +4517,12 @@ class TestBackfillCurrentAuthorization(unittest.TestCase):
         # in this class. The claim was ahead of what was checked, which is smaller than the version of
         # that mistake this PR started from and the same direction.
         self.assertIsNone(st.get("detail"), "the host detail was written on a workload failure")
-        self.assertEqual(st.get("workloadState"), "failed", "the workload failure was not recorded")
+        self.assertEqual(
+            st.get("workloadState"), "rolled-back", "the workload rollback was not recorded",
+        )
         self.assertEqual(st.get("workloadGeneration"), "g1", "the workload generation was not recorded")
         self.assertIn(
-            "admission webhook", st.get("workloadDetail") or "",
+            "kubectl rejected", st.get("workloadDetail") or "",
             "the workload detail was not recorded",
         )
 
@@ -4529,7 +4552,15 @@ class TestBackfillCurrentAuthorization(unittest.TestCase):
             "authorizedAt": "2026-08-15T00:30:00.000Z",
             "payloadHash": "sha256:" + "e" * 64,
         }
-        artifact = {"schemaVersion": hp.SCHEMA_VERSION, "generation": "g1", "rulesetHash": "sha256:old"}
+        # `workload` is present because the scenario is a workload apply that fails. Without it the real
+        # `apply_workload` returns `(True, None, "")` at its first branch and never attempts one — so an
+        # artifact without it describes a situation the stub below contradicts, and un-stubbing would
+        # silently change what these tests are about. `{"applier": …}` is the minimal accepted shape, the
+        # same one `TestCrossLayerOrdering` uses when it stubs this function.
+        artifact = {
+            "schemaVersion": hp.SCHEMA_VERSION, "generation": "g1", "rulesetHash": "sha256:old",
+            "workload": {"applier": hp.HOST_ID},
+        }
 
         real = (
             hp.apply_artifact, hp.fetch_artifact, hp.apply_workload,
@@ -4560,9 +4591,21 @@ class TestBackfillCurrentAuthorization(unittest.TestCase):
         # return and watched both tests stay green.
         def failing_workload(a: object) -> tuple[bool, str, str]:
             reached["workload"] = reached.get("workload", 0) + 1
-            return (False, "failed", "admission webhook rejected the object")
+            # 🔴 `"rolled-back"`, not `"failed"`. `apply_workload` returns `None`, `"unsupported"`,
+            # `"pending"` or `"rolled-back"` and nothing else, and an admission rejection is
+            # `"rolled-back"` because that path rolls the cluster back before returning
+            # (`heliopause-pull.py:3302`). `"failed"` was invented here, this test asserted it, and the
+            # branch in `record_result` that preserves an already-settled rollback was therefore never
+            # the one under test. Found by a review that corrected the value and watched both tests fail.
+            return (False, "rolled-back", "kubectl rejected the workload document: admission webhook denied")
 
         hp.apply_workload = failing_workload
+        # `record_result` suppresses the workload write when a rollback for this generation is already
+        # owed or settled, so the expectation below depends on that not being the case. Pinned rather
+        # than assumed: a sibling test leaving this set would otherwise turn these assertions into a
+        # measurement of test ordering.
+        real_owed = hp._wl_rollback_owed
+        hp._wl_rollback_owed = None
         hp.apply_artifact = lambda *a, **k: (_ for _ in ()).throw(
             AssertionError("the host half must not be applied when the workload half failed"),
         )
@@ -4588,6 +4631,7 @@ class TestBackfillCurrentAuthorization(unittest.TestCase):
                 hp.accept_artifact_authorization, hp._workload_report,
                 hp._preflight_host_artifact,
             ) = real
+            hp._wl_rollback_owed = real_owed
 
         st = hp.load_state()
         self.assertEqual(
@@ -4603,10 +4647,12 @@ class TestBackfillCurrentAuthorization(unittest.TestCase):
         self.assertEqual(st.get("generation"), "g1", "the host generation moved on a workload failure")
         self.assertEqual(st.get("artifactHash"), "sha256:old", "the host artifact hash moved")
         self.assertIsNone(st.get("detail"), "the host detail was written on a workload failure")
-        self.assertEqual(st.get("workloadState"), "failed", "the workload failure was not recorded")
+        self.assertEqual(
+            st.get("workloadState"), "rolled-back", "the workload rollback was not recorded",
+        )
         self.assertEqual(st.get("workloadGeneration"), "g1", "the workload generation was not recorded")
         self.assertIn(
-            "admission webhook", st.get("workloadDetail") or "",
+            "kubectl rejected", st.get("workloadDetail") or "",
             "the workload detail was not recorded",
         )
         self.assertEqual(
