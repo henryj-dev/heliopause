@@ -17,6 +17,7 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -3381,9 +3382,16 @@ class TestSignedArtifactSeam(unittest.TestCase):
         # the check was reading the explanation instead of the code. Caught by defect injection.
         return "\n".join(line for line in source.split("\n") if not line.lstrip().startswith("#"))
 
-    def test_the_apply_path_verifies_before_it_reads_a_generation(self):
-        # Order matters as much as presence: reading `generation` off the raw envelope is what the
-        # fleet did for an hour, and it reads as "the relay is behind" rather than "nothing verifies".
+    def test_the_apply_path_still_mentions_the_verifier_before_the_generation(self):
+        # A tripwire, and named as one. The property — that the generation compared is the one the
+        # verifier returned, and that a refused envelope is never read for one — is driven in
+        # `TestTheApplyPathReadsTheVerifiedArtifact`. What is left here is the cheap signal that the
+        # two moved relative to each other, which is how someone would discover the property rather
+        # than check it.
+        #
+        # ⚠️ Reading the order proves less than it looks: a `return` placed between the verifier and
+        # the comparison leaves this assertion true, which is the whole reason the behavioural tests
+        # exist. @see TestTheApplyPathReadsTheVerifiedArtifact
         src = self._source()
         self.assertIn("verify_artifact_envelope", src, "the apply path does not verify the envelope")
         verify_at = src.index("verify_artifact_envelope")
@@ -3405,6 +3413,148 @@ class TestSignedArtifactSeam(unittest.TestCase):
         src = self._source()
         self.assertIn('log(f"refusing artifact for generation', src)
         self.assertIn("except Exception as e:", src)
+
+
+class TestTheApplyPathReadsTheVerifiedArtifact(unittest.TestCase):
+    """`handle_reply` compares the generation the **verifier** returned, and never reads a refused one.
+
+    ## What this replaces
+
+    `TestSignedArtifactSeam` asserted this by source position: `src.index("verify_artifact_envelope")
+    < src.index('artifact.get("generation")')`. The property it stands for is the one the fleet broke
+    for an hour — reading a generation off an envelope nothing had verified, which reads in the logs as
+    "the relay is behind" rather than as "nothing verifies".
+
+    Position is not that property. A `return` between the two leaves the assertion true, and so does a
+    comparison that reads the envelope while the verifier's result sits unused beside it. Both are
+    driven below instead.
+
+    ## Why the suite's own harness could not be reused
+
+    `stub_artifact_verification` returns the envelope **as** the verified artifact, so the two are the
+    same object and no test using it can tell which one was read. That is the right shape for the tests
+    it serves and the wrong shape for this one; the verifier here returns an artifact that differs from
+    the envelope on purpose.
+    """
+
+    class _Envelope(dict):
+        """An envelope that records every read of its `generation`.
+
+        The refusal case needs to say "never read", and a count of reads is the only way to say it: a
+        path that reads the raw envelope and then happens to refuse looks identical from the outside.
+        """
+
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.generation_reads = 0
+
+        def get(self, key, default=None):
+            if key == "generation":
+                self.generation_reads += 1
+            return super().get(key, default)
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._state = hp.STATE_FILE
+        hp.STATE_FILE = os.path.join(self.tmp, "state.json")
+        self._real = {
+            name: getattr(hp, name) for name in (
+                "fetch_artifact", "verify_artifact_envelope", "accept_artifact_authorization",
+                "_preflight_host_artifact", "apply_workload", "apply_artifact", "log",
+            )
+        }
+        self.reached = []
+        self.logged = []
+        hp.log = lambda line: self.logged.append(str(line))
+        # Past the comparison is the only thing these tests read as "it proceeded", so every step after
+        # it records and does nothing. `accept_artifact_authorization` returning `(None, …)` would stop
+        # the path at its own refusal branch, which is a different test's subject.
+        hp.accept_artifact_authorization = lambda record, watch, expired: (
+            self.reached.append("accept"), ({}, ""))[1]
+        hp._preflight_host_artifact = lambda artifact: (
+            self.reached.append("preflight"), (None, None, "stubbed: no kernel here"))[1]
+        hp.apply_workload = lambda artifact: (
+            self.reached.append("workload"), (True, None, ""))[1]
+        hp.apply_artifact = lambda artifact, validated=None: (
+            self.reached.append("host"), (True, "pending", ""))[1]
+        hp.save_state(dict(hp._EMPTY_STATE))
+
+    def tearDown(self):
+        for name, value in self._real.items():
+            setattr(hp, name, value)
+        hp.STATE_FILE = self._state
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _beat(self, wanted="g-wanted"):
+        hp.handle_reply(hp.load_state(), {
+            "schemaVersion": hp.SCHEMA_VERSION, "generation": wanted, "gate": {"open": True},
+        })
+
+    def test_a_refused_envelope_is_never_read_for_a_generation(self):
+        """Verification raises, and nothing asks the envelope what generation it claims to be."""
+        envelope = self._Envelope({"generation": "g-forged", "payload": "..."})
+        hp.fetch_artifact = lambda: envelope
+
+        def refuse(_envelope, now=None):
+            raise ValueError("signature does not verify")
+
+        hp.verify_artifact_envelope = refuse
+        self._beat()
+
+        self.assertEqual(
+            envelope.generation_reads, 0,
+            "the apply path read the unverified envelope's generation. A path that reads it and then "
+            "refuses anyway looks the same from outside, which is why this counts reads rather than "
+            "watching what happened next.",
+        )
+        self.assertEqual(self.reached, [], f"a refused envelope reached {self.reached}")
+        self.assertTrue(
+            any("refusing artifact for generation g-wanted" in line for line in self.logged),
+            f"the refusal was not reported against the wanted generation: {self.logged}",
+        )
+        # And the refusal is durable, not only logged — a refusal nobody can act on is the defect
+        # recorded at the sibling branch in `handle_reply`.
+        self.assertIsNotNone(hp.load_state().get("lastRefusal"), "the refusal was not recorded")
+
+    def test_the_generation_compared_is_the_verifiers_not_the_envelopes(self):
+        """Both directions, because one of them is satisfied by reading either object.
+
+        The envelope and the verified artifact disagree, so each case is decided by which one the
+        comparison reads: when the **verified** generation is the wanted one the path proceeds, and when
+        only the **envelope's** is, it refuses. A test with one of these halves would pass against a
+        path that read the envelope.
+        """
+        for label, envelope_gen, verified_gen, expect_proceed in (
+            ("verified matches, envelope does not", "g-forged", "g-wanted", True),
+            ("envelope matches, verified does not", "g-wanted", "g-forged", False),
+        ):
+            with self.subTest(case=label):
+                self.reached.clear()
+                self.logged.clear()
+                hp.save_state(dict(hp._EMPTY_STATE))
+                envelope = self._Envelope({"generation": envelope_gen, "payload": "..."})
+                verified = {"generation": verified_gen, "payload": "..."}
+                hp.fetch_artifact = lambda: envelope
+                hp.verify_artifact_envelope = lambda _e, now=None: (
+                    verified, {"generation": verified_gen}, None, False,
+                )
+                self._beat()
+                if expect_proceed:
+                    self.assertIn(
+                        "accept", self.reached,
+                        "the path stopped at the generation comparison although the **verified** "
+                        f"artifact was the wanted generation: {self.logged}",
+                    )
+                else:
+                    self.assertNotIn(
+                        "accept", self.reached,
+                        "the path proceeded although the verified artifact was a different generation "
+                        "— the comparison read the envelope the verifier replaced",
+                    )
+                    self.assertTrue(
+                        any("skipping" in line for line in self.logged),
+                        f"the mismatch was not reported: {self.logged}",
+                    )
 
 
 def _openssl_has_rawin():
