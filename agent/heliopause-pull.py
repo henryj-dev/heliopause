@@ -3711,6 +3711,22 @@ _EMPTY_STATE = {
     # `None` is meaningful and distinct from the outer one: it says a backup *was* captured and
     # there was no table at the time, so restoring means deleting.
     "pendingBackup": None,
+    # The other half of that commitment: the route plan to undo, `[{spec, before}, …]` while an apply
+    # is unconfirmed and `None` otherwise.
+    #
+    # 🔴 **It was missing from this dict for as long as routes have been applied, and the absence was
+    # silent.** `apply_routes` wrote `st["pendingRoutes"]`, `rollback` wrote it again on its failed
+    # path, `_clear_commitment` cleared it beside `pendingBackup` — and `_load_state_unlocked` rebuilds
+    # this document from the keys *here*, so every one of those writes was dropped on the next read.
+    # `recover_commitment`'s recovery read therefore always saw `None`, and a restart restored the
+    # ruleset while leaving the route in place: the half-restored state `apply_routes`'s own docstring
+    # says keeping one commitment on disk makes impossible.
+    #
+    # The two halves have the same lifecycle — written at the same two places, cleared together in
+    # `_clear_commitment`, read by the same recovery — so persisting this one cannot strand a plan that
+    # `pendingBackup` would not have stranded too.
+    # @see TestTheRoutePlanSurvivesARestart
+    "pendingRoutes": None,
     # Unix time by which the apply must be confirmed. Absolute rather than a remaining duration:
     # a crash loop re-arming a duration on every start would push the deadline back forever.
     "rollbackAt": None,
