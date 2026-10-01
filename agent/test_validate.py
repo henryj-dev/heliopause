@@ -4846,20 +4846,138 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
                 ]
         return None
 
-    def test_main_calls_the_backfill_before_the_recovery_paths(self):
-        calls = self._main_calls()
-        self.assertIsNotNone(calls, "main() is not a plain function any more — this check is blind")
-        self.assertIn(
-            "backfill_current_authorization", calls,
-            "main() does not adopt the authorization already in force; every host keeps None",
+    def test_main_adopts_the_authorization_before_it_starts_beating(self):
+        """## What this replaces, and why reading `main()` could not do it
+
+        This was an AST check: parse `main()`, collect the names it calls, assert
+        `backfill_current_authorization` is among them. A review inserted `return 0` **before** that
+        call and the assertion stayed true, because the call is still in the tree. The test could not
+        tell a startup that adopts from one that returns first — which is the only thing it was for.
+
+        So it drives `main()`. `_stop` is set beforehand, so the heartbeat loop exits on its first
+        check and the startup prelude is the whole of what runs. The assertion is on the state file
+        afterwards: a host that confirmed under an older build has its authorization named.
+        """
+        state = {
+            **hp._EMPTY_STATE,
+            "generation": "g-live", "state": "confirmed",
+            # The record fixture lives with the function it describes; this class borrows it rather
+            # than building a second one that could drift from the ten keys the agent writes.
+            "authorizationWatermark": dict(TestBackfillCurrentAuthorization.REC),
+        }
+        hp.save_state(state)
+
+        real = (
+            hp.load_artifact_trust, hp.monitor_loop, hp.post_heartbeat,
+            hp.recover_commitment, hp.recover_workload_commitment,
+            hp.reconcile_recovered_commitments,
         )
-        # Before recovery, and the ordering comment at the call site says why that is not
-        # load-bearing today and what would make it so. Pinned anyway: if a recovery path ever
-        # produces `confirmed`, this assertion is the thing that has to be revisited deliberately
-        # rather than a position that quietly stopped mattering.
+        reached: dict[str, int] = {}
+
+        def counted(name, fn=None):
+            def call(*a, **k):
+                reached[name] = reached.get(name, 0) + 1
+                return None if fn is None else fn(*a, **k)
+            return call
+
+        hp.load_artifact_trust = lambda: {
+            "managerKeyIds": ["sha256:" + "a" * 64], "breakGlassKeyIds": [], "trustDigest": "sha256:t",
+        }
+        # A daemon thread that does nothing, so the test does not race a real monitor.
+        hp.monitor_loop = counted("monitor")
+        hp.post_heartbeat = counted("heartbeat")
+        hp.recover_commitment = counted("recover")
+        hp.recover_workload_commitment = counted("recover_workload")
+        hp.reconcile_recovered_commitments = counted("reconcile")
+        # The required environment is read into module constants at import, so it is patched there.
+        env = {
+            "RELAY_URL": "https://relay.example/heartbeat", "CA_FILE": "/dev/null",
+            "CERT_FILE": "/dev/null", "KEY_FILE": "/dev/null", "TARGET": "t",
+            "MANAGER_SIGNING_KEYS_DIR": "/dev/null", "BREAK_GLASS_KEYS_DIR": "/dev/null",
+            "INTERVAL_ERROR": None,
+        }
+        saved_env = {k: getattr(hp, k) for k in env}
+        for k, v in env.items():
+            setattr(hp, k, v)
+        was_set = hp._stop.is_set()
+        hp._stop.set()
+        try:
+            code = hp.main()
+        finally:
+            (
+                hp.load_artifact_trust, hp.monitor_loop, hp.post_heartbeat,
+                hp.recover_commitment, hp.recover_workload_commitment,
+                hp.reconcile_recovered_commitments,
+            ) = real
+            for k, v in saved_env.items():
+                setattr(hp, k, v)
+            if not was_set:
+                hp._stop.clear()
+
+        self.assertEqual(code, 0, "main() refused to start, so nothing below was exercised")
+        # 🔑 The probe that makes the rest mean something: the prelude ran to the end. Without this a
+        # `return 2` anywhere above would satisfy the state assertion only by leaving it untouched.
+        self.assertEqual(
+            reached.get("recover"), 1,
+            "the startup prelude did not reach the recovery calls, so this test did not get far enough "
+            "to say anything about the adoption",
+        )
+        self.assertEqual(
+            hp.load_state()["currentAuthorization"], TestBackfillCurrentAuthorization.REC,
+            "main() did not adopt the authorization already in force — every host keeps None",
+        )
+
+    def test_no_recovery_path_can_write_the_confirmed_state(self):
+        """## The invariant the ordering was standing in for
+
+        The call site says the order is a convenience: the backfill runs first only because it is cheap
+        and reads settled state, and **if a recovery path ever produces `confirmed`, the call has to
+        move below it.** That is the thing to check, and reading `main()`'s call order never checked it.
+
+        Each recovery path is driven from the states it acts on, and none of them may write `confirmed`.
+        A path that did would make the adoption read a state that is about to be invalidated.
+        """
+        vocabulary = sorted(hp._STATES) if hasattr(hp, "_STATES") else [
+            "prepared", "pending", "confirmed", "rolled-back",
+            "rollback-failed", "rollback-incident", "unsupported", "none",
+        ]
+        paths = (
+            ("recover_commitment", hp.recover_commitment),
+            ("recover_workload_commitment", hp.recover_workload_commitment),
+            ("reconcile_recovered_commitments", hp.reconcile_recovered_commitments),
+        )
+        for name, fn in paths:
+            for state in vocabulary:
+                if state == "confirmed":
+                    continue  # Already there; this asks whether a path can *reach* it.
+                hp.save_state({
+                    **hp._EMPTY_STATE,
+                    "generation": "g-live", "state": state,
+                    "workloadState": state, "workloadGeneration": "g-live",
+                })
+                try:
+                    fn()
+                except Exception:  # noqa: BLE001 — a path refusing this fixture is not the subject
+                    pass
+                settled = hp.load_state()
+                self.assertNotEqual(
+                    settled.get("state"), "confirmed",
+                    f"{name}() moved a host from {state!r} to 'confirmed' — the backfill runs before it "
+                    "and would adopt a watermark against a state about to change. Move the call below "
+                    "the recovery paths, which is what the comment at the call site says to do.",
+                )
+
+    def test_the_backfill_still_precedes_the_recovery_paths(self):
+        # A tripwire, and named as one. The position is **not** the invariant — the test above is — but
+        # a position that moves is worth a cheap signal, because moving it is how someone would discover
+        # the invariant rather than check it. Reading the call order is all this does; the behaviour is
+        # covered above.
+        calls = self._main_calls()
+        self.assertIsNotNone(calls, "main() is not a plain function any more — this tripwire is blind")
         self.assertLess(
             calls.index("backfill_current_authorization"), calls.index("recover_commitment"),
-            "the backfill moved after a recovery path — see the comment at the call site",
+            "the backfill moved after a recovery path — see "
+            "test_no_recovery_path_can_write_the_confirmed_state for what that would have to be safe",
         )
 
     def test_the_check_can_fail(self):
