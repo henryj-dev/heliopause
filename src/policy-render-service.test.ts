@@ -23,12 +23,19 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcessByStdio } from "node:child_process";
+// `fetch` will not send a malformed request target, so one test speaks HTTP directly.
+import { connect } from "node:net";
 import type { Readable } from "node:stream";
-import { mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parsePolicySource } from "./policy-source.ts";
+// Imported so the budget assertions derive both sides from the same table the renderer reads, rather
+// than restating numbers that would then have to be kept in step by hand.
+import { ENV_BOUNDS } from "./env-spec.ts";
 
 const BIN = fileURLToPath(new URL("../bin/heliopause-policy-render.ts", import.meta.url));
 
@@ -61,6 +68,23 @@ interface Started {
   proc: ChildProcessByStdio<null, Readable, Readable>;
   port: number;
   stop: () => void;
+  /**
+   * Everything the renderer said on stdout up to and including the "listening" line.
+   *
+   * The startup verification logs before the listener exists, so those lines are already consumed by
+   * this harness's own reader by the time `start()` resolves — a test that attaches afterwards sees
+   * none of them. Without this, nothing the process says at startup is assertable at all, which is
+   * how the declared-name caveat shipped with no test.
+   */
+  startupLog: string;
+  /**
+   * Everything said on stdout **so far**, including after startup.
+   *
+   * `startupLog` is frozen at the "listening" line, so a line the renderer logs while serving a
+   * request was unassertable — which is how a bound whose only visible effect is a log line had no
+   * test. The reader stays attached; this reads what it has accumulated.
+   */
+  output: () => string;
 }
 
 /** Start the renderer and wait for the line that reports the port it actually bound. */
@@ -122,6 +146,8 @@ function start(dir: string, extraEnv: Record<string, string> = {}): Promise<Star
         proc,
         port: Number(m[1]),
         stop: () => proc.kill("SIGKILL"),
+        startupLog: out,
+        output: () => out,
       });
     });
     proc.on("exit", (code) => {
@@ -684,6 +710,994 @@ describe("a site module has to be the site it is declared as", () => {
     }
   });
 
+  it("still refuses when the misdeclared module is slow to import", { timeout: 30_000 }, async () => {
+    // ## The budget above the refusal quietly turned a configuration fault into a content one
+    //
+    // The startup verification bounds each import so that a module which never settles cannot stop
+    // the process reaching `server.listen`. But a timeout means the zone check **never ran**, and
+    // the `catch` distinguishes `ZoneMismatchError` — refuse, it cannot heal itself — from every
+    // other failure — log, it changes commit to commit. A timed-out misdeclared site landed in the
+    // second branch, so the pod came up and served 503 for that VPC behind one log line instead of
+    // exiting 2 with the sentence that says which of the two names is wrong.
+    //
+    // Measured: the same wrong-zone module exits 2 at 148ms when it imports instantly, and merely
+    // logged when a budget shorter than its import cut it off. Any `await` at a policy module's top
+    // level — one `readFile`, a dynamic import, a cold transpile — is enough to be on the wrong side
+    // of that line. So the budget has to be larger than a real cold import, which is what this pins:
+    // a module that takes a second still gets zone-checked and still refuses.
+    const { dir, beta } = twoSites();
+    writeFileSync(beta, `await new Promise((r) => setTimeout(r, 1000));\n${readFileSync(beta, "utf8")}`);
+    try {
+      const { code, err } = await startExpectingRefusal(dir, {
+        HELIOPAUSE_POLICY_SITE: "",
+        HELIOPAUSE_POLICY_SITES: `alpha=${beta}`,
+        HELIOPAUSE_POLICY_RENDER_TOKEN: BEARER,
+        HELIOPAUSE_POLICY_STARTUP_BUDGET_MS: "10000",
+      });
+      assert.equal(code, 2, `a slow misdeclared module came up instead of refusing\n${err}`);
+      assert.match(err, /gw-01\.beta/, "it did not name the host that gave it away");
+    } finally {
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("verifies its sites together, so one hung module does not delay the rest", { timeout: 30_000 }, async () => {
+    // ## The bound was additive, and additive is its own outage
+    //
+    // This loop was `for … await`, so N hung sites cost N budgets before `server.listen` — and until
+    // that line nothing answers, `/healthz` included, because the listener does not exist yet.
+    // Measured 2s × 3 = 6.1s; at the 30s default with the three-VPC deployment this file keeps
+    // describing, that is ninety seconds dark, against a liveness probe of 30s × 3. The bound added
+    // to stop a hang reached the crashloop the `/healthz` comment says must never be created.
+    //
+    // Two hung sites and a budget of 2s: serial is ~4s, together is ~2s. The threshold sits between
+    // them, so this fails if the loop ever goes back to sequential.
+    const { dir, sites, alpha, beta } = twoSites();
+    const hang = "await new Promise(() => {});\nexport const site = { cfg: {}, hosts: [] };\n";
+    writeFileSync(alpha, hang);
+    writeFileSync(beta, hang);
+    let started: Started | undefined;
+    // Derived from the budget rather than written as a number, so tuning one moves the other. The
+    // threshold sits between one budget and two; measured five runs at 2147–2169ms parallel against
+    // 4119ms serial, so the slack is over a second on a ~150ms fixed cost.
+    const budget = 2_000;
+    const began = Date.now();
+    try {
+      started = await start(dir, { ...MULTI(sites), HELIOPAUSE_POLICY_STARTUP_BUDGET_MS: String(budget) });
+      const took = Date.now() - began;
+      assert.ok(
+        took < budget * 1.75,
+        `startup took ${took}ms against a ${budget}ms budget — that is one budget per site, so the ` +
+          `sites were verified one after another`,
+      );
+      // And it is listening, which is the point of bounding at all.
+      assert.equal((await fetchAt(started.port, "/healthz")).status, 200);
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("says the declared-name check did not run, whichever way the module failed", { timeout: 30_000 }, async () => {
+    // ## The caveat, and the predicate that only covered half of what needed it
+    //
+    // A site whose module never evaluated was never zone-checked, and the startup block treats a
+    // name/module mismatch as the fault that cannot heal itself. So the line has to say which check
+    // did not run — otherwise its silence is read as a pass.
+    //
+    // 🔴 That caveat was selected by `why.includes("did not finish within")`, which is wrong on both
+    // sides. The zone check runs **after** the import, so it is skipped by every failure at or before
+    // it — and a module that *throws* is the common half, which kept the plain line and left the hole
+    // open on the other path. And the string is `evaluateWithin`'s own wording, so a policy module
+    // could throw that text and choose which sentence an operator reads. The condition is now
+    // `error instanceof ZoneCheckedError` — a class a module cannot reach — and it is driven by
+    // "does not blame the declared name when the check ran and the content failed" below.
+    //
+    // Both halves are driven here: one site hangs past its budget, the other throws at import, and
+    // both must carry the caveat. Neither had a test at all — mutating the branch to `if (false)`
+    // left every test green.
+    const { dir, sites, alpha, beta } = twoSites();
+    writeFileSync(alpha, "await new Promise(() => {});\nexport const site = { cfg: {}, hosts: [] };\n");
+    writeFileSync(beta, "throw new Error('beta will not import');\n");
+    let started: Started | undefined;
+    try {
+      started = await start(dir, { ...MULTI(sites), HELIOPAUSE_POLICY_STARTUP_BUDGET_MS: "1000" });
+      const said = started.startupLog;
+      const caveat = /the declared-name check did not run for it/g;
+      assert.equal(
+        (said.match(caveat) ?? []).length, 2,
+        `both failures must carry the caveat — the timeout and the throw:\n${said}`,
+      );
+      assert.match(said, /alpha did not evaluate at startup — the declared-name check did not run/);
+      assert.match(said, /beta did not evaluate at startup — the declared-name check did not run/);
+      // And it did come up, which is the other half: neither failure may be fatal.
+      assert.equal((await fetchAt(started.port, "/healthz")).status, 200);
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("does not blame the declared name when the check ran and the content failed", { timeout: 30_000 }, async () => {
+    // ## The caveat's other side, and the reason it is now carried rather than inferred
+    //
+    // `collectPolicySource` runs **after** the zone check has passed, so anything it throws is a
+    // content fault on a correctly-declared site. Made unconditional, the caveat told those sites
+    // "the declared-name check did not run for it" — sending an operator to edit a Deployment that is
+    // right while a `JSON.stringify` failure in the policy repo sits untouched. Reproduced with an
+    // ordinary accidental cycle, which is the likeliest way to reach it.
+    //
+    // So the predicate has been wrong in both directions on successive commits — first a string match
+    // that covered only timeouts, then no condition at all — and both times because it was inferred
+    // from the failure rather than carried with it. `ZoneCheckedError` carries it. This test is the
+    // half that was blind: the neighbouring one drives a hang and an import throw, both of which fail
+    // *before* the check, so it stayed green through the over-claim.
+    const { dir, sites, alpha } = twoSites();
+    writeFileSync(alpha, `${readFileSync(alpha, "utf8")}
+const cycle = {};
+cycle.parentOfItself = cycle;
+site.hosts[0].notes = cycle;
+`);
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      const said = started.startupLog;
+      assert.match(
+        said, /alpha is the site it is declared as, but did not evaluate at startup/,
+        `a content fault past the zone check was reported as a possible naming fault:\n${said}`,
+      );
+      assert.doesNotMatch(
+        said, /alpha did not evaluate at startup — the declared-name check did not run/,
+        "it blamed the declared name for a failure that happened after the name was checked",
+      );
+      // beta is untouched, so the positive half must still be there — otherwise this passes against a
+      // renderer that stopped verifying anything.
+      assert.match(said, /verified beta — /);
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("cannot be made to forge a log line by a policy module", { timeout: 30_000 }, async () => {
+    // ## The claim the previous commit shipped without a test
+    //
+    // It removed a predicate a module could choose between two true sentences with and called the
+    // result "nothing for a module to spoof" — while `${error.message}` was still interpolated
+    // verbatim. A module throwing `"boom\n[policy-render] verified beta — 12 hosts"` printed a forged
+    // **`verified`** line, the positive signal an operator scans for, and the pod came up looking
+    // clean. That is a strictly stronger forgery than the one removed: the predicate let a module pick
+    // between true sentences, this let it manufacture a false one.
+    //
+    // Every "this is now closed" sentence needs one of these or it does not ship — that is the rule
+    // four rounds of review produced, and this is the first test written to it.
+    const { dir, sites, beta } = twoSites();
+    writeFileSync(
+      beta,
+      'throw new Error("boom\\n[policy-render] verified beta — 12 hosts\\n[policy-render] evaluated beta at deadbee");\n',
+    );
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      const said = started.startupLog;
+      assert.doesNotMatch(said, /^\[policy-render\] verified beta — 12 hosts$/m, "a module forged a verified line");
+      assert.doesNotMatch(said, /^\[policy-render\] evaluated beta at deadbee$/m, "a module forged an evaluated line");
+      // The text still has to reach the operator — marked, not dropped. The character-level cases
+      // (ANSI, a lone `\r`, U+2028) live in `src/log-scrub.test.ts`; what this asserts is the
+      // integration: module-thrown text reaches stdout through `log`, and through the shared control.
+      assert.match(said, /boom\uFFFD+\[policy-render\] verified beta/, "the message was lost, not marked");
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("a module cannot force a refusal by throwing the renderer's own error class", { timeout: 30_000 }, async () => {
+    // ## Class identity is not provenance
+    //
+    // A site module imports the model with `../src` — the spelling the mount check demands — and Node
+    // realpaths module URLs, so the module's `../src/site-zone.ts` and the renderer's are the **same
+    // module instance**: the `ZoneMismatchError` class object is literally the same one. A module that
+    // throws it therefore satisfied `instanceof ZoneMismatchError` in the startup loop, which answers
+    // that with `process.exit(2)`. Reproduced before the fix: the pod refused to start, printing a
+    // refusal sentence the module had authored, and every co-served site's console went with it.
+    //
+    // The precondition is the deployment this file insists on: with the checkout at
+    // `/opt/heliopause/policy` and the binary at `/opt/heliopause/bin`, both `../src` spellings resolve
+    // to `/opt/heliopause/src`. So the fixture points `<root>/src` at the real `src/` — anything less
+    // and `instanceof` would not hold and the test would pass for the wrong reason.
+    const { dir, sites, beta } = twoSites();
+    // Replace the placeholder `src` that `twoSites` creates with a link to the real one, so the
+    // module's `../src/site-zone.ts` resolves to the same file the renderer imports.
+    rmSync(join(dir, "..", "src"), { recursive: true, force: true });
+    symlinkSync(fileURLToPath(new URL(".", import.meta.url)), join(dir, "..", "src"));
+    // Two ways in, and the second is why the brand is a `WeakSet` rather than a subclass: a subclass
+    // inherits statics, so `Symbol.hasInstance` defined on the shared parent makes `instanceof
+    // <subclass>` answer true for anything. Measured before the fix — a plainly-constructed error
+    // satisfied `instanceof Own`. A module cannot add an entry to a set it cannot name.
+    writeFileSync(beta, `import { ZoneMismatchError } from "../src/site-zone.ts";
+Object.defineProperty(ZoneMismatchError, Symbol.hasInstance, { value: () => true, configurable: true });
+export const site = {
+  cfg: { hookPolicy: { input: "drop", output: "accept" } },
+  hosts: [{ id: "gw-01.beta", stage: "canary", items: [] }],
+  workload: [{ kind: "service", value: "kube-system/coredns" }],
+  resolveService() { throw new ZoneMismatchError("forged by the policy module"); },
+};
+`);
+    let started: Started | undefined;
+    try {
+      // If the module could still force a refusal this throws "exited with 2 before listening", which
+      // is the assertion: reaching a listener at all is the property.
+      started = await start(dir, MULTI(sites));
+      const said = started.startupLog;
+      assert.doesNotMatch(said, /refusing to start/, `a module forced a refusal:\n${said}`);
+      assert.match(
+        said, /beta is the site it is declared as, but did not evaluate/,
+        `a module-authored zone error was not treated as a content fault:\n${said}`,
+      );
+      // alpha is untouched, so it must still be served — the pod staying up is the whole point.
+      assert.equal((await fetchAt(started.port, "/source?site=alpha")).status, 200);
+      // And beta answers, rather than the request being the thing that kills the process.
+      assert.equal((await fetchAt(started.port, "/source?site=beta")).status, 503);
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("survives a policy module that throws a nullish value", { timeout: 30_000 }, async () => {
+    // ## `throw null` was two tokens and a crashloop
+    //
+    // `throw` takes any value. The startup loop read `(e as Error).message` before either branch, so a
+    // nullish throw raised a `TypeError` at the read: exit 1, `server.listen` never reached, and at
+    // `replicas: 1` with `Recreate` that is every co-served site's console down — the outage that
+    // loop's own comment refuses to manufacture. `throw 42` survived and printed the reason as the
+    // literal word `undefined`.
+    //
+    // It also broke `ZoneCheckedError` directly: constructing it from `(e as Error).message` threw
+    // inside the catch, so the wrapper never existed and a post-zone-check failure was blamed on the
+    // declared name — the confusion that class exists to end.
+    // The last four make coercion itself throw, which is what a module reaches for once `null` is
+    // handled: a `toString` that throws, a `Symbol.toPrimitive` that throws, `Object.create(null)`
+    // (no `toString` to find at all), and a Proxy whose `get` trap throws. Measured before the fix,
+    // four of five made `asError` throw — restoring the crash from inside the function that prevents it.
+    for (const thrown of [
+      "null", "undefined", "42", '"a string"', "{}",
+      "{ toString() { throw new Error('nope'); } }",
+      "{ [Symbol.toPrimitive]() { throw new Error('nope'); } }",
+      "Object.create(null)",
+      "new Proxy({}, { get() { throw new Error('nope'); } })",
+    ]) {
+      const { dir, sites, beta } = twoSites();
+      writeFileSync(beta, `throw ${thrown};\n`);
+      let started: Started | undefined;
+      try {
+        started = await start(dir, MULTI(sites));
+        const said = started.startupLog;
+        assert.match(said, /beta .*did not evaluate at startup/, `throw ${thrown}: no report`);
+        // Not "the reason says non-error value" for every case: a thrown Proxy never reaches `asError`
+        // as itself. Node's own module machinery touches the rejected value first, its `get` trap
+        // throws, and what arrives here is already an ordinary `Error`. Asserting the message shape
+        // for that case failed against correct behaviour — the property is that the process survives
+        // and reports something an operator can act on, which the per-case checks here cover.
+        assert.doesNotMatch(
+          said, /until it does:\s*$/m,
+          `throw ${thrown}: the report had no reason in it at all`,
+        );
+        // The reason has to name the value, not read as the word `undefined`.
+        assert.doesNotMatch(
+          said, /until it does: undefined$/m,
+          `throw ${thrown}: the reason was the word "undefined"`,
+        );
+        assert.match(said, /verified alpha — /, `throw ${thrown}: it stopped verifying the others`);
+      } finally {
+        started?.stop();
+        rmSync(join(dir, ".."), { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("answers 503 rather than dying when a nullish throw reaches a request", { timeout: 30_000 }, async () => {
+    // ## The half the startup fix did not cover, and it is the worse half
+    //
+    // `asError` was applied where the startup loop catches, so a module's `throw null` stopped killing
+    // startup — and that made it worse. Measured: the pod came up, `/healthz` answered 200, and the
+    // **first `/source` request** read `.message` off `null` inside a rejection handler, so an
+    // unhandled rejection took the process out with exit 1. It passed both probes and then died when
+    // the manager asked for policy, which is a crashloop driven by ordinary polling.
+    //
+    // The normalisation now sits in `evaluateWithin`'s rejection, which every consumer of
+    // `currentSource` passes through — `/source`, `/readyz` and the startup loop — rather than at the
+    // four places that read `.message`. This file noted that exact "second path a per-call-site fix
+    // forgets" about `console.error` one commit before repeating it.
+    const { dir, sites, beta } = twoSites();
+    writeFileSync(beta, "throw null;\n");
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      assert.equal((await fetchAt(started.port, "/healthz")).status, 200);
+      const res = await fetchAt(started.port, "/source?site=beta");
+      assert.equal(res.status, 503, "a nullish throw did not become a 503");
+      assert.match(
+        String(((await res.json()) as { error?: string }).error),
+        /policy module threw a non-error value: null/,
+        "the reason did not name the value that was thrown",
+      );
+      // Still alive, and still serving its sibling — the property the exit-1 crash destroyed.
+      assert.equal((await fetchAt(started.port, "/source?site=alpha")).status, 200);
+      assert.equal((await fetchAt(started.port, "/healthz")).status, 200);
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("answers 400 to a request target it cannot parse, and keeps serving", { timeout: 30_000 }, async () => {
+    // ## The worst thing seven review rounds found, and it was there the whole time
+    //
+    // `new URL("//[", "http://placeholder")` throws `ERR_INVALID_URL`: `//` makes the target
+    // protocol-relative, so `[` begins an IPv6 host and fails. The request handler is a synchronous
+    // `createServer` callback, so the throw was uncaught — **exit 1** — and it happened *before* the
+    // bearer check. One unauthenticated `GET //[` from anything that could reach the port took the pod
+    // down, and at `replicas: 1` with `Recreate` every zone's console went with it.
+    //
+    // Unchanged from `origin/main` of this repository, so it predates this branch rather than being
+    // introduced by it. That is a statement about this repository; the running image is built from
+    // another one, and its tag does not resolve here. `//[::1`, `//%` and `http://[` do the same.
+    const { dir, sites } = twoSites();
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      const port = started.port;
+      const raw = (target: string): Promise<string> => new Promise((resolve) => {
+        const sock = connect(port, "127.0.0.1", () => {
+          sock.write(`GET ${target} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n`);
+        });
+        let buf = "";
+        sock.on("data", (d: Buffer) => { buf += d.toString(); });
+        sock.on("close", () => resolve(buf.split("\r\n")[0] ?? ""));
+        sock.on("error", () => resolve("socket error"));
+        setTimeout(() => { sock.destroy(); resolve("timeout"); }, 4_000);
+      });
+      for (const target of ["//[", "//[::1", "//%"]) {
+        assert.match(await raw(target), /^HTTP\/1\.1 400 /, `${target} did not get a 400`);
+      }
+      // Still alive and still answering — the property the uncaught throw destroyed.
+      assert.equal((await fetchAt(port, "/healthz")).status, 200);
+      assert.equal((await fetchAt(port, "/source?site=alpha")).status, 200);
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("survives a module whose error resists being read", { timeout: 30_000 }, async () => {
+    // ## Three shapes that each ended the process, all in the error-handling path itself
+    //
+    // - **A thrown Proxy with a `getPrototypeOf` trap.** `thrown instanceof Error` walks the prototype
+    //   chain, so the classification in `asError` ran the trap and threw — inside a rejection handler
+    //   that had already cleared its timer, so nothing caught it. A revoked Proxy does the same with
+    //   `TypeError: Cannot perform 'getPrototypeOf' on a proxy that has been revoked`.
+    // - **An `Error` whose `.message` getter throws.** `asError` returned `Error` instances unchanged,
+    //   so the getter survived to the log line and the 503 body, outside every guard.
+    //
+    // Each of these is a normal-looking configuration mistake away from a real one: a getter that
+    // reads something undefined, a Proxy left revoked by a helper. The fix is that conversion reads
+    // the message once, into a string this process owns.
+    const shapes: Record<string, string> = {
+      proxyPrototype: 'new Proxy({}, { getPrototypeOf() { throw new Error("trap"); } })',
+      revokedProxy: '(() => { const r = Proxy.revocable({}, {}); r.revoke(); return r.proxy; })()',
+      unreadableMessage:
+        '(() => { const e = new Error("x"); Object.defineProperty(e, "message", ' +
+        '{ get() { throw new Error("message trap"); } }); return e; })()',
+    };
+    for (const [name, expr] of Object.entries(shapes)) {
+      const { dir, sites, beta } = twoSites();
+      writeFileSync(beta, `throw ${expr};\n`);
+      let started: Started | undefined;
+      try {
+        started = await start(dir, MULTI(sites));
+        assert.match(
+          started.startupLog, /beta .*did not evaluate at startup/,
+          `${name}: it did not report the failure`,
+        );
+        // The request path too, since that is where the previous round's fix did not reach.
+        assert.equal((await fetchAt(started.port, "/source?site=beta")).status, 503, `${name}: no 503`);
+        assert.equal((await fetchAt(started.port, "/source?site=alpha")).status, 200, `${name}: alpha lost`);
+        assert.equal((await fetchAt(started.port, "/healthz")).status, 200, `${name}: process gone`);
+      } finally {
+        started?.stop();
+        rmSync(join(dir, ".."), { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("keeps its provenance check working when a module patches WeakSet", { timeout: 30_000 }, async () => {
+    // ## The set was unreachable; the lookup was not
+    //
+    // `foundHere` called `OUR_ZONE_MISMATCHES.has(...)`, which resolves `has` on `WeakSet.prototype`
+    // at call time. A configuration module runs in this realm, so
+    // `WeakSet.prototype.has = () => true` in one made every error look like one this process built —
+    // turning an ordinary content fault into `exit 2` with a refusal nobody configured. Measured.
+    //
+    // Binding `has` before the first `import()` is what makes the set's unreachability the only thing
+    // that matters, and this drives it: the module patches the prototype *and* throws an ordinary
+    // error, which must still be a content fault.
+    const { dir, sites, beta } = twoSites();
+    writeFileSync(beta, `WeakSet.prototype.has = () => true;
+throw new Error("an ordinary content fault");
+`);
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      assert.doesNotMatch(
+        started.startupLog, /refusing to start/,
+        `a patched WeakSet forced a refusal:\n${started.startupLog}`,
+      );
+      assert.match(started.startupLog, /beta .*did not evaluate at startup/);
+      assert.equal((await fetchAt(started.port, "/source?site=alpha")).status, 200);
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("answers nothing rather than an empty body", { timeout: 30_000 }, async () => {
+    // ## Not throwing is not the same as producing a body
+    //
+    // The serialisation guard was written for a `toJSON` that throws. An inherited one that **returns
+    // `undefined`** does not throw: `JSON.stringify` returns `undefined`, the `catch` never runs, and
+    // `res.end(undefined)` goes out as a **200 with an empty body** under `application/json`. The
+    // manager parses nothing and has no error to report — the quietest possible failure, and the
+    // declared `let text: string` is why it read as impossible.
+    //
+    // Found by an independent audit of this branch. `/healthz` is unaffected either way: it answers a
+    // constant that was serialised when the file was written, which is asserted here so that staying
+    // 200 is a checked property and not a coincidence.
+    const { dir, sites, beta } = twoSites();
+    writeFileSync(
+      beta,
+      'Object.defineProperty(Object.prototype, "toJSON", { value() { return undefined; }, configurable: true });\n' +
+        'throw new Error("bad beta");\n',
+    );
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      const port = started.port;
+      const deadline = (): RequestInit => ({ signal: AbortSignal.timeout(10_000) });
+      const healthz = await fetchAt(port, "/healthz", deadline());
+      assert.equal(healthz.status, 200, "the liveness probe stopped answering");
+      assert.deepEqual(await healthz.json(), { ok: true }, "/healthz went through the serialiser");
+      for (const path of ["/source?site=alpha", "/source?site=beta", "/readyz"]) {
+        const res = await fetchAt(port, path, deadline());
+        const text = await res.text();
+        assert.notEqual(text, "", `${path}: an empty body went out with ${res.status}`);
+        assert.notEqual(res.status, 200, `${path}: an unserialisable answer was reported as success`);
+        assert.equal(
+          (JSON.parse(text) as { error?: string }).error, "the answer could not be serialised",
+          `${path}: the body is not the stated fallback`,
+        );
+      }
+      assert.equal((await fetchAt(port, "/healthz", deadline())).status, 200, "healthz after");
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("does not count a git checkout against the scan cap", { timeout: 60_000 }, async () => {
+    // ## 🔴 The test that would have stopped a full outage, and did not exist
+    //
+    // The policy directory **is a git checkout**, and `.git` holds thousands of entries on its own:
+    // measured in a real tree, 3,116 entries with it and 49 without. The version of the cap that
+    // counted everything and refused above it would therefore have answered 503 for **every site on
+    // every deployment** — a full console outage shipped as a fix for a memory leak, which had itself
+    // been shipped as a fix for a frozen cache key.
+    //
+    // Nothing in this suite could have caught it, because `twoSites()` builds a directory with no
+    // `.git` in it. That is the whole reason this test exists: the fixture was more forgiving than the
+    // world, and every assertion about the cap was made against the forgiving one.
+    const { dir, sites, beta } = twoSites();
+    // 🔑 **Each skip has to be enough on its own.** The first fixture put 700 files in each of three
+    // hidden directories, so removing dot-skipping exposed 1,400 and removing `node_modules`-skipping
+    // exposed 700 — both under the 2,000 cap, so either mutation survived and the test held up neither
+    // rule. Each directory now carries more than the cap by itself.
+    for (const hidden of [".git", "node_modules"]) {
+      const sub = join(dir, hidden);
+      mkdirSync(sub);
+      for (let i = 0; i < 2_100; i += 1) writeFileSync(join(sub, `o${i}.ts`), `export const n${i} = ${i};\n`);
+    }
+    // And a dot-**file** the module actually imports. The predicate skipped any entry whose name began
+    // with a dot, before the directory check, so this helper was importable, versioned by the resolve
+    // hook, and invisible to the stamp — a stale payload for a change inside the scanned directory. The
+    // assertion that catches it is the edit below, not the status code.
+    writeFileSync(join(dir, ".helper.ts"), 'export const mark = "first";\n');
+    writeFileSync(beta, `import { mark } from "./.helper.ts";
+export const site = {
+  cfg: { hookPolicy: { input: "drop", output: "accept" } },
+  hosts: [{ id: "gw-01.beta", stage: "canary", items: [] }],
+  objects: [{ id: "ao-beta", kind: "address", name: mark,
+              members: [{ kind: "cidr", value: "10.0.0.0/8" }] }],
+};
+`);
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      const port = started.port;
+      const deadline = (): RequestInit => ({ signal: AbortSignal.timeout(20_000) });
+      for (const site of ["alpha", "beta"]) {
+        assert.equal(
+          (await fetchAt(port, `/source?site=${site}`, deadline())).status, 200,
+          `${site} was refused because of files a module graph cannot reach`,
+        );
+      }
+      assert.doesNotMatch(
+        started.output(), /entries beside/,
+        "the scan overflowed on an ordinary checkout",
+      );
+      // The dot-file half: a helper whose name begins with a dot is imported, so a change to it has to
+      // move the stamp. Skipping dot-*entries* rather than dot-*directories* makes this answer "first"
+      // forever while the module says "second".
+      const named = async (): Promise<unknown> => {
+        const r = await fetchAt(port, "/source?site=beta", deadline());
+        assert.equal(r.status, 200, "beta lost");
+        return ((await r.json()) as { site?: { objects?: { name?: unknown }[] } })
+          .site?.objects?.[0]?.name;
+      };
+      assert.equal(await named(), "first", "the fixture's marker is not where this test reads it");
+      writeFileSync(join(dir, ".helper.ts"), 'export const mark = "second";\n');
+      const later = new Date(Date.now() + 5_000);
+      utimesSync(join(dir, ".helper.ts"), later, later);
+      assert.equal(
+        await named(), "second",
+        "a dot-file the module imports is invisible to the stamp, so its edit was never seen",
+      );
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a site whose tree it could not finish reading", { timeout: 60_000 }, async () => {
+    // ## A directory that cannot be enumerated is not an empty one
+    //
+    // The walk caught the failure and continued, which made an unreadable directory contribute nothing
+    // and the stamp come back **complete**. The two are different states and only one of them is safe
+    // to cache: a directory can deny enumeration while still allowing a known filename to be opened, so
+    // a helper stays importable and becomes unstampable at the same instant. Fail-open, in the function
+    // whose only job is to notice change. Found by a third review of these twenty lines.
+    //
+    // Refusing is consistent with the overflow: no complete stamp, no answer. It does mean a permissions
+    // fault anywhere under the policy directory refuses every site sharing it, which is the same shared
+    // blast radius the overflow has and is stated at the code.
+    if (process.getuid?.() === 0) {
+      // root ignores the mode bits, so there is no unreadable directory to make. Said rather than
+      // skipped silently: a test that quietly does nothing is the shape this file keeps recording.
+      console.log("skipped: running as root, which can read a 0o000 directory");
+      return;
+    }
+    const { dir, sites } = twoSites();
+    const sealed = join(dir, "sealed");
+    mkdirSync(sealed);
+    writeFileSync(join(sealed, "helper.ts"), 'export const mark = "first";\n');
+    chmodSync(sealed, 0o000);
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      const port = started.port;
+      const deadline = (): RequestInit => ({ signal: AbortSignal.timeout(20_000) });
+      const refused = await fetchAt(port, "/source?site=beta", deadline());
+      assert.equal(
+        refused.status, 503,
+        "a site whose directory could not be read was served from a stamp that cannot be complete",
+      );
+      // The process stays up and the probe answers: a reported configuration fault, not a crashloop.
+      assert.equal((await fetchAt(port, "/healthz", deadline())).status, 200, "the process went down");
+    } finally {
+      // Before `rmSync`, or the cleanup cannot enter it either.
+      chmodSync(sealed, 0o700);
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a site whose tree is larger than the scan cap", { timeout: 60_000 }, async () => {
+    // ## Three answers were tried above the cap, and the first two were worse than the defect
+    //
+    // The scan reads the entry module's neighbours so that breaking only a `./helper.ts` is noticed.
+    // Above the cap it cannot be complete, and what to do then took three goes:
+    //
+    //   1. **Stamp a placeholder** (`over-400`). A constant, so the key stopped moving and the cache
+    //      served its first answer forever — the exact defect the scan was added to fix.
+    //   2. **Evaluate without caching**, minting a fresh `?v=` per request so the re-evaluation was
+    //      real. ES modules are keyed by URL and never evicted: **7.32 KiB retained per distinct URL**
+    //      measured on Node 26.4 after a forced GC, against nothing for 4,000 imports of one URL. At a
+    //      poll every few seconds that is an OOM kill, and at `replicas: 1` every console goes with it.
+    //   3. **Refuse**, which is this. Nothing new enters the module registry and an operator gets a
+    //      reason.
+    //
+    // The second was found by an independent re-review, and the test it passed is why it got that far:
+    // "the edit is still seen" was true and never asked what seeing it cost.
+    //
+    // ⚠️ **Sites that share a directory share the refusal**, which the assertions below say out loud.
+    // In the fleet all three site modules live in one policy directory, so an oversized tree there is
+    // not a per-site 503 — it is every console. That is the cost of refusing, and it is why the cap is
+    // set far above an ordinary checkout (49 entries measured, against a cap of 2,000) and why the test
+    // above exists to keep `.git` out of the count. A tree that still overflows is one somebody built.
+    const { dir, sites } = twoSites();
+    const filler = join(dir, "filler");
+    mkdirSync(filler);
+    // 🔑 **Non-source files on purpose.** The cap counts entries *visited*, not entries that match the
+    // extension filter, and this fixture is what tells those apart: two thousand `.md` files overflow
+    // the walk while contributing nothing to the match list. With matching files both counts overflow
+    // together, a mutation swapping one for the other changed no test, and the matrix reported the line
+    // as holding nothing up. A cap counted over matches is the version that let a thousand directories
+    // holding one `.ts` each cost a full traversal on every request.
+    for (let i = 0; i < 2_100; i += 1) writeFileSync(join(filler, `f${i}.md`), `# note ${i}\n`);
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      const port = started.port;
+      const deadline = (): RequestInit => ({ signal: AbortSignal.timeout(20_000) });
+      const refused = await fetchAt(port, "/source?site=beta", deadline());
+      assert.equal(refused.status, 503, "a site whose tree cannot be stamped was served anyway");
+      assert.match(
+        (await refused.json() as { error?: string }).error ?? "",
+        /entries beside .* cannot be noticed/,
+        "the refusal does not say why, so an operator cannot act on it",
+      );
+      assert.equal(
+        (await fetchAt(port, "/source?site=alpha", deadline())).status, 503,
+        "alpha shares this directory, so it shares the refusal — if this is 200 the scan became per-site",
+      );
+      // What the refusal is for: the process stays up and the probe keeps answering, so this is a
+      // reported configuration fault rather than a crashloop.
+      assert.equal((await fetchAt(port, "/healthz", deadline())).status, 200, "the process went down");
+      assert.equal((await fetchAt(port, "/source?site=beta", deadline())).status, 503, "not idempotent");
+      assert.equal((await fetchAt(port, "/healthz", deadline())).status, 200, "the process went down");
+      assert.match(
+        started.output(), /entries beside/,
+        "the refusal was never logged, so it is invisible in the journal",
+      );
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("stays up when a module breaks in a way no guard had named", { timeout: 90_000 }, async () => {
+    // ## Five shapes the tenth round's captures did not cover, all measured live in `origin/main`
+    //
+    // The captures closed globals being *replaced*. These are the same realm reached differently, and
+    // each of them exited 1 rather than answering 503 for the one site whose module was wrong:
+    //
+    //   - `resolveService` returning a circular object or a `BigInt`: `collectPolicySource` stored the
+    //     resolver's answer without passing it through the wire crossing, so it passed startup
+    //     verification and threw in the renderer's serialiser on the **first request**.
+    //   - a throwing `Object.prototype.toJSON`: `JSON.stringify` calls a `toJSON` it *finds on the
+    //     value*, inherited included, so capturing the function closed nothing — every response threw,
+    //     `/healthz` with it.
+    //   - a throwing `Object.prototype.then` getter: resolving a promise with an object reads `.then`
+    //     off it. `Promise.all` resolves its result array, so the throw landed outside every per-site
+    //     `catch`. `origin/main` survives this with a 503 and this branch did not, which made it the
+    //     one finding of the six that this branch had **introduced**.
+    //   - a module's own `setTimeout` callback throwing after its import resolved: nothing from this
+    //     file is on that stack, so the default action exited — **after** both probes had passed.
+    //
+    // The expectation per shape differs on purpose. A resolver fault is one site's; poisoning a
+    // prototype breaks every module's render, so every site answering 503 is the correct answer and
+    // not a regression. What no shape may do is take the process or `/healthz` down.
+    const resolver = (body: string): string => `export const site = {
+  cfg: { hookPolicy: { input: "drop", output: "accept" } },
+  hosts: [{ id: "gw-01.beta", stage: "canary", items: [] }],
+  workload: [{ kind: "service", value: "kube-system/coredns" }],
+  resolveService() { ${body} },
+};
+`;
+    const shapes: { name: string; body: string; beta: number; alpha: number }[] = [
+      { name: "circularResolverResult", body: resolver("const hit = {}; hit.self = hit; return hit;"), beta: 503, alpha: 200 },
+      { name: "bigintResolverResult", body: resolver("return { port: 1n };"), beta: 503, alpha: 200 },
+      {
+        name: "poisonedToJSON",
+        body: 'Object.defineProperty(Object.prototype, "toJSON", { value() { throw new Error("bad serializer"); }, configurable: true });\nthrow new Error("bad beta");\n',
+        beta: 503, alpha: 503,
+      },
+      {
+        name: "poisonedThen",
+        body: 'Object.defineProperty(Object.prototype, "then", { get() { throw new Error("broken then"); }, configurable: true });\nthrow new Error("bad beta");\n',
+        beta: 503, alpha: 503,
+      },
+      {
+        name: "lateThrowFromModuleTimer",
+        body:
+          'setTimeout(() => { throw new Error("late config failure"); }, 400);\n' +
+          'export const site = {\n' +
+          '  cfg: { hookPolicy: { input: "drop", output: "accept" } },\n' +
+          '  hosts: [{ id: "gw-01.beta", stage: "canary", items: [] }],\n' +
+          '};\n',
+        beta: 200, alpha: 200,
+      },
+    ];
+    for (const shape of shapes) {
+      const { dir, sites, beta } = twoSites();
+      writeFileSync(beta, shape.body);
+      let started: Started | undefined;
+      try {
+        started = await start(dir, MULTI(sites));
+        const port = started.port;
+        const deadline = (): RequestInit => ({ signal: AbortSignal.timeout(10_000) });
+        assert.equal((await fetchAt(port, "/healthz", deadline())).status, 200, `${shape.name}: healthz`);
+        assert.equal((await fetchAt(port, "/source?site=alpha", deadline())).status, shape.alpha, `${shape.name}: alpha`);
+        assert.equal((await fetchAt(port, "/source?site=beta", deadline())).status, shape.beta, `${shape.name}: beta`);
+        // The late throw fires at 400ms, so this is the assertion that shape exists for: a pod that
+        // passed both probes and then died is the worst shape operationally, because it looks healthy.
+        await new Promise((r) => setTimeout(r, 900));
+        assert.equal((await fetchAt(port, "/healthz", deadline())).status, 200, `${shape.name}: healthz after`);
+        // `/readyz` reports the swallowed fault rather than hiding it — except under a poisoned
+        // `toJSON`, where the readiness body cannot be serialised either and the literal fallback goes
+        // out instead. That is the correct answer there, so the shape asserts the fallback rather than
+        // a count it could not have carried.
+        const ready = (await (await fetchAt(port, "/readyz", deadline())).json()) as {
+          faults?: number;
+          error?: string;
+        };
+        // `faults` is required in **every** shape, the unserialisable fallback included. A field that
+        // is present most of the time and absent under one condition gets its absence read as a zero,
+        // and that condition is the one where serialisation is broken — so it must carry the count too.
+        assert.equal(
+          typeof ready.faults, "number",
+          `${shape.name}: readiness did not report a fault count`,
+        );
+        if (shape.name === "poisonedToJSON") {
+          assert.equal(ready.error, "the answer could not be serialised", `${shape.name}: readyz body`);
+        }
+        if (shape.name === "lateThrowFromModuleTimer") {
+          assert.ok((ready.faults ?? 0) > 0, `${shape.name}: the fault was swallowed silently`);
+        }
+      } finally {
+        started?.stop();
+        rmSync(join(dir, ".."), { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("stops serving a cached answer when a file the module imports breaks", { timeout: 30_000 }, async () => {
+    // ## The stamp read the entry module, not what the entry module imports
+    //
+    // A policy module's `import "./helper.ts"` was in none of the stamp's inputs — entry module,
+    // allowlisted files, git sha — so breaking only the helper left the cache answering **200 with the
+    // last good payload** for a site that no longer evaluates. Not an outage: a screen that lies about
+    // what is deployed, which is what the comment above `cached` says must never happen. Measured here,
+    // and confirmed in the running image by the cluster's operator, who found no `readdirSync` in it.
+    //
+    // A helper *outside* the module's directory is still invisible to the stamp. That is a stated gap,
+    // not a claim this test covers.
+    const { dir, sites, beta } = twoSites();
+    const helper = join(dir, "helper.ts");
+    writeFileSync(helper, 'export const mark = "first";\n');
+    writeFileSync(beta, `import { mark } from "./helper.ts";
+export const site = {
+  cfg: { hookPolicy: { input: "drop", output: "accept" } },
+  hosts: [{ id: "gw-01.beta", stage: "canary", items: [] }],
+  objects: [{ id: "ao-beta", kind: "address", name: mark,
+              members: [{ kind: "cidr", value: "10.0.0.0/8" }] }],
+};
+`);
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      const port = started.port;
+      assert.equal((await fetchAt(port, "/source?site=beta")).status, 200, "the good answer was not served");
+      writeFileSync(helper, 'throw new Error("helper broke");\n');
+      const later = new Date(Date.now() + 5_000);
+      utimesSync(helper, later, later);
+      assert.equal(
+        (await fetchAt(port, "/source?site=beta")).status, 503,
+        "a stale 200 was served for a site whose helper no longer evaluates",
+      );
+      assert.equal((await fetchAt(port, "/source?site=alpha")).status, 200, "alpha lost");
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("survives a module that replaces the globals it will be described with", { timeout: 60_000 }, async () => {
+    // ## The value was read carefully and then handed to a constructor the module owned
+    //
+    // `import()` evaluates a policy module in this process's own realm, so a module can assign to
+    // `globalThis.Error`. Every guard in the renderer reads the thrown value defensively and then builds
+    // an `Error` to carry it — which called the module's function. `asError` does that inside
+    // `evaluateWithin`'s rejection handler, the one point every module failure funnels through, and a
+    // throw in a rejection handler is an unhandled rejection: **exit 1 in the startup loop, before
+    // `server.listen`**, so a crashloop and every co-served console dark at `replicas: 1`/`Recreate`.
+    //
+    // The handler's comment already described that mechanism. It did not close this door, because the
+    // comment was about the thrown *value* being unreadable and this is the *constructor* being
+    // replaced — the same "one of two sites" shape this file keeps recording, one abstraction up.
+    //
+    // Reaching a listener is the assertion in every shape. The other three are here because they are
+    // the same idea through different globals, and they were already survivable — so this test is also
+    // the record that they were checked rather than assumed.
+    const shapes: Record<string, string> = {
+      replacesError: 'globalThis.Error = function () { throw 1; };\nthrow "plain";\n',
+      replacesString:
+        'globalThis.String = function () { throw 1; };\nthrow { toString() { throw 1; } };\n',
+      poisonsObjectPrototype:
+        'Object.defineProperty(Object.prototype, "message", { get() { throw new Error("proto trap"); }, configurable: true });\nthrow Object.create(Object.prototype);\n',
+      replacesSetTimeout: 'globalThis.setTimeout = function () { throw 1; };\nthrow "plain";\n',
+      // `send` serialises every response and the readiness memo reads the clock, so these two reach
+      // `/healthz` and `/readyz` rather than `/source`. Both are asserted below for that reason.
+      replacesJson: 'globalThis.JSON = { stringify() { throw 1; }, parse() { throw 1; } };\nthrow "plain";\n',
+      replacesDate: 'globalThis.Date = function () { throw 1; };\nthrow "plain";\n',
+      // The budget timer builds an `Error` too, and only a module that **hangs** reaches it. Without
+      // the capture this throws inside a `setTimeout` callback, which is an uncaught exception rather
+      // than a rejection — still exit 1, by a third door. The budgets are lowered below so that six
+      // shapes and one hang fit in the test's own deadline.
+      hangsAndReplacesError:
+        'globalThis.Error = function () { throw 1; };\nawait new Promise(() => {});\n',
+    };
+    for (const [name, body] of Object.entries(shapes)) {
+      const { dir, sites, beta } = twoSites();
+      writeFileSync(beta, body);
+      // `HELIOPAUSE_POLICY_ALLOW_PATHS` is what makes `sourceStamp` coerce an mtime, which is one of
+      // the two shared `String` calls; the fixture already writes a `policies.json` for it to find.
+      // With the default budgets a hanging module would hold startup for 30s per shape.
+      const env = {
+        ...MULTI(sites),
+        HELIOPAUSE_POLICY_ALLOW_PATHS: "policies.json",
+        HELIOPAUSE_POLICY_STARTUP_BUDGET_MS: "700",
+        HELIOPAUSE_POLICY_SOURCE_BUDGET_MS: "700",
+      };
+      let started: Started | undefined;
+      try {
+        started = await start(dir, env);
+        const port = started.port;
+        assert.match(
+          started.startupLog, /beta .*did not evaluate at startup/,
+          `${name}: the failure was not reported`,
+        );
+        // An explicit deadline on every call. A held socket keeps the `node:test` runner alive even
+        // with `{timeout}` on the test, so a run that never finishes is not a red — it is nothing.
+        const deadline = () => ({ signal: AbortSignal.timeout(10_000) });
+        assert.equal(
+          (await fetchAt(port, "/source?site=alpha", deadline())).status, 200,
+          `${name}: alpha lost`,
+        );
+        assert.equal(
+          (await fetchAt(port, "/source?site=beta", deadline())).status, 503,
+          `${name}: no 503`,
+        );
+        // `/healthz` needs the serialiser and nothing else; `/readyz` needs the clock as well. Alpha
+        // still evaluates, so readiness is 200 and degraded rather than 503.
+        assert.equal((await fetchAt(port, "/healthz", deadline())).status, 200, `${name}: healthz`);
+        const ready = await fetchAt(port, "/readyz", deadline());
+        assert.equal(ready.status, 200, `${name}: readyz`);
+        assert.deepEqual(await ready.json(), { ok: true, degraded: true, serving: 1, total: 2, faults: 0 }, name);
+        // Again, immediately: the memo compares `Date.now()` to when it settled, so the clock is only
+        // read on a second request inside the window. One call leaves that capture untested.
+        const memoised = await fetchAt(port, "/readyz", deadline());
+        assert.equal(memoised.status, 200, `${name}: memoised readyz`);
+        assert.deepEqual(await memoised.json(), { ok: true, degraded: true, serving: 1, total: 2, faults: 0 }, name);
+        if (name === "replacesString") {
+          // The second shared `String` call is inside `sourceStamp`'s `try`/`catch`, so a replaced
+          // coercion throws nothing — it makes **every** mtime component `"-"`. The stamp then stops
+          // moving and the cache serves whatever loaded first, which is the stale-on-error cache the
+          // comment above `cached` says must not exist. So the consequence to assert is not a status
+          // code: it is whether an edit to a *different*, healthy site is still seen.
+          const named = async (): Promise<unknown> => {
+            const r = await fetchAt(port, "/source?site=alpha", deadline());
+            assert.equal(r.status, 200, "alpha lost while checking the stamp");
+            return ((await r.json()) as { site?: { objects?: { name?: unknown }[] } })
+              .site?.objects?.[0]?.name;
+          };
+          assert.equal(await named(), "alpha", "the fixture's marker is not where this test reads it");
+          const alphaPath = join(dir, "alpha.ts");
+          writeFileSync(alphaPath, readFileSync(alphaPath, "utf8").replace('"alpha"', '"alpha-edited"'));
+          const later = new Date(Date.now() + 5_000);
+          utimesSync(alphaPath, later, later);
+          assert.equal(await named(), "alpha-edited", "the stamp stopped moving — a stale policy is served");
+        }
+      } finally {
+        started?.stop();
+        rmSync(join(dir, ".."), { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("classifies without walking a prototype chain a module controls", { timeout: 30_000 }, async () => {
+    // ## Two classifications, and only one of them had been fixed
+    //
+    // Whether the declared-name check had already passed was carried by
+    // `error instanceof ZoneCheckedError`. `instanceof` walks a prototype chain, so an `Error` handed
+    // back inside a revoked `Proxy.revocable` made the classification itself throw —
+    // `TypeError: Cannot perform 'getPrototypeOf' on a proxy that has been revoked` — at startup,
+    // before the listener existed. The round before guarded the `instanceof` inside `asError` and left
+    // this one: the same fix applied to one of two sites, which is the shape this file keeps finding.
+    //
+    // ⚠️ **This test does not prove the membership change, and saying so matters.** Reverting the
+    // classification to `instanceof ZoneCheckedError` leaves all of these green — measured. The reason
+    // is that `asError` in `evaluateWithin` normalises a revoked proxy into a plain `Error` this
+    // process owns *before* the classification runs, so no proxy reaches it today. The reviewer that
+    // found it said as much: their reproduction was of the extracted code, with full-service
+    // verification deferred.
+    //
+    // The change is kept anyway, because the alternative is to rely on `asError` running first on
+    // every path that reaches a classification — which is the "another layer catches it" argument this
+    // file distrusts everywhere else. What this test pins is the property that matters to an operator:
+    // a module that hands back an error resisting inspection does not take the other zones down.
+    const shapes: Record<string, string> = {
+      revokedProxyAroundError:
+        '(() => { const r = Proxy.revocable(new Error("wrapped"), {}); r.revoke(); return r.proxy; })()',
+      prototypeTrapAroundError:
+        'new Proxy(new Error("wrapped"), { getPrototypeOf() { throw new Error("trap"); } })',
+    };
+    for (const [name, expr] of Object.entries(shapes)) {
+      const { dir, sites, beta } = twoSites();
+      writeFileSync(beta, `throw ${expr};\n`);
+      let started: Started | undefined;
+      try {
+        // Reaching a listener at all is the assertion: unguarded, `start()` throws "exited with 1".
+        started = await start(dir, MULTI(sites));
+        assert.match(
+          started.startupLog, /beta .*did not evaluate at startup/,
+          `${name}: the failure was not reported`,
+        );
+        assert.equal((await fetchAt(started.port, "/source?site=alpha")).status, 200, `${name}: alpha lost`);
+        assert.equal((await fetchAt(started.port, "/source?site=beta")).status, 503, `${name}: no 503`);
+      } finally {
+        started?.stop();
+        rmSync(join(dir, ".."), { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("does not blame the declared name when an unreadable error comes from past the check", { timeout: 30_000 }, async () => {
+    // ## The fifth `.message` read, missed because it builds a message rather than printing one
+    //
+    // `ZoneCheckedError` is constructed from the failure's message, and that construction used
+    // `asError(e).message`. `asError` returns an `Error` unchanged — on purpose, because the membership
+    // checks key on identity — so a throwing `.message` getter survived it and threw *there*, before
+    // the wrapper existed. The failure then propagated unclassified, and the startup loop reported that
+    // the declared-name check had not run for a site where it had: an operator sent to edit a
+    // Deployment that is correct.
+    //
+    // The four interpolation points were converted to `reasonOf` in the previous round; this one reads
+    // the message to *build* a message, which is why it was not among them.
+    //
+    // The throw has to come from past the zone check, so it is `resolveService` — reached because
+    // `site.workload` holds a `{kind, value}` pair — rather than the module's top level.
+    const { dir, sites, beta } = twoSites();
+    writeFileSync(beta, `export const site = {
+  cfg: { hookPolicy: { input: "drop", output: "accept" } },
+  hosts: [{ id: "gw-01.beta", stage: "canary", items: [] }],
+  workload: [{ kind: "service", value: "kube-system/coredns" }],
+  resolveService() {
+    const e = new Error("x");
+    Object.defineProperty(e, "message", { get() { throw new Error("message trap"); } });
+    throw e;
+  },
+};
+`);
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      const said = started.startupLog;
+      assert.match(
+        said, /beta is the site it is declared as, but did not evaluate/,
+        `a content fault past the zone check was blamed on the declared name:\n${said}`,
+      );
+      assert.doesNotMatch(
+        said, /beta did not evaluate at startup — the declared-name check did not run/,
+        "it told the operator to check a name that had already been checked",
+      );
+      assert.equal((await fetchAt(started.port, "/source?site=beta")).status, 503);
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
   it("starts when every name matches its module — the known positive", async () => {
     // Without this, the refusal above is equally satisfied by a renderer that never starts.
     const { dir, sites } = twoSites();
@@ -691,6 +1705,282 @@ describe("a site module has to be the site it is declared as", () => {
     try {
       started = await start(dir, MULTI(sites));
       assert.equal((await fetchAt(started.port, "/source?site=alpha")).status, 200);
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("says how many sites it can actually serve, and says nothing when asked how", async () => {
+    // ## `2/2 Running` while serving nothing
+    //
+    // That was a real state on 2026-09-29: the pod was Ready, `/healthz` answered `{ok:true}`, and
+    // all three sites were 503 because the render raced its own policy checkout. Nothing in the
+    // cluster could tell that apart from a healthy pod, and a person opening the console was the
+    // only repair.
+    //
+    // `/readyz` is that missing sentence. It is **not** wired to a probe — see the route's own
+    // comment for why replicas=1 + Recreate makes wiring it a net loss of information — so this
+    // asserts the value, which is the whole of what it is for.
+    const { dir, sites, beta } = twoSites();
+    writeFileSync(beta, "throw new Error('beta does not load');\n");
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      const res = await fetchAt(started.port, "/readyz");
+      // 200 with one of two, and `degraded` carrying the part the status code cannot. Refusing here
+      // would let a broken `dev.ts` take prod's and util's consoles down, which is the trade the
+      // startup verification already refused to make — and the test below pins the other half.
+      assert.equal(res.status, 200, "one broken site made the whole renderer report unready");
+      assert.deepEqual(await res.json(), { ok: true, degraded: true, serving: 1, total: 2, faults: 0 });
+      // Documentation, not coverage — and saying which it is matters. `deepEqual` above already
+      // rejects any added key, so a leak dies there and this line is never the failure; measured by
+      // injecting `names: "alpha,beta"` into the body, which fails on the line above. It is kept
+      // because the property is worth stating at the point it is relied on, not because it catches
+      // anything the previous line would miss.
+      const body = await (await fetchAt(started.port, "/readyz")).text();
+      assert.ok(!body.includes("alpha") && !body.includes("beta"), `named a site: ${body}`);
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a caller without the bearer, because reaching it makes this process do work", async () => {
+    // ## The assertion that was missing, and why its absence was invisible
+    //
+    // This route was unauthenticated on the argument that counts leak nothing. Counts do leak
+    // nothing — but `currentSource` calls `sourceStamp` → `policyHead`, which runs **two synchronous
+    // `execFileSync("git", …)` per site before its own cache is consulted**. A review measured
+    // 42.7 ms each and held `/healthz` — this pod's *liveness* probe — above a second with thirty
+    // concurrent unauthenticated requests. That is kubelet killing the container on demand, at
+    // `replicas: 1` with no surge pod.
+    //
+    // 🔴 **And the whole suite stayed green when the gate was added**, because `fetchAt` always sends
+    // `Bearer test-bearer`. Every assertion about this route was made by an authenticated caller, so
+    // the unauthenticated property — the one that mattered — was never once exercised. Hence the bare
+    // `fetch`: it is the only call in this file that proves anything about a caller without a token.
+    const { dir, sites } = twoSites();
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      const bare = await fetch(`http://127.0.0.1:${started.port}/readyz`);
+      assert.equal(bare.status, 401, "an unauthenticated caller could make this process fork git");
+      const wrong = await fetch(`http://127.0.0.1:${started.port}/readyz`, {
+        headers: { authorization: "Bearer not-the-token" },
+      });
+      assert.equal(wrong.status, 401);
+      // The gate is the point, but it must not have gated the answer away from a real caller.
+      assert.equal((await fetchAt(started.port, "/readyz")).status, 200);
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("answers from the tree as it is now, not from how it was at startup", async () => {
+    // ## The property the route argues for at length and nothing checked
+    //
+    // Both other tests break their modules *before* `start()`, so the startup answer and the live
+    // answer are identical and a snapshot frozen at boot would satisfy them. That matters because a
+    // site is fixed — or broken — by a git-sync every two minutes, and an answer remembered from
+    // startup would be the past wearing the present's clothes.
+    //
+    // The memo window is deliberately short for the same reason, so this also pins that it is a
+    // window and not a lifetime: the second reading has to arrive after it lapses.
+    const { dir, sites, beta } = twoSites();
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      assert.deepEqual(
+        await (await fetchAt(started.port, "/readyz")).json(),
+        { ok: true, degraded: false, serving: 2, total: 2, faults: 0 },
+      );
+      // Break it after the process is up, and move the mtime so the stamp changes — `utimesSync`
+      // because two writes inside one millisecond are indistinguishable to the stamp.
+      writeFileSync(beta, "throw new Error('beta broke after startup');\n");
+      const later = new Date(Date.now() + 5_000);
+      utimesSync(beta, later, later);
+      await new Promise((r) => setTimeout(r, 2_100)); // the memo window, plus a margin
+      assert.deepEqual(
+        await (await fetchAt(started.port, "/readyz")).json(),
+        { ok: true, degraded: true, serving: 1, total: 2, faults: 0 },
+        "the answer was remembered from startup instead of read from the tree",
+      );
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("shares an evaluation that outlives the memo window instead of starting a rival", { timeout: 30_000 }, async () => {
+    // ## The memo could not memoise the one case it exists for
+    //
+    // The window was stamped when the evaluation *started*, so anything slower than the window was
+    // stale the moment it settled and was served to nobody. Measured against a never-settling site:
+    // a caller at +2.5s found the memo expired and began its own full five-second evaluation, so the
+    // process carried two and then three concurrent evaluations — each opening with two synchronous
+    // `git` calls per site — for an answer already in flight.
+    //
+    // An in-flight answer is now shared regardless of age; the window applies to a *settled* one,
+    // which is the only kind that can be stale.
+    //
+    // 🔴 **Counted, not timed, and the timed version of this test was green against the bug.** With
+    // a rival evaluation the second caller reaches the same `import()` specifier — same path, same
+    // stamp — and Node's module loader hands back the *same* pending promise, so both finish at the
+    // same instant however many callers there are. Wall-clock cannot see the duplication at all.
+    // What it costs is real and is not time: another `sourceStamp` (two synchronous `git` forks per
+    // site) and another trip through `currentSource`, which is what the log line below records.
+    const { dir, sites, alpha } = twoSites();
+    writeFileSync(alpha, `await new Promise((r) => setTimeout(r, 3000));\n${readFileSync(alpha, "utf8")}`);
+    let started: Started | undefined;
+    try {
+      started = await start(dir, { ...MULTI(sites), HELIOPAUSE_POLICY_STARTUP_BUDGET_MS: "10000" });
+      // Move the stamp so the request path actually has an evaluation to share. Startup already
+      // cached alpha, and without this both callers are cache hits and there is nothing slow in
+      // flight — the first version of this test asserted against that and failed either way, which
+      // is the "green against the bug" it was written to avoid, arriving from the other side.
+      const later = new Date(Date.now() + 5_000);
+      utimesSync(alpha, later, later);
+      // Attached after `start()` resolves, so the startup verification's own evaluations — which
+      // happen before "listening" is printed — are not in the count.
+      // Accumulated, then matched once. Counting per `data` event would miscount if a chunk ever
+      // split inside the marker — and the direction it would miscount is 2 → 1, a green run against
+      // the bug, which is exactly what this test was rewritten to stop doing. Two short writes are
+      // nowhere near the stream's watermark today, so this is insurance rather than a fix.
+      let out = "";
+      started.proc.stdout?.on("data", (b: Buffer) => { out += b.toString(); });
+      const first = fetchAt(started.port, "/readyz");
+      await new Promise((r) => setTimeout(r, 2_500)); // past the memo window, inside the evaluation
+      const second = await fetchAt(started.port, "/readyz");
+      await first;
+      await new Promise((r) => setTimeout(r, 200)); // let the last line reach the pipe
+      const evaluations = (out.match(/evaluated alpha /g) ?? []).length;
+      assert.equal(second.status, 200);
+      assert.equal(
+        evaluations, 1,
+        `alpha was evaluated ${evaluations} times — the second caller started its own evaluation ` +
+          `instead of sharing the one already in flight`,
+      );
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  // ## Why the abort below, and not just a test timeout
+  //
+  // Without the route's budget this does not fail, it **hangs** — and a hang in CI is a job timeout
+  // with no failing test name, which reads as infrastructure rather than as this defect. A
+  // `{ timeout }` on the test is not enough: measured here, it marks the test failed and the runner
+  // still does not exit, because the held socket keeps the server's loop alive and `finally` never
+  // reaches `stop()`. Aborting the request is what lets the failure land *and* the process end.
+  it("answers even when a site module never settles", { timeout: 20_000 }, async () => {
+    // ## The state this route exists to report, arriving as silence
+    //
+    // A policy module is attacker-reachable code that runs at import (see this file's header on the
+    // C1 finding). `await new Promise(() => {})` at its top level never settles, and the first draft
+    // of this route had no bound: `Promise.all` never resolved, `send` was never called, and the
+    // socket stayed open. A review reproduced 80 held sockets from 40 requests, with `/healthz` green
+    // throughout — "up but serving nothing" reported as a hang, which a monitor cannot tell from a
+    // network fault and which is strictly less informative than the 503 the route was built to send.
+    //
+    // A site that cannot answer inside its budget is not serving. That is not an approximation.
+    // 🔴 And it takes the process down harder at startup than at request time. Unbounded, the
+    // verification loop's own `await` never returns, `server.listen` is never reached, and the
+    // renderer answers *nothing* — not even `/healthz`. That is what this test found first: it failed
+    // with "the renderer exited with 13 before listening", which was the bug and not the test. The
+    // startup budget is lowered here only so this does not cost thirty seconds.
+    const { dir, sites, beta } = twoSites();
+    writeFileSync(beta, "await new Promise(() => {});\nexport const site = { cfg: {}, hosts: [] };\n");
+    let started: Started | undefined;
+    try {
+      started = await start(dir, { ...MULTI(sites), HELIOPAUSE_POLICY_STARTUP_BUDGET_MS: "1500" });
+      const res = await fetch(`http://127.0.0.1:${started.port}/readyz`, {
+        headers: { authorization: "Bearer test-bearer" },
+        // Longer than the 5s per-site budget the route is supposed to honour, short enough that a
+        // route which honours nothing fails here instead of outliving the suite.
+        signal: AbortSignal.timeout(10_000),
+      });
+      assert.equal(res.status, 200, "alpha was serving, so this must be up and degraded");
+      assert.deepEqual(await res.json(), { ok: true, degraded: true, serving: 1, total: 2, faults: 0 });
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("reports unready only when it can serve nothing, and stays alive saying so", async () => {
+    // The state the endpoint exists for. Both modules throw, so there is no policy to serve at all
+    // — and `/healthz` must still answer 200, because it is this pod's **liveness** probe: a policy
+    // tree that will not load does not become loadable by restarting the process, it becomes a
+    // crashloop. The split between the two endpoints is the point, so it is asserted together.
+    const { dir, sites, alpha, beta } = twoSites();
+    writeFileSync(alpha, "throw new Error('alpha does not load');\n");
+    writeFileSync(beta, "throw new Error('beta does not load');\n");
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      const res = await fetchAt(started.port, "/readyz");
+      assert.equal(res.status, 503, "a renderer serving nothing reported itself ready");
+      assert.deepEqual(await res.json(), { ok: false, degraded: true, serving: 0, total: 2, faults: 0 });
+      assert.equal(
+        (await fetchAt(started.port, "/healthz")).status, 200,
+        "/healthz went strict — that restarts the pod for a policy fault",
+      );
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("answers /source with its own sentence when a module hangs, before the manager gives up", { timeout: 30_000 }, async () => {
+    // ## The route the sentence is for, and it took two tries to actually deliver it
+    //
+    // `/source`'s 503 carries "the policy module could not be evaluated: …", which the console shows
+    // instead of an empty page — and the file says an empty page there reads as "no policy", a
+    // different and much worse claim. Unbounded, a module that never settles produced exactly that
+    // empty page. Bounded at the *same* number as the manager's own `AbortSignal.timeout`
+    // (`HELIOPAUSE_RELAY_TIMEOUT_MS`, default 5000), the client's clock still started first and won
+    // every time — measured at 5005ms against a 7s module, with this side logging afterwards to an
+    // abandoned socket. The budget has to be strictly shorter, which is what `SOURCE_SITE_BUDGET_MS`
+    // derives.
+    //
+    // 🔴 This is one of two changes in `ebba030` that deleted clean — reverting `/source` to an
+    // unbounded `currentSource` left all 26 tests green. The commit that shipped it said, one
+    // paragraph earlier, "a name is not a check".
+    const { dir, sites, beta } = twoSites();
+    writeFileSync(beta, "await new Promise(() => {});\nexport const site = { cfg: {}, hosts: [] };\n");
+    let started: Started | undefined;
+    try {
+      started = await start(dir, { ...MULTI(sites), HELIOPAUSE_POLICY_STARTUP_BUDGET_MS: "1000" });
+      // Both numbers derived, so widening the renderer's budget or narrowing the caller's goes red
+      // here rather than silently removing the margin.
+      const clientAbort = ENV_BOUNDS.HELIOPAUSE_RELAY_TIMEOUT_MS.fallback;
+      const budget = ENV_BOUNDS.HELIOPAUSE_POLICY_SOURCE_BUDGET_MS.fallback;
+      assert.ok(budget < clientAbort, `the renderer's ${budget}ms budget is not under the caller's ${clientAbort}ms`);
+      const began = Date.now();
+      // The manager's default abort, applied the way `fetchPolicySource` applies it. The renderer has
+      // to answer inside this or the sentence never reaches anyone.
+      const res = await fetch(`http://127.0.0.1:${started.port}/source?site=beta`, {
+        headers: { authorization: "Bearer test-bearer" },
+        signal: AbortSignal.timeout(clientAbort),
+      });
+      const took = Date.now() - began;
+      assert.equal(res.status, 503, "a hanging module produced something other than the 503");
+      assert.match(
+        String(((await res.json()) as { error?: string }).error),
+        /the policy module could not be evaluated/,
+        "it answered without the sentence the console shows in place of an empty page",
+      );
+      // ⚠️ The margin, not the fact of answering. `took < clientAbort` cannot fail: reaching this line
+      // at all means `fetch` resolved, and `AbortSignal.timeout` guarantees that happened under the
+      // abort — so the old assertion had no detection power and one flake mode. Halfway between the
+      // budget and the abort is a threshold a 4999ms budget would miss and this one catches.
+      assert.ok(
+        took < (budget + clientAbort) / 2,
+        `answered at ${took}ms against a ${budget}ms budget and a ${clientAbort}ms caller — the margin is gone`,
+      );
     } finally {
       started?.stop();
       rmSync(join(dir, ".."), { recursive: true, force: true });

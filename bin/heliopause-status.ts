@@ -51,6 +51,7 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { request } from "node:https";
 import { rootCertificates } from "node:tls";
+import { oneLine } from "../src/log-scrub.ts";
 import { wrongCaHint } from "../src/pki.ts";
 import { hostVerdict, STALE_SEC } from "../src/rollout.ts";
 import type { FleetView, HostView } from "../src/relay.ts";
@@ -139,8 +140,10 @@ function operatorFiles(): { cert: Buffer; key: Buffer; ca: Buffer; name: string 
  * That is the trust the client certificate establishes and this cannot second-guess. What it stops
  * is a relay rewriting *other* rows than its own.
  */
-const CONTROL_CHARS = /[\u0000-\u001F\u007F-\u009F]/g;
-const scrub = (text: string): string => text.replace(CONTROL_CHARS, "\uFFFD");
+// Moved to `src/log-scrub.ts` so the policy renderer shares it. The renderer had grown a weaker
+// copy (`/[\r\n]+/`), which missed the ANSI escapes this comment is about and U+2028 besides —
+// the shape of duplicate that drifts. Same behaviour here: this call passes no cap.
+const scrub = (text: string): string => oneLine(text, Number.MAX_SAFE_INTEGER);
 
 /**
  * How long this waits for the whole answer, and how much of it it will hold.

@@ -11,8 +11,19 @@
 //
 // So the execution moves to a process with nothing in it. This one holds a policy checkout and no
 // credential, answers exactly one question, and answers it in JSON. A hostile commit still runs —
-// there is no way to render a program without running it — but it runs somewhere it can only reach
-// the policy it came from.
+// there is no way to render a program without running it — but it runs where the blast radius is a
+// rendered answer rather than a console, a credential and a fleet.
+//
+// ⚠️ **It is not confined to the policy it came from, and this file used to say it was.** A module is
+// evaluated by `import()` in this process's own realm, so it shares every intrinsic and every
+// prototype with the other sites served here. The tests below prove it: a module that poisons
+// `Object.prototype` makes a *different*, correct site answer 503, and that is asserted as the
+// expected result because it is what the code does. Per-site isolation would mean a separate realm —
+// a `worker_thread` or a `vm` context — and that is not what this is.
+//
+// What the captures and guards below buy is that one module's mistake is a 503 rather than an exit:
+// the process stays up and the sites that still evaluate keep serving. That is a smaller claim than
+// the one this paragraph made, and it is the one the tests actually hold.
 //
 // ## What keeps that true
 //
@@ -29,10 +40,11 @@
 
 import { createServer } from "node:http";
 import { registerHooks } from "node:module";
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { existsSync, opendirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { timingSafeEqual } from "node:crypto";
+import { oneLine } from "../src/log-scrub.ts";
 import { boundedInteger, ENV_BOUNDS, parsePolicySites } from "../src/env-spec.ts";
 import { zoneMismatch, ZoneMismatchError } from "../src/site-zone.ts";
 import { armedReasons } from "../src/policy-render-guard.ts";
@@ -42,7 +54,295 @@ import { installCliLanguage } from "../src/operator-i18n.ts";
 
 installCliLanguage();
 
-const log = (m: string): void => console.log(`[policy-render] ${m}`);
+/**
+ * One line, always, with this service's prefix on it.
+ *
+ * `oneLine` is the shared control in `src/log-scrub.ts`; see its doc for what it covers and — more
+ * importantly — for what it cannot: a policy module shares this process's stdout, so it can write a
+ * byte-identical line without passing through here at all. This bounds the *interpolation* channel.
+ */
+const log = (m: string): void => console.log(`[policy-render] ${oneLine(m)}`);
+
+/**
+ * A failure that happened **after** the declared-name check ran and passed.
+ *
+ * Its whole job is to be **distinguishable**. The startup verification says "the declared-name check
+ * did not run" on a failure, and that is true of an import that threw, a missing export or a
+ * timeout — and false of anything `collectPolicySource` raises, which is reached only past the
+ * check. Selecting on the message text got this wrong in both directions on successive commits;
+ * carrying the fact with the error is what stops there being a third way to get it wrong.
+ */
+/**
+ * A zone mismatch **this process** found, as opposed to one handed to it.
+ *
+ * ## Class identity is not provenance, and `instanceof` was treated as if it were
+ *
+ * A policy module can `import { ZoneMismatchError } from "../src/site-zone.ts"` -- the exact spelling
+ * the mount check above demands of a site module -- and Node's resolver realpaths by default, so the
+ * module's `../src/site-zone.ts` and this file's are the **same module instance** and the class object
+ * is literally the same. A `ZoneMismatchError` thrown by a module therefore satisfies
+ * `instanceof ZoneMismatchError` here, and the startup loop turned that into `process.exit(2)` with a
+ * refusal sentence the module wrote. Reproduced: a `resolveService` that throws one takes the pod down
+ * and prints `refusing to start: beta is declared for ..., but forged from resolveService via ../src`.
+ *
+ * The precondition is not exotic -- it is the layout this file insists on. With the checkout mounted at
+ * `/opt/heliopause/policy` and the binary at `/opt/heliopause/bin`, both `../src` spellings resolve to
+ * `/opt/heliopause/src`. So one line in a policy commit could take every co-served site's console down,
+ * which is the outage the startup block spends a paragraph refusing to manufacture.
+ *
+ * 🔴 **A subclass does not brand it, and that was this file's first answer.** `class Own extends
+ * ZoneMismatchError {}` inherits statics, so `Own[Symbol.hasInstance]` resolves up the chain to
+ * `ZoneMismatchError[Symbol.hasInstance]` — which a module can define, because it holds the same class
+ * object. Measured: after `Object.defineProperty(ZoneMismatchError, Symbol.hasInstance, {value: () =>
+ * true})`, a plainly-constructed error satisfies `instanceof Own`. The brand has to be something a
+ * module cannot name at all.
+ *
+ * A `WeakSet` this module closes over is that: membership is not a property of the error, not on any
+ * prototype, and not reachable through the class. `Symbol.hasInstance`, `setPrototypeOf`, a forged
+ * prototype chain and prototype pollution all move properties around and none of them can add an
+ * entry here. Weak so a refused error is still collectable.
+ *
+ * A module-authored `ZoneMismatchError` is therefore an ordinary content fault: wrapped as
+ * `ZoneCheckedError`, logged, that site answers 503, and the pod stays up.
+ *
+ * @see src/policy-render-service.test.ts "a module cannot force a refusal by throwing the renderer's
+ *      own error class"
+ */
+const OUR_ZONE_MISMATCHES = new WeakSet<ZoneMismatchError>();
+// ## Bound before any policy module is imported
+//
+// `foundHere` called `OUR_ZONE_MISMATCHES.has(...)`, which looks the method up on
+// `WeakSet.prototype` **at call time** — and a policy module runs in this realm, so
+// `WeakSet.prototype.has = () => true` in one makes every error look like ours. Measured: it turned an
+// ordinary content fault into `exit 2` with a refusal nobody configured. The set is unreachable to a
+// module, but the *lookup* was not; capturing it here, before the first `import()`, is what makes the
+// unreachability of the set the only thing that matters.
+const zoneMismatchIsOurs = WeakSet.prototype.has.bind(OUR_ZONE_MISMATCHES) as (e: object) => boolean;
+const rememberOurZoneMismatch = WeakSet.prototype.add.bind(OUR_ZONE_MISMATCHES) as (e: object) => unknown;
+
+// ## The value was guarded; the constructor used to describe it was not
+//
+// A policy module is evaluated by `import()` in **this process's own realm** — the same `globalThis` —
+// so `globalThis.Error = function () { throw 1; };` is two tokens that replace the constructor every
+// later `new Error(...)` resolves. The guards below all read the thrown value carefully and then build
+// an `Error` to carry it, which called the module's function instead.
+//
+// Where that lands is the whole severity. `asError` runs inside `evaluateWithin`'s rejection handler,
+// the single point every module failure funnels through, and a throw inside a rejection handler is an
+// unhandled rejection: **exit 1 during the startup loop, before `server.listen`.** Measured — a module
+// that replaces `Error` and then throws a string takes the process down at boot, so it restarts and
+// does it again. At `replicas: 1` with `Recreate` that is every co-served site's console dark on a
+// crashloop, the same outage `asError` was added to prevent, reached through `asError` itself. The
+// handler's own comment describes this mechanism and did not close it, because the comment was about
+// the *value* being unreadable and this is the *constructor* being replaced.
+//
+// Captured here, before the first dynamic import, for the reason the block above gives. `extends Error`
+// needs no capture: the superclass is resolved when the class definition is evaluated, which is also
+// before any import, so `ZoneCheckedError` and `ZoneMismatchError` already hold the real one.
+//
+// @see src/policy-render-service.test.ts "survives a module that replaces the globals it will be described with"
+const RealError = Error;
+
+// ## A module's callback outlives the handler that was watching its import
+//
+// `setTimeout(() => { throw new Error("late") }, 500)` at a policy module's top level resolves its
+// import cleanly, passes startup verification, answers `/healthz` 200 — and then throws with nothing
+// from this file on the stack. The default action for that is to exit, so the pod died **after** both
+// probes had passed, which at `replicas: 1` with `Recreate` is every co-served console dark on a
+// crashloop driven by a config commit. Measured against `origin/main` of this repository — not
+// against the running image, whose tag is a sha from the other repository and does not resolve here.
+//
+// Staying up is the better trade: one module's delayed mistake should not be a fleet outage, and the
+// sites that do evaluate keep serving. The cost is real and deliberate — a genuine fault in *this*
+// file no longer crashes loudly either — so it is not swallowed: every one is logged and counted, and
+// the count is on `/readyz`, where an operator polling readiness sees it without reading logs.
+//
+// Installed before the first dynamic import, like the captures above.
+//
+// @see src/policy-render-service.test.ts "keeps serving when a module's own callback throws later"
+let faults = 0;
+for (const signal of ["uncaughtException", "unhandledRejection"] as const) {
+  process.on(signal, (thrown: unknown) => {
+    faults += 1;
+    // `oneLine` and `reasonOf`: the text can come from a policy module, so it carries the same
+    // forgery and unreadability channels as any other module-supplied string.
+    console.error(`[policy-render] ${oneLine(`${signal} #${faults} — the process is staying up: ${reasonOf(thrown)}`)}`);
+    console.error(`[policy-render]   this cannot be attributed to one site; check /readyz and the policy commits`);
+  });
+}
+
+// The same capture, for the same reason, on the coercion two shared paths use. `globalThis.String =
+// function () { throw 1; };` in one module made **another site** answer 503: `sourceStamp` and
+// `hostIds` run for every site, so a module that replaces `String` un-serves the modules it does not
+// own, and the log says only that they failed to evaluate. Measured. That is quieter than the crash
+// above and worse — a correct prod policy stops rendering because a dev commit is hostile or broken.
+//
+// Not substituted inside `reasonOf` and `asError`: those calls are already wrapped in the `try`/`catch`
+// that exists for a value whose coercion throws, so a replaced `String` lands in the same fallback.
+// `boundedInteger`'s runs before the first import, where nothing has been replaced yet.
+const toText = String;
+
+// And the rest of what a shared path resolves at call time. `evaluateWithin` arms a timer for **every**
+// site, so `globalThis.setTimeout = function () { throw 1; };` in one module throws inside the
+// `new Promise` executor of another site's evaluation — measured, alpha answered 503 because beta was
+// hostile. `send` serialises every response including `/healthz`, and the readiness memo reads the
+// clock, so a replaced `JSON` or `Date` is the same reach by a different name.
+//
+// Captured rather than each call being wrapped: a `try` around a timer that was replaced still has no
+// timer, and the point is that the module never gets to participate in another site's request at all.
+const arm = setTimeout;
+const disarm = clearTimeout;
+const readClock = Date.now;
+const toJson = JSON.stringify;
+
+// ## ⚠️ What this does **not** do, stated because leaving it implied is the same silence
+//
+// The substitutions above are the call sites that were *measured* to reach another site or the
+// process. Nothing stops the next edit from adding a bare `JSON.stringify(`, `String(` or
+// `setTimeout(` on a shared path, and the tests will not catch it: they exercise the shapes known
+// today, and a new unguarded call is only reachable by a shape nobody has written yet.
+//
+// A check over this file's source text would find it, and that is deliberately not here: `AGENTS.md`
+// records three separate times that asserting on source text in this repo missed the thing it was
+// written for, and the test file's own preamble says the same. So this is a gap held open on purpose,
+// not an oversight — and it is a second reason the captures are a patch on measured paths rather than
+// a boundary. Evaluating policy in its own realm removes the whole class, including this.
+//
+// Until then, the rule for anyone editing this file: an intrinsic resolved at call time on a path
+// more than one site reaches must use the captured name. Ask what the operation looks up **on the
+// value** as well — `JSON.stringify` calls an inherited `toJSON`, resolving a promise reads an
+// inherited `then`, and capturing the global closes neither.
+
+// ## The same treatment for "the zone check had already passed"
+//
+// That fact was carried by `error instanceof ZoneCheckedError`, and `instanceof` walks a prototype
+// chain — so an `Error` wrapped in a revoked `Proxy.revocable` made the classification itself throw
+// (`TypeError: Cannot perform 'getPrototypeOf' on a proxy that has been revoked`) at startup, before
+// the listener existed. Measured. The previous round guarded the `instanceof` inside `asError` and left
+// this one, which is the same fix applied to one of two sites.
+//
+// Membership rather than a guarded `instanceof`, so there is no prototype walk to trap at all, and so
+// both classifications in this file work the same way. Bound here, before the first dynamic import,
+// for the reason the block above gives.
+const OUR_ZONE_CHECKED = new WeakSet<object>();
+const zoneCheckedIsOurs = WeakSet.prototype.has.bind(OUR_ZONE_CHECKED) as (e: object) => boolean;
+const rememberZoneChecked = WeakSet.prototype.add.bind(OUR_ZONE_CHECKED) as (e: object) => unknown;
+
+/** A zone mismatch this process found. Registered so `foundHere` can recognise it later. */
+function ownZoneMismatch(message: string): ZoneMismatchError {
+  const error = new ZoneMismatchError(message);
+  rememberOurZoneMismatch(error);
+  return error;
+}
+
+/** Whether this process constructed `error`. Unspoofable because the set is unreachable. */
+function foundHere(error: unknown): error is ZoneMismatchError {
+  // No `instanceof` here. It cannot help — membership already implies this process built the object —
+  // and it can hurt: `instanceof` runs a Proxy's `getPrototypeOf` trap, so the check meant to
+  // establish provenance could itself throw. `typeof` is enough to keep the bound `has` from being
+  // handed a primitive.
+  if (error === null || (typeof error !== "object" && typeof error !== "function")) return false;
+  return zoneMismatchIsOurs(error);
+}
+
+/**
+ * Whatever was thrown, as an `Error`.
+ *
+ * ## `throw null` in a policy commit was a crashloop
+ *
+ * `throw` takes any value, and a policy module is code this process runs on purpose without trusting
+ * it. `(e as Error).message` on a nullish throw raises a `TypeError` **at the read**, so the startup
+ * loop died before `server.listen` — exit 1, no listener, and at `replicas: 1` with `Recreate` that is
+ * every co-served site's console down, which is precisely the outage the loop's own comment says must
+ * never be manufactured. Two tokens in a policy repo. `throw 42` survived and printed the reason as
+ * the literal word `undefined`.
+ *
+ * It also broke the fix directly above it: `new ZoneCheckedError((e as Error).message)` threw *inside
+ * the catch*, so the wrapper was never constructed and a post-zone-check failure fell into the branch
+ * that blames the declared name — the exact confusion `ZoneCheckedError` exists to end.
+ *
+ * Normalised once, where the value is caught, rather than at each read. There were four reads.
+ *
+ * @see src/policy-render-service.test.ts "survives a policy module that throws a nullish value"
+ */
+/**
+ * An error's message, or a stand-in — never a throw.
+ *
+ * `.message` is an ordinary property and a configuration module can make it a getter that throws.
+ * Measured: an `Error` with such a getter reached the log line and the 503 body, where the interpolation
+ * threw outside every guard and the process exited. That is a getter away from an ordinary mistake — a
+ * property that reads something undefined during construction.
+ *
+ * Used at every place a caught value's message is interpolated. There are four, which is why this is a
+ * function rather than a `try` at each one.
+ *
+ * @see src/policy-render-service.test.ts "survives a module whose error resists being read"
+ */
+function reasonOf(error: unknown): string {
+  try {
+    const message = (error as { message?: unknown } | null)?.message;
+    return typeof message === "string" ? message : String(message);
+  } catch {
+    return "an error whose message cannot be read";
+  }
+}
+
+function asError(thrown: unknown): Error {
+  // ## Even the classification can throw
+  //
+  // `thrown instanceof Error` walks the prototype chain, which runs a Proxy's `getPrototypeOf` trap
+  // — so a thrown `new Proxy({}, { getPrototypeOf() { throw … } })` made **this line** throw, and a
+  // revoked Proxy raised `TypeError: Cannot perform 'getPrototypeOf' on a proxy that has been
+  // revoked`. Both landed in a rejection handler that had already cleared its timer, so the process
+  // exited. The guard below covers the classification for that reason and not for tidiness.
+  let isError: boolean;
+  try {
+    isError = thrown instanceof Error;
+  } catch {
+    isError = false;
+  }
+  // Returned as it is, deliberately. An earlier version rebuilt the error around a safely-read
+  // message, and that breaks two things that key on the **object**: `foundHere`'s `WeakSet`, which is
+  // how a zone mismatch this process built is told from one a module threw, and the
+  // `ZoneCheckedError` membership set, which is how a content fault past the zone check is told
+  // from one before it. A rebuilt error is in neither, so both silently reclassify. (That version also
+  // compared `message === source.message` to skip the rebuild in the common case, which read the
+  // getter a **second** time outside the guard and threw — the defect, inside its own fix.)
+  //
+  // Reading the message safely belongs at the point of reading. `reasonOf` below does that.
+  if (isError) return thrown as Error;
+  // ## The coercion is the part a module attacks next
+  //
+  // `String(thrown)` is not safe on a value a policy module chose. Measured, four of five hostile
+  // shapes made **this function** throw: a `toString` that throws, a `Symbol.toPrimitive` that throws,
+  // `Object.create(null)` (two tokens, no `toString` to find), and a Proxy whose `get` trap throws. Any
+  // of them restored the exact crash `asError` exists to prevent, from inside it.
+  //
+  // `typeof` cannot throw — not even through a Proxy, which has no trap for it — so the fallback is
+  // always available. `JSON.stringify` is not an alternative: `undefined` for a function, and it throws
+  // on a cycle, which is where this started.
+  let described: string;
+  try {
+    described = String(thrown);
+  } catch {
+    described = `a ${typeof thrown} that cannot be described`;
+  }
+  return new RealError(`policy module threw a non-error value: ${described}`);
+}
+
+class ZoneCheckedError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "ZoneCheckedError";
+    rememberZoneChecked(this);
+  }
+}
+
+/** Whether this process wrapped `error` after the zone check passed. */
+function zoneWasChecked(error: unknown): boolean {
+  if (error === null || (typeof error !== "object" && typeof error !== "function")) return false;
+  return zoneCheckedIsOurs(error);
+}
 
 const env = (name: string, fallback?: string): string => {
   const v = process.env[name] ?? fallback;
@@ -112,7 +412,7 @@ const sites: { name: string | null; path: string }[] = (() => {
     try {
       return parsePolicySites(many).map((s) => ({ name: s.name, path: resolve(s.path) }));
     } catch (e) {
-      console.error(`[policy-render] refusing to start: ${(e as Error).message}`);
+      console.error(`[policy-render] ${oneLine(`refusing to start: ${reasonOf(e)}`)}`);
       process.exit(2);
     }
   }
@@ -280,22 +580,151 @@ if (!token) {
 const cached = new Map<string, { stamp: string; source: PolicySource }>();
 
 /**
- * Everything that can change what `/source` should answer, in one string.
+ * What can change what `/source` should answer, in one string — as much of it as this can see.
+ *
+ * Not "everything", which is what this claimed. It reads the entry module, the allowlisted files, the
+ * git sha and the entry module's neighbours; a file the module imports from **outside** its directory
+ * is invisible, and breaking one leaves the cache answering 200 with the last good payload. The
+ * neighbour scan was added because the narrower version had that failure for any `./helper.ts`.
  *
  * Read the mtimes of the allowed files too, not just the module: the whole defect above was a key
  * that could not see a change to `policies.json`. A path that does not exist contributes `-`, so
  * its appearance and disappearance both move the key.
  */
-function sourceStamp(sitePath: string): string {
+/**
+ * How many directory entries the stamp will visit before it gives up.
+ *
+ * Entries, not matching files. Counting matches let a tree of a thousand directories holding one
+ * `.ts` file pass the cap untouched while still costing a full traversal on every request, which is
+ * the cost the cap exists to bound.
+ */
+const STAMP_SCAN_CAP = 2_000;
+
+/**
+ * `null` means **no complete stamp**: the tree has more entries than the scan cap, so a change here
+ * cannot be noticed. The caller refuses the site rather than serving it — see `currentSource`.
+ * Returning a placeholder instead froze the key; evaluating without caching leaked the module
+ * registry. Both were tried, in that order, and both are recorded there.
+ */
+function sourceStamp(sitePath: string): string | null {
   const head = policyHead(sitePath);
   const dir = dirname(resolve(sitePath));
   const mtime = (p: string): string => {
     try {
-      return String(statSync(p).mtimeMs);
+      return toText(statSync(p).mtimeMs);
     } catch {
       return "-";
     }
   };
+  // ## The entry module is not the only file that changes what it evaluates to
+  //
+  // This read the entry module, the allowlisted files and the git sha. A policy module's own
+  // `import "./helper.ts"` was in none of them, so breaking only the helper left the cache answering
+  // **200 with the last good payload** for a site that no longer evaluates — not an outage, a screen
+  // that lies about what is deployed, which the comment above `cached` says must never happen.
+  // Measured here, and confirmed in the running image by the cluster's operator, who read its
+  // `heliopause-policy-render.ts` and found no `readdirSync` — the stamp there is the entry module,
+  // the allowlisted files and the sha, and nothing else.
+  //
+  // The whole directory rather than a dependency graph: Node exposes no import graph for an evaluated
+  // module, and policy modules keep their helpers beside them. A helper **outside** this directory is
+  // still invisible to the stamp — the known remaining gap, not an oversight.
+  //
+  // ## Two things the first version of this got wrong, both found by an audit
+  //
+  // It called `readdirSync(dir, { recursive: true })` and `break`'d at the cap. That bounds the array
+  // it builds and **not the walk**: the recursive form returns a materialised array, so the whole tree
+  // is read before the loop sees its first entry. The walk below is explicit and stops.
+  //
+  // And above the cap it substituted the literal `over-400`, a constant — so a tree larger than the cap
+  // had a stamp that could never move, and the cache served its first answer forever. That is exactly
+  // the defect the neighbour scan exists to fix, reintroduced inside the fix. Above the cap this now
+  // refuses to produce a stamp at all and the caller does not cache, which costs an evaluation per
+  // request and cannot serve a stale one.
+  //
+  // @see src/policy-render-service.test.ts "refuses a site whose tree is larger than the scan cap"
+  // ## 🔴 `.git` is why this skips dot-directories, and skipping them is why the cap means anything
+  //
+  // The policy directory is a git checkout. Measured in a real tree: **3,116 entries** with `.git`
+  // included and **49** without — 24 of them source files. A cap counted over everything is therefore
+  // exceeded on the first request of every ordinary deployment, and the version of this that refused
+  // above the cap would have answered 503 for **every site at once**. That is a full console outage,
+  // which is worse than the leak it replaced, which was worse than the frozen key before that. Three
+  // attempts at this line, each worse than the last, and the thing that settled it was counting the
+  // entries in an actual checkout instead of reasoning about a plausible one.
+  //
+  // What is skipped is **dot-directories and `node_modules`**, and a module importing out of one of
+  // those is invisible to the stamp — the same class of gap as a helper outside the directory, stated in
+  // the same breath. This did say the skipped paths are "not part of any module graph", which is not
+  // true of `.generated/` or a vendored directory and was never true of a dot-**file**: the first
+  // version of the predicate ran before the directory check and hid `./.helper.ts` too, which is a legal
+  // import the resolve hook versions. Directories only, for that reason.
+  //
+  // `withFileTypes` reports a symlink as a symlink rather than as what it points at, so
+  // `isDirectory()` is false for one and this walk never follows them. That is what makes a cycle
+  // impossible here rather than merely unlikely — and it is why a helper reached through a symlink is
+  // invisible too.
+  const neighbours: string[] = [];
+  let visited = 0;
+  let overflowed = false;
+  const stack = [dir];
+  walk: while (stack.length > 0) {
+    const here = stack.pop() as string;
+    // ## `opendirSync`, not `readdirSync`, and the cap is why
+    //
+    // `readdirSync` materialises **every** entry of a directory before the loop sees the first one, so
+    // the cap bounded the entries this loop processed and not the entries the process allocated. One
+    // very wide directory therefore still cost its full enumeration synchronously, which is time
+    // `/healthz` spends waiting on a request for a different site. A handle read one entry at a time
+    // makes the cap mean what it says.
+    let handle: ReturnType<typeof opendirSync>;
+    try {
+      handle = opendirSync(here);
+    } catch {
+      // ## 🔴 A directory that cannot be read is not an empty one
+      //
+      // This used to `continue`, which treated a refused enumeration as "nothing here" and returned a
+      // **complete** stamp. A directory can deny enumeration while still allowing a known filename to
+      // be opened, so a helper stays importable and becomes unstampable at the same instant — and this
+      // function's whole job is to notice when it changes. Fail-open, in the one place that must not.
+      //
+      // Refusing instead is consistent with the overflow below: no complete stamp, no answer. It does
+      // mean a permissions fault anywhere under the policy directory refuses every site sharing it,
+      // which is loud — and the alternative is a console that keeps drawing a policy nobody can
+      // invalidate.
+      return null;
+    }
+    try {
+      for (;;) {
+        const entry = handle.readSync();
+        if (entry === null) break;
+        visited += 1;
+        if (visited > STAMP_SCAN_CAP) { overflowed = true; break walk; }
+        // Directories only. The first version of this line skipped **any** entry whose name began with
+        // a dot, which hid `./.helper.ts` as well as `./.git/` — a legal import that the resolve hook
+        // versions and this stamp could not see change. Inside the scanned directory, which made it a
+        // new defect rather than the stated gap about helpers outside it.
+        if (entry.isDirectory()) {
+          if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
+          stack.push(join(here, entry.name));
+          continue;
+        }
+        if (!entry.isFile()) continue;
+        if (!/\.(ts|mts|cts|js|mjs|cjs|json)$/.test(entry.name)) continue;
+        neighbours.push(join(here, entry.name));
+      }
+    } finally {
+      // `break walk` leaves through here too, which is the case that would otherwise leak the handle.
+      try {
+        handle.closeSync();
+      } catch {
+        // Already closed, or the directory went away mid-walk. Neither changes the stamp.
+      }
+    }
+  }
+  if (overflowed) return null;
+  neighbours.sort();
+  const scanned = neighbours.map(mtime).join(",");
   const files = [sitePath, ...allowPaths.map((p) => resolve(dir, p))].map(mtime).join(",");
   // The path is in the key, not only in the `Map` bucket it is stored under. Two modules in one
   // directory share a git sha and an allowlist, so the rest of this string is identical for both —
@@ -303,27 +732,52 @@ function sourceStamp(sitePath: string): string {
   // stamp for `alpha.ts` and `beta.ts` can be byte-identical, and then a cache that keys on the
   // stamp alone answers one site's request with the other's policy. Belt and braces on purpose: the
   // bucket and the stamp each encode the site, so a mistake in either is caught by the other.
-  return `${sitePath}:${head.sha ?? "nogit"}:${head.dirty ? "dirty" : "clean"}:${files}`;
+  return `${sitePath}:${head.sha ?? "nogit"}:${head.dirty ? "dirty" : "clean"}:${files}:${scanned}`;
 }
 
 /** The host ids a rendered site declares, for the zone check. */
 function hostIdsOf(site: ScreenSite): string[] {
   const hosts = (site as { hosts?: readonly { id?: unknown }[] }).hosts ?? [];
-  return hosts.map((h) => String(h?.id ?? "")).filter(Boolean);
+  return hosts.map((h) => toText(h?.id ?? "")).filter(Boolean);
 }
 
 async function currentSource(site: { name: string | null; path: string }): Promise<PolicySource> {
   const { name, path: sitePath } = site;
+  // ## 🔴 No complete stamp is a refusal, and the first version of this served instead
+  //
+  // `null` means the tree has more entries than the scan cap, so a change cannot be noticed. An earlier
+  // version of this evaluated anyway and skipped the cache, minting a fresh `?v=` per request so the
+  // re-evaluation was a real one — that code is gone, and this paragraph is why it is not coming
+  // back. It leaks: ES modules are keyed by URL and never evicted, and a
+  // measured 7.32 KiB is retained per distinct URL (Node 26.4, after a forced GC; 4,000 imports of one
+  // URL retain nothing). At one poll every few seconds that is hundreds of megabytes a day and then an
+  // OOM kill, which at `replicas: 1` takes every co-served console with it.
+  //
+  // So the defect that fix introduced was worse than the one it closed — a stale policy against no
+  // policy at all. Refusing is the third option and the right one: this site answers 503 and says why,
+  // nothing new enters the module registry, and a tree this large is a configuration an operator can
+  // fix or a cap they can raise.
+  //
+  // ⚠️ **Its neighbours are not unaffected, and this line used to say they were.** The scan is of the
+  // directory, so every site whose module sits in it reaches the same verdict — and in the fleet all
+  // three do. An overflow is therefore every console, not one. That is the price of refusing, and it is
+  // why the cap sits far above a measured checkout rather than near it.
   const stamp = sourceStamp(sitePath);
   const hit = cached.get(sitePath);
   if (hit && hit.stamp === stamp) return hit.source;
+  if (stamp === null) {
+    throw new RealError(
+      `more than ${STAMP_SCAN_CAP} entries beside ${sitePath} — a change here cannot be noticed, ` +
+        "so this site is refused rather than served from a key that cannot move",
+    );
+  }
   // Before the import, so the hook above knows which tree this evaluation may version.
   policyRoots.add(`${pathToFileURL(realpathSync(dirname(resolve(sitePath)))).pathname}/`);
   // The import specifier still needs a value that moves, and `stamp` is not URL-safe.
   const mod = (await import(`${pathToFileURL(sitePath).href}?v=${encodeURIComponent(stamp)}`)) as {
     site?: ScreenSite;
   };
-  if (!mod.site) throw new Error(`${sitePath} does not export \`site\``);
+  if (!mod.site) throw new RealError(`${sitePath} does not export \`site\``);
   // ## Checked on every evaluation, not only at startup
   //
   // Startup is where a wrong manifest is caught while somebody is watching, but a module that threw
@@ -331,9 +785,55 @@ async function currentSource(site: { name: string | null; path: string }): Promi
   // holds; the startup one is the one that is loud. Throwing here surfaces as the 503 below, which
   // is the right shape — the module is present and this process will not vouch for it.
   const wrongZone = name === null ? null : zoneMismatch({ target: name, hostIds: hostIdsOf(mod.site) });
-  if (wrongZone) throw new ZoneMismatchError(wrongZone);
+  if (wrongZone) throw ownZoneMismatch(wrongZone);
+  // ## Everything past this point has been zone-checked, and the caller needs to know that
+  //
+  // The startup verification logs "the declared-name check did not run" on any failure that is not a
+  // `ZoneMismatchError`. That was right for the failures above — the import, the missing export, a
+  // timeout — and **wrong for everything below**, which happens only after the check ran and passed.
+  // `collectPolicySource` has three reachable throw paths, all from the module: a `JSON.stringify`
+  // over a site with a cycle, a `BigInt`, or a throwing `toJSON`; the module's own `resolveService`
+  // being called; and `Object.values` over a throwing getter. Reproduced with an ordinary accidental
+  // cycle: a correctly-declared site printed "the declared-name check did not run for it", sending
+  // an operator to edit a Deployment that was right.
+  //
+  // That is the round-three defect inverted — it under-claimed, this over-claimed — and the reason
+  // both happened is that the distinction was being inferred from where the failure came from rather
+  // than carried with it. Wrapping is what carries it. Note the distinction from the zone brand above:
+  // `ZoneCheckedError` is declared here and a module has no reason to construct one, but if it did,
+  // the consequence is a *milder* log line — whereas forging the zone error escalated to `exit 2`,
+  // which is why the zone brand needed a `WeakSet` first. This one has the same treatment now: an
+  // `instanceof` walks a prototype chain, and a module handing back a revoked `Proxy` made the
+  // classification itself throw. Two rounds of this file said "and this one does not" after the
+  // `WeakSet` had already been added to both — the code moved and the sentence explaining why it
+  // needn't stayed.
+  try {
+    // The narrowed value, not `mod` plus a `!` at the use. The guard above is twenty lines from the use
+    // and the compiler cannot see across the call, so an assertion there rested on an accident:
+    // deleting the guard reported `TS2345` at an unrelated line, and adding `!` there too went silent.
+    return await evaluated({ site: mod.site, name, sitePath, stamp });
+  } catch (e) {
+    // Only ours passes through. A `ZoneMismatchError` reaching here came from the module -- the
+    // class is shared, so its type says nothing about who built it -- and that is a content fault.
+    if (foundHere(e)) throw e;
+    // `reasonOf`, not `asError(e).message`. `asError` returns an `Error` unchanged — deliberately,
+    // because identity is what the membership checks key on — so a throwing `.message` getter survived
+    // it and threw *here*, before the wrapper existed. The failure then propagated unclassified and the
+    // startup loop reported that the declared-name check had not run, on a site where it had. Same
+    // getter, same line of reasoning as the four interpolation points; this was the fifth and it was
+    // missed because it reads the message to *build* a message rather than to print one.
+    throw new ZoneCheckedError(reasonOf(e), { cause: e });
+  }
+}
+
+/** The half of `currentSource` that runs once the zone check has passed. Separated so the caller can
+ *  tell a failure here — where the check ran — from one before it. */
+async function evaluated(
+  input: { site: ScreenSite; name: string | null; sitePath: string; stamp: string },
+): Promise<PolicySource> {
+  const { site: siteValue, name, sitePath, stamp } = input;
   const source = collectPolicySource({
-    site: mod.site, sitePath, allowPaths,
+    site: siteValue, sitePath, allowPaths,
     // ## The label follows the site once there is more than one
     //
     // `HELIOPAUSE_POLICY_LABEL` is one value for the process, and the console prints it as "which
@@ -344,9 +844,255 @@ async function currentSource(site: { name: string | null; path: string }): Promi
     label: name ?? label,
     ...(name === null ? {} : { siteName: name }),
   });
+  // Always stored, because nothing reaches here without a complete stamp: `currentSource` refuses a
+  // null one above the scan cap. Two earlier versions of this line carried a `stamp !== null` guard —
+  // one of them dead, because it sat where the value had already been replaced by a substitute — and
+  // the substitute was what leaked. The refusal upstream is what makes this unconditional again.
   cached.set(sitePath, { stamp, source });
   log(`evaluated ${name ?? label} at ${source.head.sha ?? "unknown"}${source.head.dirty ? " (dirty)" : ""}`);
   return source;
+}
+
+/**
+ * How long one readiness answer stands, and how long a single site gets to produce one.
+ *
+ * The memo window is what keeps `/readyz` O(1) under repetition: `currentSource` runs two
+ * synchronous `git` calls per site before it ever reaches its own cache, so an ungated loop over
+ * this route is a loop of `execFileSync` on the only event loop this process has. Two seconds is far
+ * below the policy checkout's own sync interval, so nothing observable is lost.
+ *
+ * The per-site budget exists because a policy module is attacker-reachable code that runs at import.
+ * `await new Promise(() => {})` at its top level never settles, and without a bound the whole route
+ * never answers: the socket stays open, `/healthz` stays green, and the state this endpoint was
+ * built to report arrives as **silence** — strictly worse than the 503 it exists to send. A site
+ * that cannot answer inside the budget is not serving, which is not an approximation.
+ */
+const READY_MEMO_MS = 2_000;
+// Larger than the two request-path budgets **at their defaults** — not by construction; `min: 100`
+// lets an operator set this below either of them, and nothing here stops that because a small startup
+// budget is a legitimate choice for a small tree. What the default expresses is that this is the
+// first, cold import of each module, and being slow
+// at boot is not the failure being bounded here — never settling is.
+//
+// Through `boundedInteger` like every other number this file reads, and **not** through a local
+// `Number(...)` guard, which is what it was. That guard admitted `2147483648`, which `setTimeout`
+// clamps to one millisecond: the largest-looking value became the smallest possible budget while
+// the timeout text still quoted what the operator asked for. See the entry in `ENV_BOUNDS`.
+//
+// 🔴 **A bad value now refuses to start, and the comment this replaced promised it would not.** It
+// said *"a typo in it must not become a second way to lose the renderer"*, and that was written
+// against `NaN` and negatives — which the old guard did handle — not against the garbage that
+// actually got through. Giving up the fallback is the deliberate half of the trade: a value outside
+// the range is a value whose effect the operator cannot predict, and this file's answer to that
+// everywhere else is to refuse rather than to substitute. What is **not** acceptable is refusing
+// badly, which is what the first version of this did — an uncaught `EnvSpecError`, exit 1, and a V8
+// stack naming `env-spec.ts` instead of the manifest line. Wrapped like `port` above, it refuses in
+// this service's own vocabulary with the same exit code as every other refusal here.
+let STARTUP_SITE_BUDGET_MS: number;
+try {
+  STARTUP_SITE_BUDGET_MS = boundedInteger(
+    "HELIOPAUSE_POLICY_STARTUP_BUDGET_MS",
+    process.env["HELIOPAUSE_POLICY_STARTUP_BUDGET_MS"],
+    ENV_BOUNDS.HELIOPAUSE_POLICY_STARTUP_BUDGET_MS,
+  );
+} catch (error) {
+  console.error(`[policy-render] ${(error as Error).message}`);
+  process.exit(2);
+}
+
+/**
+ * The request path's budget, which has to stay **below the manager's own client timeout**.
+ *
+ * `/source`'s 503 carries the sentence the console shows instead of an empty page, and that sentence
+ * only reaches anyone if this side gives up first. At `READY_SITE_BUDGET_MS` it did not — that is
+ * 5000, and so is the manager's `AbortSignal.timeout(HELIOPAUSE_RELAY_TIMEOUT_MS)` default, applied
+ * before it connects, so the caller's clock always started first.
+ *
+ * ⚠️ **This was then `Math.floor(ENV_BOUNDS.HELIOPAUSE_RELAY_TIMEOUT_MS.fallback * 0.8)` with a
+ * comment claiming "raising the relay timeout raises this with it". That coupling does not exist.**
+ * The manager's timeout is a value in the *manager's* environment; what this read was a compile-time
+ * default, so nothing an operator sets moves this number — including setting that very variable here,
+ * measured. A reader would have gone looking for a lever that is wired to nothing.
+ *
+ * It is an env of its own now, so an operator who lowers one can lower the other. That is a knob, not
+ * a guarantee: the only correct form is the caller sending its deadline and this side budgeting
+ * against what it was told, which is a change to two services and is not in this one.
+ */
+let SOURCE_SITE_BUDGET_MS: number;
+try {
+  SOURCE_SITE_BUDGET_MS = boundedInteger(
+    "HELIOPAUSE_POLICY_SOURCE_BUDGET_MS",
+    process.env["HELIOPAUSE_POLICY_SOURCE_BUDGET_MS"],
+    ENV_BOUNDS.HELIOPAUSE_POLICY_SOURCE_BUDGET_MS,
+  );
+} catch (error) {
+  console.error(`[policy-render] ${oneLine((error as Error).message)}`);
+  process.exit(2);
+}
+
+// ## Why these two are asserted and `port` is not
+//
+// `port` is read in straight-line code, so TypeScript's definite-assignment analysis covers it: soften
+// `process.exit(2)` to `process.exitCode = 2` and the compiler says `TS2454: used before being
+// assigned`. Both budgets are read **only inside closures**, and TS does not run that analysis into a
+// closure — demonstrated on a minimal file, the `port` shape errors and the closure shape does not.
+// The same softening would leave these `undefined`, and `setTimeout(fn, undefined)` fires at **1ms**
+// with the message reading `did not finish within undefinedms`: round two's silent-1ms budget,
+// restored, with no compiler signal and a message that names the bug. Cheap insurance for a failure
+// whose only symptom is a number.
+// Declared after the assertion below would be neater, but it has to follow `SOURCE_SITE_BUDGET_MS`
+// and the compiler is emphatic about that — this line read above its source for one revision and
+// `tsc` gave both `TS2448` and `TS2454` immediately. That is the straight-line protection the two
+// budgets above do **not** get, since they are only read inside closures; the contrast is the reason
+// the loop below exists at all.
+//
+// Same number as `/source`, and for the same reason rather than by coincidence. This was a literal
+// `5_000` — the relay timeout's own default — which is precisely the collision `/source` was changed
+// to avoid, left sitting on the neighbouring route. Nothing polls `/readyz` today, so there is no
+// live victim; but `readiness()` waits on every site, so the first thing that polls it with the relay
+// timeout inherits the identical race. Fixing one route and leaving its neighbour is how the same
+// defect gets rediscovered.
+const READY_SITE_BUDGET_MS = SOURCE_SITE_BUDGET_MS;
+
+for (const [name, value] of [
+  ["HELIOPAUSE_POLICY_STARTUP_BUDGET_MS", STARTUP_SITE_BUDGET_MS],
+  ["HELIOPAUSE_POLICY_SOURCE_BUDGET_MS", SOURCE_SITE_BUDGET_MS],
+] as const) {
+  if (!Number.isInteger(value)) {
+    console.error(`[policy-render] refusing to start: ${name} resolved to ${String(value)}, not an integer`);
+    process.exit(2);
+  }
+}
+
+let readyMemo: {
+  /** `null` while in flight — an unsettled answer is shared regardless of age, never expired. */
+  settledAt: number | null;
+  answer: Promise<{ serving: number; total: number }>;
+} | null = null;
+
+/**
+ * `currentSource`, or a rejection once the budget is spent.
+ *
+ * ⚠️ **Not "never hangs", which is what this said.** The budget is a timer, and a timer cannot
+ * preempt synchronous code. `while (true) {}` at a policy module's top level blocks the event loop,
+ * so the callback that would reject never runs: measured, the process stays alive and answers
+ * nothing at all — no listener if it happens at startup, and no `/healthz` either way, so the
+ * liveness probe kills the pod and the next one does the same. Measured against `origin/main` of
+ * this repository; not separately checked in the running image.
+ *
+ * There is no fix for this in the same realm, which is why the sentence is a warning rather than a
+ * TODO: interrupting the module means evaluating it somewhere with its own event loop — a
+ * `worker_thread` or a `vm` context. That is also the boundary the intrinsic captures above are
+ * explicitly *not*. The budget still does what it says for a module that hangs **asynchronously**,
+ * which is the common case and the one the test covers.
+ *
+ * @see src/policy-render-service.test.ts "answers even when a site module never settles"
+ *
+ * Used by the readiness route *and* by the startup verification, because the unbounded wait is worse
+ * at startup: a module that never settles there means `server.listen` is never reached, so the
+ * process answers nothing at all — not even `/healthz` — and the only evidence is a pod that never
+ * becomes ready. A test for the route found that by failing with "the renderer exited with 13 before
+ * listening", which is the shape of the bug rather than a flaw in the test.
+ */
+function evaluateWithin(
+  site: { name: string | null; path: string },
+  budgetMs: number,
+): Promise<PolicySource> {
+  return new Promise<PolicySource>((resolve, reject) => {
+    // ## Deliberately **not** `unref`'d, and the first draft was
+    //
+    // At startup this is awaited at the module's top level. An `unref`'d timer does not hold the
+    // event loop open, so with the only other pending work being an import that never settles, Node
+    // finds nothing to do and exits **13** — "unsettled top-level await" — before the budget can
+    // fire. The bound was there and could not reach: the process still answered nothing, which is
+    // the exact failure it was added to prevent, arriving through the mechanism meant to prevent it.
+    //
+    // Holding the loop open costs at most one budget, and the timer is cleared on every normal path,
+    // so a fast answer leaves nothing behind.
+    const timer = arm(
+      () => reject(new RealError(`evaluation did not finish within ${budgetMs}ms`)),
+      budgetMs,
+    );
+    void currentSource(site).then(
+      // No `try` around `resolve`. Resolving an object does read `.then` off it, and a module can
+      // make that throw — but `currentSource` resolves its own object first, so its promise rejects
+      // and this handler is never entered. Written, then deleted when no mutation could make it fire.
+      (source) => { disarm(timer); resolve(source); },
+      // `asError`, not a cast. `throw null` in a policy module rejected the import with `null`,
+      // which `/source`'s handler then read `.message` off — a `TypeError` in a rejection handler,
+      // so an unhandled rejection, so **exit 1 on the first request**. The startup loop had its own
+      // `asError` and survived, which made it worse: the pod passed both probes and died when the
+      // manager asked for policy, so the crashloop was driven by ordinary polling. Every consumer of
+      // `currentSource` comes through here, which is why the normalisation belongs here and not at
+      // the four places that read `.message` — the same "second path a per-call-site fix forgets"
+      // this file noted about `console.error` one commit earlier, repeated.
+      // A throw *in this handler* is an unhandled rejection, so the process would be gone — which is
+      // exactly what a module that replaced `globalThis.Error` achieved through `asError`, measured as
+      // exit 1 during the startup loop. The fix is that `asError` cannot throw: every inspection in it
+      // is wrapped, `typeof` has no trap, and the constructor is captured before the first import. A
+      // `try` here as well was written and then deleted — no mutation could make it fire, and a guard
+      // no test can reach also hides the code it wraps from single-point mutation.
+      (e: unknown) => { disarm(timer); reject(asError(e)); },
+    );
+  });
+}
+
+/**
+ * Whether each site can be evaluated right now, bounded and memoised.
+ *
+ * This said "never rejects", which was true of the per-site failures it was written for — each one is
+ * caught below — and false of the collection. Resolving the answer reads a `then` a policy module can
+ * poison, so `/readyz` handles a rejection as well as an answer; without that it was exit 1 on the
+ * readiness probe, i.e. on a schedule.
+ *
+ * ## The window runs from when the answer *settled*, not from when it started
+ *
+ * Stamped at the start, an evaluation slower than the window was stale the moment it finished and
+ * was served to nobody: measured against one never-settling site, a caller arriving at +2.5s found
+ * the memo already expired and began its own full five-second evaluation, so the process carried
+ * two and then three concurrent evaluations — each opening with two synchronous `git` calls per
+ * site — for an answer it already had in flight. The slow case is the only case this memo exists
+ * for, and it was the one case it could not memoise.
+ *
+ * An in-flight answer is shared regardless of age (that half was always right and is kept): callers
+ * queue behind it rather than starting rivals. The age test applies to a *settled* answer, which is
+ * the only kind that can be stale.
+ */
+function readiness(): Promise<{ serving: number; total: number }> {
+  if (readyMemo && (readyMemo.settledAt === null || readClock() - readyMemo.settledAt < READY_MEMO_MS)) {
+    return readyMemo.answer;
+  }
+  // Not `Promise.all`: it resolves an array, and an array inherits a `then` a policy module can
+  // poison — see the startup loop. The per-site promises resolve booleans, which are primitives and
+  // run no thenable check at all, so only the collection had to change. Started before any is
+  // awaited, as before.
+  const started = sites.map((site) => evaluateWithin(site, READY_SITE_BUDGET_MS).then(() => true, () => false));
+  const answer = (async () => {
+    let serving = 0;
+    for (const one of started) if (await one) serving += 1;
+    // A plain object, deliberately. Resolving it reads `.then`, which a module can poison, and a
+    // `__proto__: null` literal here would dodge that — but `/readyz` already answers the resulting
+    // rejection, so both together meant reverting either one left every test green. One guard, the
+    // general one, is worth more than two that hide each other from a mutation check.
+    return { serving, total: started.length };
+  })();
+  const memo: { settledAt: number | null; answer: typeof answer } = { settledAt: null, answer };
+  readyMemo = memo;
+  // Both handlers, not just one. Every per-site promise is caught above, so `answer` rejects only if
+  // the collection itself fails — which it can: resolving the answer reads a `then` a module may have
+  // poisoned. With one handler that rejection was unhandled, and a `void`ed unhandled rejection is
+  // exit 1. Stamping on either outcome is also correct: a settled failure is as stale as a settled
+  // success and must not pin the memo open.
+  //
+  // The closure stamps **its own object**, not `readyMemo`, so a superseded memo can only mark itself
+  // and nothing reads it again. (This said "guarded on identity", which named a `readyMemo === memo`
+  // check that is not here and never was; the behaviour was right and the mechanism described was
+  // fiction, which is the worse of the two ways to be wrong in a comment.)
+  const stamp = (): void => {
+    memo.settledAt = readClock();
+  };
+  void answer.then(stamp, stamp);
+  return answer;
 }
 
 /**
@@ -363,9 +1109,38 @@ function bearerOk(header: string | undefined): boolean {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
+// ## Serialising is not safe either, and capturing `JSON.stringify` did not make it safe
+//
+// `JSON.stringify` calls a **`toJSON` method it finds on the value**, inherited included. So
+// `Object.defineProperty(Object.prototype, "toJSON", { value() { throw … } })` in a policy module
+// made every response throw — inside the request handler, which is an uncaught exception, so
+// **exit 1 on the first request**, `/healthz` included. Capturing the function closed nothing here:
+// the hook is on the value, not on the global. Measured here, and confirmed in the running image by
+// the cluster's operator: its `send` serialises unguarded and its `/healthz` goes through it.
+//
+// Two answers. `/healthz` gets a body that was serialised when this file was written, so the liveness
+// probe never calls a serialiser at all. Everything else goes through a `send` that falls back to a
+// literal: an error code is kept (a 503 stays a 503 and says why it has no body), and a success code
+// becomes 500, because a 200 with a literal body would claim an empty policy is the policy.
+//
+// @see src/policy-render-service.test.ts "answers /healthz when the module poisoned serialisation"
+const HEALTHZ_BODY = '{"ok":true}';
+// ## The fallback carries `faults` too, because a field that vanishes is read as a zero
+//
+// This was a constant without it. So under a poisoned `toJSON` — the one condition that reaches this
+// body — `/readyz` answered with no `faults` key at all, and an operator checking that field sees
+// nothing and concludes there are none. The absence appeared precisely where something was wrong.
+// Reported by the operator of the cluster this serves, who had just been bitten by reading a table's
+// zero rows as "verified".
+//
+// Built by concatenation rather than `toJson`: interpolating a **number primitive** uses the spec's
+// Number::toString, not `Number.prototype.toString`, so a module cannot hook it — which matters
+// because the only way to get here is a module having hooked something.
+const unserialisableBody = (): string =>
+  '{"error":"the answer could not be serialised","faults":' + faults + "}";
+
 const server = createServer((req, res) => {
-  const send = (code: number, body: unknown): void => {
-    const text = JSON.stringify(body);
+  const raw = (code: number, text: string): void => {
     res.writeHead(code, {
       "content-type": "application/json; charset=utf-8",
       "cache-control": "no-store",
@@ -373,10 +1148,135 @@ const server = createServer((req, res) => {
     });
     res.end(text);
   };
+  const send = (code: number, body: unknown): void => {
+    let text: unknown;
+    try {
+      text = toJson(body);
+    } catch {
+      log(`a response body could not be serialised — answering ${code >= 400 ? code : 500} without it`);
+      raw(code >= 400 ? code : 500, unserialisableBody());
+      return;
+    }
+    // ## Not throwing is not the same as producing a body
+    //
+    // `JSON.stringify` calls the `toJSON` it finds on the value, and an inherited one that **returns
+    // `undefined`** makes it return `undefined` rather than raise — so the `catch` above never ran and
+    // `res.end(undefined)` went out as a **200 with an empty body** under a JSON content type. The
+    // manager then parses nothing and has no error to report. The guard above was written for a
+    // throwing hook and the type annotation here said `string`, which was how it read as impossible.
+    //
+    // @see src/policy-render-service.test.ts "answers nothing rather than an empty body"
+    if (typeof text !== "string") {
+      log(`a response body serialised to ${typeof text} — answering ${code >= 400 ? code : 500} without it`);
+      raw(code >= 400 ? code : 500, unserialisableBody());
+      return;
+    }
+    raw(code, text);
+  };
 
-  const url = new URL(req.url ?? "/", "http://placeholder");
+  // ## 🔴 A request target this cannot parse used to end the process
+  //
+  // `new URL("//[", "http://placeholder")` throws `ERR_INVALID_URL` — `//` makes it
+  // protocol-relative, so `[` is read as the start of an IPv6 host and fails. This callback is
+  // synchronous, so the throw left `createServer` uncaught: **exit 1**. Before authentication, so
+  // `curl 'http://host:9099//['` from anything that could reach the port took the pod down, and at
+  // `replicas: 1` with `Recreate` every zone's console went with it. Also `//[::1`, `//%` and
+  // `http://[`. Measured on Node 26.4.0; the line is unchanged from `origin/main`, so this is live
+  // today rather than something this branch introduced.
+  //
+  // A malformed target is a client error, so it gets 400 and the process keeps serving.
+  let url: URL;
+  try {
+    url = new URL(req.url ?? "/", "http://placeholder");
+  } catch {
+    // No detail echoed back: the input is the caller's and there is nothing here worth quoting.
+    return send(400, { error: "unparseable request target" });
+  }
 
-  if (req.method === "GET" && url.pathname === "/healthz") return send(200, { ok: true });
+  // Unchanged on purpose. It answers "the listener is up" and nothing else, because it is wired to
+  // this pod's **liveness** probe as well as its readiness one — liveness period 30s × 3, readiness
+  // 10s × 3, `replicas: 1`, `strategy: Recreate`. Those five values are **not in this repository**:
+  // they were read out of the deployment manifests in `stardust-deploy` by the session that owns
+  // them and relayed here on 2026-09-29. Treat them as a citation, not as something this tree can
+  // check — if the manifests move, nothing here goes red.
+  //
+  // Making this one strict would restart the pod for a policy problem, and a policy tree that cannot
+  // be cloned does not become clonable by restarting — it becomes a crashloop. `/readyz` below is
+  // the strict one, and it is deliberately not a probe.
+  //
+  // 🔴 **This endpoint's cheapness is load-bearing, and it is why `/readyz` is gated and memoised.**
+  // Everything here shares one event loop. A route that does synchronous work holds this one up, and
+  // holding it up past `timeoutSeconds` is a liveness failure — so any expensive route is a lever on
+  // this pod's life. `/readyz` reached for `currentSource`, which calls `sourceStamp` → `policyHead`
+  // → two synchronous `execFileSync("git", …)` per site **before** the cache is consulted, and a
+  // review measured 42.7 ms each: thirty concurrent unauthenticated requests held `/healthz` over a
+  // second and would have had kubelet kill the container on demand. The fix this comment is pointing
+  // at is below; the rule it leaves behind is that nothing reachable without the bearer may call
+  // `currentSource` on the request path.
+  // Not `send`: the liveness probe must not depend on a serialiser a policy module can hook.
+  if (req.method === "GET" && url.pathname === "/healthz") return raw(200, HEALTHZ_BODY);
+
+  // ## Can this process serve any policy at all?
+  //
+  // `2/2 Running` with every site answering 503 was a real state on 2026-09-29, and nothing in the
+  // cluster could say so: `/healthz` returns `{ok:true}` from a listener that has never successfully
+  // evaluated anything. This is the sentence that tells "up" from "useful".
+  //
+  // 🔴 **Not wired to a probe, and that is the decision rather than an omission.** The renderer runs
+  // at `replicas: 1` with `strategy: Recreate` (cited, not checkable here — see `/healthz` above), so
+  // there is no surge pod: a readiness failure empties the endpoint list and the manager's
+  // `GET /source` stops connecting at all. Compare the two failures — serving 503 puts "the policy
+  // module could not be evaluated: …" on the console, and an empty endpoint list puts nothing
+  // anywhere. **Both are broken; only one of them talks.** The common cause, the render/clone race,
+  // was closed by an init container on the deployment side, so wiring this would trade information
+  // away in the rare case and buy nothing in the common one.
+  //
+  // **Two replicas would not change that, and an earlier draft of this comment said they would.**
+  // The pods share one policy remote, so a policy fault is *correlated*: both go unready together,
+  // the endpoint list empties anyway, and the outage arrives by the route this paragraph refuses.
+  // Readiness gating pays only for *uncorrelated* per-pod failure — which was the clone race, and
+  // that is already closed. The sentence concluded the opposite of what it reasoned.
+  //
+  // 🔴 **Behind the bearer, and that is a correction.** It was unauthenticated, on the argument that
+  // counts leak nothing. Counts do leak nothing — but *reaching* this route makes the process do
+  // work, and `/healthz` above explains why work is the thing that must be gated here. `/sites` is
+  // next door for the weaker reason (names); this one is gated for the stronger one. Both controls
+  // are kept rather than one: the file already refuses, at the token check below, to rest on a single
+  // control silently.
+  //
+  // **Counts, not names.** Site names are zone names; "2 of 3" says everything a health signal needs
+  // and names nothing. Which site is failing is in this process's log and in `/source`'s own 503.
+  // `ok` and the status code answer different questions on purpose — the code says "can this serve
+  // anything", `degraded` says "is anything dark". A one-VPC outage is the 2026-09-28 shape, and it
+  // must not read as plain green to whatever consumes the status line.
+  //
+  // Evaluated live rather than remembered from startup, within a window: a site that failed to
+  // import at boot is fixed by the next git-sync two minutes later, and one that verified then can
+  // break the same way, so an answer frozen at startup would be the past wearing the present's
+  // clothes. `READY_MEMO_MS` is far shorter than that sync interval, so the answer is live at the
+  // only granularity that exists — and it caps the work at one evaluation per window instead of one
+  // per request. Not O(1): a sustained poll still costs `elapsed / READY_MEMO_MS` evaluations, which
+  // is what an earlier version of this line overclaimed. What it removes is the *rate* lever, which
+  // is the one that reached `/healthz`.
+  if (req.method === "GET" && url.pathname === "/readyz") {
+    if (!bearerOk(req.headers.authorization)) return send(401, { error: "bad or missing bearer" });
+    void readiness().then(
+      ({ serving, total }) => {
+        // One site is enough to be *up*. Refusing while two of three work would let a bad `dev.ts`
+        // take prod's and util's consoles down — the trade the startup verification below refused.
+        send(serving > 0 ? 200 : 503, { ok: serving > 0, degraded: serving < total, serving, total, faults });
+      },
+      // `readiness` is documented as not rejecting and that was true of the per-site failures it was
+      // written for. It is not true of the collection: a module can poison the `then` that resolving
+      // the answer reads. Without this handler that rejection is unhandled and the process exits 1 —
+      // on `/readyz`, which is the readiness probe, so on a schedule.
+      (e: unknown) => {
+        log(`readiness could not be computed: ${reasonOf(e)}`);
+        send(503, { ok: false, degraded: true, error: "readiness could not be computed", faults });
+      },
+    );
+    return;
+  }
 
   // Behind the bearer, beside `/source` rather than beside `/healthz`: the site names are the
   // fleet's zone names, which is the same class of information the payload carries.
@@ -406,7 +1306,7 @@ const server = createServer((req, res) => {
       // 404 and not a fallback. Answering a name this process does not serve with the site it
       // happens to hold is the whole of the 2026-09-28 incident, reproduced inside the renderer by a
       // typo instead of by a manifest.
-      if (!site) return send(404, { error: `no site named ${JSON.stringify(asked)} here — this renderer serves ${named}` });
+      if (!site) return send(404, { error: `no site named ${toJson(asked)} here — this renderer serves ${named}` });
     } else if (sites.length === 1) {
       // The old manager's request, and the single-site deployment's. Unchanged.
       site = sites[0]!;
@@ -417,19 +1317,25 @@ const server = createServer((req, res) => {
       // the manager learns `?site=`, and the console goes down until it is rolled.
       return send(400, { error: `this renderer serves ${sites.length} sites — name one with ?site=: ${named}` });
     }
-    void currentSource(site).then(
+    // Bounded for the reason the paragraph below gives, and bounded **below the caller's own
+    // timeout** — see `SOURCE_SITE_BUDGET_MS`. Unbounded, a module that never settles makes this
+    // route answer nothing, and "nothing" is the empty page that comment calls the much worse claim;
+    // bounded at the same number as the manager's abort, this side loses the race every time and the
+    // sentence still never ships.
+    void evaluateWithin(site, SOURCE_SITE_BUDGET_MS).then(
       (source) => send(200, source),
       (e: Error) => {
         // The manager turns this into a 503 with this sentence in it. An empty page there would read
         // as "no policy", which is a different and much worse claim than "the policy will not load".
-        log(`evaluation failed: ${e.message}`);
-        send(503, { error: `the policy module could not be evaluated: ${e.message}` });
+        const why = reasonOf(e);
+        log(`evaluation failed: ${why}`);
+        send(503, { error: `the policy module could not be evaluated: ${oneLine(why)}` });
       },
     );
     return;
   }
 
-  return send(404, { error: "this service answers GET /source, GET /sites and GET /healthz" });
+  return send(404, { error: "this service answers GET /source, GET /sites, GET /healthz and GET /readyz" });
 });
 
 // ## Is each module the site it is declared as? Checked before anything is served.
@@ -447,20 +1353,86 @@ const server = createServer((req, res) => {
 // restart: a new outage manufactured by the fix. So it is logged and the process keeps listening,
 // with that one site answering 503. `currentSource` re-checks the zone on every evaluation, so a
 // module that could not be verified here is verified before it is ever served.
-for (const site of sites) {
-  if (site.name === null) continue; // Nothing was declared, so there is nothing to contradict.
+// ## Together, not one after another
+//
+// This was a `for … await`, which made the budget below **additive**: three sites that all hang cost
+// three budgets before `server.listen` is reached, and until then nothing answers — `/healthz`
+// included, because it does not exist yet. Measured at 2s × 3 = 6.1s, so the three-site deployment
+// at the 30s default is ninety seconds dark. The liveness probe this file is careful about is
+// 30s × 3, so the serial loop reached the very crashloop the `/healthz` comment argues must never
+// be created, by way of the bound added to prevent a worse version of it.
+//
+// There is no ordering between sites — nothing here reads another site's result — and the same
+// `evaluateWithin` is already used in parallel by `readiness()`. One helper with opposite
+// concurrency in its two callers, and nothing said so.
+//
+// ⚠️ **What did change is what runs before a refusal.** Serially, a mismatch on the first site
+// exited before the later ones were imported; now every declared module's top level executes and
+// only then is the refusal considered. Measured: two misdeclared sites, both modules' side effects
+// observed, then exit 2. That is accepted rather than fixed — running policy code is this process's
+// whole job and `/source` would run all of them the moment it came up — but it is a widening during
+// a boot already known to be misconfigured, and "no ordering between sites" is true of results and
+// says nothing about side effects, which is the only thing that moved.
+// ## Concurrent, but no array is ever resolved
+//
+// This was `await Promise.all(sites.map(...))` with the same per-site `try`, and the `try` did not
+// help: `Promise.all` resolves its **result array**, an array inherits from `Object.prototype`, and
+// a module that poisons `then` makes that resolution throw — outside every per-site handler, so an
+// unhandled rejection at the top level and exit 1 before `server.listen`. Each site's promise is
+// still started before any is awaited, so the imports still overlap; the results are collected by
+// side effect into a plain array this code owns and never hands to a promise.
+const failures: { site: (typeof sites)[number]; error: Error }[] = [];
+const pending = sites.map(async (site) => {
+  // Nothing was declared, so there is nothing to contradict.
+  if (site.name === null) return;
   try {
-    const source = await currentSource(site);
+    const source = await evaluateWithin(site, STARTUP_SITE_BUDGET_MS);
     log(`verified ${site.name} — ${source.site.hosts?.length ?? 0} hosts`);
   } catch (e) {
-    const why = (e as Error).message;
-    if (e instanceof ZoneMismatchError) {
-      console.error(`[policy-render] refusing to start: ${site.name} is declared for ${site.path}, but ${why}`);
-      console.error(`[policy-render]   a zone's name is the last label of every host id under it — one of these is wrong`);
-      process.exit(2);
-    }
-    log(`${site.name} did not evaluate at startup and will answer 503 until it does: ${why}`);
+    failures.push({ site, error: asError(e) });
   }
+});
+for (const one of pending) await one;
+
+for (const failure of failures) {
+  const { site, error } = failure;
+  const why = reasonOf(error);
+  if (foundHere(error)) {
+    // `oneLine` here too: `why` is built from host ids the policy module declares, so it carries the
+    // same forgery channel as any other module-supplied text. `console.error` does not go through
+    // `log`, which is exactly the kind of second path a per-call-site fix forgets.
+    console.error(`[policy-render] ${oneLine(`refusing to start: ${site.name} is declared for ${site.path}, but ${why}`)}`);
+    console.error(`[policy-render]   a zone's name is the last label of every host id under it — one of these is wrong`);
+    process.exit(2);
+  }
+  // 🔴 **Whether the declared-name check ran is carried by the error's class, not guessed from it.**
+  //
+  // The paragraph above splits configuration faults from content faults, and anything that stops the
+  // evaluation merges them: the check happens *after* the import, so a misdeclared site — the case
+  // that block says "cannot heal itself" and must refuse — lands here instead of in `exit 2` whenever
+  // its module fails first. That silence must not read as a pass, which is what the caveat is for.
+  //
+  // ⚠️ **This predicate has been wrong twice, once in each direction, and both times because it was
+  // inferred instead of carried.** First it was `why.includes("did not finish within")`: that covered
+  // only the timeout, so a module that *throws* — the commoner half — kept the plain line and the
+  // hole stayed open, and the string was `evaluateWithin`'s own wording, so a module could choose
+  // which sentence an operator read. Removing the condition fixed that and broke the other side:
+  // `collectPolicySource` runs only *past* the check, so a correctly-declared site with an ordinary
+  // `JSON.stringify` cycle was told its declared name might be wrong. `ZoneCheckedError` carries the
+  // fact with the failure instead of inferring it from the message.
+  //
+  // Not fatal, because a slow-but-correct module must not take the pod down — that is the outage the
+  // fix would manufacture. Containment is unchanged either way: `currentSource` re-checks the zone on
+  // every evaluation, so an unverified site 503s rather than serving the wrong policy.
+  if (zoneWasChecked(error)) {
+    // The check ran and passed; what failed is the module's content. Same non-fatal outcome, and the
+    // operator is pointed at the policy commit rather than at a Deployment that is correct.
+    log(`${site.name} is the site it is declared as, but did not evaluate at startup and will ` +
+      `answer 503 until it does: ${why}`);
+    continue;
+  }
+  log(`${site.name} did not evaluate at startup — the declared-name check did not run for it, ` +
+    `and it will answer 503 until it does: ${why}`);
 }
 
 server.listen(port, hostname, () => {
@@ -474,5 +1446,13 @@ server.listen(port, hostname, () => {
   // person tells a three-site pod from a one-site pod without reading the manifest.
   const serving = sites.map((s) => (s.name === null ? s.path : `${s.name}=${s.path}`)).join(", ");
   log(`listening on ${hostname}:${at} — serving ${serving}, editable ${allowPaths.join(", ") || "(nothing)"}`);
-  log("bearer required on GET /source and GET /sites");
+  // `/readyz` joined this set in the commit that gated it, and this line did not follow. It is what
+  // an operator reads in `kubectl logs` to learn what needs a token.
+  log("bearer required on GET /source, GET /sites and GET /readyz");
+  // Printed because a knob nobody can observe is a knob nobody can trust. `SOURCE_SITE_BUDGET_MS` has
+  // to sit under the manager's own `HELIOPAUSE_RELAY_TIMEOUT_MS` and this process cannot read that
+  // variable — it lives in another Deployment — so the operator is the one holding the relationship.
+  // Without this line the only way to see which value took effect was to induce the timeout it exists
+  // to prevent.
+  log(`budgets: ${SOURCE_SITE_BUDGET_MS}ms per site on request, ${STARTUP_SITE_BUDGET_MS}ms at startup`);
 });
