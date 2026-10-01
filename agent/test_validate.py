@@ -4406,7 +4406,13 @@ class TestBackfillCurrentAuthorization(unittest.TestCase):
         # The table is present. The **workload** objects are not, which is the condition that makes
         # the early return fall through for a generation already in force.
         hp._host_observation_report = lambda: {
-            "observed": [], "detail": "", "foreignFilters": [], "publishedPorts": [],
+            # A digest, not `[]`. `_read_host_observation` answers `None` for an absent table and a
+            # digest string for a present one; `[]` is neither, and the code under test only asks
+            # `observed is not None`, so an impossible fixture passed. The table being **present** is
+            # what this test needs — the fall-through it exercises comes from the workload objects
+            # being gone, not from the table.
+            "observed": "sha256:" + "0" * 64,
+            "detail": "", "foreignFilters": [], "publishedPorts": [],
         }
         hp._workload_report = lambda st=None: {"workload": {"observed": []}}
         # 🔴 Probed, like the acceptance — and for a reason the acceptance probe did not cover. An
@@ -4536,7 +4542,13 @@ class TestBackfillCurrentAuthorization(unittest.TestCase):
         hp.accept_artifact_authorization = _REAL_ACCEPT_AUTHORIZATION
         reached: dict[str, int] = {}
         hp._host_observation_report = lambda: {
-            "observed": [], "detail": "", "foreignFilters": [], "publishedPorts": [],
+            # A digest, not `[]`. `_read_host_observation` answers `None` for an absent table and a
+            # digest string for a present one; `[]` is neither, and the code under test only asks
+            # `observed is not None`, so an impossible fixture passed. The table being **present** is
+            # what this test needs — the fall-through it exercises comes from the workload objects
+            # being gone, not from the table.
+            "observed": "sha256:" + "0" * 64,
+            "detail": "", "foreignFilters": [], "publishedPorts": [],
         }
         hp._workload_report = lambda st=None: {"workload": {"observed": []}}
         hp._preflight_host_artifact = lambda a: ({"nftables": ""}, 30, None)
