@@ -3383,11 +3383,12 @@ class TestSignedArtifactSeam(unittest.TestCase):
         return "\n".join(line for line in source.split("\n") if not line.lstrip().startswith("#"))
 
     def test_the_apply_path_still_mentions_the_verifier_before_the_generation(self):
-        # A tripwire, and named as one. The property — that the generation compared is the one the
-        # verifier returned, and that a refused envelope is never read for one — is driven in
-        # `TestTheApplyPathReadsTheVerifiedArtifact`. What is left here is the cheap signal that the
-        # two moved relative to each other, which is how someone would discover the property rather
-        # than check it.
+        # A tripwire, and named as one. What this file actually drives is in
+        # `TestTheApplyPathReadsTheVerifiedArtifact`, whose own docstring states how far its claim
+        # reaches and which accesses it cannot see. This comment used to restate that claim in the
+        # stronger form the review disproved, so it no longer states a property at all — the cheap signal
+        # that the two lines moved relative to each other is the whole of what is here, and that is how
+        # someone would discover the property rather than check it.
         #
         # ⚠️ Reading the order proves less than it looks, and a review measured how much less. A `return`
         # placed between the verifier and the comparison leaves this assertion true while the driven
@@ -3420,7 +3421,15 @@ class TestSignedArtifactSeam(unittest.TestCase):
 
 
 class TestTheApplyPathReadsTheVerifiedArtifact(unittest.TestCase):
-    """`handle_reply` compares the generation the **verifier** returned, and never reads a refused one.
+    """`handle_reply` compares the generation the **verifier** returned, and does not consult a refused
+    envelope for one through any access this class's observer can see.
+
+    ⚠️ The second half of that sentence said "never reads a refused one" for two rounds, and a review
+    disproved it: a bare `dict.get(envelope, "generation")` — the container bypassed, the value never
+    compared — is invisible here and leaves every test green. That is one of the escapes named in
+    `_Envelope`, and the sentence now reaches only as far as the observer does.
+    @see test_a_refused_envelope_is_not_consulted_for_a_generation
+    @see test_the_generation_compared_is_the_verifiers_not_the_envelopes
 
     ## What this replaces
 
@@ -3506,8 +3515,10 @@ class TestTheApplyPathReadsTheVerifiedArtifact(unittest.TestCase):
 
         ⚠️ **Not a completeness claim, and these are the known ways past it.**
 
-        · A **bare retrieval** that never compares, stringifies or interpolates the value — both columns
-          blank. `dict.get(env, "generation")` on its own is the smallest example.
+        · A **retrieval that bypasses the container** and never compares, stringifies or interpolates the
+          value — both columns blank. `dict.get(env, "generation")` on its own is the smallest example;
+          `env.get("generation")` on its own is **not**, because that one still records a container tick.
+          The table distinguishes them and this limit used to say "bare retrieval", which did not.
         · `startswith` and the other `str` methods, `hash`, and identity (`is`): each can steer a branch
           without reaching an override. A review built a passing escape from exactly those —
           `dict.get(…).startswith(…)` guarding a later access — and it is caught now only because the
@@ -3683,7 +3694,14 @@ class TestTheApplyPathReadsTheVerifiedArtifact(unittest.TestCase):
                 #     if dict.get(envelope, "generation").startswith("g-wanted"):
                 #         envelope["generation"]
                 #
-                # which made the refusal test red and left **both halves of this one green**.
+                # which left **every test in this class green**.
+                #
+                # ⚠️ That line read "made the refusal test red" until a review re-ran it: the refusal
+                # fixture's generation is `g-forged`, so `startswith("g-wanted")` is False there and the
+                # guarded access never executes. What went red in my own matrix was this test's
+                # `envelope matches, verified does not` half, and I recorded it against the wrong test.
+                # Naming the failing test the runner printed, rather than writing "it went red", is the
+                # habit that was missing.
                 #
                 # ⚠️ The assertion is out here rather than inside the stub on purpose. `handle_reply` calls
                 # the verifier inside `try: … except Exception`, so an `AssertionError` raised in there is
