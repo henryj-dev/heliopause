@@ -1258,32 +1258,45 @@ export const site = {
     }
   });
 
-  it("holds one directory handle at a time while it descends", { timeout: 60_000 }, async () => {
-    // ## The property the mutation matrix could not speak to
+  it("does not use more descriptors as the tree gets deeper", { timeout: 60_000 }, async () => {
+    // ## Named for what it shows, which is less than the first name claimed
     //
-    // The walk opens a directory handle, reads it, and closes it in a `finally` before opening the next
-    // one — so its descriptor use is constant in the depth of the tree. A review pointed out that
-    // nothing asserted this: six mutations came back red and none of them removed the closure, injected
-    // a read failure, or counted descriptors, so "six red" said nothing about resource behaviour.
+    // The walk opens a directory handle, reads it, and closes it in a `finally` before opening the next —
+    // so descriptor use is constant in the depth of the tree. This was called "holds one handle at a
+    // time", and a review pointed out that an implementation holding **two** would pass it just as well.
+    // What the test can see is the absence of growth, so that is what it is called.
     //
-    // Lowering the child's descriptor limit makes it deterministic rather than probabilistic. With one
-    // handle at a time a chain deeper than the limit finishes; with handles held while descending it
-    // runs out at the limit's depth and the site is refused. 64 against a chain of 200.
+    // It exists because nothing else asserted any of this: a mutation matrix came back six-for-six red
+    // and none of those six removed the closure, injected a read failure, or counted descriptors. "Six
+    // red" said nothing about resource behaviour at all.
+    //
+    // ## 🔴 And the limit has to be checked, because asking for it can fail
+    //
+    // `ulimit -n 64` fails on a host whose **hard** limit is lower, and the shell then carries on under
+    // whatever the limit already was. If that is 1024, a 200-deep chain proves nothing and this test
+    // passes anyway — a resource assertion that silently stops asserting, which is worse than not having
+    // one. So the child reports the limit it actually runs under and the assertion below requires it to
+    // be no higher than what was asked for. Lower is stricter and fine; higher is a failure.
+    const LIMIT = 64;
+    const DEPTH = 200;
+    let started: { proc: ChildProcessByStdio<null, Readable, Readable>; dir: string } | undefined;
     const { dir, sites, beta } = twoSites();
-    let deep = dir;
-    for (let i = 0; i < 200; i += 1) {
-      deep = join(deep, `d${i}`);
-      mkdirSync(deep);
-    }
-    writeFileSync(join(deep, "leaf.ts"), "export const leaf = 1;\n");
-    writeFileSync(beta, `export const site = {
+    try {
+      let deep = dir;
+      for (let i = 0; i < DEPTH; i += 1) {
+        deep = join(deep, `d${i}`);
+        mkdirSync(deep);
+      }
+      writeFileSync(join(deep, "leaf.ts"), "export const leaf = 1;\n");
+      writeFileSync(beta, `export const site = {
   cfg: { hookPolicy: { input: "drop", output: "accept" } },
   hosts: [{ id: "gw-01.beta", stage: "canary", items: [] }],
 };
 `);
     // `ulimit` is a shell builtin, so the child is started through `sh`. `exec` keeps the process
-    // identity the harness's reader expects.
-    const proc = spawn("sh", ["-c", `ulimit -n 64; exec "$0" "$@"`, process.execPath, BIN], {
+    // identity the harness's reader expects, and `ulimit -n` afterwards prints what was actually
+    // applied — the value the assertion reads, rather than the value that was requested.
+    const proc = spawn("sh", ["-c", `ulimit -n ${LIMIT}; ulimit -n 1>&2; exec "$0" "$@"`, process.execPath, BIN], {
       env: {
         PATH: process.env.PATH ?? "",
         HOME: process.env.HOME ?? "",
@@ -1294,11 +1307,11 @@ export const site = {
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
+    started = { proc, dir };
     let out = "";
     let err = "";
     proc.stdout.on("data", (b: Buffer) => { out += b.toString(); });
     proc.stderr.on("data", (b: Buffer) => { err += b.toString(); });
-    try {
       const port = await new Promise<number>((resolve, reject) => {
         const fail = setTimeout(() => reject(new Error(`never listened:\n${out}\n${err}`)), 20_000);
         proc.stdout.on("data", () => {
@@ -1310,15 +1323,26 @@ export const site = {
           reject(new Error(`exited with ${code} before listening:\n${out}\n${err}`));
         });
       });
+      // The limit the child is really under, from the child. Asking is not the same as getting.
+      const applied = Number(/^\s*(\d+)\s*$/m.exec(err)?.[1]);
+      assert.ok(
+        Number.isInteger(applied) && applied > 0,
+        `the child did not report its descriptor limit, so this test cannot know what it ran under:\n${err}`,
+      );
+      assert.ok(
+        applied <= LIMIT,
+        `the descriptor limit is ${applied}, not ${LIMIT} or less — \`ulimit\` did not take, so a ` +
+          `${DEPTH}-deep tree proves nothing about descriptor growth and this test was passing for free`,
+      );
       const res = await fetchAt(port, "/source?site=beta", { signal: AbortSignal.timeout(20_000) });
       assert.equal(
         res.status, 200,
-        `a 200-deep tree was not served under a 64-descriptor limit, which is what holding a handle ` +
-          `per level looks like: ${(await res.json() as { error?: string }).error ?? ""}`,
+        `a ${DEPTH}-deep tree was not served under a ${applied}-descriptor limit, which is what ` +
+          `descriptor use growing with depth looks like: ${(await res.json() as { error?: string }).error ?? ""}`,
       );
       assert.doesNotMatch(out + err, /EMFILE/, "the walk ran out of descriptors");
     } finally {
-      proc.kill("SIGKILL");
+      started?.proc.kill("SIGKILL");
       rmSync(join(dir, ".."), { recursive: true, force: true });
     }
   });
