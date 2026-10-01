@@ -1,23 +1,40 @@
 # 새 워크트리 준비
 
 `EnterWorktree` 는 `.claude/settings.json` 의 `worktree.symlinkDirectories` 를 걸어 준다.
-**하지만 실측에서 안 걸린 적이 있다** — 새 워크트리에서 아래 일곱 개가 있는지 눈으로 보고,
+**하지만 실측에서 안 걸린 적이 있다** — 새 워크트리에서 아래 여섯 개가 있는지 눈으로 보고,
 없으면 이 명령을 돌린다.
 
 ```bash
 # 메인 트리는 git 에게 묻는다 — 경로를 적어 두면 다른 클론에서 그 줄이 거짓말을 한다.
 MAIN="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
-for d in node_modules policy docs pki pki-prod pki-util pki-signing; do
+for d in node_modules policy pki pki-prod pki-util pki-signing; do
   [ -e "$d" ] || ln -s "$MAIN/$d" "$d"
 done
-ls -ld node_modules policy docs pki pki-prod pki-util pki-signing
+ls -ld node_modules policy pki pki-prod pki-util pki-signing
 ```
 
-이 일곱은 **이 저장소가 배포되는 사이트에만 있는 것**이다. 공개 클론에는 애초에 없고, 없어도
+이 여섯은 **이 저장소가 배포되는 사이트에만 있는 것**이다. 공개 클론에는 애초에 없고, 없어도
 `npm test` · `npm run typecheck` · `npm run check:web` 는 `node_modules` 만 있으면 전부 돈다.
 아래는 그 사이트에서 작업할 때의 이야기다.
 
-## 왜 심링크인가 — 이 일곱은 **git 이 안 옮겨 준다**
+**이 목록에는 `docs` 도 있었고 일곱이라고 적혀 있었다. `docs/` 는 반은 안, 반은 밖이다.**
+경로마다 각각 재서 확인했다(2026-10-01): `node_modules` · `policy` · `pki` · `pki-prod` ·
+`pki-util` · `pki-signing` 는 전부 심링크이고 추적 파일 0. `docs` 는 **실제 디렉토리에 추적 파일 2** 다.
+
+정확히는 이렇다. `docs/` 는 `.gitignore` 에 있다. 그런데 `agent-auto-update-design.md` 와
+`host-retirement-policy-migration.md` 두 파일은 **추적된다** — gitignore 는 이미 추적된 파일에
+영향을 주지 않는다. 그래서 그 둘은 **체크아웃에 딸려오고, 심링크로 걸 대상이 아니다.**
+
+⚠️ **그러나 `docs/` 에 새로 넣는 파일은 git 에게 보이지 않는다.** `git status` 에 `??` 로도 안
+뜨므로, 거기에 설계 문서를 쓰고 `git add .` 로 커밋하면 **커밋했다고 믿고 잃는다.** 남기려면
+`git add -f docs/<파일>` 을 써야 하고, 기존 두 파일도 그렇게 들어왔다.
+
+위 루프는 `[ -e "$d" ]` 로 건너뛰고 하네스도 이미 있는 경로를 건드리지 않으므로, `docs` 가 목록에
+끼어 있어도 **동작은 바뀌지 않았다** — 그래서 아무도 못 봤다. 틀린 것은 아래 표가 「`docs` 가 없을
+때」를 설명하던 것이고, 그걸 읽으면 **워크트리에서 그 문서를 찾지 않게 된다.** 거기에 설계 결정이
+들어 있다.
+
+## 왜 심링크인가 — 이 여섯은 **git 이 안 옮겨 준다**
 
 전부 이 저장소에서 추적되지 않는다(이유는 `.gitignore` 의 주석에 적혀 있다). 워크트리
 체크아웃은 추적된 파일만 가져오므로 **새 워크트리는 이것들이 통째로 없는 상태로 시작한다.**
@@ -26,9 +43,11 @@ ls -ld node_modules policy docs pki pki-prod pki-util pki-signing
 |---|---|
 | `node_modules` | `npm test` · `npm run typecheck` 이 아예 안 돈다 |
 | `policy` | 정책 스위트가 **말없이 빠진다** — 깨지지 않는다. `AGENTS.md` 의 「새 워크트리에는 없는 것」 참조. 자체 git 저장소다 |
-| `docs` | 배포 설계 기록을 못 읽는다 (코드는 참조하지 않는다) |
 | `pki-prod` · `pki-signing` | `heliopause-publish` · `heliopause-approve` 흐름을 워크트리에서 못 돌린다 |
 | `pki` · `pki-util` | 함대를 못 읽는다. 매니저는 클라이언트 인증서를 **해당 VPC 의** CA 로 검증하므로, 조회에 쓰는 운영자 인증서와 CA 가 같은 VPC 의 것이어야 한다 |
+
+`docs` 는 이 표에 없다. 그 두 파일은 추적되므로 **없을 때가 없다.** 대신 거기에 **새로 쓴 것이
+조용히 안 들어가는** 쪽이 위험이고, 그것은 위에 적었다.
 
 ⚠️ **CA 는 VPC 마다 하나인데 이름이 전부 같다.** 그래서 엉뚱한 것을 들이대도 「이름이 맞으니
 되겠지」로 읽힌다 — 다른 VPC 의 운영자 인증서로 매니저를 부르면 `no client certificate and no

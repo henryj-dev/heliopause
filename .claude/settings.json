@@ -4,7 +4,6 @@
     "symlinkDirectories": [
       "node_modules",
       "policy",
-      "docs",
       "pki",
       "pki-prod",
       "pki-util",
