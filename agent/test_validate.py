@@ -17,6 +17,7 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -3381,9 +3382,21 @@ class TestSignedArtifactSeam(unittest.TestCase):
         # the check was reading the explanation instead of the code. Caught by defect injection.
         return "\n".join(line for line in source.split("\n") if not line.lstrip().startswith("#"))
 
-    def test_the_apply_path_verifies_before_it_reads_a_generation(self):
-        # Order matters as much as presence: reading `generation` off the raw envelope is what the
-        # fleet did for an hour, and it reads as "the relay is behind" rather than "nothing verifies".
+    def test_the_apply_path_still_mentions_the_verifier_before_the_generation(self):
+        # A tripwire, and named as one. What this file actually drives is in
+        # `TestTheApplyPathReadsTheVerifiedArtifact`, whose own docstring states how far its claim
+        # reaches and which accesses it cannot see. This comment used to restate that claim in the
+        # stronger form the review disproved, so it no longer states a property at all — the cheap signal
+        # that the two lines moved relative to each other is the whole of what is here, and that is how
+        # someone would discover the property rather than check it.
+        #
+        # ⚠️ Reading the order proves less than it looks, and a review measured how much less. A `return`
+        # placed between the verifier and the comparison leaves this assertion true while the driven
+        # tests go red. Of five defects injected into this seam, this caught two — and both only because
+        # the mutation deleted the string it indexes, not because it noticed the behaviour. **It is not
+        # security evidence**; it is a syntax alarm for the two lines moving relative to each other, kept
+        # for the same reason the ordering tripwire in `TestStartupCallsTheBackfill` is kept.
+        # @see TestTheApplyPathReadsTheVerifiedArtifact
         src = self._source()
         self.assertIn("verify_artifact_envelope", src, "the apply path does not verify the envelope")
         verify_at = src.index("verify_artifact_envelope")
@@ -3405,6 +3418,331 @@ class TestSignedArtifactSeam(unittest.TestCase):
         src = self._source()
         self.assertIn('log(f"refusing artifact for generation', src)
         self.assertIn("except Exception as e:", src)
+
+
+class TestTheApplyPathReadsTheVerifiedArtifact(unittest.TestCase):
+    """`handle_reply` compares the generation the **verifier** returned, and does not consult a refused
+    envelope for one through any access this class's observer can see.
+
+    ⚠️ The second half of that sentence said "never reads a refused one" for two rounds, and a review
+    disproved it: a bare `dict.get(envelope, "generation")` — the container bypassed, the value never
+    compared — is invisible here and leaves every test green. That is one of the escapes named in
+    `_Envelope`, and the sentence now reaches only as far as the observer does.
+    @see test_a_refused_envelope_is_not_consulted_for_a_generation
+    @see test_the_generation_compared_is_the_verifiers_not_the_envelopes
+
+    ## What this replaces
+
+    `TestSignedArtifactSeam` asserted this by source position: `src.index("verify_artifact_envelope")
+    < src.index('artifact.get("generation")')`. The property it stands for is the one the fleet broke
+    for an hour — reading a generation off an envelope nothing had verified, which reads in the logs as
+    "the relay is behind" rather than as "nothing verifies".
+
+    Position is not that property. A `return` between the two leaves the assertion true, and so does a
+    comparison that reads the envelope while the verifier's result sits unused beside it. Both are
+    driven below instead.
+
+    ## Why the suite's own harness could not be reused
+
+    `stub_artifact_verification` returns the envelope **as** the verified artifact, so the two are the
+    same object and no test using it can tell which one was read. That is the right shape for the tests
+    it serves and the wrong shape for this one; the verifier here returns an artifact that differs from
+    the envelope on purpose.
+    """
+
+    class _Claim(str):
+        """The envelope's generation **value**, recording the four operations overridden below.
+
+        One of two layers. This one survives a read that bypasses the container — `dict.get(env, key)`,
+        `dict.__getitem__`, `pop` — **provided the value is then compared, stringified or interpolated.**
+        A path can act on it without any of those: `startswith`, `hash` and `is` all reach past these
+        overrides, which is why the earlier wording here ("what a path would have to do to act on it")
+        was wrong. @see `_Envelope` for the measured table and the known escapes
+        """
+
+        def __new__(cls, value, uses):
+            claim = super().__new__(cls, value)
+            claim.uses = uses
+            return claim
+
+        def __eq__(self, other):
+            self.uses.append("compared")
+            return str.__eq__(self, other)
+
+        def __ne__(self, other):
+            self.uses.append("compared")
+            return str.__ne__(self, other)
+
+        def __hash__(self):
+            return str.__hash__(self)
+
+        def __str__(self):
+            self.uses.append("stringified")
+            return str.__str__(self)
+
+        def __format__(self, spec):
+            self.uses.append("interpolated")
+            return str.__format__(self, spec)
+
+    class _Envelope(dict):
+        """The container, which records the ways its `generation` can be reached.
+
+        ## What this observes, measured rather than assumed — and the measurement corrected once
+
+        The first version intercepted `get` alone and its docstring said it recorded every read. A review
+        found four ways past it in one pass. The replacement came with a table, and **the table was wrong
+        too**: the probe script that produced it compared each retrieved value against a string, so every
+        tick in the value column came from *that* comparison and not from the expression printed beside
+        it. Bare retrieval records nothing. Measured again, with the comparison called out
+        (2026-10-01):
+
+        | access | container, bare | value, after one `==` |
+        |---|---|---|
+        | `env.get("generation")` | ✓ | ✓ |
+        | `env["generation"]` | ✓ | ✓ |
+        | `dict(env.items())[...]` | ✓ | ✓ |
+        | `env.copy()[...]` | ✓ | ✓ |
+        | `{**env}[...]` | ✓ | ✓ |
+        | `json.dumps(env)` | ✓ (`items`) | — |
+        | `"generation" in env` | ✓ | — |
+        | `list(env)` | ✓ | — |
+        | `dict.get(env, "generation")` | — | ✓ |
+        | `dict.__getitem__(env, ...)` | — | ✓ |
+        | `env.pop("generation")` | — | ✓ |
+
+        The value layer sees exactly the four operations `_Claim` overrides: `__eq__`, `__ne__`,
+        `__str__`, `__format__`. Nothing else.
+
+        ⚠️ **Not a completeness claim, and these are the known ways past it.**
+
+        · A **retrieval that bypasses the container** and never compares, stringifies or interpolates the
+          value — both columns blank. `dict.get(env, "generation")` on its own is the smallest example;
+          `env.get("generation")` on its own is **not**, because that one still records a container tick.
+          The table distinguishes them and this limit used to say "bare retrieval", which did not.
+        · `startswith` and the other `str` methods, `hash`, and identity (`is`): each can steer a branch
+          without reaching an override. A review built a passing escape from exactly those —
+          `dict.get(…).startswith(…)` guarding a later access — and it is caught now only because the
+          later access touches the container.
+        · Anything reaching the dict from C, which these Python-level overrides cannot see.
+
+        What the tests may therefore say is "none of the accesses this observes happened". That is
+        weaker than "never read", and it is the sentence they use.
+
+        ## Reusing this for the remaining conversions
+
+        One known difference in behaviour, measured: `_Claim` changes comparison dispatch against a
+        **sibling `str` subclass with its own `__eq__`** — `plain == sibling` is False where
+        `claim == sibling` is True. These fixtures compare against plain strings only, so nothing here is
+        affected, but a conversion that compares two subclasses would need to know.
+        """
+
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.touches = []
+
+        def get(self, key, default=None):
+            if key == "generation":
+                self.touches.append("get")
+            return super().get(key, default)
+
+        def __getitem__(self, key):
+            if key == "generation":
+                self.touches.append("subscript")
+            return super().__getitem__(key)
+
+        def items(self):
+            self.touches.append("items")
+            return super().items()
+
+        def keys(self):
+            self.touches.append("keys")
+            return super().keys()
+
+        def values(self):
+            self.touches.append("values")
+            return super().values()
+
+        def __iter__(self):
+            self.touches.append("iter")
+            return super().__iter__()
+
+        def __contains__(self, key):
+            if key == "generation":
+                self.touches.append("contains")
+            return super().__contains__(key)
+
+        def copy(self):
+            self.touches.append("copy")
+            return dict(self)
+
+    def _envelope(self, generation):
+        """An envelope whose generation is observed by both layers."""
+        uses = []
+        envelope = self._Envelope({"payload": "..."})
+        envelope["generation"] = self._Claim(generation, uses)
+        envelope.touches.clear()
+        self.value_uses = uses
+        return envelope
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._state = hp.STATE_FILE
+        hp.STATE_FILE = os.path.join(self.tmp, "state.json")
+        self._real = {
+            name: getattr(hp, name) for name in (
+                "fetch_artifact", "verify_artifact_envelope", "accept_artifact_authorization",
+                "_preflight_host_artifact", "apply_workload", "apply_artifact", "log",
+            )
+        }
+        self.reached = []
+        self.logged = []
+        hp.log = lambda line: self.logged.append(str(line))
+        # Past the comparison is the only thing these tests read as "it proceeded", so each step after it
+        # records and returns something benign. `accept_artifact_authorization` returning `(None, …)`
+        # would stop the path at its own refusal branch, which is a different test's subject.
+        #
+        # ⚠️ "Records and does nothing" was too strong: `handle_reply` writes real state around these
+        # calls, and with the preflight stub answering `None` the path takes the unsupported-host branch,
+        # so the `workload` and `host` stubs are **never reached at all**. They are here so that a change
+        # which does reach them records rather than touching a machine — not as evidence about apply.
+        hp.accept_artifact_authorization = lambda record, watch, expired: (
+            self.reached.append("accept"), ({}, ""))[1]
+        hp._preflight_host_artifact = lambda artifact: (
+            self.reached.append("preflight"), (None, None, "stubbed: no kernel here"))[1]
+        hp.apply_workload = lambda artifact: (
+            self.reached.append("workload"), (True, None, ""))[1]
+        hp.apply_artifact = lambda artifact, validated=None: (
+            self.reached.append("host"), (True, "pending", ""))[1]
+        hp.save_state(dict(hp._EMPTY_STATE))
+
+    def tearDown(self):
+        for name, value in self._real.items():
+            setattr(hp, name, value)
+        hp.STATE_FILE = self._state
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _beat(self, wanted="g-wanted"):
+        hp.handle_reply(hp.load_state(), {
+            "schemaVersion": hp.SCHEMA_VERSION, "generation": wanted, "gate": {"open": True},
+        })
+
+    def test_a_refused_envelope_is_not_consulted_for_a_generation(self):
+        """Verification raises, and none of the accesses the observer sees happen.
+
+        Narrower than "never read", which is what this said before a review found four ways past the
+        observer. @see `_Envelope` for the table of what is and is not seen.
+        """
+        envelope = self._envelope("g-forged")
+        hp.fetch_artifact = lambda: envelope
+
+        def refuse(_envelope, now=None):
+            raise ValueError("signature does not verify")
+
+        hp.verify_artifact_envelope = refuse
+        self._beat()
+
+        self.assertEqual(
+            (envelope.touches, self.value_uses), ([], []),
+            "the apply path consulted the unverified envelope for its generation. A path that reads it "
+            "and then refuses anyway looks the same from outside, which is why this watches the object "
+            "rather than what happened next.",
+        )
+        self.assertEqual(self.reached, [], f"a refused envelope reached {self.reached}")
+        self.assertTrue(
+            any("refusing artifact for generation g-wanted" in line for line in self.logged),
+            f"the refusal was not reported against the wanted generation: {self.logged}",
+        )
+        # And the refusal is durable, not only logged — a refusal nobody can act on is the defect
+        # recorded at the sibling branch in `handle_reply`.
+        self.assertIsNotNone(hp.load_state().get("lastRefusal"), "the refusal was not recorded")
+
+    def test_the_generation_compared_is_the_verifiers_not_the_envelopes(self):
+        """Both directions, because each pins a different way the comparison can be wrong.
+
+        The envelope and the verified artifact disagree, so each case is decided by which one the
+        comparison reads: when the **verified** generation is the wanted one the path proceeds, and when
+        only the **envelope's** is, it refuses.
+
+        ⚠️ A review measured that **either half alone** catches a comparison switched to the envelope, so
+        the pair is not needed for that. What the pair pins is the two unconditional failures: a
+        comparison that always proceeds is caught by the second half, one that always refuses by the
+        first. The earlier wording claimed one half would pass against a path reading the envelope, which
+        the measurement contradicts.
+
+        ⚠️ And it cannot say **which** verifier-returned value decided it: `record` carries the same
+        generation as the artifact, so a comparison reading `record` passes here too. That is not the
+        security property — both are the verifier's own output — but the attribution is not available
+        from these fixtures.
+        """
+        for label, envelope_gen, verified_gen, expect_proceed in (
+            ("verified matches, envelope does not", "g-forged", "g-wanted", True),
+            ("envelope matches, verified does not", "g-wanted", "g-forged", False),
+        ):
+            with self.subTest(case=label):
+                self.reached.clear()
+                self.logged.clear()
+                hp.save_state(dict(hp._EMPTY_STATE))
+                envelope = self._envelope(envelope_gen)
+                verified = {"generation": verified_gen, "payload": "..."}
+                hp.fetch_artifact = lambda: envelope
+                # ## 🔑 Empty on the way in, and empty on the way out
+                #
+                # The counts are captured as the verifier hands back and asserted **empty**, not merely
+                # unchanged. Comparing against the snapshot was the first attempt and it absorbed
+                # whatever happened before the verifier into its own baseline: a review inserted
+                #
+                #     if dict.get(envelope, "generation").startswith("g-wanted"):
+                #         envelope["generation"]
+                #
+                # which left **every test in this class green**.
+                #
+                # ⚠️ That line read "made the refusal test red" until a review re-ran it: the refusal
+                # fixture's generation is `g-forged`, so `startswith("g-wanted")` is False there and the
+                # guarded access never executes. What went red in my own matrix was this test's
+                # `envelope matches, verified does not` half, and I recorded it against the wrong test.
+                # Naming the failing test the runner printed, rather than writing "it went red", is the
+                # habit that was missing.
+                #
+                # ⚠️ The assertion is out here rather than inside the stub on purpose. `handle_reply` calls
+                # the verifier inside `try: … except Exception`, so an `AssertionError` raised in there is
+                # swallowed and reappears as a refusal — the test would then fail, or pass, for a reason
+                # that has nothing to do with the envelope.
+                at_return = {}
+
+                def verify(_e, now=None):
+                    at_return["touches"] = list(envelope.touches)
+                    at_return["uses"] = list(self.value_uses)
+                    return verified, {"generation": verified_gen}, None, False
+
+                hp.verify_artifact_envelope = verify
+                self._beat()
+                self.assertEqual(
+                    (at_return.get("touches"), at_return.get("uses")), ([], []),
+                    "the envelope was consulted for its generation **before** the verifier returned "
+                    f"one: {at_return}. Nothing upstream of verification is supposed to look at it.",
+                )
+                self.assertEqual(
+                    (envelope.touches, self.value_uses), ([], []),
+                    "the envelope was consulted for its generation after the verifier had already "
+                    "returned one. Everything downstream is supposed to read the verifier's artifact; "
+                    f"the envelope recorded {envelope.touches} and {self.value_uses}.",
+                )
+                if expect_proceed:
+                    self.assertIn(
+                        "accept", self.reached,
+                        "the path stopped at the generation comparison although the **verified** "
+                        f"artifact was the wanted generation: {self.logged}",
+                    )
+                else:
+                    self.assertNotIn(
+                        "accept", self.reached,
+                        "the path proceeded although the verified artifact was a different generation "
+                        "— the comparison read the envelope the verifier replaced",
+                    )
+                    self.assertTrue(
+                        any("skipping" in line for line in self.logged),
+                        f"the mismatch was not reported: {self.logged}",
+                    )
 
 
 def _openssl_has_rawin():
