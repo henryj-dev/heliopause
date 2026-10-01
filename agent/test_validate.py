@@ -4485,6 +4485,11 @@ class TestBackfillCurrentAuthorization(unittest.TestCase):
         # version of that comment said the whole state was untouched, which this would have caught.
         self.assertEqual(st.get("generation"), "g1", "the host generation moved on a workload failure")
         self.assertEqual(st.get("artifactHash"), "sha256:old", "the host artifact hash moved")
+        # The fourth one. The comment above named `detail` among the unchanged host fields and the
+        # assertions covered three — an unconditional host-side `detail` write passed all thirteen tests
+        # in this class. The claim was ahead of what was checked, which is smaller than the version of
+        # that mistake this PR started from and the same direction.
+        self.assertIsNone(st.get("detail"), "the host detail was written on a workload failure")
         self.assertEqual(st.get("workloadState"), "failed", "the workload failure was not recorded")
         self.assertEqual(st.get("workloadGeneration"), "g1", "the workload generation was not recorded")
         self.assertIn(
@@ -4578,6 +4583,20 @@ class TestBackfillCurrentAuthorization(unittest.TestCase):
             "the workload apply was never attempted, so this test is not about a failed one",
         )
         self.assertEqual(st.get("state"), "confirmed", "the fixture no longer reproduces the pair")
+        # The same persisted-result assertions as the companion test, and for the reason that test
+        # found: without them a `return` placed immediately after `apply_workload` leaves this one green.
+        # The probe fires, the watermark moves, the adoption happens — and nothing here establishes that
+        # the workload failure was ever recorded, which is the state the adoption is supposed to be
+        # reading. The companion caught that mutation; this one did not.
+        self.assertEqual(st.get("generation"), "g1", "the host generation moved on a workload failure")
+        self.assertEqual(st.get("artifactHash"), "sha256:old", "the host artifact hash moved")
+        self.assertIsNone(st.get("detail"), "the host detail was written on a workload failure")
+        self.assertEqual(st.get("workloadState"), "failed", "the workload failure was not recorded")
+        self.assertEqual(st.get("workloadGeneration"), "g1", "the workload generation was not recorded")
+        self.assertIn(
+            "admission webhook", st.get("workloadDetail") or "",
+            "the workload detail was not recorded",
+        )
         self.assertEqual(
             (st.get("currentAuthorization") or {}).get("authorizationMode"), "two-person",
             "the adoption stopped taking the watermark — if that was deliberate, this test is the "

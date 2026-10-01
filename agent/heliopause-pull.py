@@ -1979,9 +1979,11 @@ def backfill_current_authorization():
       fails leaves `host_result` false, so the **host half** is not written: `generation`, `state`,
       `artifactHash` and `detail` keep their values and `confirm()` never runs, so the field keeps
       naming what the kernel is enforcing and this function returns on its first line. (`record_result`
-      does persist `workloadGeneration`, `workloadState` and `workloadDetail` — the workload failure is
-      recorded. Saying "no state is written" was wrong and is the kind of over-broad claim this
-      docstring was rewritten to stop making.) Every host in the fleet is in this state.
+      persists `workloadGeneration`, `workloadState` and `workloadDetail` when `wl_state` is set **and**
+      no workload rollback is owed or already settled — so the failure is usually recorded and a timer
+      that got there first keeps its own verdict. Saying "no state is written" was wrong, and saying the
+      failure is always recorded was the same over-broad shape one size down.) Every host in the fleet
+      is in this state.
 
     · With the field **absent**, the adoption takes the watermark, including a record accepted after
       the apply that is actually in force. Measured. There is no fix inside this function: the
