@@ -1258,6 +1258,71 @@ export const site = {
     }
   });
 
+  it("holds one directory handle at a time while it descends", { timeout: 60_000 }, async () => {
+    // ## The property the mutation matrix could not speak to
+    //
+    // The walk opens a directory handle, reads it, and closes it in a `finally` before opening the next
+    // one — so its descriptor use is constant in the depth of the tree. A review pointed out that
+    // nothing asserted this: six mutations came back red and none of them removed the closure, injected
+    // a read failure, or counted descriptors, so "six red" said nothing about resource behaviour.
+    //
+    // Lowering the child's descriptor limit makes it deterministic rather than probabilistic. With one
+    // handle at a time a chain deeper than the limit finishes; with handles held while descending it
+    // runs out at the limit's depth and the site is refused. 64 against a chain of 200.
+    const { dir, sites, beta } = twoSites();
+    let deep = dir;
+    for (let i = 0; i < 200; i += 1) {
+      deep = join(deep, `d${i}`);
+      mkdirSync(deep);
+    }
+    writeFileSync(join(deep, "leaf.ts"), "export const leaf = 1;\n");
+    writeFileSync(beta, `export const site = {
+  cfg: { hookPolicy: { input: "drop", output: "accept" } },
+  hosts: [{ id: "gw-01.beta", stage: "canary", items: [] }],
+};
+`);
+    // `ulimit` is a shell builtin, so the child is started through `sh`. `exec` keeps the process
+    // identity the harness's reader expects.
+    const proc = spawn("sh", ["-c", `ulimit -n 64; exec "$0" "$@"`, process.execPath, BIN], {
+      env: {
+        PATH: process.env.PATH ?? "",
+        HOME: process.env.HOME ?? "",
+        HELIOPAUSE_POLICY_RENDER_TOKEN: BEARER,
+        HELIOPAUSE_POLICY_RENDER_PORT: "0",
+        HELIOPAUSE_POLICY_RENDER_HOST: "127.0.0.1",
+        ...MULTI(sites),
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    let err = "";
+    proc.stdout.on("data", (b: Buffer) => { out += b.toString(); });
+    proc.stderr.on("data", (b: Buffer) => { err += b.toString(); });
+    try {
+      const port = await new Promise<number>((resolve, reject) => {
+        const fail = setTimeout(() => reject(new Error(`never listened:\n${out}\n${err}`)), 20_000);
+        proc.stdout.on("data", () => {
+          const m = /listening on [^:]+:(\d+)/.exec(out);
+          if (m) { clearTimeout(fail); resolve(Number(m[1])); }
+        });
+        proc.on("exit", (code) => {
+          clearTimeout(fail);
+          reject(new Error(`exited with ${code} before listening:\n${out}\n${err}`));
+        });
+      });
+      const res = await fetchAt(port, "/source?site=beta", { signal: AbortSignal.timeout(20_000) });
+      assert.equal(
+        res.status, 200,
+        `a 200-deep tree was not served under a 64-descriptor limit, which is what holding a handle ` +
+          `per level looks like: ${(await res.json() as { error?: string }).error ?? ""}`,
+      );
+      assert.doesNotMatch(out + err, /EMFILE/, "the walk ran out of descriptors");
+    } finally {
+      proc.kill("SIGKILL");
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
   it("refuses a site whose tree it could not finish reading", { timeout: 60_000 }, async () => {
     // ## A directory that cannot be enumerated is not an empty one
     //
@@ -1290,6 +1355,16 @@ export const site = {
       assert.equal(
         refused.status, 503,
         "a site whose directory could not be read was served from a stamp that cannot be complete",
+      );
+      // 🔑 The cause, not the cap. This is what the previous version got wrong: every enumeration
+      // failure was reported as "more than 2000 entries", discarding the `errno` at the only point
+      // that had it.
+      const why = (await refused.json() as { error?: string }).error ?? "";
+      assert.match(why, /could not be read \(EACCES\)/, `the refusal does not name the cause: ${why}`);
+      assert.match(why, /sealed/, "the refusal does not name which directory could not be read");
+      assert.doesNotMatch(
+        why, /more than 2000 entries/,
+        "an unreadable directory was reported as the scan cap being exceeded",
       );
       // The process stays up and the probe answers: a reported configuration fault, not a crashloop.
       assert.equal((await fetchAt(port, "/healthz", deadline())).status, 200, "the process went down");
@@ -1341,11 +1416,15 @@ export const site = {
       const deadline = (): RequestInit => ({ signal: AbortSignal.timeout(20_000) });
       const refused = await fetchAt(port, "/source?site=beta", deadline());
       assert.equal(refused.status, 503, "a site whose tree cannot be stamped was served anyway");
+      const why = (await refused.json() as { error?: string }).error ?? "";
       assert.match(
-        (await refused.json() as { error?: string }).error ?? "",
-        /entries beside .* cannot be noticed/,
+        why, /more than 2000 entries beside it/,
         "the refusal does not say why, so an operator cannot act on it",
       );
+      // And it names *this* cause rather than the other one. Both used to arrive as a bare `null` and
+      // be reported as the cap, so a permissions fault on a four-file directory sent an operator to
+      // look at a limit nowhere near being reached.
+      assert.doesNotMatch(why, /could not be read/, "an overflow was reported as an unreadable directory");
       assert.equal(
         (await fetchAt(port, "/source?site=alpha", deadline())).status, 503,
         "alpha shares this directory, so it shares the refusal — if this is 200 the scan became per-site",

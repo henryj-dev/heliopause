@@ -592,6 +592,29 @@ const cached = new Map<string, { stamp: string; source: PolicySource }>();
  * its appearance and disappearance both move the key.
  */
 /**
+ * Why a stamp could not be completed, for the refusal to quote.
+ *
+ * Two unrelated causes used to arrive as the same bare `null`, and the caller reported both as the cap
+ * being exceeded — so a permissions fault on a four-file directory told the operator to go and look at
+ * a limit that was nowhere near being reached, and the `errno` was discarded by the only code that had
+ * it. This file already records two defects of that shape: a `faults` count that disappeared exactly
+ * when something was wrong, and a log line that claimed an authorization was "already in force" about a
+ * record the kernel had never seen.
+ *
+ * @see src/policy-render-service.test.ts "says which failure stopped the scan"
+ */
+type ScanFailure =
+  | { kind: "overflow"; visited: number }
+  | { kind: "unreadable"; at: string; code: string };
+
+/** The reason a refusal quotes, in one sentence an operator can act on. */
+function scanFailureReason(failure: ScanFailure): string {
+  return failure.kind === "overflow"
+    ? `more than ${STAMP_SCAN_CAP} entries beside it, so a change here cannot be noticed`
+    : `${failure.at} could not be read (${failure.code}), so a change here cannot be noticed`;
+}
+
+/**
  * How many directory entries the stamp will visit before it gives up.
  *
  * Entries, not matching files. Counting matches let a tree of a thousand directories holding one
@@ -606,7 +629,7 @@ const STAMP_SCAN_CAP = 2_000;
  * Returning a placeholder instead froze the key; evaluating without caching leaked the module
  * registry. Both were tried, in that order, and both are recorded there.
  */
-function sourceStamp(sitePath: string): string | null {
+function sourceStamp(sitePath: string): string | ScanFailure {
   const head = policyHead(sitePath);
   const dir = dirname(resolve(sitePath));
   const mtime = (p: string): string => {
@@ -680,7 +703,7 @@ function sourceStamp(sitePath: string): string | null {
     let handle: ReturnType<typeof opendirSync>;
     try {
       handle = opendirSync(here);
-    } catch {
+    } catch (e) {
       // ## 🔴 A directory that cannot be read is not an empty one
       //
       // This used to `continue`, which treated a refused enumeration as "nothing here" and returned a
@@ -692,7 +715,18 @@ function sourceStamp(sitePath: string): string | null {
       // mean a permissions fault anywhere under the policy directory refuses every site sharing it,
       // which is loud — and the alternative is a console that keeps drawing a policy nobody can
       // invalidate.
-      return null;
+      //
+      // The cause travels with the refusal. Reporting this as the cap being exceeded — which it was, for
+      // one release — sends an operator to a limit that may be nowhere near reached. `code` is read
+      // defensively because the value is whatever the runtime threw.
+      let code: string;
+      try {
+        const given = (e as { code?: unknown } | null)?.code;
+        code = typeof given === "string" ? given : "no errno on the error";
+      } catch {
+        code = "an error whose code cannot be read";
+      }
+      return { kind: "unreadable", at: here, code };
     }
     try {
       for (;;) {
@@ -722,7 +756,7 @@ function sourceStamp(sitePath: string): string | null {
       }
     }
   }
-  if (overflowed) return null;
+  if (overflowed) return { kind: "overflow", visited };
   neighbours.sort();
   const scanned = neighbours.map(mtime).join(",");
   const files = [sitePath, ...allowPaths.map((p) => resolve(dir, p))].map(mtime).join(",");
@@ -762,15 +796,16 @@ async function currentSource(site: { name: string | null; path: string }): Promi
   // directory, so every site whose module sits in it reaches the same verdict — and in the fleet all
   // three do. An overflow is therefore every console, not one. That is the price of refusing, and it is
   // why the cap sits far above a measured checkout rather than near it.
-  const stamp = sourceStamp(sitePath);
-  const hit = cached.get(sitePath);
-  if (hit && hit.stamp === stamp) return hit.source;
-  if (stamp === null) {
+  const stamped = sourceStamp(sitePath);
+  if (typeof stamped !== "string") {
     throw new RealError(
-      `more than ${STAMP_SCAN_CAP} entries beside ${sitePath} — a change here cannot be noticed, ` +
-        "so this site is refused rather than served from a key that cannot move",
+      `${sitePath}: ${scanFailureReason(stamped)} — so this site is refused rather than served from a ` +
+        "key that cannot move",
     );
   }
+  const stamp = stamped;
+  const hit = cached.get(sitePath);
+  if (hit && hit.stamp === stamp) return hit.source;
   // Before the import, so the hook above knows which tree this evaluation may version.
   policyRoots.add(`${pathToFileURL(realpathSync(dirname(resolve(sitePath)))).pathname}/`);
   // The import specifier still needs a value that moves, and `stamp` is not URL-safe.
