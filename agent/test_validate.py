@@ -4403,7 +4403,17 @@ class TestBackfillCurrentAuthorization(unittest.TestCase):
             "observed": [], "detail": "", "foreignFilters": [], "publishedPorts": [],
         }
         hp._workload_report = lambda st=None: {"workload": {"observed": []}}
-        hp.apply_workload = lambda a: (False, "failed", "admission webhook rejected the object")
+        # 🔴 Probed, like the acceptance — and for a reason the acceptance probe did not cover. An
+        # unconditional return placed after the acceptance and before the host preflight leaves every
+        # other assertion in this test true: the watermark moves, no state is written, the field keeps
+        # its value. So counting the acceptance proves the path *started*, not that it reached the
+        # branch this test is named for. Found by an independent review, which inserted exactly that
+        # return and watched both tests stay green.
+        def failing_workload(a: object) -> tuple[bool, str, str]:
+            reached["workload"] = reached.get("workload", 0) + 1
+            return (False, "failed", "admission webhook rejected the object")
+
+        hp.apply_workload = failing_workload
         hp.apply_artifact = lambda *a, **k: (_ for _ in ()).throw(
             AssertionError("the host half must not be applied when the workload half failed"),
         )
@@ -4441,6 +4451,12 @@ class TestBackfillCurrentAuthorization(unittest.TestCase):
             reached["accept"], 1,
             "the confirmed early return did not fall through, so this test exercised nothing — "
             "the scenario it is about is that missing workload objects let it through",
+        )
+        self.assertEqual(
+            reached.get("workload"), 1,
+            "the workload apply was never attempted, so this test is not about a failed one — "
+            "a return anywhere between the acceptance and the apply leaves every other assertion "
+            "here true, which is how the acceptance probe alone was not enough",
         )
         # The dangerous half did happen: the watermark now names the offered record, which is the
         # replay protection working as designed and is why the question is only about the field
@@ -4496,12 +4512,23 @@ class TestBackfillCurrentAuthorization(unittest.TestCase):
         hp.fetch_artifact = lambda: {"payload": "signed"}
         hp.verify_artifact_envelope = lambda envelope, now=None: (artifact, dict(offered), {}, False)
         hp.accept_artifact_authorization = _REAL_ACCEPT_AUTHORIZATION
+        reached: dict[str, int] = {}
         hp._host_observation_report = lambda: {
             "observed": [], "detail": "", "foreignFilters": [], "publishedPorts": [],
         }
         hp._workload_report = lambda st=None: {"workload": {"observed": []}}
         hp._preflight_host_artifact = lambda a: ({"nftables": ""}, 30, None)
-        hp.apply_workload = lambda a: (False, "failed", "admission webhook rejected the object")
+        # 🔴 Probed, like the acceptance — and for a reason the acceptance probe did not cover. An
+        # unconditional return placed after the acceptance and before the host preflight leaves every
+        # other assertion in this test true: the watermark moves, no state is written, the field keeps
+        # its value. So counting the acceptance proves the path *started*, not that it reached the
+        # branch this test is named for. Found by an independent review, which inserted exactly that
+        # return and watched both tests stay green.
+        def failing_workload(a: object) -> tuple[bool, str, str]:
+            reached["workload"] = reached.get("workload", 0) + 1
+            return (False, "failed", "admission webhook rejected the object")
+
+        hp.apply_workload = failing_workload
         hp.apply_artifact = lambda *a, **k: (_ for _ in ()).throw(
             AssertionError("the host half must not be applied when the workload half failed"),
         )
@@ -4529,6 +4556,10 @@ class TestBackfillCurrentAuthorization(unittest.TestCase):
             ) = real
 
         st = hp.load_state()
+        self.assertEqual(
+            reached.get("workload"), 1,
+            "the workload apply was never attempted, so this test is not about a failed one",
+        )
         self.assertEqual(st.get("state"), "confirmed", "the fixture no longer reproduces the pair")
         self.assertEqual(
             (st.get("currentAuthorization") or {}).get("authorizationMode"), "two-person",
@@ -4617,7 +4648,25 @@ class TestBackfillCurrentAuthorization(unittest.TestCase):
             hp._save_state_unlocked, hp.log = real, real_log
         said = " ".join(lines)
         self.assertIn("cannot persist", said, "a refused write was reported as an adopt")
-        self.assertNotIn("adopted the authorization", said)
+        # ⚠️ Derived from the agent's own source, not retyped. This read
+        # `assertNotIn("adopted the authorization", said)`, and the success line was later reworded to
+        # "adopted the watermark authorization …" — so the negative matched nothing and a test whose
+        # whole job is "the success line must not appear when the write failed" could no longer see the
+        # success line. A negative assertion against a literal is worth exactly as much as the literal,
+        # and nothing tied them together. Now the literal comes from the function being tested.
+        source = pathlib.Path(hp.__file__).read_text()
+        body = source[source.index("def backfill_current_authorization("):]
+        body = body[: body.index("\ndef ")]
+        spoken = [
+            line.strip().strip('f"').strip('"')
+            for line in body.splitlines()
+            if "adopted the" in line and "#" not in line.split("adopted the")[0]
+        ]
+        self.assertTrue(spoken, "the success line no longer says 'adopted the' — update this test")
+        for phrase in spoken:
+            head = phrase.split("{")[0].strip()
+            self.assertTrue(head, "the success line interpolates before it says anything")
+            self.assertNotIn(head, said)
         # And the disk is unchanged, so the next boot tries again rather than believing it is done.
         self.assertIsNone(hp.load_state()["currentAuthorization"])
 

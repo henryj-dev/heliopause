@@ -1936,11 +1936,13 @@ def backfill_current_authorization():
     two-person approval and an OTP per site for a field that could be derived from what is already on
     disk.
 
-    ## Why the watermark is the right value, and not a guess
+    ## Why the watermark is the best value available, and when it is still a guess
 
     `authorizationWatermark` is the last authorization this host *accepted* — written durably before
     any kernel change, by the same function that refuses replays. When all three conditions below
-    hold, that record is the authorization for exactly what is running:
+    hold, that record is **ordinarily** the authorization for what is running — and the section
+    "🔴 The mode can be wrong" below says exactly when it is not, which is a case these three
+    conditions cannot see. Read the two together or neither:
 
       · `currentAuthorization` is absent — nothing to contradict
       · `state` is `confirmed` — the apply settled. **Not "a ruleset is in force"**: an nftables
@@ -2007,9 +2009,11 @@ def backfill_current_authorization():
 
     `state: confirmed` with `workloadState: rolled-back` adopts, and should. The screen has a line
     for that pair (`m.hostOkWorkloadRolled`), so it is a state a host really sits in, and in it the
-    nftables ruleset *is* what the watermark authorized. `currentAuthorization`'s two readers — the
-    expiry escape and the trust report — both ask about the host half; gating on the workload half
-    would withhold the field from a host whose firewall is exactly as authorized.
+    nftables ruleset is what the watermark authorized **unless the watermark has moved since that
+    apply** — the case the warning below describes, and the reason this sentence is not a guarantee.
+    `currentAuthorization`'s two readers — the expiry escape and the trust report — both ask about the
+    host half; gating on the workload half would withhold the field from a host whose firewall is as
+    authorized.
 
     ## What it is not
 
