@@ -4936,7 +4936,7 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         self._saved_globals = {n: getattr(hp, n) for n in self._RECOVERY_GLOBALS}
         self._saved_boundaries = {n: getattr(hp, n) for n in self._STUBBED_BOUNDARIES}
         for name in ("nft_calls", "kubectl_calls", "route_calls", "delete_calls", "replace_calls",
-                     "logged", "states_written", "_timers_seen"):
+                     "reads", "logged", "states_written", "_timers_seen"):
             if not hasattr(self, name):
                 setattr(self, name, [])
         rc = 0 if succeed else 1
@@ -4952,10 +4952,11 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         # reached **zero** times while `rollback_workload` was entered eighteen.
         #
         # ⚠️ Replacing it with `not found` fixed the settlement and then **stood in for the whole success
-        # path**. An absent object skips cleanly at `:2593`, so the sweep settled nine times while the
-        # ownership check, the delete at `:3088` and the replace at `:3101` ran **zero** times — a review
-        # wrote `confirmed` into both and watched this test stay green. "The success tail runs" was true
-        # of the cheapest success there is.
+        # path**. An absent object skips cleanly at `:2593`, so the sweep as it stood then settled nine
+        # times while the ownership check, the delete at `:3088` and the replace at `:3102` ran **zero**
+        # times — a review wrote `confirmed` into both and watched this test stay green. "The success tail
+        # runs" was true of the cheapest success there is. (Those counts are what that round measured, not
+        # what this sweep does now; the sweep has grown since.)
         #
         # So `cluster_answer` picks which the case is about:
         # · "absent" — `rc != 0` with `not found`, what a restart finds when the previous process already
@@ -4976,7 +4977,14 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         def cluster(args, stdin=None, timeout_sec=None):
             self.kubectl_calls.append(args)
             if "get" in args:
-                return absent if cluster_answer == "absent" else (0, bodies[cluster_answer], "")
+                answer = absent if cluster_answer == "absent" else (0, bodies[cluster_answer], "")
+                # 🔑 **What the read actually returned, not what the case asked for.** The witness below
+                # used to read `case["cluster_answer"]`, which is configuration: a review changed this
+                # stub to answer `absent` while leaving the configuration at `"owned"`, and the sweep
+                # stayed green with `:3067-3068` at zero visits. Recording the response means a stub that
+                # stops handing back an object stops satisfying the witness.
+                self.reads.append(answer[0] == 0)
+                return answer
             if "replace" in args:
                 self.replace_calls.append(stdin)
             # `replace` and anything else: the boundary's own outcome.
@@ -5007,7 +5015,7 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         # distinct sentence to `incidents` and continue, and `rollback_workload` logs the collected ones.
         # Collecting the log here is the only observation needed; inserting counters into the agent to
         # measure a test would make the agent carry the test's apparatus.
-        # @see the nine branch witnesses at the end of the sweep
+        # @see the ten branch witnesses at the end of the sweep
         self._real_log = hp.log
         hp.log = lambda line: self.logged.append(str(line))
         hp._timer = None
@@ -5219,7 +5227,7 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
             # what is in the cluster is a replace (`:3101`). Both need an object the ownership check
             # accepts, so these cases answer "owned" at the cluster boundary. The replacement snapshot
             # changes the description, because an identical one is short-circuited as already safe
-            # (`:3065`) and would never reach the replace.
+            # (`:3067-3068`; `:3065` is the explanation above it) and would never reach the replace.
             #
             # `workloadGeneration` is `g1` here, not `g-live`: `_owned_object_error` refuses an object
             # whose generation annotation is not the rollback's generation, and `cnp()` annotates `g1`.
@@ -5287,7 +5295,8 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
                     succeed=case["succeed"], cluster_answer=case.get("cluster_answer", "absent"),
                 )
                 written_before = len(self.states_written)
-                before = (len(self.delete_calls), len(self.replace_calls), len(self.logged))
+                before = (len(self.delete_calls), len(self.replace_calls), len(self.logged),
+                          len(self.reads))
                 try:
                     hp.save_state({**hp._EMPTY_STATE, "generation": "g-live", **case["over"]})
                     # Not wrapped in a bare `except`. A path that raises on a state it is supposed to
@@ -5328,8 +5337,9 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
                     "logged": self.logged[before[2]:],
                     "settled": "rolled-back" in wl_values[1:],
                     # Recorded because the already-safe witness cannot be told from the missing-object
-                    # shortcut without it: both settle while touching nothing and logging nothing.
-                    "answer": case.get("cluster_answer", "absent"),
+                    # shortcut without it: both settle while touching nothing and logging nothing. It is
+                    # what the reads **returned**, not what the case configured. @see the stub
+                    "read_an_object": any(self.reads[before[3]:]),
                 }
                 for seq, bucket in ((0, host_transitions), (1, workload_transitions)):
                     values = [write[seq] for write in during]
@@ -5386,8 +5396,8 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
             f"Transitions seen: {sorted(set(workload_transitions))}",
         )
         # The two branches an absent object cannot reach. Without these, "the workload success tail runs"
-        # was satisfied by nine settlements that all took the missing-object shortcut, and `confirmed`
-        # written at either branch survived.
+        # was satisfied by settlements that had all taken the missing-object shortcut — nine of them, in
+        # the sweep as it stood then — and `confirmed` written at either branch survived.
         # ## Ten branch witnesses — a hand-written list, and it says so
         #
         # Twice a branch was opened and the neighbouring ones left at zero: first the whole workload
@@ -5396,11 +5406,13 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         # the sweep.
         #
         # ⚠️ **These are ten branches I went and read, not "the branches".** A review counted the loop and
-        # found **five more at zero** — a legacy record (`heliopause-pull.py:3048`), an invalid reference
-        # (`:3052`), a read failure (`:3056`), an exception from the cleaner (`:3069-3070`), and an
-        # exhausted replacement budget (`:3099`). Writing `confirmed` into any of those is still green.
-        # Deliberately out of scope here and filed as henryj-dev/heliopause#80; saying the list is partial
-        # is not the same as the holes not being there.
+        # found **five more this sweep never enters** — a legacy record (`heliopause-pull.py:3048`), an
+        # invalid reference (`:3052`), a read failure (`:3056`), an exception from the cleaner
+        # (`:3069-3070`), and an exhausted replacement budget (`:3099`). Writing `confirmed` into any of
+        # them is still green. (`:3056` is reached once by the file's wider suite, which proves it is
+        # reachable and not that anything is asserted about it: removing its append leaves that test
+        # green too.) Deliberately out of scope here and filed as henryj-dev/heliopause#80; saying the
+        # list is partial is not the same as the holes not being there.
         #
         # The device that claimed completeness instead of listing was removed in an earlier round for
         # being wrong about its own scope. This one claims the ten it names.
@@ -5434,17 +5446,21 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
             # boundary. So the witness is the case that reaches it having settled while deleting nothing,
             # replacing nothing and logging no incident —
             #
-            # 🔴 **and having been answered `owned`.** Without that last clause a review flipped those two
-            # cases to `absent`, `:3067-3068` ran **zero** times, and all 299 tests still passed: the
-            # missing-object shortcut (`:3058-3059`) settles while touching nothing too, so it satisfied
-            # the same evidence. The object had to be *there* for the shortcut being named to be the one
-            # that skipped it.
+            # 🔴 **and the read having come back with an object.** Without that clause a review flipped
+            # those two cases to `absent`, `:3067-3068` ran **zero** times, and all 299 tests still
+            # passed: the missing-object shortcut (`:3058-3059`) settles while touching nothing too, so it
+            # satisfied the same evidence. The object had to be *there* for the shortcut being named to be
+            # the one that skipped it.
+            #
+            # ⚠️ And the first version of that clause read the case's **configuration**, which a review
+            # then defeated by changing the stub's answer and leaving the configuration alone: green
+            # again, zero visits again. It reads what the stub returned now.
             #
             # (An earlier version asserted `_clean_workload_object(current) == snapshot()`, a property of
             # these fixtures that says nothing about whether the loop ran — a tautology inside the device
-            # built to catch tautologies. Three of these witnesses have now needed narrowing.)
+            # built to catch tautologies. Four of these witnesses have now needed narrowing.)
             "already safe (:3067-3068)": any(
-                ev["answer"] == "owned"
+                ev["read_an_object"]
                 and ev["settled"] and not ev["deleted"] and not ev["replaced"]
                 and not any("left untouched" in line for line in ev["logged"])
                 for name, ev in evidence.items() if "already safe" in name
