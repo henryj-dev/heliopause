@@ -4379,8 +4379,14 @@ class TestBackfillCurrentAuthorization(unittest.TestCase):
         # different branch entirely — `host_result = host_doc is None` is True when the preflight
         # *fails*, so the state was written as `unsupported` and `apply_workload` never ran. It was
         # green, and it was green about a scenario nobody asked about. The branch this test is for is
-        # the one where the host half is fine and the **workload** half fails, which is the only one
-        # that leaves the state untouched.
+        # the one where the host half is fine and the **workload** half fails — the only one that leaves
+        # the **host-half** fields unchanged.
+        #
+        # Not the whole state: `record_result` still persists `workloadGeneration`, `workloadState` and
+        # `workloadDetail`, so the workload failure is recorded. This comment said "the state untouched",
+        # which overstated what the test proves and was the same over-broad shape the docstring was
+        # rewritten to stop making. What matters here is that `generation`, `state`, `artifactHash` and
+        # `detail` keep their values and `confirm()` never runs.
         hp._preflight_host_artifact = lambda a: ({"nftables": ""}, 30, None)
         hp.fetch_artifact = lambda: {"payload": "signed"}
         hp.verify_artifact_envelope = lambda envelope, now=None: (artifact, dict(offered), {}, False)
@@ -4473,6 +4479,17 @@ class TestBackfillCurrentAuthorization(unittest.TestCase):
         self.assertEqual(
             st.get("state"), "confirmed",
             "the fixture no longer reproduces the state the adoption reads",
+        )
+        # The scoped claim, asserted rather than only written in the comment above: the host half keeps
+        # its values because `host_result` is false, and the workload failure **is** recorded. The first
+        # version of that comment said the whole state was untouched, which this would have caught.
+        self.assertEqual(st.get("generation"), "g1", "the host generation moved on a workload failure")
+        self.assertEqual(st.get("artifactHash"), "sha256:old", "the host artifact hash moved")
+        self.assertEqual(st.get("workloadState"), "failed", "the workload failure was not recorded")
+        self.assertEqual(st.get("workloadGeneration"), "g1", "the workload generation was not recorded")
+        self.assertIn(
+            "admission webhook", st.get("workloadDetail") or "",
+            "the workload detail was not recorded",
         )
 
     def test_an_absent_field_adopts_a_record_the_ruleset_was_never_applied_under(self):
@@ -4573,38 +4590,31 @@ class TestBackfillCurrentAuthorization(unittest.TestCase):
             "the adoption now agrees with the enforced ruleset, which would mean the hole is closed",
         )
 
-    def test_the_confirmed_state_and_the_promotion_are_written_together(self):
-        # The precondition for a wrong adoption is `state == "confirmed"` with no
-        # `currentAuthorization`. Through the program that pair cannot be written, because `confirm()`
-        # sets both in one `update_state` mutator — so this asserts the pair rather than the two
-        # lines' positions in the file, which is the mistake the test above replaced.
+    def test_an_acceptance_leaves_a_confirm_something_to_promote(self):
+        # ## What this used to assert, and why that was the same mistake one layer along
         #
-        # This is the load-bearing half of the argument the docstring is allowed to make. It says
-        # nothing about a state file rewritten from outside: an operator's script, or an **older
-        # agent**, which drops keys it does not know because `_load_state_unlocked` rebuilds the dict
-        # from its own `_EMPTY_STATE`. That residual is stated in the docstring rather than claimed
-        # away.
-        source = pathlib.Path(hp.__file__).read_text()
-        confirmed_writes = [
-            n for n, line in enumerate(source.splitlines(), 1)
-            if 'fresh["state"] = "confirmed"' in line
-        ]
-        self.assertEqual(
-            len(confirmed_writes), 1,
-            f"more than one place writes the confirmed state: lines {confirmed_writes}",
-        )
-        promotions = [
-            n for n, line in enumerate(source.splitlines(), 1)
-            if 'fresh["currentAuthorization"] = fresh.get("pendingAuthorization")' in line
-        ]
-        self.assertEqual(len(promotions), 1, f"the promotion moved or multiplied: {promotions}")
-        # Same function, and the behavioural check below is what makes that mean anything.
-        self.assertLess(
-            abs(promotions[0] - confirmed_writes[0]), 60,
-            "the confirmed write and the promotion are no longer in the same mutator",
-        )
-        # Behavioural: accepting an authorization writes the watermark **and** the pending record
-        # together, so a confirm that follows always has something to promote.
+        # The precondition for a wrong adoption is `state == "confirmed"` with no
+        # `currentAuthorization`, and the program does not write that pair because `confirm()` sets both
+        # in one `update_state` mutator. This test used to argue that by scanning this file's source for
+        # the two assignments and asserting they were **within sixty lines of each other** — source
+        # distance as a proxy for "same mutator", which is the technique this whole PR exists to remove,
+        # used inside the removal. Two assignments in different functions can sit within sixty lines,
+        # and the reviewer said so.
+        #
+        # Deleted rather than replaced, because the property is already covered where it should be:
+        # `test_confirming_promotes_the_authorization_this_host_is_enforcing` drives a real apply and a
+        # real confirm and asserts the settled `state` and the promoted record together, with a known
+        # negative before the confirm. A second confirm-driving test here would duplicate it.
+        #
+        # What is left is the other half, which that test does not cover: the acceptance writes the
+        # watermark and the pending record **together**, so a confirm always has something to promote.
+        #
+        # Neither half says anything about a state file rewritten from outside — an operator's script, or
+        # an **older agent**, which drops keys it does not know because `_load_state_unlocked` rebuilds
+        # the dict from its own `_EMPTY_STATE`. That residual is stated in the docstring rather than
+        # claimed away.
+        # Accepting an authorization writes the watermark **and** the pending record together, so a
+        # confirm that follows always has something to promote. That is this test's whole subject.
         hp.save_state({**hp._EMPTY_STATE, "generation": "g-live", "state": "pending"})
         fresh, err = _REAL_ACCEPT_AUTHORIZATION(dict(self.REC), {}, False)
         self.assertIsNotNone(fresh, f"the fixture no longer accepts: {err}")
