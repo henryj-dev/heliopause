@@ -690,9 +690,11 @@ export const MESSAGES = {
   },
   "m.expectReach": { en: "expect: must reach", ko: "기대: 닿아야 한다" },
   "m.expectBlocked": { en: "expect: must not reach", ko: "기대: 닿지 않아야 한다" },
+  // `stale` sits next to `pass` rather than inside it. A check that passed yesterday and has not been
+  // measured since is not currently passing, and this line is what a reader skims before the table.
   "m.coverageCounts": {
-    en: "fail {fail} · unknown {unknown} · pass {pass} — the only table that is not the fleet talking about itself.",
-    ko: "실패 {fail} · 알 수 없음 {unknown} · 통과 {pass} — 함대가 자기 자신에 대해 말한 것이 아닌 유일한 표다.",
+    en: "fail {fail} · unknown {unknown} · stale {stale} · pass {pass} — the only table that is not the fleet talking about itself.",
+    ko: "실패 {fail} · 알 수 없음 {unknown} · 낡음 {stale} · 통과 {pass} — 함대가 자기 자신에 대해 말한 것이 아닌 유일한 표다.",
   },
   "m.devicesUncompared": {
     en: "approval list only. Cloudflare was not compared — that is not “no difference”.",

@@ -486,6 +486,9 @@ export function coverageTable(rows: readonly CoverageRow[], summary: CoverageSum
     (summary.lastRun ? `last measured ${esc(summary.lastRun)}` : '<span class="warn">never measured</span>') +
     ` &middot; <span class="${summary.failing ? "bad" : "ok"}">${summary.failing} failing</span>` +
     ` &middot; <span class="${summary.unknown ? "warn" : "dim"}">${summary.unknown} not measured</span>` +
+    // Stale passes get their own number rather than swelling `passing`. The cells have always shown
+    // `△ stale` beside the verdict; this line was the one place still calling an old pass current.
+    ` &middot; <span class="${summary.stale ? "warn" : "dim"}">${summary.stale} stale</span>` +
     ` &middot; ${summary.passing} passing` +
     (summary.observedFrom.length ? ` &middot; from ${esc(summary.observedFrom.join(", "))}` : "") +
     `</div>`;

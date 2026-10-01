@@ -325,6 +325,7 @@
         {t(prefs.lang, "m.coverageCounts", {
           fail: view.coverage.failing,
           unknown: view.coverage.unknown,
+          stale: view.coverage.stale,
           pass: view.coverage.passing,
         })}
       </p>

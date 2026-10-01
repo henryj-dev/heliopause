@@ -96,7 +96,10 @@ export interface CoverageView {
   rows: CoverageRow[];
   failing: number;
   unknown: number;
+  /** Passing **and** measured recently enough to say so. A stale pass is in `stale`. */
   passing: number;
+  /** Passing, but the newest probe is older than the freshness window. */
+  stale: number;
 }
 
 export interface DeviceRow {
@@ -403,6 +406,10 @@ function readCoverage(value: unknown): CoverageView | null {
     failing: typeof summary.failing === "number" ? summary.failing : 0,
     unknown: typeof summary.unknown === "number" ? summary.unknown : 0,
     passing: typeof summary.passing === "number" ? summary.passing : 0,
+    // Absent from a page rendered before this field existed. Zero is the right reading for that:
+    // the renderer that produced it folded stale passes into `passing`, so claiming a count here
+    // would be inventing one. The per-cell `△ stale` chip still works on those pages.
+    stale: typeof summary.stale === "number" ? summary.stale : 0,
   };
 }
 

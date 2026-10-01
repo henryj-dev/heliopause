@@ -181,10 +181,28 @@ function worst(cells: CoverageCell[]): CoverageCell {
   return cells.slice().sort((a, b) => rank[a.verdict] - rank[b.verdict])[0]!;
 }
 
+/**
+ * Age at which a probe stops counting as current.
+ *
+ * **Tied to the publishing cadence, not picked.** `coverage` runs four times a day, six hours apart
+ * (`17 2,8,14,20 * * *` in the policy repository). One missed slot plus the scheduler's delivery
+ * jitter tops out at a twelve-hour-old probe and is ordinary; two missed slots reaches eighteen and is
+ * not. Thirteen hours sits between them, so this trips when **more than one** slot was lost.
+ *
+ * It was `24 * 3600` written inline, and the link to the cron lived only in somebody's head. That
+ * mattered more than it looks: while the cron claimed hourly, twenty-four hours was twenty-four
+ * missed slots, and the screen called a day-old probe current. Measured 2026-10-01, that cron
+ * actually delivered 22% of its slots — so the window was lax against the claim *and* against the
+ * reality, in different directions.
+ *
+ * Change this with the cron, never alone.
+ */
+export const COVERAGE_STALE_SEC = 13 * 3600;
+
 export interface RowOptions {
   /** Instant to measure staleness against. Passed in so rendering is deterministic in tests. */
   now: string;
-  /** A probe older than this is marked stale. The screen shows the age either way. */
+  /** A probe older than this is marked stale. Defaults to {@link COVERAGE_STALE_SEC}. */
   staleAfterSec?: number;
 }
 
@@ -200,7 +218,7 @@ export function coverageRows(
   opts: RowOptions,
 ): CoverageRow[] {
   const nowMs = Date.parse(opts.now);
-  const staleAfter = opts.staleAfterSec ?? 24 * 3600;
+  const staleAfter = opts.staleAfterSec ?? COVERAGE_STALE_SEC;
 
   const newest = new Map<string, Probe>();
   for (const p of probes) {
@@ -238,7 +256,27 @@ export interface CoverageSummary {
   failing: number;
   /** Checks with at least one cell nobody measured. Counted apart from failures on purpose. */
   unknown: number;
+  /**
+   * Checks that pass **and were measured recently enough to say so**.
+   *
+   * A stale pass is counted in {@link CoverageSummary.stale}, not here. See the note there.
+   */
   passing: number;
+  /**
+   * Checks that pass but whose newest probe is older than the freshness window.
+   *
+   * Split out because the cells already said so and this number did not. Each cell has carried a
+   * `△ stale` chip beside its verdict for a long time — deliberately two chips and never one merged
+   * word, because "pass, and stale" is a real combination. The banner above the table was still
+   * folding those into `passing`, so the summary a reader skims said a check was currently fine while
+   * the cell underneath said nobody had looked in a day. That is the same defect as a green cell for
+   * something never measured, one level up.
+   *
+   * Not folded into `failing`: an old pass is not evidence of a failure. Not folded into `unknown`
+   * either — something *was* measured, just not lately, and the two call for different actions. The
+   * probe cadence is the suspect for `stale`; the rule is the suspect for `failing`.
+   */
+  stale: number;
   /** Newest probe across everything, or `undefined` when there are none. */
   lastRun?: string;
   /** Distinct vantage points seen. More than one is worth showing. */
@@ -264,6 +302,7 @@ export function coverageSummary(
   let failing = 0;
   let unknown = 0;
   let passing = 0;
+  let stale = 0;
   let lastRun: string | undefined;
   const from = new Set<string>();
 
@@ -273,15 +312,21 @@ export function coverageSummary(
       ...(!scoped || scoped.includes("v6") ? [r.v6] : []),
     ];
     if (!cells.length) continue;
+    // `fail` and `unknown` keep precedence over staleness. An old failure is still a failure and an
+    // old gap is still a gap — the age changes neither, and demoting them to "stale" would bury the
+    // thing to act on under the reason it was noticed late.
     if (cells.some((c) => c.verdict === "fail")) failing += 1;
     else if (cells.some((c) => c.verdict === "unknown")) unknown += 1;
-    else if (cells.some((c) => c.verdict === "pass")) passing += 1;
+    else if (cells.some((c) => c.verdict === "pass")) {
+      if (cells.some((c) => c.verdict === "pass" && c.stale)) stale += 1;
+      else passing += 1;
+    }
     for (const c of cells) {
       if (c.observedFrom) from.add(c.observedFrom);
       if (c.at && (!lastRun || Date.parse(c.at) > Date.parse(lastRun))) lastRun = c.at;
     }
   }
-  return { failing, unknown, passing, lastRun, observedFrom: [...from].sort() };
+  return { failing, unknown, passing, stale, lastRun, observedFrom: [...from].sort() };
 }
 
 // ── The baseline, and whether anything measures it ───────────────────────────
