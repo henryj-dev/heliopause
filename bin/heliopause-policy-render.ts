@@ -592,22 +592,20 @@ const cached = new Map<string, { stamp: string; source: PolicySource }>();
  * that could not see a change to `policies.json`. A path that does not exist contributes `-`, so
  * its appearance and disappearance both move the key.
  */
-/** How many neighbouring files the stamp will read before it gives up on a complete one. */
-const STAMP_FILE_CAP = 400;
-
 /**
- * A value for the import specifier when there is no stamp, distinct on every call.
+ * How many directory entries the stamp will visit before it gives up.
  *
- * ES modules are cached by URL, so the `?v=` has to move or a re-evaluation is not one. With no
- * stamp there is nothing to derive it from, and the answer is not cached either — so a fresh counter
- * is exactly right here and would be exactly wrong anywhere the result is kept.
+ * Entries, not matching files. Counting matches let a tree of a thousand directories holding one
+ * `.ts` file pass the cap untouched while still costing a full traversal on every request, which is
+ * the cost the cap exists to bound.
  */
-let uncachedEvaluations = 0;
-const uncachedStamp = (): string => `uncached-${(uncachedEvaluations += 1)}`;
+const STAMP_SCAN_CAP = 2_000;
 
 /**
- * `null` means **no complete stamp**, which the caller must read as "do not cache this answer".
- * Returning a placeholder instead is what froze the key above the cap.
+ * `null` means **no complete stamp**: the tree has more entries than the scan cap, so a change here
+ * cannot be noticed. The caller refuses the site rather than serving it — see `currentSource`.
+ * Returning a placeholder instead froze the key; evaluating without caching leaked the module
+ * registry. Both were tried, in that order, and both are recorded there.
  */
 function sourceStamp(sitePath: string): string | null {
   const head = policyHead(sitePath);
@@ -645,8 +643,27 @@ function sourceStamp(sitePath: string): string | null {
   // refuses to produce a stamp at all and the caller does not cache, which costs an evaluation per
   // request and cannot serve a stale one.
   //
-  // @see src/policy-render-service.test.ts "keeps noticing edits in a tree larger than the scan cap"
+  // @see src/policy-render-service.test.ts "refuses a site whose tree is larger than the scan cap"
+  // ## 🔴 `.git` is why this skips dot-directories, and skipping them is why the cap means anything
+  //
+  // The policy directory is a git checkout. Measured in a real tree: **3,116 entries** with `.git`
+  // included and **49** without — 24 of them source files. A cap counted over everything is therefore
+  // exceeded on the first request of every ordinary deployment, and the version of this that refused
+  // above the cap would have answered 503 for **every site at once**. That is a full console outage,
+  // which is worse than the leak it replaced, which was worse than the frozen key before that. Three
+  // attempts at this line, each worse than the last, and the thing that settled it was counting the
+  // entries in an actual checkout instead of reasoning about a plausible one.
+  //
+  // What is skipped is not part of any module graph: dot-directories and `node_modules`. A module that
+  // imports out of one of those is invisible to the stamp, which is the same class of gap as a helper
+  // outside the directory and is stated in the same breath.
+  //
+  // `withFileTypes` reports a symlink as a symlink rather than as what it points at, so
+  // `isDirectory()` is false for one and this walk never follows them. That is what makes a cycle
+  // impossible here rather than merely unlikely — and it is why a helper reached through a symlink is
+  // invisible too.
   const neighbours: string[] = [];
+  let visited = 0;
   let overflowed = false;
   const stack = [dir];
   walk: while (stack.length > 0) {
@@ -659,8 +676,10 @@ function sourceStamp(sitePath: string): string | null {
       continue;
     }
     for (const entry of entries) {
-      if (neighbours.length >= STAMP_FILE_CAP) { overflowed = true; break walk; }
+      visited += 1;
+      if (visited > STAMP_SCAN_CAP) { overflowed = true; break walk; }
       const full = join(here, entry.name);
+      if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
       if (entry.isDirectory()) { stack.push(full); continue; }
       if (!entry.isFile()) continue;
       if (!/\.(ts|mts|cts|js|mjs|cjs|json)$/.test(entry.name)) continue;
@@ -688,20 +707,32 @@ function hostIdsOf(site: ScreenSite): string[] {
 
 async function currentSource(site: { name: string | null; path: string }): Promise<PolicySource> {
   const { name, path: sitePath } = site;
-  // `null` when the tree is larger than the scan cap and the stamp cannot be complete. `evaluated`
-  // does not store an answer under a null stamp, so nothing in the map ever carries one and this
-  // comparison is already false for it. An explicit `stamp === null` check here was written first and
-  // deleted: reverting it changed no test, because the store is where the decision belongs.
+  // ## 🔴 No complete stamp is a refusal, and the first version of this served instead
+  //
+  // `null` means the tree has more entries than the scan cap, so a change cannot be noticed. The first
+  // fix here evaluated anyway and skipped the cache, minting a fresh `?v=` per request so the
+  // re-evaluation was a real one. That leaks: ES modules are keyed by URL and never evicted, and a
+  // measured 7.32 KiB is retained per distinct URL (Node 26.4, after a forced GC; 4,000 imports of one
+  // URL retain nothing). At one poll every few seconds that is hundreds of megabytes a day and then an
+  // OOM kill, which at `replicas: 1` takes every co-served console with it.
+  //
+  // So the defect that fix introduced was worse than the one it closed — a stale policy against no
+  // policy at all. Refusing is the third option and the right one: this site answers 503 and says why,
+  // its neighbours are unaffected, nothing new enters the module registry, and a tree this large is a
+  // configuration an operator can fix or a cap they can raise.
   const stamp = sourceStamp(sitePath);
   const hit = cached.get(sitePath);
   if (hit && hit.stamp === stamp) return hit.source;
   if (stamp === null) {
-    log(`${name ?? label}: more than ${STAMP_FILE_CAP} files beside the module — evaluating without caching`);
+    throw new RealError(
+      `more than ${STAMP_SCAN_CAP} entries beside ${sitePath} — a change here cannot be noticed, ` +
+        "so this site is refused rather than served from a key that cannot move",
+    );
   }
   // Before the import, so the hook above knows which tree this evaluation may version.
   policyRoots.add(`${pathToFileURL(realpathSync(dirname(resolve(sitePath)))).pathname}/`);
   // The import specifier still needs a value that moves, and `stamp` is not URL-safe.
-  const mod = (await import(`${pathToFileURL(sitePath).href}?v=${encodeURIComponent(stamp ?? uncachedStamp())}`)) as {
+  const mod = (await import(`${pathToFileURL(sitePath).href}?v=${encodeURIComponent(stamp)}`)) as {
     site?: ScreenSite;
   };
   if (!mod.site) throw new RealError(`${sitePath} does not export \`site\``);
@@ -756,7 +787,7 @@ async function currentSource(site: { name: string | null; path: string }): Promi
 /** The half of `currentSource` that runs once the zone check has passed. Separated so the caller can
  *  tell a failure here — where the check ran — from one before it. */
 async function evaluated(
-  input: { site: ScreenSite; name: string | null; sitePath: string; stamp: string | null },
+  input: { site: ScreenSite; name: string | null; sitePath: string; stamp: string },
 ): Promise<PolicySource> {
   const { site: siteValue, name, sitePath, stamp } = input;
   const source = collectPolicySource({
@@ -771,16 +802,11 @@ async function evaluated(
     label: name ?? label,
     ...(name === null ? {} : { siteName: name }),
   });
-  // ## `null` means the stamp could not be complete, so this answer must not be kept
-  //
-  // A stored entry whose key cannot be invalidated is the stale answer the key exists to prevent.
-  // This guard was first written one call up, where `stamp` had already been replaced by a
-  // substitute and so was never `null` — dead, and reverting it changed no test. What was actually
-  // preventing the stale answer was that the substitute never matched a later lookup, which is a
-  // property nobody wrote down and nothing asserted.
-  //
-  // @see src/policy-render-service.test.ts "keeps noticing edits in a tree larger than the scan cap"
-  if (stamp !== null) cached.set(sitePath, { stamp, source });
+  // Always stored, because nothing reaches here without a complete stamp: `currentSource` refuses a
+  // null one above the scan cap. Two earlier versions of this line carried a `stamp !== null` guard —
+  // one of them dead, because it sat where the value had already been replaced by a substitute — and
+  // the substitute was what leaked. The refusal upstream is what makes this unconditional again.
+  cached.set(sitePath, { stamp, source });
   log(`evaluated ${name ?? label} at ${source.head.sha ?? "unknown"}${source.head.dirty ? " (dirty)" : ""}`);
   return source;
 }

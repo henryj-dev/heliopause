@@ -1184,57 +1184,103 @@ throw new Error("an ordinary content fault");
     }
   });
 
-  it("keeps noticing edits in a tree larger than the scan cap", { timeout: 60_000 }, async () => {
-    // ## A placeholder above the cap is a key that cannot move
+  it("does not count a git checkout against the scan cap", { timeout: 60_000 }, async () => {
+    // ## 🔴 The test that would have stopped a full outage, and did not exist
     //
-    // The neighbour scan was bounded by `break`ing at a cap and stamping the literal `over-400` when
-    // it was hit. Two defects in one: `readdirSync(dir, { recursive: true })` returns a **materialised
-    // array**, so the whole tree is walked before the loop sees an entry and the `break` bounds
-    // nothing; and a constant placeholder never changes, so a tree above the cap had a stamp that
-    // could not move and the cache served its first answer forever — the exact failure the scan was
-    // added to fix, reintroduced inside the fix. Found by an independent audit.
+    // The policy directory **is a git checkout**, and `.git` holds thousands of entries on its own:
+    // measured in a real tree, 3,116 entries with it and 49 without. The version of the cap that
+    // counted everything and refused above it would therefore have answered 503 for **every site on
+    // every deployment** — a full console outage shipped as a fix for a memory leak, which had itself
+    // been shipped as a fix for a frozen cache key.
     //
-    // Above the cap there is now no stamp, and no stamp means no caching: an evaluation per request,
-    // which is slower and cannot be stale. This asserts the second edit is seen, which is what the
-    // placeholder made impossible.
-    const { dir, sites, beta } = twoSites();
+    // Nothing in this suite could have caught it, because `twoSites()` builds a directory with no
+    // `.git` in it. That is the whole reason this test exists: the fixture was more forgiving than the
+    // world, and every assertion about the cap was made against the forgiving one.
+    const { dir, sites } = twoSites();
+    // Two thousand entries under dot-directories and `node_modules` — more than the cap on its own.
+    for (const hidden of [".git", ".github", "node_modules"]) {
+      const sub = join(dir, hidden);
+      mkdirSync(sub);
+      for (let i = 0; i < 700; i += 1) writeFileSync(join(sub, `o${i}.ts`), `export const n${i} = ${i};\n`);
+    }
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      const deadline = (): RequestInit => ({ signal: AbortSignal.timeout(20_000) });
+      for (const site of ["alpha", "beta"]) {
+        assert.equal(
+          (await fetchAt(started.port, `/source?site=${site}`, deadline())).status, 200,
+          `${site} was refused because of files a module graph cannot reach`,
+        );
+      }
+      assert.doesNotMatch(
+        started.output(), /entries beside/,
+        "the scan overflowed on an ordinary checkout",
+      );
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a site whose tree is larger than the scan cap", { timeout: 60_000 }, async () => {
+    // ## Three answers were tried above the cap, and the first two were worse than the defect
+    //
+    // The scan reads the entry module's neighbours so that breaking only a `./helper.ts` is noticed.
+    // Above the cap it cannot be complete, and what to do then took three goes:
+    //
+    //   1. **Stamp a placeholder** (`over-400`). A constant, so the key stopped moving and the cache
+    //      served its first answer forever — the exact defect the scan was added to fix.
+    //   2. **Evaluate without caching**, minting a fresh `?v=` per request so the re-evaluation was
+    //      real. ES modules are keyed by URL and never evicted: **7.32 KiB retained per distinct URL**
+    //      measured on Node 26.4 after a forced GC, against nothing for 4,000 imports of one URL. At a
+    //      poll every few seconds that is an OOM kill, and at `replicas: 1` every console goes with it.
+    //   3. **Refuse**, which is this. Nothing new enters the module registry and an operator gets a
+    //      reason.
+    //
+    // The second was found by an independent re-review, and the test it passed is why it got that far:
+    // "the edit is still seen" was true and never asked what seeing it cost.
+    //
+    // ⚠️ **Sites that share a directory share the refusal**, which the assertions below say out loud.
+    // In the fleet all three site modules live in one policy directory, so an oversized tree there is
+    // not a per-site 503 — it is every console. That is the cost of refusing, and it is why the cap is
+    // set far above an ordinary checkout (49 entries measured, against a cap of 2,000) and why the test
+    // above exists to keep `.git` out of the count. A tree that still overflows is one somebody built.
+    const { dir, sites } = twoSites();
     const filler = join(dir, "filler");
     mkdirSync(filler);
-    for (let i = 0; i < 420; i += 1) writeFileSync(join(filler, `f${i}.ts`), `export const n${i} = ${i};\n`);
-    const marker = (value: string): string => `export const site = {
-  cfg: { hookPolicy: { input: "drop", output: "accept" } },
-  hosts: [{ id: "gw-01.beta", stage: "canary", items: [] }],
-  objects: [{ id: "ao-beta", kind: "address", name: "${value}",
-              members: [{ kind: "cidr", value: "10.0.0.0/8" }] }],
-};
-`;
-    writeFileSync(beta, marker("first"));
+    // 🔑 **Non-source files on purpose.** The cap counts entries *visited*, not entries that match the
+    // extension filter, and this fixture is what tells those apart: two thousand `.md` files overflow
+    // the walk while contributing nothing to the match list. With matching files both counts overflow
+    // together, a mutation swapping one for the other changed no test, and the matrix reported the line
+    // as holding nothing up. A cap counted over matches is the version that let a thousand directories
+    // holding one `.ts` each cost a full traversal on every request.
+    for (let i = 0; i < 2_100; i += 1) writeFileSync(join(filler, `f${i}.md`), `# note ${i}\n`);
     let started: Started | undefined;
     try {
       started = await start(dir, MULTI(sites));
       const port = started.port;
-      const named = async (): Promise<unknown> => {
-        const r = await fetchAt(port, "/source?site=beta", { signal: AbortSignal.timeout(20_000) });
-        assert.equal(r.status, 200, "beta lost");
-        return ((await r.json()) as { site?: { objects?: { name?: unknown }[] } })
-          .site?.objects?.[0]?.name;
-      };
-      assert.equal(await named(), "first", "the fixture's marker is not where this test reads it");
-      writeFileSync(beta, marker("second"));
-      const later = new Date(Date.now() + 5_000);
-      utimesSync(beta, later, later);
-      assert.equal(
-        await named(), "second",
-        "an edit went unseen above the scan cap — the stamp stopped moving and the cache answered",
-      );
-      // And the overflow path is what answered. Without this the bound is untestable here: a
-      // *complete* stamp also sees the edit, so removing the cap makes this assertion pass and only
-      // the cost worse. This is the line that says the cap was reached and the answer was not cached.
+      const deadline = (): RequestInit => ({ signal: AbortSignal.timeout(20_000) });
+      const refused = await fetchAt(port, "/source?site=beta", deadline());
+      assert.equal(refused.status, 503, "a site whose tree cannot be stamped was served anyway");
       assert.match(
-        started.output(), /more than 400 files beside the module — evaluating without caching/,
-        "the scan never overflowed, so this test is about a tree that fits and not about the cap",
+        (await refused.json() as { error?: string }).error ?? "",
+        /entries beside .* cannot be noticed/,
+        "the refusal does not say why, so an operator cannot act on it",
       );
-      assert.equal((await fetchAt(port, "/source?site=alpha")).status, 200, "alpha lost");
+      assert.equal(
+        (await fetchAt(port, "/source?site=alpha", deadline())).status, 503,
+        "alpha shares this directory, so it shares the refusal — if this is 200 the scan became per-site",
+      );
+      // What the refusal is for: the process stays up and the probe keeps answering, so this is a
+      // reported configuration fault rather than a crashloop.
+      assert.equal((await fetchAt(port, "/healthz", deadline())).status, 200, "the process went down");
+      assert.equal((await fetchAt(port, "/source?site=beta", deadline())).status, 503, "not idempotent");
+      assert.equal((await fetchAt(port, "/healthz", deadline())).status, 200, "the process went down");
+      assert.match(
+        started.output(), /entries beside/,
+        "the refusal was never logged, so it is invisible in the journal",
+      );
     } finally {
       started?.stop();
       rmSync(join(dir, ".."), { recursive: true, force: true });
