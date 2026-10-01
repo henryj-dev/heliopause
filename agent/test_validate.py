@@ -3389,9 +3389,13 @@ class TestSignedArtifactSeam(unittest.TestCase):
         # two moved relative to each other, which is how someone would discover the property rather
         # than check it.
         #
-        # ⚠️ Reading the order proves less than it looks: a `return` placed between the verifier and
-        # the comparison leaves this assertion true, which is the whole reason the behavioural tests
-        # exist. @see TestTheApplyPathReadsTheVerifiedArtifact
+        # ⚠️ Reading the order proves less than it looks, and a review measured how much less. A `return`
+        # placed between the verifier and the comparison leaves this assertion true while the driven
+        # tests go red. Of five defects injected into this seam, this caught two — and both only because
+        # the mutation deleted the string it indexes, not because it noticed the behaviour. **It is not
+        # security evidence**; it is a syntax alarm for the two lines moving relative to each other, kept
+        # for the same reason the ordering tripwire in `TestStartupCallsTheBackfill` is kept.
+        # @see TestTheApplyPathReadsTheVerifiedArtifact
         src = self._source()
         self.assertIn("verify_artifact_envelope", src, "the apply path does not verify the envelope")
         verify_at = src.index("verify_artifact_envelope")
@@ -3437,21 +3441,115 @@ class TestTheApplyPathReadsTheVerifiedArtifact(unittest.TestCase):
     the envelope on purpose.
     """
 
-    class _Envelope(dict):
-        """An envelope that records every read of its `generation`.
+    class _Claim(str):
+        """The envelope's generation **value**, which records being used.
 
-        The refusal case needs to say "never read", and a count of reads is the only way to say it: a
-        path that reads the raw envelope and then happens to refuse looks identical from the outside.
+        One of two layers. This one survives a read that bypasses the container — `dict.get(env, key)`,
+        `dict.__getitem__`, `pop` — because the thing recorded is the value's own comparison or
+        stringification, which is what a path would have to do to act on it.
+        """
+
+        def __new__(cls, value, uses):
+            claim = super().__new__(cls, value)
+            claim.uses = uses
+            return claim
+
+        def __eq__(self, other):
+            self.uses.append("compared")
+            return str.__eq__(self, other)
+
+        def __ne__(self, other):
+            self.uses.append("compared")
+            return str.__ne__(self, other)
+
+        def __hash__(self):
+            return str.__hash__(self)
+
+        def __str__(self):
+            self.uses.append("stringified")
+            return str.__str__(self)
+
+        def __format__(self, spec):
+            self.uses.append("interpolated")
+            return str.__format__(self, spec)
+
+    class _Envelope(dict):
+        """The container, which records the ways its `generation` can be reached.
+
+        ## What this observes, measured rather than assumed
+
+        The first version intercepted `get` alone and its docstring said it recorded every read. A review
+        found four ways past it in one pass. These are the paths that were then **tried and measured**
+        (2026-10-01), with which layer saw each:
+
+        | access | container | value |
+        |---|---|---|
+        | `env.get("generation")` | ✓ | ✓ |
+        | `env["generation"]` | ✓ | ✓ |
+        | `dict(env.items())[...]` | ✓ | ✓ |
+        | `env.copy()[...]` | ✓ | ✓ |
+        | `{**env}[...]` | ✓ | ✓ |
+        | `json.dumps(env)` | ✓ (`items`) | — |
+        | `"generation" in env` | ✓ | — |
+        | `list(env)` | ✓ | — |
+        | `dict.get(env, "generation")` | — | ✓ |
+        | `dict.__getitem__(env, ...)` | — | ✓ |
+        | `env.pop("generation")` | — | ✓ |
+
+        ⚠️ **Not a completeness claim.** The two layers happen to be complementary across everything
+        tried, and the union is what the assertions read — but a read that neither touches the container
+        through these methods nor compares or stringifies the value is unobserved, and so is anything
+        reaching the dict from C. What the tests may say is "none of the accesses this observes
+        happened", which is weaker than "never read" and is the sentence they now use.
         """
 
         def __init__(self, *a, **kw):
             super().__init__(*a, **kw)
-            self.generation_reads = 0
+            self.touches = []
 
         def get(self, key, default=None):
             if key == "generation":
-                self.generation_reads += 1
+                self.touches.append("get")
             return super().get(key, default)
+
+        def __getitem__(self, key):
+            if key == "generation":
+                self.touches.append("subscript")
+            return super().__getitem__(key)
+
+        def items(self):
+            self.touches.append("items")
+            return super().items()
+
+        def keys(self):
+            self.touches.append("keys")
+            return super().keys()
+
+        def values(self):
+            self.touches.append("values")
+            return super().values()
+
+        def __iter__(self):
+            self.touches.append("iter")
+            return super().__iter__()
+
+        def __contains__(self, key):
+            if key == "generation":
+                self.touches.append("contains")
+            return super().__contains__(key)
+
+        def copy(self):
+            self.touches.append("copy")
+            return dict(self)
+
+    def _envelope(self, generation):
+        """An envelope whose generation is observed by both layers."""
+        uses = []
+        envelope = self._Envelope({"payload": "..."})
+        envelope["generation"] = self._Claim(generation, uses)
+        envelope.touches.clear()
+        self.value_uses = uses
+        return envelope
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -3466,9 +3564,14 @@ class TestTheApplyPathReadsTheVerifiedArtifact(unittest.TestCase):
         self.reached = []
         self.logged = []
         hp.log = lambda line: self.logged.append(str(line))
-        # Past the comparison is the only thing these tests read as "it proceeded", so every step after
-        # it records and does nothing. `accept_artifact_authorization` returning `(None, …)` would stop
-        # the path at its own refusal branch, which is a different test's subject.
+        # Past the comparison is the only thing these tests read as "it proceeded", so each step after it
+        # records and returns something benign. `accept_artifact_authorization` returning `(None, …)`
+        # would stop the path at its own refusal branch, which is a different test's subject.
+        #
+        # ⚠️ "Records and does nothing" was too strong: `handle_reply` writes real state around these
+        # calls, and with the preflight stub answering `None` the path takes the unsupported-host branch,
+        # so the `workload` and `host` stubs are **never reached at all**. They are here so that a change
+        # which does reach them records rather than touching a machine — not as evidence about apply.
         hp.accept_artifact_authorization = lambda record, watch, expired: (
             self.reached.append("accept"), ({}, ""))[1]
         hp._preflight_host_artifact = lambda artifact: (
@@ -3490,9 +3593,13 @@ class TestTheApplyPathReadsTheVerifiedArtifact(unittest.TestCase):
             "schemaVersion": hp.SCHEMA_VERSION, "generation": wanted, "gate": {"open": True},
         })
 
-    def test_a_refused_envelope_is_never_read_for_a_generation(self):
-        """Verification raises, and nothing asks the envelope what generation it claims to be."""
-        envelope = self._Envelope({"generation": "g-forged", "payload": "..."})
+    def test_a_refused_envelope_is_not_consulted_for_a_generation(self):
+        """Verification raises, and none of the accesses the observer sees happen.
+
+        Narrower than "never read", which is what this said before a review found four ways past the
+        observer. @see `_Envelope` for the table of what is and is not seen.
+        """
+        envelope = self._envelope("g-forged")
         hp.fetch_artifact = lambda: envelope
 
         def refuse(_envelope, now=None):
@@ -3502,10 +3609,10 @@ class TestTheApplyPathReadsTheVerifiedArtifact(unittest.TestCase):
         self._beat()
 
         self.assertEqual(
-            envelope.generation_reads, 0,
-            "the apply path read the unverified envelope's generation. A path that reads it and then "
-            "refuses anyway looks the same from outside, which is why this counts reads rather than "
-            "watching what happened next.",
+            (envelope.touches, self.value_uses), ([], []),
+            "the apply path consulted the unverified envelope for its generation. A path that reads it "
+            "and then refuses anyway looks the same from outside, which is why this watches the object "
+            "rather than what happened next.",
         )
         self.assertEqual(self.reached, [], f"a refused envelope reached {self.reached}")
         self.assertTrue(
@@ -3517,12 +3624,22 @@ class TestTheApplyPathReadsTheVerifiedArtifact(unittest.TestCase):
         self.assertIsNotNone(hp.load_state().get("lastRefusal"), "the refusal was not recorded")
 
     def test_the_generation_compared_is_the_verifiers_not_the_envelopes(self):
-        """Both directions, because one of them is satisfied by reading either object.
+        """Both directions, because each pins a different way the comparison can be wrong.
 
         The envelope and the verified artifact disagree, so each case is decided by which one the
         comparison reads: when the **verified** generation is the wanted one the path proceeds, and when
-        only the **envelope's** is, it refuses. A test with one of these halves would pass against a
-        path that read the envelope.
+        only the **envelope's** is, it refuses.
+
+        ⚠️ A review measured that **either half alone** catches a comparison switched to the envelope, so
+        the pair is not needed for that. What the pair pins is the two unconditional failures: a
+        comparison that always proceeds is caught by the second half, one that always refuses by the
+        first. The earlier wording claimed one half would pass against a path reading the envelope, which
+        the measurement contradicts.
+
+        ⚠️ And it cannot say **which** verifier-returned value decided it: `record` carries the same
+        generation as the artifact, so a comparison reading `record` passes here too. That is not the
+        security property — both are the verifier's own output — but the attribution is not available
+        from these fixtures.
         """
         for label, envelope_gen, verified_gen, expect_proceed in (
             ("verified matches, envelope does not", "g-forged", "g-wanted", True),
@@ -3532,13 +3649,30 @@ class TestTheApplyPathReadsTheVerifiedArtifact(unittest.TestCase):
                 self.reached.clear()
                 self.logged.clear()
                 hp.save_state(dict(hp._EMPTY_STATE))
-                envelope = self._Envelope({"generation": envelope_gen, "payload": "..."})
+                envelope = self._envelope(envelope_gen)
                 verified = {"generation": verified_gen, "payload": "..."}
                 hp.fetch_artifact = lambda: envelope
-                hp.verify_artifact_envelope = lambda _e, now=None: (
-                    verified, {"generation": verified_gen}, None, False,
-                )
+                # 🔑 The counts as the verifier hands back, so the assertion below is about what happened
+                # **after** it. The observer was asserted only on the refusal path before, and a review
+                # inserted `envelope.get("generation")` after a successful verification and watched both
+                # tests stay green: the supported access was unguarded on the path that proceeds.
+                at_return = {}
+
+                def verify(_e, now=None):
+                    at_return["touches"] = list(envelope.touches)
+                    at_return["uses"] = list(self.value_uses)
+                    return verified, {"generation": verified_gen}, None, False
+
+                hp.verify_artifact_envelope = verify
                 self._beat()
+                self.assertEqual(
+                    (envelope.touches, self.value_uses),
+                    (at_return["touches"], at_return["uses"]),
+                    "the envelope was consulted for its generation after the verifier had already "
+                    "returned one. Everything downstream is supposed to read the verifier's artifact; "
+                    f"the envelope gained {envelope.touches[len(at_return['touches']):]} and "
+                    f"{self.value_uses[len(at_return['uses']):]}.",
+                )
                 if expect_proceed:
                     self.assertIn(
                         "accept", self.reached,
