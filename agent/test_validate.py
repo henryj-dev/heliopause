@@ -4667,7 +4667,7 @@ class TestBackfillCurrentAuthorization(unittest.TestCase):
             "the adoption now agrees with the enforced ruleset, which would mean the hole is closed",
         )
 
-    def test_an_acceptance_leaves_a_confirm_something_to_promote(self):
+    def test_an_acceptance_leaves_something_for_confirm_to_promote(self):
         # ## What this used to assert, and why that was the same mistake one layer along
         #
         # The precondition for a wrong adoption is `state == "confirmed"` with no
