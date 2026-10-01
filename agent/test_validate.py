@@ -17,9 +17,11 @@ import json
 import os
 import pathlib
 import re
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -4245,14 +4247,15 @@ class TestBackfillCurrentAuthorization(unittest.TestCase):
             "in this class is comparing something the program never produces",
         )
 
-    def state(self, **over):
+    @classmethod
+    def state(cls, **over):
         # `pendingAuthorization` carries the same record, because that is the only shape a real host
         # has: `accept_artifact_authorization` writes both fields to the same value in the same
         # mutator and nothing else writes either. Leaving it `None` built a state the program cannot
         # produce — and worse, it hid what this function is: `confirm()`'s promotion line with
         # `confirm()`'s precondition reconstructed from state instead of witnessed.
-        return {**hp._EMPTY_STATE, "authorizationWatermark": self.REC,
-                "pendingAuthorization": self.REC,
+        return {**hp._EMPTY_STATE, "authorizationWatermark": cls.REC,
+                "pendingAuthorization": cls.REC,
                 "generation": "g-live", "state": "confirmed", **over}
 
     # Every value the agent ever writes into a `state` field, read out of the agent. Four shapes
@@ -4267,10 +4270,11 @@ class TestBackfillCurrentAuthorization(unittest.TestCase):
         r'"([a-z-]+)" if \w+ else',
     )
 
-    def state_vocabulary(self):
+    @classmethod
+    def state_vocabulary(cls):
         source = pathlib.Path(hp.__file__).read_text()
         found = set()
-        for pattern in self._STATE_PATTERNS:
+        for pattern in cls._STATE_PATTERNS:
             found |= set(re.findall(pattern, source))
         return found
 
@@ -4846,6 +4850,63 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
                 ]
         return None
 
+    # ## The boundary these tests must not cross, and how
+    #
+    # `recover_commitment` is a **real** recovery path: with `state: pending` and no `pendingBackup` it
+    # logs "removing our table" and calls `rollback()`, which reaches nftables
+    # (`heliopause-pull.py:2103`). A failed restore then arms a daemon retry timer (`:2244`). The first
+    # version of these tests called it unguarded, and a review measured it leaving an uncancelled timer
+    # and `_nft_rollback_owed = "g-live"` in module state.
+    #
+    # So the kernel boundary is stubbed and the module's recovery globals are reset and restored, the
+    # way `TestRollback` has done since it was written. `tearDown` asserts they came back, because a
+    # leak here does not fail this test — it fails a later one, somewhere else, for a reason that will
+    # read as unrelated.
+    _RECOVERY_GLOBALS = ("_timer", "_wl_timer", "_backup", "_nft_rollback_owed", "_wl_rollback_owed")
+
+    def _isolate_recovery(self):
+        self._saved_globals = {n: getattr(hp, n) for n in self._RECOVERY_GLOBALS}
+        if not hasattr(self, "_timers_seen"):
+            self._timers_seen = []
+        self._real_nft = hp._nft_apply_json
+        self._real_kubectl = hp.kubectl
+        # Inert failure on both boundaries: every kernel write and every cluster call is refused, so no
+        # recovery path can change this machine or any cluster it can see.
+        #
+        # 🔴 **The cluster half was missed once.** The first version stubbed only nftables, and a check
+        # of the module globals printed `The connection to the server localhost:8080 was refused` —
+        # `rollback_workload` shells out to kubectl (`heliopause-pull.py:788`). On this laptop that is a
+        # refused connection; on a host with a kubeconfig it is a **real attempt to delete policy
+        # objects**. One stub answers "is this machine safe", two answer "is any machine safe", and the
+        # second is the question.
+        self.nft_calls = []
+        self.kubectl_calls = []
+        hp._nft_apply_json = lambda doc: (self.nft_calls.append(doc), (1, "stubbed: no kernel here"))[1]
+        hp.kubectl = lambda args, stdin=None, timeout_sec=None: (
+            self.kubectl_calls.append(args), (1, "", "stubbed: no cluster here"))[1]
+        hp._timer = None
+        hp._wl_timer = None
+        hp._backup = hp._NO_BACKUP
+        hp._nft_rollback_owed = None
+        hp._wl_rollback_owed = None
+
+    def _restore_recovery(self):
+        # 🔴 **Cancel, then record — restoring alone is not enough.** Writing the saved `None` back over
+        # a live timer drops the reference without stopping the thread, and it fires later, after this
+        # class has put the real `kubectl` back. Measured: removing the `cancel()` below left the suite
+        # green, because the snapshot assertion saw `None` and was satisfied. So each timer this sweep
+        # armed is kept and checked for having actually stopped.
+        # @see test_no_recovery_path_can_write_the_confirmed_state's closing assertion
+        for name in ("_timer", "_wl_timer"):
+            live = getattr(hp, name)
+            if live is not None:
+                live.cancel()
+                self._timers_seen.append(live)
+        hp._nft_apply_json = self._real_nft
+        hp.kubectl = self._real_kubectl
+        for name, value in self._saved_globals.items():
+            setattr(hp, name, value)
+
     def test_main_adopts_the_authorization_before_it_starts_beating(self):
         """## What this replaces, and why reading `main()` could not do it
 
@@ -4858,37 +4919,46 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         check and the startup prelude is the whole of what runs. The assertion is on the state file
         afterwards: a host that confirmed under an older build has its authorization named.
         """
-        state = {
-            **hp._EMPTY_STATE,
-            "generation": "g-live", "state": "confirmed",
-            # The record fixture lives with the function it describes; this class borrows it rather
-            # than building a second one that could drift from the ten keys the agent writes.
-            "authorizationWatermark": dict(TestBackfillCurrentAuthorization.REC),
-        }
-        hp.save_state(state)
+        # The builder, not a hand-made dict: production writes `pendingAuthorization` and the watermark
+        # together, and the first version of this fixture left the former `None` — a combination the
+        # agent does not produce. Four fixtures in this file have already been found that way.
+        hp.save_state(TestBackfillCurrentAuthorization.state(currentAuthorization=None))
 
         real = (
             hp.load_artifact_trust, hp.monitor_loop, hp.post_heartbeat,
             hp.recover_commitment, hp.recover_workload_commitment,
-            hp.reconcile_recovered_commitments,
+            hp.reconcile_recovered_commitments, signal.signal,
         )
         reached: dict[str, int] = {}
 
-        def counted(name, fn=None):
-            def call(*a, **k):
+        def counted(name):
+            def call(*_a, **_k):
                 reached[name] = reached.get(name, 0) + 1
-                return None if fn is None else fn(*a, **k)
             return call
 
         hp.load_artifact_trust = lambda: {
             "managerKeyIds": ["sha256:" + "a" * 64], "breakGlassKeyIds": [], "trustDigest": "sha256:t",
         }
-        # A daemon thread that does nothing, so the test does not race a real monitor.
-        hp.monitor_loop = counted("monitor")
+        # 🔑 **The probe is on the last thing the prelude does.** It used to be on
+        # `recover_commitment`, and a review placed `return 0` immediately after that call and watched
+        # this test stay green — workload recovery, reconciliation and the monitor start all come after
+        # it. `monitor_loop` is the final step before the heartbeat loop, so reaching it is what "the
+        # prelude ran to the end" can mean here. The thread is joined below so nothing outlives the test.
+        monitor_started = threading.Event()
+
+        def monitor():
+            reached["monitor"] = reached.get("monitor", 0) + 1
+            monitor_started.set()
+
+        hp.monitor_loop = monitor
         hp.post_heartbeat = counted("heartbeat")
         hp.recover_commitment = counted("recover")
         hp.recover_workload_commitment = counted("recover_workload")
         hp.reconcile_recovered_commitments = counted("reconcile")
+        # Restored too: `main()` installs SIGTERM/SIGINT handlers that set `_stop`, and leaving them on
+        # a module-level event would let any later test's signal reach this file's state.
+        installed: list[int] = []
+        signal.signal = lambda sig, handler: installed.append(sig)
         # The required environment is read into module constants at import, so it is patched there.
         env = {
             "RELAY_URL": "https://relay.example/heartbeat", "CA_FILE": "/dev/null",
@@ -4903,11 +4973,12 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         hp._stop.set()
         try:
             code = hp.main()
+            monitor_started.wait(5)
         finally:
             (
                 hp.load_artifact_trust, hp.monitor_loop, hp.post_heartbeat,
                 hp.recover_commitment, hp.recover_workload_commitment,
-                hp.reconcile_recovered_commitments,
+                hp.reconcile_recovered_commitments, signal.signal,
             ) = real
             for k, v in saved_env.items():
                 setattr(hp, k, v)
@@ -4915,17 +4986,16 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
                 hp._stop.clear()
 
         self.assertEqual(code, 0, "main() refused to start, so nothing below was exercised")
-        # 🔑 The probe that makes the rest mean something: the prelude ran to the end. Without this a
-        # `return 2` anywhere above would satisfy the state assertion only by leaving it untouched.
         self.assertEqual(
-            reached.get("recover"), 1,
-            "the startup prelude did not reach the recovery calls, so this test did not get far enough "
-            "to say anything about the adoption",
+            reached.get("monitor"), 1,
+            "the startup prelude did not reach its last step, so this test cannot say the adoption "
+            "happened during a startup that completed — a return anywhere above would look the same",
         )
         self.assertEqual(
             hp.load_state()["currentAuthorization"], TestBackfillCurrentAuthorization.REC,
             "main() did not adopt the authorization already in force — every host keeps None",
         )
+        self.assertEqual(installed, [signal.SIGTERM, signal.SIGINT], "the signal handlers moved")
 
     def test_no_recovery_path_can_write_the_confirmed_state(self):
         """## The invariant the ordering was standing in for
@@ -4934,44 +5004,103 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         and reads settled state, and **if a recovery path ever produces `confirmed`, the call has to
         move below it.** That is the thing to check, and reading `main()`'s call order never checked it.
 
-        Each recovery path is driven from the states it acts on, and none of them may write `confirmed`.
-        A path that did would make the adoption read a state that is about to be invalidated.
+        ## Why a sweep over state labels was not enough
+
+        The first version set `state` and `workloadState` to the same value and left
+        `workloadRollbackAt` and `workloadApplied` empty. Workload recovery then returns at its first
+        branch (`heliopause-pull.py:3433`) and reconciliation's second branch is unreachable, because it
+        needs a **failed workload** beside a **live host**. A review inserted `state = "confirmed"` at
+        both places and this test passed: the labels were swept, the paths were not.
+
+        So each path gets the state it actually acts on, built from the agent's own vocabulary.
         """
-        vocabulary = sorted(hp._STATES) if hasattr(hp, "_STATES") else [
-            "prepared", "pending", "confirmed", "rolled-back",
-            "rollback-failed", "rollback-incident", "unsupported", "none",
-        ]
-        paths = (
-            ("recover_commitment", hp.recover_commitment),
-            ("recover_workload_commitment", hp.recover_workload_commitment),
-            ("reconcile_recovered_commitments", hp.reconcile_recovered_commitments),
-        )
-        for name, fn in paths:
-            for state in vocabulary:
-                if state == "confirmed":
-                    continue  # Already there; this asks whether a path can *reach* it.
-                hp.save_state({
-                    **hp._EMPTY_STATE,
-                    "generation": "g-live", "state": state,
-                    "workloadState": state, "workloadGeneration": "g-live",
-                })
+        states = TestBackfillCurrentAuthorization.state_vocabulary()
+        self.assertIn("confirmed", states, "the vocabulary regexes stopped matching")
+        self.assertGreaterEqual(len(states), 8, f"vocabulary shrank to {sorted(states)}")
+        live = sorted({"prepared", "pending", "rollback-failed"} & states)
+        failed = sorted({"rolled-back", "rollback-failed", "rollback-incident"} & states)
+        self.assertTrue(live and failed, "the live/failed partitions are empty — vocabulary changed")
+
+        deadline = time.time() + 300
+        cases = []
+        # `recover_commitment`: entered on a live host half. Both with a recorded backup and without,
+        # because the without case is the one that reaches for the kernel.
+        for state in live:
+            cases.append(("recover_commitment", hp.recover_commitment, {
+                "state": state, "pendingBackup": {"elements": []}, "rollbackAt": deadline,
+            }))
+            cases.append(("recover_commitment (no backup)", hp.recover_commitment, {
+                "state": state, "pendingBackup": None, "rollbackAt": deadline,
+            }))
+        # `recover_workload_commitment`: needs a deadline **and** applied objects, which is what the
+        # first version was missing.
+        for wl in live:
+            cases.append(("recover_workload_commitment", hp.recover_workload_commitment, {
+                "state": "pending", "workloadState": wl, "workloadRollbackAt": deadline,
+                "workloadApplied": [{"ref": "util/hp-dev-p700"}], "workloadGeneration": "g-live",
+            }))
+        # `reconcile_recovered_commitments`: both branches, which need the halves to **differ**.
+        for host, wl in ((failed[0], "confirmed"),):
+            cases.append(("reconcile_recovered_commitments", hp.reconcile_recovered_commitments, {
+                "state": host, "workloadState": wl, "workloadGeneration": "g-live",
+                "workloadApplied": [{"ref": "util/hp-dev-p700"}], "workloadRollbackAt": deadline,
+            }))
+        for host in live:
+            cases.append(("reconcile_recovered_commitments (host live)",
+                          hp.reconcile_recovered_commitments, {
+                "state": host, "workloadState": failed[0], "workloadGeneration": "g-live",
+                "workloadApplied": [{"ref": "util/hp-dev-p700"}], "workloadRollbackAt": deadline,
+            }))
+
+        for name, fn, over in cases:
+            with self.subTest(path=name, state=over.get("state"), workload=over.get("workloadState")):
+                self.assertNotEqual(
+                    over.get("state"), "confirmed",
+                    "this case starts where the assertion below forbids, so it cannot tell whether the "
+                    "path got there — give it a host state the path would have to change",
+                )
+                self._isolate_recovery()
                 try:
+                    hp.save_state({**hp._EMPTY_STATE, "generation": "g-live", **over})
+                    # Not wrapped in a bare `except`. A path that raises on a state it is supposed to
+                    # handle is a finding, and swallowing it hid both that and a broken fixture.
                     fn()
-                except Exception:  # noqa: BLE001 — a path refusing this fixture is not the subject
-                    pass
-                settled = hp.load_state()
+                    settled = hp.load_state()
+                finally:
+                    self._restore_recovery()
                 self.assertNotEqual(
                     settled.get("state"), "confirmed",
-                    f"{name}() moved a host from {state!r} to 'confirmed' — the backfill runs before it "
-                    "and would adopt a watermark against a state about to change. Move the call below "
-                    "the recovery paths, which is what the comment at the call site says to do.",
+                    f"{name} moved a host from {over.get('state')!r} to 'confirmed'. The backfill runs "
+                    "before it and would adopt a watermark against a state about to change — move the "
+                    "call below the recovery paths, which is what the comment at the call site says.",
                 )
+
+        # Nothing was left armed, and the module is back where it started. Two assertions because they
+        # are two facts: a live timer is the hazard, and "it equals what was saved" is what restoration
+        # means. Comparing only against `None` would also pass if the module had never been touched.
+        self.assertIsNone(hp._timer, "a host rollback timer outlived the sweep")
+        self.assertIsNone(hp._wl_timer, "a workload rollback timer outlived the sweep")
+        # The sweep does arm timers — `recover_workload_commitment` arms one from these fixtures — so
+        # this is not a vacuous check, and a `cancel()` that stopped happening makes it red.
+        self.assertTrue(self._timers_seen, "no timer was armed, so this check proved nothing")
+        for armed in self._timers_seen:
+            armed.join(2)
+            self.assertFalse(
+                armed.is_alive(),
+                f"{armed!r} is still waiting to fire. Restoring the saved value over it only dropped "
+                "the reference; the thread would have called a rollback after this class put the real "
+                "kubectl back.",
+            )
+        self.assertEqual(
+            {n: getattr(hp, n) for n in self._RECOVERY_GLOBALS}, self._saved_globals,
+            "the sweep did not put the recovery globals back — a leak here does not fail this test, it "
+            "fails a later one for a reason that will read as unrelated",
+        )
 
     def test_the_backfill_still_precedes_the_recovery_paths(self):
         # A tripwire, and named as one. The position is **not** the invariant — the test above is — but
         # a position that moves is worth a cheap signal, because moving it is how someone would discover
-        # the invariant rather than check it. Reading the call order is all this does; the behaviour is
-        # covered above.
+        # the invariant rather than check it. Reading the call order is all this does.
         calls = self._main_calls()
         self.assertIsNotNone(calls, "main() is not a plain function any more — this tripwire is blind")
         self.assertLess(
