@@ -61,6 +61,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * cell that saves as `undefined` — a hole the renderer then refuses at a distance from the edit. A
  * document this function rejects falls back to the textarea, which is the only honest thing to offer
  * for a file the table would mangle.
+ *
+ * ⚠️ **`reason` is produced and currently not displayed.** `PolicyWrite.svelte` branches on whether
+ * the parse succeeded and shows the textarea when it did not; it does not paint the string. So a
+ * reader gets "this file is text today" without being told why, which is worse than it sounds —
+ * the two causes a person would act on differently (malformed JSON vs. a row the table cannot edit)
+ * look identical. The field is kept because it is the right thing to show and showing it is a UI
+ * change rather than a rename.
  */
 export function readDeviceDoc(content: string): DeviceDocRead {
   let raw: unknown;

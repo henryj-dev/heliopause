@@ -54,11 +54,25 @@ describe("the device registry the table edits", () => {
     assert.equal(back.devices[0].retiredAt, "2026-01-01T00:00:00Z", "a row-level key vanished");
   });
 
-  it("round-trips byte-for-byte when nothing is edited", () => {
+  it("round-trips byte-for-byte when the file is already in the canonical format", () => {
+    // The qualifier is the whole of it. `writeDeviceDoc` emits two-space JSON with a trailing
+    // newline, so a file already in that shape survives untouched — which is the case that matters,
+    // because that is what this tool writes and therefore what the repository holds.
+    //
+    // A compact or differently-indented file does **not** round-trip: opening and saving it reformats
+    // the whole document even with no edit, and the diff then shows every line. That is a real effect
+    // and it is not a defect — a formatter that preserved the input's spacing would have to model it,
+    // and the repository has one format. The earlier name for this test omitted the qualifier and so
+    // claimed something broader than it checks.
     const source = `${JSON.stringify({ schemaVersion: 1, devices: [ROW] }, null, 2)}\n`;
     const read = readDeviceDoc(source);
     assert.ok(read.ok);
-    assert.equal(writeDeviceDoc(read.doc), source, "an untouched file must produce no diff");
+    assert.equal(writeDeviceDoc(read.doc), source, "an untouched canonical file must produce no diff");
+
+    const compact = JSON.stringify({ schemaVersion: 1, devices: [ROW] });
+    const readCompact = readDeviceDoc(compact);
+    assert.ok(readCompact.ok);
+    assert.notEqual(writeDeviceDoc(readCompact.doc), compact, "reformatting is expected, and is why the name says canonical");
   });
 
   it("falls back rather than painting a document it cannot show", () => {

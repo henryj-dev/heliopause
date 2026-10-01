@@ -151,6 +151,48 @@ forks, caches, or backups, and neither would a rewrite. The addresses in it are 
 hosts, and that is a fact about the past which no future scan changes. It is the reason `docs/` and
 `policy/` are untracked rather than sanitized — see the split in CONTRIBUTING.
 
+### 2026-09-30 — 두 결정, 그리고 게이트가 보지 않는 곳
+
+이 두 항목은 과제가 아니라 **기록**이다. 아래 둘은 검토되었고 수용되었다.
+
+#### 커밋 메시지는 스캔되지 않는다 — 한 건 수용
+
+`c8f1713` 의 커밋 메시지에 실제 mgmt 주소 하나(IPv6)와 그 기기의 v4·이름이 있다. 파일에서 그
+값들을 **지우는** 커밋이었고, 무엇을 지웠는지 설명하려고 메시지에 인용했다.
+
+`scripts/scan-public-history.mjs` 는 **blob 만 읽는다.** `git cat-file blob` 으로 트리의 내용을
+보고, 커밋 메시지는 대상이 아니다. 그래서 이 경로는 게이트가 통과시킨 것이 아니라 **보지 않은**
+것이고, 게이트를 고쳐서 막을 수 있는 종류가 아니다 — 메시지를 스캔하려면 그 자체가 다른 도구다.
+
+같은 실수의 앞 판(`ab4ee35`)은 force push 로 브랜치에서 떨어졌지만 **GitHub API 로는 여전히
+조회된다.** dangling object 는 서버 쪽 GC 전까지 URL 로 남고, 이력 재작성으로는 지워지지 않는다.
+
+**이번 건은 수용한다(2026-09-30).** 재등록도, GC 요청도, 이력 재작성도 하지 않는다. 근거는
+비용과 값의 비교다 — 재작성은 `main` ruleset 의 `non_fast_forward` 해제와 열린 브랜치들의
+rebase 를 요구하는데, 그러고도 더 접근하기 쉬운 쪽(`ab4ee35` 의 URL)은 남는다. 노출된 값은
+인증 수단이 아니고 WARP 인증 없이는 도달성을 주지 않으며, 재등록되면 바뀐다.
+
+**다음에 같은 일이 생기면 그때 고친다.** 이 문단은 그 판단이 한 번 내려졌다는 기록이지,
+앞으로도 같은 답이라는 뜻이 아니다. 특히 값이 인증 수단이거나 재등록으로 무효화되지 않는
+종류라면 위 두 경로가 다시 후보다.
+
+**그래서 남는 규칙 하나.** 사이트 값을 지우는 커밋은 **그 값을 메시지에 적지 않는다.** 무엇이
+바뀌었는지는 diff 가 말한다.
+
+#### `dispatch`·`heliopause`·`node-enroll` 은 공개 가능한 이름이다
+
+이 세 호스트네임이 `src/manager-server.ts`·`src/manager-server.test.ts`·
+`packaging/systemd/README.md` 에 있다. 누출 패턴(`HELIOPAUSE_SITE_HOSTNAME_PATTERN`)에 넣으면
+그 게이트가 **영구히 빨개진다** — 트리에 이미 있기 때문이다.
+
+**공개 가능한 이름으로 둔다(2026-09-30).** 셋 다 이 소프트웨어가 무엇을 하는지 설명하는 데
+쓰이는 이름이고, 그 이름을 아는 것으로 도달할 수 있는 것은 없다. 패턴은 트리에 없는 이름을
+위한 것이고, 트리에 있는 이름을 넣으면 보호는 0이면서 검사만 죽는다 — 그 조합은 「항상 빨간
+검사」를 만들고, 항상 빨간 검사는 읽히지 않는다.
+
+이것이 위 문단의 「disclosed to everyone who could read the former remote」와 다른 점은 **의도**다.
+저쪽은 사고였고 이것은 결정이다.
+
 ### If a mirror is ever created, or this is ever re-bootstrapped
 
 The same two routes apply, in the same order, and both require repository-owner coordination —

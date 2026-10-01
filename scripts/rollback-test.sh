@@ -38,9 +38,15 @@ WORK="$(mktemp -d)"
 # against a fixed number that two concurrent runs collide on *every* time, is the whole of the
 # improvement being claimed here. It is not zero.
 #
-# The draw asks for 127.0.0.1 and the relay then binds 0.0.0.0. That is the conservative direction
-# and not an oversight: a wildcard bind conflicts with a loopback bind on the same port, so a port
-# the kernel will hand out on 127.0.0.1 is one nothing holds on 0.0.0.0 either.
+# The draw asks for 127.0.0.1 and the relay then binds 0.0.0.0. That is deliberate but it is **not** a
+# guarantee, and this comment used to claim one: it said a port free on loopback is free on the
+# wildcard too. It does not follow. `bind(0.0.0.0:p)` fails when anything holds `p` on any address,
+# and `bind(127.0.0.1:p)` only proves loopback was free — a listener on one external interface is
+# invisible to the draw and takes the relay's bind down. The window between closing the drawn socket
+# and the relay opening it is open the same way.
+#
+# What the draw does buy is the thing named above: two concurrent runs of this script no longer
+# collide *every* time. That is the claim, and it is smaller than "a free port".
 #
 # Set HELIOPAUSE_ROLLBACK_PORT to pin it.
 free_port() {
