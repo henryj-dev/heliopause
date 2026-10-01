@@ -167,6 +167,69 @@ export const ENV_BOUNDS = {
   HELIOPAUSE_PUBLISH_TIMEOUT_MS: { min: 1_000, max: 600_000, fallback: 30_000 },
   HELIOPAUSE_PLAN_TTL_SEC: { min: 60, max: 86_400, fallback: 600 },
   HELIOPAUSE_MAX_PENDING_PLANS: { min: 1, max: 1024, fallback: 32 },
+
+  /**
+   * How long one policy module gets to import before the renderer gives up on it at startup.
+   *
+   * It bounds a module that **never settles**, not a slow one: unbounded, the verification loop's
+   * own `await` never returns, `server.listen` is never reached, and the process answers nothing at
+   * all — not even `/healthz`.
+   *
+   * 🔴 **It lives here because its first version did not, and that was a hole.** Read as
+   * `Number(raw)` with a `isFinite && > 0` guard, `2147483648` passed — and `setTimeout` clamps
+   * anything past 2³¹−1 to **one millisecond**, so the largest-looking value became the smallest
+   * possible budget while the error text still quoted the number the operator typed. Worse, it is
+   * invisible in a smoke test: a healthy synchronous module blocks the loop, so the 1 ms timer
+   * cannot fire and every site still verifies. It bites only on a module that does async work at
+   * import, which is the module the bound is for.
+   *
+   * The `max` is what makes that unrepresentable, and it is the half that matters here.
+   *
+   * ⚠️ **The table's other benefit does not apply to this name, and saying so is the point.**
+   * `env-spec.test.ts` cross-checks these names against five files — two scripts and three
+   * `*.env.example` — and the renderer has none: it is a Deployment, and its environment lives in
+   * manifests outside this repository. So the scan finds nothing for this variable and will keep
+   * finding nothing. Putting it in `manager.env.example` to give the net something to catch would
+   * be worse than the gap, because the manager does not read it. What this entry buys is the bound
+   * and the shared refusal vocabulary, not coverage.
+   *
+   * ## Why 60s and not a round 120s
+   *
+   * The ceiling is a second outage budget, not just a sanity limit. While the renderer is still
+   * verifying, `server.listen` has not run, so **nothing answers — `/healthz` included**, and the
+   * probe watching it is 30s × 3 (cited from the deployment manifests, which this repository cannot
+   * check). A single site allowed 120s is therefore 120s dark against a 90s deadline: the same
+   * crashloop the parallel verification was introduced to remove, re-reachable by one site instead
+   * of three. `120_000` was the first value here: it did make the 1 ms clamp unrepresentable, which is
+   * all the sentence above claims, and it left the **dark window past the liveness deadline**
+   * representable, which is a second thing a ceiling here has to rule out. Two jobs, one number; the
+   * first value only did the first. 60s keeps headroom under the deadline and is still far longer than
+   * any cold import measured.
+   */
+  HELIOPAUSE_POLICY_STARTUP_BUDGET_MS: { min: 100, max: 60_000, fallback: 30_000 },
+
+  /**
+   * How long one policy module gets on the **request** path before `/source` answers 503.
+   *
+   * 🔴 **It exists because the relationship it needs cannot be expressed as a constant.** `/source`'s
+   * 503 carries the sentence the console shows in place of an empty page, and that sentence only
+   * reaches anyone if this side gives up before its caller does. The caller is the manager, whose
+   * clock is `HELIOPAUSE_RELAY_TIMEOUT_MS` — **in the manager's own environment**, which this process
+   * cannot read. Deriving from that variable's `fallback` looked like a coupling and is not one: an
+   * operator who sets the manager to 2000 gets a renderer still budgeting 4000, which is the defect
+   * the derivation was written to remove, reachable again. Measured: client abort at 2007ms with the
+   * renderer logging its own timeout at 4000ms, to a socket nobody was reading.
+   *
+   * So the honest shape is a knob with a default that matches the common case, and an operator who
+   * moves one moves both. The real fix is for the caller to send its deadline and for this side to
+   * budget against what it was told — a header, backward compatible the way `?site=` is — and that is
+   * a change to two services, deliberately not smuggled in here.
+   *
+   * The default is 80% of `HELIOPAUSE_RELAY_TIMEOUT_MS`'s own default, which is where the margin
+   * comes from: measured 4040ms against a 5000ms client, ~960ms of slack, with the synchronous `git`
+   * calls inside the budget window rather than before it.
+   */
+  HELIOPAUSE_POLICY_SOURCE_BUDGET_MS: { min: 100, max: 60_000, fallback: 4_000 },
 } as const satisfies Record<string, NumberBounds>;
 
 export type BoundedEnvName = keyof typeof ENV_BOUNDS;

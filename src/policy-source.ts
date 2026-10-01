@@ -21,10 +21,16 @@
  *
  * ## What makes that safe rather than merely rearranged
  *
- * Everything in `PolicySource` is JSON. Measured before this file was written: `buildScreen` over the
- * live `dev.ts` produces a **byte-identical** `Screen` before and after `JSON.parse(JSON.stringify())`
- * of the site, and the site has exactly one function-valued field (`resolveService`), which is
- * carried here as a lookup table instead. There is no serialisation gap to paper over.
+ * Everything in `PolicySource` is JSON — because every field is put through the crossing, which is a
+ * property of the code below and not of the shapes a module happens to produce. Measured before this
+ * file was written: `buildScreen` over the live `dev.ts` produces a **byte-identical** `Screen` before
+ * and after `JSON.parse(JSON.stringify())` of the site, and the site has exactly one function-valued
+ * field (`resolveService`), which is carried here as a lookup table instead.
+ *
+ * ⚠️ That table was the exception until round eleven, and the sentence above was false for it: the
+ * resolver's return value was stored as it came back, so a circular object or a `BigInt` from
+ * `resolveService` passed startup verification and threw in the renderer's serialiser on the first
+ * request — an outage, from the one field this paragraph named as handled.
  *
  * The manager then treats this payload the way it treats any request body: untrusted input to
  * validate, not a module to trust. `parsePolicySource` is that check, and the escaping in
@@ -39,6 +45,14 @@ import type { Probe } from "./coverage.ts";
 import { buildId } from "./build-id.ts";
 import { generationLabel, policyCommits, policyHead, readCoverageProbes } from "./policy-screen.ts";
 import type { RepoFacts, ScreenSite } from "./policy-screen.ts";
+
+// Captured before anything a policy module could replace — see the block at the `toWire` call.
+// The **functions**, detached. Writing the body as `JSON.parse(JSON.stringify(v))` would capture
+// nothing: an arrow body resolves `JSON` when it runs, which is after the module has been imported.
+// Neither of these reads `this`.
+const parseJson = JSON.parse;
+const writeJson = JSON.stringify;
+const toWire = <T>(value: T): unknown => parseJson(writeJson(value)) as unknown;
 
 /** Bumped when a field changes meaning. A mismatch is refused rather than guessed at. */
 export const POLICY_SOURCE_SCHEMA = 1;
@@ -312,7 +326,15 @@ export function collectPolicySource(input: {
       const hit = resolver(ref);
       // Only non-null entries travel — see `PolicySource.services` for why the absence has to stay
       // an absence rather than becoming a `null` the far side reads as an answer.
-      if (hit) services[ref] = hit;
+      //
+      // ⚠️ `toWire`, like `site` below, and for the reason given there. This stored `hit` as it came
+      // back, so a resolver returning a circular object or a `BigInt` passed startup verification
+      // and then threw in the renderer's serialiser — on the **first request**, in the request
+      // handler, which is an uncaught exception and a full outage for every co-served site. Both
+      // measured here, and confirmed in the running image by the cluster's operator, who found the
+      // same `services[ref] = hit` beside a `site` that does cross. Crossing here means the mistake is a 503
+      // for the one site whose module made it, because this function runs inside that site's `try`.
+      if (hit) services[ref] = toWire(hit) as ServiceSelector;
     }
   }
 
@@ -332,7 +354,20 @@ export function collectPolicySource(input: {
   // `JSON.parse(JSON.stringify())` rather than a spread: it is the wire, applied here, so a field
   // that cannot survive the crossing fails in the process that owns the mistake instead of arriving
   // as a silently missing table three seconds later in the manager's log.
-  const wire = JSON.parse(JSON.stringify({ ...site, resolveService: undefined })) as ScreenSite;
+  //
+  // ⚠️ `toWire`, not `JSON`. `site` came from a module the renderer evaluated with `import()`, which
+  // runs it in the renderer's **own realm** — so `globalThis.JSON = { stringify() { throw 1; } }` is
+  // two tokens in a policy commit, and this line runs for **every** site. Measured: one hostile module
+  // made a different, correct site answer 503 after the renderer had already captured its own `JSON`,
+  // because the crossing is here. Captured at module load, which is before the renderer's first
+  // dynamic import.
+  //
+  // This is a patch on a measured path, not a boundary. Every module the renderer imports resolves its
+  // intrinsics at call time, so the general claim "a policy module cannot reach another site" is not
+  // true and must not be written down. The boundary would be evaluating policy in a separate realm.
+  //
+  // @see src/policy-render-service.test.ts "survives a module that replaces the globals it will be described with"
+  const wire = toWire({ ...site, resolveService: undefined }) as ScreenSite;
 
   const head = policyHead(sitePath);
   // A checkout with a `.git` and no answer from git is a different state from no checkout, and the
