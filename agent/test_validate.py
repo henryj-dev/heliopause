@@ -4880,7 +4880,7 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
     # Hand-written lists do not claim what they cannot deliver. What holds them honest is below: each
     # stub has an assertion that a case reached it, so a stub nothing drives is a line that fails rather
     # than a line that reassures.
-    _STUBBED_BOUNDARIES = ("_nft_apply_json", "kubectl", "_ip_route")
+    _STUBBED_BOUNDARIES = ("_nft_apply_json", "kubectl", "_ip_route", "_delete_workload_object")
     _RECOVERY_GLOBALS = (
         "_timer", "_wl_timer", "_backup", "_nft_rollback_owed", "_wl_rollback_owed", "_route_restore",
     )
@@ -4890,7 +4890,19 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
     # reaches `_restore_routes`: that branch rolls back and returns before `:2113` overwrites the global.
     _ROUTE_SENTINEL = [{"spec": {"dst": "203.0.113.0/24"}, "before": None}]
 
-    def _isolate_recovery(self, succeed=False):
+    # The namespaced object every workload case is about, borrowed from the module's `cnp()` builder so a
+    # second copy cannot drift from what the ownership check reads. `uid` and `resourceVersion` are added
+    # because the builder does not carry them and the restore loop requires both (`:3081`, `:3085`).
+    UID = "11111111-2222-3333-4444-555555555555"
+    REF = "util/hp-dev-p700"
+
+    @classmethod
+    def owned_object(cls, **meta):
+        obj = cnp()
+        obj["metadata"].update({"uid": cls.UID, "resourceVersion": "4242", **meta})
+        return obj
+
+    def _isolate_recovery(self, succeed=False, cluster_answer="absent"):
         """Stub the three boundaries and pin the globals. `succeed` makes the boundaries report success.
 
         Both outcomes are needed. With every boundary failing, `rollback` takes its retry tail and its
@@ -4899,29 +4911,51 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         """
         self._saved_globals = {n: getattr(hp, n) for n in self._RECOVERY_GLOBALS}
         self._saved_boundaries = {n: getattr(hp, n) for n in self._STUBBED_BOUNDARIES}
-        for name in ("nft_calls", "kubectl_calls", "route_calls", "states_written", "_timers_seen"):
+        for name in ("nft_calls", "kubectl_calls", "route_calls", "delete_calls", "replace_calls",
+                     "states_written", "_timers_seen"):
             if not hasattr(self, name):
                 setattr(self, name, [])
         rc = 0 if succeed else 1
         hp._nft_apply_json = lambda doc: (self.nft_calls.append(doc), (rc, "stubbed: no kernel here"))[1]
-        # ## Why success is `NotFound` here rather than `rc=0` with an empty body
+        # ## What the cluster boundary answers, and why there are two answers
         #
-        # `rc=0, ""` is not a success kubectl can produce: `_read_workload_object` parses stdout as JSON
-        # (`heliopause-pull.py:2597`), so an empty body is an unparseable read, it goes on the retryable
-        # list, and `_restore_workload_objects` returns false before any restore or settlement runs. The
-        # first version of this stub did exactly that, and a review measured the workload settlement
-        # branch reached **zero** times while `rollback_workload` was entered eighteen.
+        # `rc=0` with an empty body is not a success kubectl can produce: `_read_workload_object` parses
+        # stdout as JSON (`heliopause-pull.py:2597`), so an empty body is an unparseable read, the object
+        # joins the retryable list, and `rollback_workload` returns before any restore or settlement. The
+        # first version of this stub answered exactly that, and a review measured the workload settlement
+        # reached **zero** times while `rollback_workload` was entered eighteen.
         #
-        # An object that is already gone is what a restart recovery actually finds when the previous
-        # process removed it: `rc != 0` with `not found` in stderr, which `:2593` reads as `missing` and
-        # skips cleanly, leaving nothing retryable. `rc=0` with a real object instead would need the
-        # ownership fields and a `cluster` in the rollback record, and these fixtures carry neither — a
-        # different test's subject.
-        # @see the workload-settlement assertion at the end of this test
-        wl_ok = (1, "", 'Error from server (NotFound): ciliumnetworkpolicies.cilium.io "x" not found')
-        hp.kubectl = lambda args, stdin=None, timeout_sec=None: (
-            self.kubectl_calls.append(args),
-            wl_ok if succeed else (1, "", "stubbed: no cluster here"))[1]
+        # ⚠️ Replacing it with `not found` fixed the settlement and then **stood in for the whole success
+        # path**. An absent object skips cleanly at `:2593`, so the sweep settled nine times while the
+        # ownership check, the delete at `:3088` and the replace at `:3101` ran **zero** times — a review
+        # wrote `confirmed` into both and watched this test stay green. "The success tail runs" was true
+        # of the cheapest success there is.
+        #
+        # So `cluster_answer` picks which the case is about:
+        # · "absent" — `rc != 0` with `not found`, what a restart finds when the previous process already
+        #   removed the object.
+        # · "owned" — a real object this agent owns, which is the only way past `_owned_object_error`
+        #   (`:2605`) to the delete and replace branches. Built from the module's own `cnp()` rather than
+        #   a second copy, plus the `uid` and `resourceVersion` the loop reads.
+        # @see the delete/replace assertions at the end of this test
+        absent = (1, "", 'Error from server (NotFound): ciliumnetworkpolicies.cilium.io "x" not found')
+        owned = json.dumps(self.owned_object())
+
+        def cluster(args, stdin=None, timeout_sec=None):
+            self.kubectl_calls.append(args)
+            if "get" in args:
+                return absent if cluster_answer == "absent" else (0, owned, "")
+            if "replace" in args:
+                self.replace_calls.append(stdin)
+            # `replace` and anything else: the boundary's own outcome.
+            return (0, owned, "") if succeed else (1, "", "stubbed: no cluster here")
+
+        hp.kubectl = cluster
+        # Stubbed in its own right: it does not go through `kubectl`, it launches a proxy with
+        # `subprocess.Popen` (`:2916`) and talks to it over a Unix socket (`:2881`).
+        hp._delete_workload_object = lambda ref, uid, rv, deadline=None: (
+            self.delete_calls.append((ref, uid)),
+            (True, "stubbed: deleted") if succeed else (False, "stubbed: delete refused"))[1]
         hp._ip_route = lambda args: (self.route_calls.append(args), (rc, "stubbed: no routes here"))[1]
         # 🔑 Every durable write, not the state the file happens to end on. `_save_state_unlocked` is the
         # one place both `save_state` and `update_state` commit through, so recording there sees each
@@ -5082,7 +5116,9 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         self.assertGreaterEqual(len(states), 8, f"vocabulary shrank to {sorted(states)}")
         live = sorted({"prepared", "pending", "rollback-failed"} & states)
         failed = sorted({"rolled-back", "rollback-failed", "rollback-incident"} & states)
-        self.assertTrue(live and failed, "the live/failed partitions are empty — vocabulary changed")
+        # No separate guard on the partitions being non-empty: an empty `live` already fails the outcome
+        # assertions and an empty `failed` raises at `failed[0]`, so a diagnostic here caught nothing the
+        # test did not already catch. Deleted rather than kept as reassurance.
 
         # Captured here rather than read out of `_RECOVERY_GLOBALS`: the closing comparison builds both
         # of its sides from that tuple, so a name deleted from it is deleted from the expectation too and
@@ -5093,10 +5129,9 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         EXPIRED = time.time() - 300
         # Writes made by the paths, with each case's own fixture save left out. The outcome assertions at
         # the end read this and never `states_written`, which the fixtures are in.
-        recovery_writes = []
         # Changes a path made, as `(before, after)`. The outcome assertions read these rather than the
         # written values, because a write records the document's whole `state` field whether the path
-        # changed it or not — and the fixtures start at the very values being looked for.
+        # changed it or not — and some fixtures start at the very values being looked for.
         host_transitions = []
         workload_transitions = []
         cases = []
@@ -5134,6 +5169,32 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
                             "workloadGeneration": "g-live",
                         },
                     })
+            # ## The two branches an absent object never reaches
+            #
+            # `previous is None` is a delete (`heliopause-pull.py:3088`); a `previous` that differs from
+            # what is in the cluster is a replace (`:3101`). Both need an object the ownership check
+            # accepts, so these cases answer "owned" at the cluster boundary. The replacement snapshot
+            # changes the description, because an identical one is short-circuited as already safe
+            # (`:3065`) and would never reach the replace.
+            #
+            # `workloadGeneration` is `g1` here, not `g-live`: `_owned_object_error` refuses an object
+            # whose generation annotation is not the rollback's generation, and `cnp()` annotates `g1`.
+            previous = self.owned_object()
+            previous["spec"] = {**previous["spec"], "description": "an earlier revision"}
+            for label, prior in (("delete", None), ("replace", previous)):
+                cases.append({
+                    "name": f"recover_workload_commitment (owned object, {label}, "
+                            f"{'succeeds' if succeed else 'fails'})",
+                    "fn": hp.recover_workload_commitment, "succeed": succeed,
+                    "cluster_answer": "owned",
+                    "over": {
+                        "state": "pending", "workloadState": "pending",
+                        "workloadRollbackAt": EXPIRED, "workloadGeneration": "g1",
+                        "workloadApplied": [{
+                            "ref": self.REF, "cluster": "dev", "uid": self.UID, "previous": prior,
+                        }],
+                    },
+                })
             # Reconciliation's two branches need the halves to **differ**: a failed host beside a live
             # workload, and a failed workload beside a live host.
             pairs = [(failed[0], "confirmed")] + [(host, failed[0]) for host in live]
@@ -5155,7 +5216,9 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
                     "this case starts where the assertion below forbids, so it cannot tell whether the "
                     "path got there — give it a host state the path would have to change",
                 )
-                self._isolate_recovery(succeed=case["succeed"])
+                self._isolate_recovery(
+                    succeed=case["succeed"], cluster_answer=case.get("cluster_answer", "absent"),
+                )
                 written_before = len(self.states_written)
                 try:
                     hp.save_state({**hp._EMPTY_STATE, "generation": "g-live", **case["over"]})
@@ -5176,7 +5239,6 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
                 # own fixture; everything after it came from the path. `by_recovery` is what the
                 # assertions below use, never `states_written`, for the reason in the next comment.
                 by_recovery = during[1:]
-                recovery_writes.extend(by_recovery)
                 # ## 🔴 A written value is not a produced value
                 #
                 # The recorder captures the whole document's `state` at each commit, so a path that
@@ -5209,15 +5271,14 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         # every test still green, and three such lines have already been found in this file.
         # ## Both boundary outcomes ran — counted from recovery writes only
         #
-        # ⚠️ **This asserted against `states_written` once, and the fixtures satisfied it.** Forty-four
-        # cases *start* at `rollback-failed`, each fixture save records that, and so "both outcomes
-        # appeared" held even with every boundary succeeding: measured, `for succeed in (True,)` stayed
-        # green. The same test sliced the fixture write off for the `confirmed` check one line above and
-        # not here — the trap avoided in one assertion and walked into in the next.
+        # ⚠️ **This asserted against `states_written` once, and the fixtures satisfied it.** Twelve of the
+        # host fixtures *start* at `rollback-failed`, each fixture save records that, and so "both
+        # outcomes appeared" held even with every boundary succeeding: measured, `for succeed in (True,)`
+        # stayed green. Excluding the fixture save was not enough either — the recorder captures the whole
+        # document's `state`, so any write by a path brought the same value back.
         #
-        # `recovery_writes` excludes each case's own fixture save, so these two states can only come from
-        # a path. `rolled-back` needs the restore to report success and `rollback-failed` needs it to
-        # fail, which is what makes the pair say both halves of the sweep ran.
+        # Transitions are what a path can produce: `rolled-back` needs the restore to report success and
+        # `rollback-failed` needs it to fail, so requiring both says the sweep ran both halves.
         produced = [after for _before, after in host_transitions]
         for expected in ("rolled-back", "rollback-failed"):
             self.assertIn(
@@ -5235,6 +5296,18 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
             "no recovery path ever changed the workload state to 'rolled-back', so the workload success "
             "tail did not run — check what the cluster stub answers when it is meant to succeed. "
             f"Transitions seen: {sorted(set(workload_transitions))}",
+        )
+        # The two branches an absent object cannot reach. Without these, "the workload success tail runs"
+        # was satisfied by nine settlements that all took the missing-object shortcut, and `confirmed`
+        # written at either branch survived.
+        self.assertTrue(
+            self.delete_calls,
+            "no case deleted an owned object, so the delete branch never ran — the cluster boundary was "
+            "probably answering 'absent' for every case",
+        )
+        self.assertTrue(
+            self.replace_calls,
+            "no case replaced an owned object with its prior snapshot, so the replace branch never ran",
         )
         self.assertTrue(self.nft_calls, "no case reached the kernel boundary")
         self.assertTrue(self.route_calls, "no case reached the route boundary")
