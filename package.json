@@ -70,8 +70,8 @@
     "build:web": "npm run build -w @heliopause/web"
   },
   "devDependencies": {
-    "@types/node": "^22.0.0",
-    "lucide-static": "^1.38.0",
+    "@types/node": "^22.20.4",
+    "lucide-static": "^1.48.0",
     "typescript": "^6.0.3"
   }
 }
