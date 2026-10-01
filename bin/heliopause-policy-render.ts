@@ -601,7 +601,8 @@ const cached = new Map<string, { stamp: string; source: PolicySource }>();
  * when something was wrong, and a log line that claimed an authorization was "already in force" about a
  * record the kernel had never seen.
  *
- * @see src/policy-render-service.test.ts "says which failure stopped the scan"
+ * @see src/policy-render-service.test.ts "refuses a site whose tree is larger than the scan cap"
+ * @see src/policy-render-service.test.ts "refuses a site whose tree it could not finish reading"
  */
 type ScanFailure =
   | { kind: "overflow"; visited: number }
@@ -624,8 +625,11 @@ function scanFailureReason(failure: ScanFailure): string {
 const STAMP_SCAN_CAP = 2_000;
 
 /**
- * `null` means **no complete stamp**: the tree has more entries than the scan cap, so a change here
- * cannot be noticed. The caller refuses the site rather than serving it — see `currentSource`.
+ * A `ScanFailure` instead of a stamp means **no complete stamp**, and carries which of the two reasons
+ * it was: the tree has more entries than the scan cap, or a directory could not be enumerated. Either
+ * way a change here cannot be noticed, so the caller refuses the site rather than serving it — see
+ * `currentSource`. (This said `null`, which is what the function returned before the reason was added to
+ * it in this same change.)
  * Returning a placeholder instead froze the key; evaluating without caching leaked the module
  * registry. Both were tried, in that order, and both are recorded there.
  */
@@ -779,7 +783,10 @@ async function currentSource(site: { name: string | null; path: string }): Promi
   const { name, path: sitePath } = site;
   // ## 🔴 No complete stamp is a refusal, and the first version of this served instead
   //
-  // `null` means the tree has more entries than the scan cap, so a change cannot be noticed. An earlier
+  // A `ScanFailure` rather than a stamp means a change cannot be noticed — either the tree has more
+  // entries than the scan cap, or a directory could not be enumerated, and the refusal below says which.
+  // (This said `null`; the reason was added to that return in this same change and the sentence did not
+  // follow.) An earlier
   // version of this evaluated anyway and skipped the cache, minting a fresh `?v=` per request so the
   // re-evaluation was a real one — that code is gone, and this paragraph is why it is not coming
   // back. It leaks: ES modules are keyed by URL and never evicted, and a

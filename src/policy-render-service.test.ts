@@ -1258,13 +1258,22 @@ export const site = {
     }
   });
 
-  it("does not use more descriptors as the tree gets deeper", { timeout: 60_000 }, async () => {
-    // ## Named for what it shows, which is less than the first name claimed
+  it("serves a 200-deep tree under at most 64 descriptors", { timeout: 60_000 }, async () => {
+    // ## Named for what it shows, on the third attempt
     //
-    // The walk opens a directory handle, reads it, and closes it in a `finally` before opening the next —
-    // so descriptor use is constant in the depth of the tree. This was called "holds one handle at a
-    // time", and a review pointed out that an implementation holding **two** would pass it just as well.
-    // What the test can see is the absence of growth, so that is what it is called.
+    // The walk opens a directory handle, reads it, and closes it in a `finally` before opening the next,
+    // so in the implementation descriptor use is constant in the depth of the tree. **This test cannot
+    // see that.** Two earlier names claimed more than it measures:
+    //
+    //   · "holds one directory handle at a time" — an implementation holding two passes just as well.
+    //   · "does not use more descriptors as the tree gets deeper" — a review retained every tenth handle
+    //     and measured peak use going from 3 at depth 20 to 21 at depth 200, while **both** scans still
+    //     succeeded under a 64-handle budget. Growth was present and the test was green.
+    //
+    // What it establishes is the sentence in its name: this tree, this budget, served. That rules out
+    // descriptor use that grows *unboundedly* with depth, which is what a leaked handle per level looks
+    // like, and rules out nothing finer. Each earlier name was the property I wanted rather than the one
+    // being measured — the same substitution this file keeps recording, three times on one line.
     //
     // It exists because nothing else asserted any of this: a mutation matrix came back six-for-six red
     // and none of those six removed the closure, injected a read failure, or counted descriptors. "Six
