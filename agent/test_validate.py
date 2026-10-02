@@ -5943,12 +5943,62 @@ class TestTheRoutePlanSurvivesARestart(unittest.TestCase):
         )
 
     def test_a_restart_that_rolls_back_restores_the_route(self):
-        """① The successful rollback. The ruleset is restored and the route must be too."""
+        """① The successful rollback: the ruleset **does** go back, and the route has to as well.
+
+        ⚠️ This said "the ruleset is restored" while running under the failing nft stub, so it finished
+        `rollback-failed` every time and the sentence was false — a review instrumented it and found
+        both immediate-recovery cases taking the same failed path. The kernel boundary reports success
+        here, which is the only way to reach the outcome this case is named after.
+        """
+        hp._nft_apply_json = lambda doc: (0, "")
         self._restart_with(state="prepared", rollbackAt=time.time() + 300)
         hp.recover_commitment()
+        settled = hp.load_state()
+        self.assertEqual(settled["state"], "rolled-back", f"unexpected outcome: {self.logged}")
         self.assertEqual(
             self.route_calls, [["del", "203.0.113.0/24", "via", "203.0.113.1"]],
             f"recovery rolled back without restoring the route: {self.logged}",
+        )
+        self.assertIsNone(
+            settled.get("pendingRoutes"),
+            "a spent commitment left its route plan behind, which is what the next generation would "
+            "inherit",
+        )
+
+    def test_a_new_commitment_does_not_inherit_the_previous_route_plan(self):
+        """The hazard persisting the field revived, in the shape a review reproduced it.
+
+        Generation 1 ends having written no route but leaving its plan on disk; generation 2 starts, and
+        `_persist_commitment` replaces the backup. Before this commit it did not touch `pendingRoutes`,
+        so recovery under generation 2 consumed generation 1's plan and issued a real `ip route del` for
+        a destination the live generation had never declared.
+
+        That was unreachable while the field was absent from `_EMPTY_STATE` — the write never survived a
+        read. Adding the key is what made it live, which is why both changes are in one commit.
+        """
+        hp.save_state({
+            **hp._EMPTY_STATE, "generation": "generation-1", "state": "rolled-back",
+            "pendingRoutes": [dict(self.ROUTE)],
+        })
+        self.assertTrue(
+            hp._persist_commitment(hp._NO_BACKUP, time.time() + 300, "generation-2", "hash-2"),
+            "the new commitment was not persisted at all",
+        )
+        inherited = hp.load_state()
+        self.assertEqual(inherited["generation"], "generation-2", "the new commitment did not take")
+        self.assertIsNone(
+            inherited.get("pendingRoutes"),
+            "generation-2 began holding generation-1's route plan. Recovery would consume it and "
+            "delete a route the live generation never declared.",
+        )
+        # And the consequence, driven: recovery now has nothing to undo.
+        hp._route_restore = []
+        hp.save_state({**inherited, "state": "prepared", "pendingBackup": {"elements": []},
+                       "rollbackAt": time.time() + 300})
+        hp.recover_commitment()
+        self.assertEqual(
+            self.route_calls, [],
+            f"recovery acted on a route plan from another generation: {self.route_calls}",
         )
 
     def test_a_restart_that_fails_its_rollback_keeps_the_plan(self):
@@ -5980,18 +6030,45 @@ class TestTheRoutePlanSurvivesARestart(unittest.TestCase):
 
         This is the case that reads as an ordinary timeout rollback in the logs, because the restart and
         the rollback are separated by whatever is left of the deadline.
+
+        ⚠️ The first version asserted on `hp._timer` and `hp._route_restore` and stopped there, which a
+        review showed establishes **preparation and not completion**: firing the callback changed none of
+        those assertions. The timer is a fake here and its callback is run, so what is asserted is the
+        route actually being restored when it fires. Real `threading.Timer` objects also made the
+        teardown cancel-without-join, which is isolation this class should not need.
         """
-        self._restart_with(state="pending", rollbackAt=time.time() + 300)
-        hp.recover_commitment()
-        self.assertIsNotNone(hp._timer, f"recovery did not re-arm the rollback timer: {self.logged}")
+        armed = {}
+
+        class FakeTimer:
+            def __init__(self, delay, fn, args=()):
+                armed["delay"], armed["fn"], armed["args"] = delay, fn, args
+
+            def start(self):
+                armed["started"] = True
+
+            def cancel(self):
+                armed["cancelled"] = True
+
+        real_timer, threading.Timer = threading.Timer, FakeTimer
+        try:
+            self._restart_with(state="pending", rollbackAt=time.time() + 300)
+            hp.recover_commitment()
+            self.assertTrue(armed.get("started"), f"recovery did not re-arm a timer: {self.logged}")
+            self.assertEqual(
+                hp._route_restore, [dict(self.ROUTE)],
+                "the re-armed timer was left with an empty route plan",
+            )
+            self.assertEqual(
+                hp.load_state().get("pendingRoutes"), [dict(self.ROUTE)],
+                "and the plan is no longer on disk either, so another restart loses it",
+            )
+            # 🔑 Fire it. Preparation was what the earlier version proved; this is the outcome.
+            armed["fn"](*armed["args"])
+        finally:
+            threading.Timer = real_timer
         self.assertEqual(
-            hp._route_restore, [dict(self.ROUTE)],
-            "the re-armed timer was left with an empty route plan, so firing it would restore the "
-            "ruleset and leave the route in place",
-        )
-        self.assertEqual(
-            hp.load_state().get("pendingRoutes"), [dict(self.ROUTE)],
-            "and the plan is no longer on disk either, so another restart loses it",
+            self.route_calls, [["del", "203.0.113.0/24", "via", "203.0.113.1"]],
+            f"the timer fired and the route was not restored: {self.logged}",
         )
 
     def test_no_other_persisted_field_is_missing_from_the_schema(self):
@@ -6001,6 +6078,14 @@ class TestTheRoutePlanSurvivesARestart(unittest.TestCase):
         the load drops it exactly as this one was dropped. Coarse on purpose — any constant-key subscript
         assignment counts, whatever mapping it was on — which is the same bargain
         `TestStateSchemaHasBothHalves` documents, and it is what catches the shape that has occurred.
+
+        ⚠️ **What it does not catch**, measured by a review that injected each one: `st.update({...})`,
+        `st.setdefault(...)`, a key built at runtime, and a key held in a variable all introduce a root
+        key while leaving this scan green. It reads constant-key subscript assignments and nothing else.
+        The scan is deliberately not being grown to cover them — in this series every widening of a
+        checking device produced a new escape, while every narrowing of the claim held — so what is
+        written here is the limit rather than a bigger scanner. No such write exists in the agent today;
+        that was checked, not assumed.
         """
         source = Path(hp.__file__).read_text()
         assigned = set()

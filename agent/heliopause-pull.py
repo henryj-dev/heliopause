@@ -1887,6 +1887,20 @@ def _persist_commitment(backup, deadline, generation=None, artifact_hash=None):
             st["artifactHash"] = artifact_hash
         st["detail"] = None
         st["pendingBackup"] = None if backup is _NO_BACKUP else {"elements": backup}
+        # The route half starts empty too, and it has to be said here rather than left implicit.
+        #
+        # 🔴 **A new commitment used to inherit the previous generation's route plan.** This function
+        # writes the backup at the *start* of a commitment; `_persist_route_commitment` writes the plan
+        # later, once routes have been planned. They are not written together, so a generation that
+        # ended before reaching the route step left its plan behind — and the next commitment replaced
+        # the backup without touching it. An independent review reproduced the consequence: generation 1
+        # rolled back having written no route, generation 2 inherited its plan, and recovery issued a
+        # real `ip route del` for a destination the live generation had never declared.
+        #
+        # It only became reachable when `pendingRoutes` entered `_EMPTY_STATE`: before that the field
+        # never survived a read, which hid the asymmetry rather than removing it.
+        # @see test_a_new_commitment_does_not_inherit_the_previous_route_plan
+        st["pendingRoutes"] = None
         st["rollbackAt"] = deadline
 
     _, saved = update_state(mutate)
@@ -3722,10 +3736,18 @@ _EMPTY_STATE = {
     # ruleset while leaving the route in place: the half-restored state `apply_routes`'s own docstring
     # says keeping one commitment on disk makes impossible.
     #
-    # The two halves have the same lifecycle — written at the same two places, cleared together in
-    # `_clear_commitment`, read by the same recovery — so persisting this one cannot strand a plan that
-    # `pendingBackup` would not have stranded too.
+    # ⚠️ **The two halves are not written together, and a comment here claimed they were.** What was
+    # actually compared was four write sites; the claim that followed — identical lifecycles, so nothing
+    # new can be stranded — was broader than that comparison and false. `pendingBackup` is written when a
+    # commitment *begins* (`_persist_commitment`), this one only once routes have been planned
+    # (`_persist_route_commitment`), so a generation that ends in between leaves a plan behind. A review
+    # reproduced a newer generation inheriting one. `_persist_commitment` now clears this field for that
+    # reason.
+    #
+    # They are cleared together in `_clear_commitment` and read by the same recovery. That much was
+    # compared and holds.
     # @see TestTheRoutePlanSurvivesARestart
+    # @see test_a_new_commitment_does_not_inherit_the_previous_route_plan
     "pendingRoutes": None,
     # Unix time by which the apply must be confirmed. Absolute rather than a remaining duration:
     # a crash loop re-arming a duration on every start would push the deadline back forever.
