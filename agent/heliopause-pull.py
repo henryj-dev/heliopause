@@ -2506,7 +2506,7 @@ def apply_artifact(artifact, validated=None):
 
 def confirm(state):
     """Cancel the rollback timer. Called when a heartbeat lands while an apply is pending."""
-    global _timer, _backup
+    global _timer, _backup, _route_restore
     # This heartbeat has already reached the relay, which is the confirmation evidence. The drift
     # baseline was captured from the verified post-apply snapshot before `pending` became durable;
     # never replace it with a potentially stale telemetry cache value here.
@@ -2560,6 +2560,27 @@ def confirm(state):
         _timer.cancel()
         _timer = None
         _backup = _NO_BACKUP
+        # The route half of the same commitment, and it was being left behind. Issue #84.
+        #
+        # 🔴 A confirmed generation's plan stayed in memory, so the **next** generation's rollback
+        # consumed it: an independent review drove apply→confirm for one generation, then a
+        # route-free apply and its timer, and watched the agent `replace` and then `del` a
+        # destination the live generation had never declared.
+        #
+        # ## Why this is the only place that needed it, enumerated rather than assumed
+        #
+        # Every other way a commitment ends already empties it. `rollback` **consumes** it
+        # (`route_plan, _route_restore = _route_restore, []`) and puts it back only when the rollback
+        # did not settle, which is the retry it exists for. The two abandonments inside
+        # `apply_artifact` run *before* this generation's plan is set, so what they would clear is a
+        # previous generation's — and after this line there is no previous generation's plan left to
+        # clear. On the lifecycle as it stands, resets there would be lines no mutation could make red;
+        # that is a statement about these paths today, not about any future ending.
+        #
+        # The sibling issue #84 also records a window where planning and persistence run ahead of the
+        # locked timer check. That is **not** closed by this line.
+        # @see TestConfirmDoesNotLeaveTheRoutePlanBehind
+        _route_restore = []
     state.update(fresh)
     log(f"generation {fresh['generation']} confirmed — rollback disarmed")
     return True
@@ -3747,21 +3768,22 @@ _EMPTY_STATE = {
     # They are cleared together in `_clear_commitment` and read by the same recovery. That much was
     # compared and holds.
     #
-    # ⚠️ **Two related gaps are open, not closed by this field** — `henryj-dev/heliopause#84`.
+    # ## `henryj-dev/heliopause#84` — one of its two gaps is closed, the other is not
     #
-    # The confirm path returns `_backup` to its empty value in memory and leaves `_route_restore` alone,
-    # so a later generation's rollback can undo a route it never declared. It reproduces on the commit
-    # before this work too, which makes it **pre-existing**; whether the revisions running in the fleet
-    # carry it and reach that path has not been checked, and an earlier version of this comment said
-    # "live in the fleet" without checking.
+    # **Closed.** The confirm path used to return `_backup` to its empty value and leave
+    # `_route_restore` alone, so a later generation's rollback could undo a route it never declared.
+    # `confirm` clears it now. An earlier version of this comment said "live in the fleet" without
+    # checking; the fleet check has since been done and all eight hosts report `ff7770b89766`, which is
+    # `8f5e8a0` — a revision that carries the shape and predates the fix.
     #
-    # The same issue records that route planning and persistence run ahead of the locked
-    # `_timer is None` check. That window is **reachable inside a single apply** — the rollback timer is
-    # on its own thread and `observed_routes()` is I/O, so it can fire between the read and the
-    # persistence. An earlier version here called it unreachable on the grounds that apply is
-    # synchronous through `handle_reply`, which is true of the apply path and says nothing about the
-    # timer. The consequence is bounded: the guard below the persistence stops any route command, so
-    # what is left is a stranded plan rather than a route written after a rollback.
+    # **Open.** The window between an apply and the rollback timer — outcomes and reproductions are in
+    # #84, not here. Two review rounds went on the paragraph that used to describe them in this file;
+    # every version bounded the consequence by the branches it had looked at, and there was always
+    # another branch. The issue is the place for that.
+    #
+    # Both are **dormant on the fleet today**: the whole route block sits behind `if declared:`, and the
+    # deployed revision's own comment says routes are absent on every host. That is the deployed code's
+    # assertion, not a reading of today's artifacts.
     # @see TestTheRoutePlanSurvivesARestart
     # @see test_a_new_commitment_does_not_inherit_the_previous_route_plan
     "pendingRoutes": None,

@@ -5857,6 +5857,132 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         self.assertNotIn("thisFunctionDoesNotExist", calls)
 
 
+class TestConfirmDoesNotLeaveTheRoutePlanBehind(unittest.TestCase):
+    """A confirmed generation's route plan must not be in memory for the next one. Issue #84.
+
+    `confirm` cancelled the timer and returned `_backup` to its empty value and said nothing about
+    `_route_restore`, so the plan of a generation that had **succeeded** stayed in the process. The next
+    generation's rollback then consumed it: an independent review drove apply→confirm for generation 1,
+    then a route-free apply for generation 2 and its timer, and watched the agent `replace` and then
+    `del` a destination generation 2 had never declared.
+
+    ## What this does not cover
+
+    The other window in #84 — between an apply and the rollback timer — is outside this PR, and its
+    outcomes and reproductions are recorded there rather than here. Two rounds of review were spent on
+    the paragraph that used to describe it: each version bounded the consequence by the branches it had
+    looked at, and each time there was another branch.
+    """
+
+    ROUTE = {"spec": {"dst": "203.0.113.0/24", "via": "203.0.113.1"}, "before": None}
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._state_file = hp.STATE_FILE
+        hp.STATE_FILE = os.path.join(self.tmp, "state.json")
+        self._real = {n: getattr(hp, n) for n in ("_nft_apply_json", "_ip_route", "log")}
+        self._globals = {n: getattr(hp, n) for n in (
+            "_timer", "_backup", "_nft_rollback_owed", "_route_restore",
+        )}
+        self.route_calls = []
+        hp.log = lambda line: None
+        hp._nft_apply_json = lambda doc: (0, "")
+        hp._ip_route = lambda args: (self.route_calls.append(args), (0, ""))[1]
+        hp._timer = None
+        hp._backup = hp._NO_BACKUP
+        hp._nft_rollback_owed = None
+        hp._route_restore = []
+        hp.save_state(dict(hp._EMPTY_STATE))
+
+    def tearDown(self):
+        if hp._timer is not None:
+            hp._timer.cancel()
+        for name, value in self._real.items():
+            setattr(hp, name, value)
+        for name, value in self._globals.items():
+            setattr(hp, name, value)
+        hp.STATE_FILE = self._state_file
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_a_confirmed_generations_plan_is_not_left_in_memory(self):
+        """Generation 1 applies routes and confirms. Nothing of its plan may remain."""
+        hp.save_state({
+            **hp._EMPTY_STATE, "generation": "generation-1", "state": "pending",
+            "pendingBackup": {"elements": []}, "pendingRoutes": [dict(self.ROUTE)],
+            "rollbackAt": time.time() + 300,
+            # `confirm` refuses without a durable post-apply observation, and a generation that
+            # actually applied always has one.
+            "referenceHash": "sha256:" + "a" * 64,
+        })
+        # What an apply leaves behind in memory, which is the thing `confirm` has to clear.
+        hp._route_restore = [dict(self.ROUTE)]
+        hp._backup = []
+        hp._timer = threading.Timer(300, lambda: None)
+        hp._timer.start()
+
+        self.assertTrue(hp.confirm(hp.load_state()), "the generation did not confirm")
+
+        self.assertEqual(
+            hp._route_restore, [],
+            "a confirmed generation's route plan is still in memory. The next generation's rollback "
+            "consumes this list, so it would undo a route that generation never declared.",
+        )
+        self.assertEqual(hp._backup, hp._NO_BACKUP, "the host half was not released either")
+        self.assertIsNone(hp.load_state().get("pendingRoutes"), "the durable half was not cleared")
+
+    def test_the_next_generations_rollback_undoes_nothing_it_did_not_declare(self):
+        """The review's scenario, with the commitments synthesised rather than applied.
+
+        Generation 2 declares no routes, so a rollback of it must issue no route command. Before the
+        fix it issued a `del` for generation 1's destination — the plan was still in the process.
+
+        ⚠️ This builds each commitment by hand and calls `rollback` directly; it does not run
+        `apply_artifact` or a real timer callback. It reaches the consumption point that matters
+        (`heliopause-pull.py:2218`), which is what it is for, and the review drove the same sequence
+        through the real apply and callback separately. "End to end" was the earlier description and
+        claimed more than it does.
+        """
+        hp.save_state({
+            **hp._EMPTY_STATE, "generation": "generation-1", "state": "pending",
+            "pendingBackup": {"elements": []}, "pendingRoutes": [dict(self.ROUTE)],
+            "rollbackAt": time.time() + 300,
+            # `confirm` refuses without a durable post-apply observation, and a generation that
+            # actually applied always has one.
+            "referenceHash": "sha256:" + "a" * 64,
+        })
+        hp._route_restore = [dict(self.ROUTE)]
+        hp._backup = []
+        hp._timer = threading.Timer(300, lambda: None)
+        hp._timer.start()
+        self.assertTrue(hp.confirm(hp.load_state()), "generation-1 did not confirm")
+        self.route_calls.clear()
+
+        # Generation 2: a commitment with no routes of its own, then its rollback.
+        #
+        # ⚠️ **Not through `recover_commitment`**, which was the first version of this test and was
+        # green under the defect. Recovery assigns `_route_restore` from the state it loaded
+        # (`heliopause-pull.py:2127`), and generation 2 has no `pendingRoutes`, so recovery wipes the
+        # contamination before the rollback could consume it — the test passed because something else
+        # cleaned up, not because `confirm` had. Caught by mutating the fix.
+        #
+        # The review drove generation 2's apply and fired its timer. The equivalent here is the
+        # in-memory commitment an apply leaves plus the rollback itself, which is the consumer.
+        hp.save_state({
+            **hp._EMPTY_STATE, "generation": "generation-2", "state": "prepared",
+            "pendingBackup": {"elements": []}, "rollbackAt": time.time() + 300,
+        })
+        hp._backup = []
+        hp._timer = threading.Timer(300, lambda: None)
+        hp._timer.start()
+        hp.rollback("generation-2 rolled back having declared no routes")
+
+        self.assertEqual(
+            self.route_calls, [],
+            f"generation-2's rollback touched routes it never declared: {self.route_calls}. That is "
+            "generation-1's plan, left in memory by its own confirmation.",
+        )
+
+
 class TestTheRoutePlanSurvivesARestart(unittest.TestCase):
     """The route half of the commitment reaches the disk and comes back. Issue #71.
 
