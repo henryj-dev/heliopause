@@ -5857,6 +5857,313 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         self.assertNotIn("thisFunctionDoesNotExist", calls)
 
 
+class TestTheRoutePlanSurvivesARestart(unittest.TestCase):
+    """The route half of the commitment reaches the disk and comes back. Issue #71.
+
+    `apply_routes`'s docstring says "what to undo reaches the disk before the thing that would need
+    undoing happens", and calls that "the whole reason this host can be restarted mid-apply". It was not
+    true of the route half: `pendingRoutes` was absent from `_EMPTY_STATE`, and `_load_state_unlocked`
+    rebuilds the document from that dict's keys, so every write of the field was dropped on the next
+    read. `recover_commitment`'s recovery read always saw `None`.
+
+    The three cases below are the three ways that surfaced, and each one is a restart: the state is
+    saved, loaded back, and only then does recovery run.
+    """
+
+    ROUTE = {"spec": {"dst": "203.0.113.0/24", "via": "203.0.113.1"}, "before": None}
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._state_file = hp.STATE_FILE
+        hp.STATE_FILE = os.path.join(self.tmp, "state.json")
+        self._real = {n: getattr(hp, n) for n in ("_nft_apply_json", "_ip_route", "log")}
+        self._globals = {n: getattr(hp, n) for n in (
+            "_timer", "_backup", "_nft_rollback_owed", "_route_restore",
+        )}
+        self.route_calls = []
+        self.logged = []
+        # Both boundaries refused, and the route one records. A rollback that reports success would
+        # clear the commitment and take the plan with it, which is a different test's subject.
+        hp._nft_apply_json = lambda doc: (1, "stubbed: no kernel here")
+        hp._ip_route = lambda args: (self.route_calls.append(args), (0, ""))[1]
+        hp.log = lambda line: self.logged.append(str(line))
+        hp._timer = None
+        hp._backup = hp._NO_BACKUP
+        hp._nft_rollback_owed = None
+        # Empty, so a plan reaching `_restore_routes` can only have come off the disk. This is the whole
+        # point: the in-process global always worked, and the restart path is what did not.
+        hp._route_restore = []
+
+    def tearDown(self):
+        if hp._timer is not None:
+            hp._timer.cancel()
+        for name, value in self._real.items():
+            setattr(hp, name, value)
+        for name, value in self._globals.items():
+            setattr(hp, name, value)
+        hp.STATE_FILE = self._state_file
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _restart_with(self, **over):
+        """Write a state carrying a route plan, then read it back the way a new process would."""
+        hp.save_state({
+            **hp._EMPTY_STATE, "generation": "g-live",
+            "pendingBackup": {"elements": []}, "pendingRoutes": [dict(self.ROUTE)], **over,
+        })
+        return hp.load_state()
+
+    def test_the_plan_is_still_there_after_a_restart(self):
+        """The defect itself, with nothing else involved: save, load, look."""
+        self.assertIn(
+            "pendingRoutes", hp._EMPTY_STATE,
+            "the field is not in the state schema, so `_load_state_unlocked` rebuilds the document "
+            "without it and every write of it is dropped on the next read",
+        )
+        self.assertEqual(
+            self._restart_with().get("pendingRoutes"), [dict(self.ROUTE)],
+            "the route plan did not survive a save and load",
+        )
+
+    def test_the_apply_path_is_what_puts_the_plan_on_disk(self):
+        """Through `_persist_route_commitment`, which is how the plan gets there in production.
+
+        ⚠️ The other cases here write the state directly, so a mutation that stopped
+        `_persist_route_commitment` from writing the field left them all green — the plan they read back
+        had been put there by the fixture. Measured. This case is the one that makes that line
+        load-bearing, and without it the suite would be testing the schema and the recovery while taking
+        the write between them on trust.
+        """
+        hp.save_state(dict(hp._EMPTY_STATE))
+        self.assertTrue(
+            hp._persist_route_commitment([dict(self.ROUTE)]), "the commitment was not persisted at all",
+        )
+        self.assertEqual(
+            hp.load_state().get("pendingRoutes"), [dict(self.ROUTE)],
+            "the apply path's own write of the plan did not survive the load",
+        )
+
+    def test_a_restart_that_rolls_back_restores_the_route(self):
+        """① The successful rollback: the ruleset **does** go back, and the route has to as well.
+
+        ⚠️ This said "the ruleset is restored" while running under the failing nft stub, so it finished
+        `rollback-failed` every time and the sentence was false — a review instrumented it and found
+        both immediate-recovery cases taking the same failed path. The kernel boundary reports success
+        here, which is the only way to reach the outcome this case is named after.
+        """
+        hp._nft_apply_json = lambda doc: (0, "")
+        self._restart_with(state="prepared", rollbackAt=time.time() + 300)
+        hp.recover_commitment()
+        settled = hp.load_state()
+        self.assertEqual(settled["state"], "rolled-back", f"unexpected outcome: {self.logged}")
+        self.assertEqual(
+            self.route_calls, [["del", "203.0.113.0/24", "via", "203.0.113.1"]],
+            f"recovery rolled back without restoring the route: {self.logged}",
+        )
+        self.assertIsNone(
+            settled.get("pendingRoutes"),
+            "a spent commitment left its route plan behind, which is what the next generation would "
+            "inherit",
+        )
+
+    def test_a_new_commitment_does_not_inherit_the_previous_route_plan(self):
+        """The hazard persisting the field revived, in the shape a review reproduced it.
+
+        Generation 1 ends having written no route but leaving its plan on disk; generation 2 starts, and
+        `_persist_commitment` replaces the backup. Before this commit it did not touch `pendingRoutes`,
+        so recovery under generation 2 consumed generation 1's plan and issued a real `ip route del` for
+        a destination the live generation had never declared.
+
+        That was unreachable while the field was absent from `_EMPTY_STATE` — the write never survived a
+        read. Adding the key is what made it live, which is why both changes are in **one PR** (two
+        commits: the schema key, then this clearing). Schema-first is the order that exposes the
+        inheritance; clearing-first would have kept the original restart defect without revealing it.
+        """
+        hp.save_state({
+            **hp._EMPTY_STATE, "generation": "generation-1", "state": "rolled-back",
+            "pendingRoutes": [dict(self.ROUTE)],
+        })
+        self.assertTrue(
+            hp._persist_commitment(hp._NO_BACKUP, time.time() + 300, "generation-2", "hash-2"),
+            "the new commitment was not persisted at all",
+        )
+        inherited = hp.load_state()
+        self.assertEqual(inherited["generation"], "generation-2", "the new commitment did not take")
+        self.assertIsNone(
+            inherited.get("pendingRoutes"),
+            "generation-2 began holding generation-1's route plan. Recovery would consume it and "
+            "delete a route the live generation never declared.",
+        )
+        # And the consequence, driven: recovery now has nothing to undo.
+        hp._route_restore = []
+        hp.save_state({**inherited, "state": "prepared", "pendingBackup": {"elements": []},
+                       "rollbackAt": time.time() + 300})
+        hp.recover_commitment()
+        self.assertEqual(
+            self.route_calls, [],
+            f"recovery acted on a route plan from another generation: {self.route_calls}",
+        )
+
+    def test_a_restart_that_fails_its_rollback_keeps_the_plan(self):
+        """② The failed rollback. Its own write of the field has to survive the next restart too.
+
+        `rollback` records the plan again when it could not finish (`heliopause-pull.py:2234`) precisely
+        so a retry can use it. That write was being dropped as well, so a process that died in this
+        state left nothing to restore the route from.
+
+        ⚠️ **What this does not establish**: deleting that re-write leaves this test green. Measured —
+        nothing on the failed path clears `pendingRoutes`, so the value the document was loaded with is
+        carried through the mutator and saved again regardless. The property asserted here is the one
+        that matters for the next restart (the plan is on disk afterwards); whether that re-write is
+        doing the work or is redundant with the carried-through value is a separate question this cannot
+        answer.
+
+        ⚠️ "It is redundant today" was the earlier wording and it is too broad: it holds **for this
+        fixture**, whose plan arrives unchanged. A partial apply replaces the in-memory plan with
+        `written` (`heliopause-pull.py:2466`), so the re-write is carrying a different value there.
+        """
+        self._restart_with(state="prepared", rollbackAt=time.time() + 300)
+        hp.recover_commitment()
+        settled = hp.load_state()
+        self.assertEqual(settled["state"], "rollback-failed", f"unexpected outcome: {self.logged}")
+        self.assertEqual(
+            settled.get("pendingRoutes"), [dict(self.ROUTE)],
+            "the failed rollback did not keep the route plan, so a restart here has nothing to undo "
+            "the route with",
+        )
+
+    def test_a_commitment_whose_deadline_has_not_passed_keeps_the_plan_for_its_timer(self):
+        """③ The re-armed timer. Recovery does not roll back yet, and the plan must outlast that.
+
+        This is the case that reads as an ordinary timeout rollback in the logs, because the restart and
+        the rollback are separated by whatever is left of the deadline.
+
+        ⚠️ The first version asserted on `hp._timer` and `hp._route_restore` and stopped there, which a
+        review showed establishes **preparation and not completion**: firing the callback changed none of
+        those assertions. The timer is a fake here and its callback is run, so what is asserted is the
+        route actually being restored when it fires. Real `threading.Timer` objects also made the
+        teardown cancel-without-join, which is isolation this class should not need.
+        """
+        armed = {}
+
+        class FakeTimer:
+            def __init__(self, delay, fn, args=()):
+                armed["delay"], armed["fn"], armed["args"] = delay, fn, args
+
+            def start(self):
+                armed["started"] = True
+
+            def cancel(self):
+                armed["cancelled"] = True
+
+        real_timer, threading.Timer = threading.Timer, FakeTimer
+        try:
+            self._restart_with(state="pending", rollbackAt=time.time() + 300)
+            hp.recover_commitment()
+            self.assertTrue(armed.get("started"), f"recovery did not re-arm a timer: {self.logged}")
+            self.assertEqual(
+                hp._route_restore, [dict(self.ROUTE)],
+                "the re-armed timer was left with an empty route plan",
+            )
+            self.assertEqual(
+                hp.load_state().get("pendingRoutes"), [dict(self.ROUTE)],
+                "and the plan is no longer on disk either, so another restart loses it",
+            )
+            # 🔑 Fire it. Preparation was what the earlier version proved; this is the outcome.
+            armed["fn"](*armed["args"])
+        finally:
+            threading.Timer = real_timer
+        self.assertEqual(
+            self.route_calls, [["del", "203.0.113.0/24", "via", "203.0.113.1"]],
+            f"the timer fired and the route was not restored: {self.logged}",
+        )
+
+    def test_no_other_persisted_field_is_missing_from_the_schema(self):
+        """The general shape, checked again rather than taken from the issue.
+
+        Every key assigned into a state document somewhere in the agent has to be in `_EMPTY_STATE`, or
+        the load drops it exactly as this one was dropped. Coarse on purpose, which is the same bargain
+        `TestStateSchemaHasBothHalves` documents, and it is what catches the shape that has occurred.
+
+        ## What it reads, exactly
+
+        **Single-target `ast.Assign` nodes whose target is a subscript with a constant string key, and
+        whose subscripted object is a bare name or a call on a bare name.** Nothing else.
+
+        "Any constant-key subscript assignment" was the first description and a review showed it too
+        broad; the holder restriction was missing from the second. What escapes: annotated assignments,
+        chained assignments, dict union, a direct `__setitem__`, `st.update({...})`, `st.setdefault(...)`,
+        a key built at runtime, a key held in a variable, and — because of the holder rule — any write
+        through an attribute or a deeper expression, `self.st["fresh"] = 1` and
+        `obj.state()["fresh"] = 1` among them. Each was injected and each left this scan green.
+
+        The scan is deliberately not being grown to cover them: in this series every widening of a
+        checking device produced a new escape, while every narrowing of a claim held. What is written
+        here is the limit, not a bigger scanner.
+
+        ⚠️ **No *omitted* write introduces an undeclared persisted root key today** — checked, not
+        assumed. That is narrower than "no such write exists", which was the earlier claim and is false:
+        `st.update` appears at `heliopause-pull.py:3800`, bounded to keys already in the schema.
+        """
+        source = Path(hp.__file__).read_text()
+        assigned = set()
+        for node in ast.walk(ast.parse(source)):
+            if not (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Subscript)
+                and isinstance(node.targets[0].slice, ast.Constant)
+                and isinstance(node.targets[0].slice.value, str)
+            ):
+                continue
+            target = node.targets[0]
+            holder = target.value
+            if isinstance(holder, ast.Name):
+                where = holder.id
+            elif isinstance(holder, ast.Call) and isinstance(holder.func, ast.Name):
+                where = f"{holder.func.id}()"
+            else:
+                # A nested write — `doc["a"]["b"] = …`. It cannot be the shape this test is about: the
+                # key it sets is not a top-level key of the document, and `doc["a"]` has to exist
+                # already, which means `a` is either in the schema or lost before this line runs.
+                continue
+            assigned.add((where, target.slice.value))
+        self.assertIn(
+            ("st", "pendingRoutes"), assigned, "the scan stopped seeing the write that started this",
+        )
+        # ## The pairs that are **not** state documents, each with the reason it is not
+        #
+        # Keyed by the object as well as the key, because a key name alone would keep passing if the
+        # same name later started being written onto a state document — which is the defect this test is
+        # about. Checked when written, 2026-10-01:
+        #
+        # · `globals()["_route_restore"]` — the module namespace, by construction not a document.
+        # · `result["error"]` — the local `accept_artifact_authorization` builds and returns; never saved.
+        # · `heartbeat["ciliumExposure"]` — the payload posted to the relay, not the state file.
+        # · `meta["uid"]` / `meta["resourceVersion"]` — the `metadata` of the CNP being submitted, so
+        #   the API server can reject a stale conditional replace (`heliopause-pull.py:2748`).
+        # · `record["uid"]` — a workload rollback record, which lives inside the state's
+        #   `workloadApplied` list rather than being a state document itself.
+        elsewhere = {
+            ("globals()", "_route_restore"),
+            ("result", "error"),
+            ("heartbeat", "ciliumExposure"),
+            ("meta", "uid"),
+            ("meta", "resourceVersion"),
+            ("record", "uid"),
+        }
+        missing = sorted(
+            f"{where}[{key!r}]" for where, key in assigned - elsewhere if key not in hp._EMPTY_STATE
+        )
+        self.assertEqual(
+            missing, [],
+            f"these keys are assigned into a document but absent from the state schema: {missing}. If "
+            "any of them reaches the state file, the load rebuilds the document without it and the write "
+            "is silently lost — issue #71 was exactly that for `pendingRoutes`. If one of them is not a "
+            "state document, add the (object, key) pair to `elsewhere` **with the reason**, rather than "
+            "the bare key: a key name on its own would go on passing once it appeared on `st`.",
+        )
+
+
 class TestStateSchemaHasBothHalves(unittest.TestCase):
     """Every key in `_EMPTY_STATE` is written somewhere and read somewhere.
 

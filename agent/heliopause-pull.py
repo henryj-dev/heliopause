@@ -1887,6 +1887,20 @@ def _persist_commitment(backup, deadline, generation=None, artifact_hash=None):
             st["artifactHash"] = artifact_hash
         st["detail"] = None
         st["pendingBackup"] = None if backup is _NO_BACKUP else {"elements": backup}
+        # The route half starts empty too, and it has to be said here rather than left implicit.
+        #
+        # 🔴 **A new commitment used to inherit the previous generation's route plan.** This function
+        # writes the backup at the *start* of a commitment; `_persist_route_commitment` writes the plan
+        # later, once routes have been planned. They are not written together, so a generation that
+        # ended before reaching the route step left its plan behind — and the next commitment replaced
+        # the backup without touching it. An independent review reproduced the consequence: generation 1
+        # rolled back having written no route, generation 2 inherited its plan, and recovery issued a
+        # real `ip route del` for a destination the live generation had never declared.
+        #
+        # It only became reachable when `pendingRoutes` entered `_EMPTY_STATE`: before that the field
+        # never survived a read, which hid the asymmetry rather than removing it.
+        # @see test_a_new_commitment_does_not_inherit_the_previous_route_plan
+        st["pendingRoutes"] = None
         st["rollbackAt"] = deadline
 
     _, saved = update_state(mutate)
@@ -3711,6 +3725,46 @@ _EMPTY_STATE = {
     # `None` is meaningful and distinct from the outer one: it says a backup *was* captured and
     # there was no table at the time, so restoring means deleting.
     "pendingBackup": None,
+    # The other half of that commitment: the route plan to undo, `[{spec, before}, …]` while an apply
+    # is unconfirmed and `None` otherwise.
+    #
+    # 🔴 **It was missing from this dict for as long as routes have been applied, and the absence was
+    # silent.** `apply_routes` wrote `st["pendingRoutes"]`, `rollback` wrote it again on its failed
+    # path, `_clear_commitment` cleared it beside `pendingBackup` — and `_load_state_unlocked` rebuilds
+    # this document from the keys *here*, so every one of those writes was dropped on the next read.
+    # `recover_commitment`'s recovery read therefore always saw `None`, and a restart restored the
+    # ruleset while leaving the route in place: the half-restored state `apply_routes`'s own docstring
+    # says keeping one commitment on disk makes impossible.
+    #
+    # ⚠️ **The two halves are not written together, and a comment here claimed they were.** What was
+    # actually compared was four write sites; the claim that followed — identical lifecycles, so nothing
+    # new can be stranded — was broader than that comparison and false. `pendingBackup` is written when a
+    # commitment *begins* (`_persist_commitment`), this one only once routes have been planned
+    # (`_persist_route_commitment`), so a generation that ends in between leaves a plan behind. A review
+    # reproduced a newer generation inheriting one. `_persist_commitment` now clears this field for that
+    # reason.
+    #
+    # They are cleared together in `_clear_commitment` and read by the same recovery. That much was
+    # compared and holds.
+    #
+    # ⚠️ **Two related gaps are open, not closed by this field** — `henryj-dev/heliopause#84`.
+    #
+    # The confirm path returns `_backup` to its empty value in memory and leaves `_route_restore` alone,
+    # so a later generation's rollback can undo a route it never declared. It reproduces on the commit
+    # before this work too, which makes it **pre-existing**; whether the revisions running in the fleet
+    # carry it and reach that path has not been checked, and an earlier version of this comment said
+    # "live in the fleet" without checking.
+    #
+    # The same issue records that route planning and persistence run ahead of the locked
+    # `_timer is None` check. That window is **reachable inside a single apply** — the rollback timer is
+    # on its own thread and `observed_routes()` is I/O, so it can fire between the read and the
+    # persistence. An earlier version here called it unreachable on the grounds that apply is
+    # synchronous through `handle_reply`, which is true of the apply path and says nothing about the
+    # timer. The consequence is bounded: the guard below the persistence stops any route command, so
+    # what is left is a stranded plan rather than a route written after a rollback.
+    # @see TestTheRoutePlanSurvivesARestart
+    # @see test_a_new_commitment_does_not_inherit_the_previous_route_plan
+    "pendingRoutes": None,
     # Unix time by which the apply must be confirmed. Absolute rather than a remaining duration:
     # a crash loop re-arming a duration on every start would push the deadline back forever.
     "rollbackAt": None,
