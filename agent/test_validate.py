@@ -3403,9 +3403,13 @@ class TestSignedArtifactSeam(unittest.TestCase):
         gen_at = src.index('artifact.get("generation")')
         self.assertLess(verify_at, gen_at, "the generation is read before the envelope is verified")
 
-    def test_the_apply_path_advances_the_replay_watermark(self):
-        # Durably, and before any kernel or kubectl side effect — a crash between apply and record
-        # leaves a window where the same authorization can be replayed.
+    def test_the_apply_path_still_mentions_the_watermark_before_the_host_half(self):
+        # A tripwire, and named as one, on the same terms as its sibling above: it reads two positions
+        # and a `return` placed between them leaves it true. The property — that the watermark reaches
+        # the disk before anything with a side effect runs — is driven in
+        # `TestTheWatermarkIsDurableBeforeAnySideEffect`, which also records what this cannot: that the
+        # write is *durable* rather than merely earlier in the file.
+        # @see TestTheWatermarkIsDurableBeforeAnySideEffect
         src = self._source()
         self.assertIn("accept_artifact_authorization", src, "the apply path does not record replay state")
         accept_at = src.index("accept_artifact_authorization")
@@ -3418,6 +3422,150 @@ class TestSignedArtifactSeam(unittest.TestCase):
         src = self._source()
         self.assertIn('log(f"refusing artifact for generation', src)
         self.assertIn("except Exception as e:", src)
+
+
+class TestTheWatermarkIsDurableBeforeAnySideEffect(unittest.TestCase):
+    """The replay watermark reaches the disk before anything that touches a kernel or a cluster.
+
+    ## What this replaces
+
+    `TestSignedArtifactSeam` asserted it by source position:
+    `src.index("accept_artifact_authorization") < src.index("_preflight_host_artifact")`. The property
+    behind it is that a crash between applying and recording leaves a window where the same
+    authorization can be replayed — so what matters is that the record is **durable** when the first
+    side effect begins, which a position cannot say at all. A `return` between the two also leaves the
+    position true.
+
+    ## How the order is observed
+
+    One timeline, appended to from both ends: the commit point `_save_state_unlocked` records
+    `watermark` the first time a document carrying `authorizationWatermark` is written, and each
+    boundary records its own name. Then the assertion is about the sequence rather than about any
+    single call having happened.
+
+    A boundary here is anything that leaves the process or changes the machine, and the list is
+    written by hand: `_preflight_host_artifact` validates the host half, `apply_workload` reaches the
+    cluster, `apply_artifact` reaches nftables. It does not claim to be every boundary — only that
+    these three are after the watermark.
+
+    ## Measured, four mutations
+
+    Each applied to `agent/heliopause-pull.py` alone and reverted; the whole file was green before and
+    after (312 collected, 12 skipped on macOS). "proxy" is the tripwire that stayed behind,
+    `TestSignedArtifactSeam.test_the_apply_path_still_mentions_the_watermark_before_the_host_half`.
+
+        mutation                                            proxy   ordering  refusal  others
+        a boundary call inserted before the acceptance       RED     RED       RED      0
+        `st["authorizationWatermark"] = record` deleted      green   RED       green    8
+        the `return` after a refused acceptance deleted      green   green     RED      1
+        `json.dump` drops that one key before writing        green   RED       green    13
+
+    **The proxy caught one of the four.** It is red for the first only because that mutation moves
+    text — an inserted call puts `_preflight_host_artifact` earlier in the file than
+    `accept_artifact_authorization`, which is the one thing two `str.index` calls can see. The other
+    three leave the file's two positions exactly as they are: a write that never happens, a refusal
+    that does not stop, and a write that happens but does not settle all read as "accept is still
+    above preflight".
+
+    The fourth is the one worth naming. `authorizationWatermark` is set on the document and the
+    commit point observes it, so the ordering holds and only the last assertion — reading the file
+    back — goes red. `assertEqual(None, …)` with "recorded in the timeline but is not on disk". That
+    is the difference between *earlier in the sequence* and *durable*, and no reading of the source's
+    shape reaches it.
+
+    The row counts in the last column are other tests that also fail, not coverage this class adds:
+    `TestReplayWatermark` and `TestBackfillCurrentAuthorization` already hold the acceptance's own
+    behaviour. What they do not assert is the **order against a side effect**, which is why the
+    proxy existed and why this replaces it rather than being dropped.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._state_file = hp.STATE_FILE
+        hp.STATE_FILE = os.path.join(self.tmp, "state.json")
+        self._real = {
+            name: getattr(hp, name) for name in (
+                "fetch_artifact", "verify_artifact_envelope", "accept_artifact_authorization",
+                "_preflight_host_artifact", "apply_workload", "apply_artifact", "log",
+                "_save_state_unlocked",
+            )
+        }
+        self.timeline = []
+        hp.log = lambda line: None
+        hp.fetch_artifact = lambda: {"generation": "g-wanted", "payload": "..."}
+        hp.verify_artifact_envelope = lambda envelope, now=None: (
+            envelope, dict(TestBackfillCurrentAuthorization.REC), None, False,
+        )
+        # 🔑 **The real acceptance, put back explicitly.** This module installs
+        # `stub_artifact_verification()` at import and never restores it, so `hp.accept_artifact_authorization`
+        # is a stub answering `({}, "")` for the whole suite — the comment beside
+        # `_REAL_ACCEPT_AUTHORIZATION` says any test reaching it is testing the stub. The first version
+        # of this class said "the real acceptance" and used the stub: measured, the timeline came back
+        # `['preflight']` with no watermark anywhere and nothing on disk, because a stub that writes
+        # nothing still returns a non-None value and the path walks on.
+        hp.accept_artifact_authorization = _REAL_ACCEPT_AUTHORIZATION
+        real_commit = self._real["_save_state_unlocked"]
+
+        def commit(st):
+            if st.get("authorizationWatermark") is not None and "watermark" not in self.timeline:
+                self.timeline.append("watermark")
+            return real_commit(st)
+
+        hp._save_state_unlocked = commit
+        for name, label, answer in (
+            ("_preflight_host_artifact", "preflight", (None, None, "stubbed: no kernel here")),
+            ("apply_workload", "workload", (True, None, "")),
+            ("apply_artifact", "host", (True, "pending", "")),
+        ):
+            def boundary(*_a, _label=label, _answer=answer, **_kw):
+                self.timeline.append(_label)
+                return _answer
+            setattr(hp, name, boundary)
+        hp.save_state(dict(hp._EMPTY_STATE))
+
+    def tearDown(self):
+        for name, value in self._real.items():
+            setattr(hp, name, value)
+        hp.STATE_FILE = self._state_file
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _beat(self):
+        hp.handle_reply(hp.load_state(), {
+            "schemaVersion": hp.SCHEMA_VERSION, "generation": "g-wanted", "gate": {"open": True},
+        })
+
+    def test_the_watermark_is_written_before_the_first_boundary(self):
+        """And it is on disk when the assertion runs, not merely earlier in the sequence."""
+        self._beat()
+        self.assertIn("watermark", self.timeline, f"no watermark was ever recorded: {self.timeline}")
+        self.assertIn("preflight", self.timeline, f"the apply path never reached a boundary: {self.timeline}")
+        self.assertEqual(
+            self.timeline[0], "watermark",
+            f"a boundary ran before the watermark reached the disk: {self.timeline}. A crash in that "
+            "gap leaves the same authorization replayable, which is the whole reason for the order.",
+        )
+        self.assertEqual(
+            hp.load_state().get("authorizationWatermark"),
+            TestBackfillCurrentAuthorization.REC,
+            "the watermark was recorded in the timeline but is not on disk — the write did not settle",
+        )
+
+    def test_a_refused_acceptance_reaches_no_boundary_at_all(self):
+        """The other direction: if the watermark cannot be recorded, nothing may be applied.
+
+        Without this the ordering assertion is satisfied by a path that records and then applies
+        regardless of whether the record succeeded.
+        """
+        hp.accept_artifact_authorization = lambda record, watch, expired: (None, "stubbed: refused")
+        self._beat()
+        self.assertEqual(
+            self.timeline, [],
+            f"a refused acceptance still reached {self.timeline}. The watermark is what makes a replay "
+            "detectable; applying without it is the case this ordering exists to prevent.",
+        )
+        self.assertIsNotNone(
+            hp.load_state().get("lastRefusal"), "the refusal was not recorded for an operator either",
+        )
 
 
 class TestTheApplyPathReadsTheVerifiedArtifact(unittest.TestCase):
