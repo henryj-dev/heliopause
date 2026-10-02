@@ -3746,6 +3746,13 @@ _EMPTY_STATE = {
     #
     # They are cleared together in `_clear_commitment` and read by the same recovery. That much was
     # compared and holds.
+    #
+    # ⚠️ **Two related gaps are open, not closed by this field.** `henryj-dev/heliopause#84`: the confirm
+    # path returns `_backup` to its empty value in memory and leaves `_route_restore` alone, so a later
+    # generation's rollback can undo a route it never declared — reproduced on the commit before this
+    # work as well, so it is live in the fleet. The same issue records that route planning and
+    # persistence run ahead of the locked `_timer is None` check, which a review could only reach by
+    # overlapping two applies artificially, since apply is synchronous through `handle_reply` today.
     # @see TestTheRoutePlanSurvivesARestart
     # @see test_a_new_commitment_does_not_inherit_the_previous_route_plan
     "pendingRoutes": None,

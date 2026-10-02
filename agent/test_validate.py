@@ -5974,7 +5974,9 @@ class TestTheRoutePlanSurvivesARestart(unittest.TestCase):
         a destination the live generation had never declared.
 
         That was unreachable while the field was absent from `_EMPTY_STATE` — the write never survived a
-        read. Adding the key is what made it live, which is why both changes are in one commit.
+        read. Adding the key is what made it live, which is why both changes are in **one PR** (two
+        commits: the schema key, then this clearing). Schema-first is the order that exposes the
+        inheritance; clearing-first would have kept the original restart defect without revealing it.
         """
         hp.save_state({
             **hp._EMPTY_STATE, "generation": "generation-1", "state": "rolled-back",
@@ -6011,9 +6013,13 @@ class TestTheRoutePlanSurvivesARestart(unittest.TestCase):
         ⚠️ **What this does not establish**: deleting that re-write leaves this test green. Measured —
         nothing on the failed path clears `pendingRoutes`, so the value the document was loaded with is
         carried through the mutator and saved again regardless. The property asserted here is the one
-        that matters for the next restart (the plan is on disk afterwards); whether `:2234` is doing the
-        work or is redundant with the carried-through value is a separate question this cannot answer,
-        and it is redundant today.
+        that matters for the next restart (the plan is on disk afterwards); whether that re-write is
+        doing the work or is redundant with the carried-through value is a separate question this cannot
+        answer.
+
+        ⚠️ "It is redundant today" was the earlier wording and it is too broad: it holds **for this
+        fixture**, whose plan arrives unchanged. A partial apply replaces the in-memory plan with
+        `written` (`heliopause-pull.py:2466`), so the re-write is carrying a different value there.
         """
         self._restart_with(state="prepared", rollbackAt=time.time() + 300)
         hp.recover_commitment()
@@ -6075,17 +6081,24 @@ class TestTheRoutePlanSurvivesARestart(unittest.TestCase):
         """The general shape, checked again rather than taken from the issue.
 
         Every key assigned into a state document somewhere in the agent has to be in `_EMPTY_STATE`, or
-        the load drops it exactly as this one was dropped. Coarse on purpose — any constant-key subscript
-        assignment counts, whatever mapping it was on — which is the same bargain
+        the load drops it exactly as this one was dropped. Coarse on purpose, which is the same bargain
         `TestStateSchemaHasBothHalves` documents, and it is what catches the shape that has occurred.
 
-        ⚠️ **What it does not catch**, measured by a review that injected each one: `st.update({...})`,
-        `st.setdefault(...)`, a key built at runtime, and a key held in a variable all introduce a root
-        key while leaving this scan green. It reads constant-key subscript assignments and nothing else.
-        The scan is deliberately not being grown to cover them — in this series every widening of a
-        checking device produced a new escape, while every narrowing of the claim held — so what is
-        written here is the limit rather than a bigger scanner. No such write exists in the agent today;
-        that was checked, not assumed.
+        ## What it reads, exactly
+
+        **Single-target `ast.Assign` nodes whose target is a subscript with a constant string key.**
+        Nothing else. "Any constant-key subscript assignment" was the earlier description and a review
+        showed it too broad: annotated assignments, chained assignments, dict union and a direct
+        `__setitem__` all escape, as do `st.update({...})`, `st.setdefault(...)`, a key built at runtime
+        and a key held in a variable — each injected and each leaving this scan green.
+
+        The scan is deliberately not being grown to cover them: in this series every widening of a
+        checking device produced a new escape, while every narrowing of a claim held. What is written
+        here is the limit, not a bigger scanner.
+
+        ⚠️ **No *omitted* write introduces an undeclared persisted root key today** — checked, not
+        assumed. That is narrower than "no such write exists", which was the earlier claim and is false:
+        `st.update` appears at `heliopause-pull.py:3800`, bounded to keys already in the schema.
         """
         source = Path(hp.__file__).read_text()
         assigned = set()
