@@ -4756,6 +4756,400 @@ class TestRelayRequestDeadline(unittest.TestCase):
         )
 
 
+class TestTheExpiryEscapeOnAStateThatWasRun(unittest.TestCase):
+    """The escape hatch, on a state produced by applying and confirming rather than by hand.
+
+    ## Why another escape test
+
+    `TestRestartWhilePending` already has two: `test_a_confirmed_generation_is_reapplied_when_the_table_is_gone`
+    and `test_the_same_host_is_refused_when_nothing_was_adopted`. Both write the starting state with
+    `hp.save_state({**hp._EMPTY_STATE, …})` and both replace `apply_artifact` with a recorder.
+
+    That is the shape this repository has already paid for once. `currentAuthorization` was read and
+    never assigned for months, and what hid it was a test that set the field by hand: the escape
+    clause was green against a state the program could not produce. A fixture cannot catch a
+    write-never field, because the fixture is the write.
+
+    So this class never writes a state document. It runs the real acceptance, the real
+    `apply_artifact`, and the real `confirm()` for one generation, and the state the reboot cases
+    start from is whatever that sequence left on disk.
+
+    ## What is still stubbed, and why that is not the same hole
+
+    Three boundaries, each because it leaves the machine: `_nft_apply_json` (the kernel), `snapshot`
+    (reading the kernel back) and `_host_observation_report` (likewise). Signature verification is
+    stubbed too — `verify_artifact_envelope` needs a real signing key — which means **`expired` is an
+    input to these tests rather than something they compute**. The real function derives it as
+    `expires <= current` from the artifact's own `expiresAt` (`heliopause-pull.py:4325`), and
+    `TestBackfillCurrentAuthorization.test_the_fixture_is_the_record_the_agent_actually_builds`
+    pins the record's shape against the agent's source.
+
+    What is *not* stubbed is everything that writes state: acceptance, apply, confirm. That is the
+    part the hand-built fixtures replaced.
+
+    ## 🔑 `expired` describes the artifact being applied, not the stored authorization
+
+    Reading it the other way makes two of these cases look like the same case. The escape at
+    `heliopause-pull.py:4375` only runs when the artifact *now being fetched* has lapsed; a host
+    whose stored `currentAuthorization` expired long ago applies a newer, unexpired generation
+    through the ordinary path and never reaches the clause.
+
+    ## Measured, five mutations, and one test deleted for one of them
+
+    Each applied to `agent/heliopause-pull.py` alone and reverted; the file was green before and
+    after (315 collected, 12 skipped on macOS). Every name below is one the runner printed.
+
+        mutation                                      what went red
+        the whole escape clause removed               test_a_run_state_whose_authorization_lapsed_reapplies_after_a_reboot
+        (`if expired:`)                               + 4 that already covered it: TestBackfillCurrentAuthorization
+                                                        .test_the_adopted_record_arms_the_expiry_escape,
+                                                        .test_a_watermark_written_before_expiresAt_existed_still_arms_the_escape,
+                                                      TestReplayWatermark
+                                                        .test_lets_an_expired_authorization_stand_when_it_is_the_one_already_confirmed,
+                                                      TestRestartWhilePending
+                                                        .test_an_expired_authorization_still_re_applies_when_the_table_is_gone
+        the identity comparison removed               test_a_lapsed_reissue_of_the_same_generation_is_refused_as_expired — alone
+        the generation condition removed              TestReplayWatermark
+                                                        .test_an_expired_authorization_for_a_different_generation_is_still_refused — alone,
+                                                      and **nothing in this class**
+        the replay guard removed                      test_the_watermark_is_a_door_that_does_not_reopen
+        (`authorizedAt <` → `if False`)               + TestReplayWatermark.test_refuses_an_authorization_older_than_the_watermark
+        `expired` read off the stored `current`        test_a_host_mid_publish_applies_the_new_generation_by_the_ordinary_path
+        instead of off the fetched artifact           + test_the_watermark_is_a_door_that_does_not_reopen — **and nothing else
+                                                      in the file**
+
+    The last row is the one worth keeping. That mutation is the behaviour
+    `fleet-escape-hatch-check.sh` assumes the agent has, and out of 315 tests only these two see it.
+
+    A sixth test stood here, offering a lapsed authorization for a generation the host never
+    confirmed. **No single-point mutation could kill it**: with the identity comparison gone the
+    generation condition still refused it, and with the generation condition gone the identity
+    comparison did. It was not covering a condition, it was standing where two of them overlap —
+    which this repository has measured the cost of before: a reviewer who reverts one line, sees
+    green and concludes the line guarantees nothing is reading the overlap, not a dead guard. So it
+    is deleted, and the row above records which test does cover the generation condition.
+
+    The two conditions are not redundant in the *code*, and that is why the deletion is of the test
+    rather than of a line: identity compares `currentAuthorization` against the incoming record,
+    while the generation condition compares the **state's** generation against it. Those disagree
+    exactly in the publish window the fourth test drives, where `current` is a generation behind.
+    """
+
+    AUTHORIZED_AT = "2026-09-20T00:00:00.000Z"
+    EXPIRES_AT = "2026-09-21T00:00:00.000Z"
+
+    @classmethod
+    def record(cls, generation, authorized_at=None, expires_at=None, payload=None):
+        """An authorization record of the shape the agent builds, for one generation."""
+        return {
+            "authorizedAt": authorized_at or cls.AUTHORIZED_AT,
+            "expiresAt": expires_at or cls.EXPIRES_AT,
+            "payloadHash": "sha256:" + (payload or generation[:1] * 64)[:64].ljust(64, "0"),
+            "keyId": "sha256:" + "b" * 64,
+            "authorizationMode": "two-person",
+            "target": hp.TARGET,
+            "host": hp.HOST_ID,
+            "planHash": "sha256:" + "c" * 64,
+            "bundleHash": "sha256:" + "d" * 64,
+            "generation": generation,
+        }
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._state_file = hp.STATE_FILE
+        hp.STATE_FILE = os.path.join(self.tmp, "state.json")
+        self._real = {
+            name: getattr(hp, name) for name in (
+                "fetch_artifact", "verify_artifact_envelope", "accept_artifact_authorization",
+                "apply_workload", "snapshot", "_nft_apply_json", "_host_observation_report",
+                "_preflight_host_artifact", "log",
+            )
+        }
+        hp.log = lambda line: self.logs.append(line)
+        self.logs = []
+        # The real acceptance. This module installs stub_artifact_verification() at import and never
+        # restores it, so without this line `accept_artifact_authorization` answers `({}, "")` to
+        # everything and every refusal case below would pass for the wrong reason.
+        hp.accept_artifact_authorization = _REAL_ACCEPT_AUTHORIZATION
+        hp.apply_workload = lambda _a: (True, None, "")
+        hp._nft_apply_json = lambda _doc: (0, "")
+        hp.save_state(dict(hp._EMPTY_STATE))
+        self._timer = None
+
+    def tearDown(self):
+        for name, value in self._real.items():
+            setattr(hp, name, value)
+        with hp._apply_lock:
+            if hp._timer is not None:
+                hp._timer.cancel()
+                hp._timer = None
+            hp._backup = hp._NO_BACKUP
+            hp._route_restore = []
+            hp._nft_rollback_owed = None
+        hp.STATE_FILE = self._state_file
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    # ── building the starting state by running the agent ─────────────────────────────────────────
+
+    def _serve(self, generation, record, expired):
+        """Make the relay offer `generation`, verifying to `record` with this `expired` verdict."""
+        artifact = {
+            "generation": generation, "ruleset": VALID, "rulesetHash": VALID_HASH,
+            "confirmTimeoutSec": hp.NFT_CONFIRM_MIN_SEC,
+        }
+        hp.fetch_artifact = lambda: {"payload": "signed", "generation": generation}
+        hp.verify_artifact_envelope = lambda envelope, now=None: (
+            artifact, dict(record), {}, expired,
+        )
+
+    def _table_is_present(self):
+        snapshots = iter((([], [], ""), ([{"table": TABLE}], [], "")))
+        hp.snapshot = lambda: next(snapshots)
+        hp._host_observation_report = lambda: {
+            "observed": "sha256:" + "0" * 64, "detail": "",
+            "foreignFilters": [], "publishedPorts": [],
+        }
+
+    def _table_is_gone(self):
+        """What a reboot leaves: the kernel has no table of ours at all."""
+        snapshots = iter((([], [], ""), ([{"table": TABLE}], [], "")))
+        hp.snapshot = lambda: next(snapshots)
+        hp._host_observation_report = lambda: {
+            "observed": None, "detail": "table inet heliopause is absent",
+            "foreignFilters": [], "publishedPorts": [],
+        }
+
+    def _beat(self, wanted):
+        hp.handle_reply(hp.load_state(), {
+            "schemaVersion": hp.SCHEMA_VERSION, "generation": wanted, "gate": {"open": True},
+        })
+
+    def _run_a_generation_to_confirmed(self, generation, record, expired=False):
+        """Accept, apply and confirm `generation` for real. Returns the settled state document."""
+        self._serve(generation, record, expired)
+        self._table_is_present()
+        self._beat(generation)
+        pending = hp.load_state()
+        self.assertEqual(
+            pending["generation"], generation,
+            f"the apply did not reach {generation}: {pending['state']} — {self.logs}",
+        )
+        self.assertTrue(hp.confirm(pending), f"{generation} did not confirm: {self.logs}")
+        settled = hp.load_state()
+        # Known positives, so that a case below cannot start from a state it only looks like.
+        self.assertEqual(settled["state"], "confirmed")
+        self.assertEqual(settled["currentAuthorization"]["generation"], generation)
+        self.assertEqual(settled["authorizationWatermark"]["generation"], generation)
+        return settled
+
+    # ── the escape ──────────────────────────────────────────────────────────────────────────────
+
+    def test_a_run_state_whose_authorization_lapsed_reapplies_after_a_reboot(self):
+        """The whole path: apply, confirm, the window closes, the table is gone, apply again."""
+        rec = self.record("g-live")
+        self._run_a_generation_to_confirmed("g-live", rec)
+        applied = []
+        real_apply = hp.apply_artifact
+        hp.apply_artifact = lambda artifact, *a, **kw: (
+            applied.append(artifact["generation"]), real_apply(artifact, *a, **kw))[1]
+        try:
+            # Same generation, same authorization — and now past its window.
+            self._serve("g-live", rec, expired=True)
+            self._table_is_gone()
+            self._beat("g-live")
+        finally:
+            hp.apply_artifact = real_apply
+        self.assertEqual(
+            applied, ["g-live"],
+            f"an expired authorization the host had confirmed did not re-apply: {self.logs}. This "
+            "is the 2026-09-28 exposure — a rebooted gateway with no table and a lapsed window.",
+        )
+        self.assertIsNone(
+            hp.load_state().get("lastRefusal"),
+            f"it refused instead of escaping, and recorded it: {hp.load_state().get('lastRefusal')}",
+        )
+
+    def _refuse(self, generation, record, expected_reason):
+        """Offer an expired artifact to the rebooted host and pin why it was turned away."""
+        applied = []
+        real_apply = hp.apply_artifact
+        hp.apply_artifact = lambda artifact, *a, **kw: (
+            applied.append(artifact["generation"]), real_apply(artifact, *a, **kw))[1]
+        try:
+            self._serve(generation, record, expired=True)
+            self._table_is_gone()
+            self._beat(generation)
+        finally:
+            hp.apply_artifact = real_apply
+        self.assertEqual(applied, [], f"it was applied anyway: {self.logs}")
+        refusal = hp.load_state().get("lastRefusal")
+        self.assertIsNotNone(refusal, f"nothing was recorded for an operator to read: {self.logs}")
+        self.assertIn(
+            expected_reason, json.dumps(refusal),
+            f"it was refused for another reason than the one under test: {refusal}. A refusal that "
+            "arrives from a different guard makes this case pass without reaching the clause.",
+        )
+
+    def test_a_lapsed_reissue_of_the_same_generation_is_refused_as_expired(self):
+        """The counter-case for the escape's identity condition.
+
+        Same generation, newer than the watermark, and a different `payloadHash` — a different
+        authorization for the same generation. Two of the three conditions hold (the generation
+        matches, the state is `confirmed`) and only the identity differs, so this is the one case
+        that isolates that comparison.
+        """
+        self._run_a_generation_to_confirmed("g-live", self.record("g-live"))
+        self._refuse(
+            "g-live",
+            self.record(
+                "g-live", authorized_at="2026-09-25T00:00:00.000Z",
+                expires_at="2026-09-26T00:00:00.000Z", payload="e",
+            ),
+            "expired",
+        )
+
+    def test_the_third_condition_is_not_reachable_through_a_heartbeat(self):
+        """`state == "confirmed"` — measured, and the measurement is the point.
+
+        The escape's third condition has no counter-case here, and that is a fact about the agent
+        rather than a gap left open. A host carrying a `currentAuthorization` can only be in two
+        other states, and a beat reaches the acceptance from neither:
+
+            pending       `heliopause-pull.py:5013` — the beat calls `confirm(st)` and returns
+            rolled-back   `:5080` — *"this generation already cost us the path to the relay once"*
+
+        The first version of this class tried the second route, via `rollback()`, and passed while
+        testing nothing: the beat returned before anything could refuse, so `lastRefusal` stayed
+        `None` and the assertion read that as a refusal. The log said `ROLLBACK … nothing to
+        restore` and nothing compared it to what was expected.
+
+        `TestRestartWhilePending.test_the_same_host_is_refused_when_nothing_was_adopted` covers the
+        clause itself by writing the state directly, which is the right tool for a state the program
+        does not produce. This test exists so that if a future beat *does* reach acceptance from a
+        non-confirmed state, the assertion below starts failing and says where to look.
+        """
+        rec = self.record("g-live")
+        self._serve("g-live", rec, expired=False)
+        self._table_is_present()
+        self._beat("g-live")
+        mid = hp.load_state()
+        self.assertEqual(mid["state"], "pending", f"the apply did not leave `pending`: {self.logs}")
+        self.assertIsNone(mid["currentAuthorization"], "an unconfirmed apply promoted its own record")
+        before = list(self.logs)
+        self._serve("g-live", rec, expired=True)
+        self._table_is_gone()
+        self._beat("g-live")
+        self.assertIn(
+            "confirmed", " ".join(self.logs[len(before):]),
+            f"the beat from `pending` no longer confirms: {self.logs[len(before):]}. If it now "
+            "reaches the acceptance, this class needs a real counter-case for the third condition.",
+        )
+        self.assertIsNone(
+            hp.load_state().get("lastRefusal"),
+            "the beat recorded a refusal, so it did reach the acceptance — see the docstring",
+        )
+
+    # ── the transition window stardust measured on k3s-01, 2026-10-02 07:42:13Z ──────────────────
+
+    def test_a_host_mid_publish_applies_the_new_generation_by_the_ordinary_path(self):
+        """`current` lapsed, `watermark` and `pending` are the new generation, and the table is gone.
+
+        stardust measured this on k3s-01 during the `6cf0140` publish and it held for 25–45 seconds:
+        `state confirmed` on the old generation, `currentAuthorization` expired, `watermark` and
+        `pendingAuthorization` on the new one and still valid. `fleet-escape-hatch-check.sh` read
+        `current` against `watermark`, saw them differ, and called the escape refused.
+
+        The escape is not the path. The artifact the relay is serving is the new generation and it
+        has not lapsed, so `expired` is false and the clause at `heliopause-pull.py:4374` is never
+        evaluated. What this asserts is that the ordinary path still runs with a stale `current` on
+        disk — and the assertion on `lastRefusal` is what would have failed if the replay guard had
+        objected to the new generation instead.
+        """
+        old = self.record("g-old")
+        self._run_a_generation_to_confirmed("g-old", old)
+        new = self.record(
+            "g-new", authorized_at="2026-09-30T00:00:00.000Z",
+            expires_at="2026-10-03T00:00:00.000Z", payload="f",
+        )
+        # Reach the measured window by running the real acceptance and going no further. Acceptance
+        # writes the watermark and `pendingAuthorization` before any boundary runs — the ordering
+        # `TestTheWatermarkIsDurableBeforeAnySideEffect` drives — and it writes neither `generation`
+        # nor `state`, so what it leaves is the document stardust read.
+        #
+        # ⚠️ The first version got here by letting the beat run with a failing
+        # `_preflight_host_artifact`. That is not the same state: a failed preflight makes
+        # `host_result` true and the beat writes `state: "unsupported"`, so the measured
+        # `state confirmed` was gone before the assertions ran. Stopping the beat and stopping
+        # *inside* it are different stops, and only one of them leaves the state alone.
+        accepted, accept_error = hp.accept_artifact_authorization(dict(new), {}, False)
+        self.assertIsNotNone(accepted, f"the new authorization was refused: {accept_error}")
+        window = hp.load_state()
+        self.assertEqual(window["state"], "confirmed", "the window state is not what was measured")
+        self.assertEqual(window["generation"], "g-old")
+        self.assertEqual(window["currentAuthorization"]["generation"], "g-old")
+        self.assertEqual(window["authorizationWatermark"]["generation"], "g-new")
+        self.assertEqual(window["pendingAuthorization"]["generation"], "g-new")
+
+        applied = []
+        real_apply = hp.apply_artifact
+        hp.apply_artifact = lambda artifact, *a, **kw: (
+            applied.append(artifact["generation"]), real_apply(artifact, *a, **kw))[1]
+        try:
+            self._serve("g-new", new, expired=False)
+            self._table_is_gone()
+            self._beat("g-new")
+        finally:
+            hp.apply_artifact = real_apply
+        self.assertEqual(
+            applied, ["g-new"],
+            f"a reboot inside the publish window applied nothing: {self.logs}. The check script "
+            "reads this state as refused; it is the ordinary path.",
+        )
+        self.assertIsNone(hp.load_state().get("lastRefusal"), f"it refused: {self.logs}")
+
+    def test_the_watermark_is_a_door_that_does_not_reopen(self):
+        """From the same window, being offered the older generation is refused — by replay, not expiry.
+
+        This is the direction that is dangerous, and it is not a window but a door: once a host has
+        accepted generation N+1's authorization it can never accept N again, including to put a
+        firewall back. `src/relay.ts:890-897` says the relay holds one current manifest and cannot
+        serve an older generation, so nothing in the system is supposed to ask — this test fixes what
+        happens if something does.
+
+        The refusal must be the replay guard's. If this ever starts refusing for expiry instead, the
+        assertion on the recorded reason is what will say so.
+        """
+        old = self.record("g-old")
+        self._run_a_generation_to_confirmed("g-old", old)
+        new = self.record(
+            "g-new", authorized_at="2026-09-30T00:00:00.000Z",
+            expires_at="2026-10-03T00:00:00.000Z", payload="f",
+        )
+        accepted, accept_error = hp.accept_artifact_authorization(dict(new), {}, False)
+        self.assertIsNotNone(accepted, f"the new authorization was refused: {accept_error}")
+        self.assertEqual(hp.load_state()["authorizationWatermark"]["generation"], "g-new")
+
+        applied = []
+        real_apply = hp.apply_artifact
+        hp.apply_artifact = lambda artifact, *a, **kw: (
+            applied.append(artifact["generation"]), real_apply(artifact, *a, **kw))[1]
+        try:
+            # The relay goes backwards. It is not meant to be able to.
+            self._serve("g-old", old, expired=True)
+            self._table_is_gone()
+            self._beat("g-old")
+        finally:
+            hp.apply_artifact = real_apply
+        self.assertEqual(applied, [], f"an artifact below the watermark was applied: {self.logs}")
+        refusal = hp.load_state().get("lastRefusal")
+        self.assertIsNotNone(refusal, f"nothing was recorded for an operator to read: {self.logs}")
+        self.assertIn(
+            "watermark", json.dumps(refusal),
+            f"the refusal was not the replay guard's: {refusal}. If this is now an expiry refusal, "
+            "the escape's conditions have been reached in a case that should stop before them.",
+        )
+
+
 class TestBackfillCurrentAuthorization(unittest.TestCase):
     """A host that confirmed under an older build adopts the authorization it is already enforcing.
 
