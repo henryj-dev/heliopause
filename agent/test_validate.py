@@ -5868,18 +5868,10 @@ class TestConfirmDoesNotLeaveTheRoutePlanBehind(unittest.TestCase):
 
     ## What this does not cover
 
-    The sibling window in #84 — planning and persistence running ahead of the locked timer check — is
-    untouched by this. It is reachable inside one apply, because the rollback timer is on its own thread
-    and `observed_routes()` is I/O. There is no test for it here.
-
-    ⚠️ **Its consequence depends on how that rollback ended, and an earlier version of this paragraph
-    gave only the half that looks harmless.** It said "a stranded plan rather than a route written after
-    a rollback", which holds when the rollback **succeeds**. When nft restoration fails, `rollback`
-    re-arms a retry timer, and the guard the apply then meets is `if _timer is None` — "is a timer
-    armed", not "has a rollback already run". So the apply continues and writes routes *after* a
-    rollback, with `_nft_rollback_owed` set. A review reproduced `replace` then `del` with the real
-    apply and callback, on this commit and with the fix reverted alike: pre-existing, and outside what
-    this PR changes.
+    The other window in #84 — between an apply and the rollback timer — is outside this PR, and its
+    outcomes and reproductions are recorded there rather than here. Two rounds of review were spent on
+    the paragraph that used to describe it: each version bounded the consequence by the branches it had
+    looked at, and each time there was another branch.
     """
 
     ROUTE = {"spec": {"dst": "203.0.113.0/24", "via": "203.0.113.1"}, "before": None}

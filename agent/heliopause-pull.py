@@ -3776,22 +3776,14 @@ _EMPTY_STATE = {
     # checking; the fleet check has since been done and all eight hosts report `ff7770b89766`, which is
     # `8f5e8a0` — a revision that carries the shape and predates the fix.
     #
-    # **Open.** Route planning and persistence run ahead of the locked `_timer is None` check. That
-    # window is **reachable inside a single apply**: the rollback timer is on its own thread and
-    # `observed_routes()` is I/O, so it can fire between the read and the persistence. An earlier
-    # version here called it unreachable because apply is synchronous through `handle_reply`, which is
-    # true of the apply path and says nothing about the timer.
+    # **Open.** The window between an apply and the rollback timer — outcomes and reproductions are in
+    # #84, not here. Two review rounds went on the paragraph that used to describe them in this file;
+    # every version bounded the consequence by the branches it had looked at, and there was always
+    # another branch. The issue is the place for that.
     #
-    # ⚠️ And its consequence depends on how that rollback ended. When the rollback **succeeds** the
-    # result is a stranded plan. When nft restoration **fails**, `rollback` re-arms a retry timer, and
-    # the guard the apply meets is `if _timer is None` — "is a timer armed", not "has a rollback already
-    # run" — so the apply continues and writes routes after a rollback, with `_nft_rollback_owed` set.
-    # A review reproduced `replace` then `del`. An earlier version of this comment gave only the
-    # succeeding half.
-    #
-    # Both gaps are **dormant on the fleet today**: the whole route block sits behind `if declared:`,
-    # and the deployed revision's own comment says routes are absent on every host. That is the
-    # deployed code's assertion, not a reading of today's artifacts.
+    # Both are **dormant on the fleet today**: the whole route block sits behind `if declared:`, and the
+    # deployed revision's own comment says routes are absent on every host. That is the deployed code's
+    # assertion, not a reading of today's artifacts.
     # @see TestTheRoutePlanSurvivesARestart
     # @see test_a_new_commitment_does_not_inherit_the_previous_route_plan
     "pendingRoutes": None,
