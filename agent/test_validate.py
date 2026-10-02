@@ -4834,6 +4834,12 @@ class TestTheExpiryEscapeOnAStateThatWasRun(unittest.TestCase):
         an `accept_artifact_authorization(...)` call   test_the_third_condition_is_not_reachable_through_a_heartbeat — alone
         inserted above `confirm(st)` in the
         `pending` heartbeat branch
+        the same call, but only when                   the same test — alone, and **only after** that test
+        `st["currentAuthorization"] is not None`        gained a `pending`-while-carrying half. Before it,
+                                                        the shape the claim named was never driven
+        the acceptance recorder's `append`              the same test, at its positive control. Without
+        replaced with `pass`                            that control the recorder could be dead and three
+                                                        comparisons against `[]` would still pass
 
     Both were **green before this round's fixes**, and the review predicted that before either was
     run. The first is measured: with the weak witness restored (comparing only the generations the
@@ -5092,20 +5098,41 @@ class TestTheExpiryEscapeOnAStateThatWasRun(unittest.TestCase):
             reached.append((record.get("generation"), expired))
             return real_accept(record, watch, expired)
 
-        # `pending` — the beat confirms and returns.
+        @contextlib.contextmanager
+        def counting():
+            hp.accept_artifact_authorization = count
+            try:
+                yield
+            finally:
+                hp.accept_artifact_authorization = real_accept
+
+        # ## The positive control comes first, because three assertions below compare with `[]`
+        #
+        # An empty recording satisfies all of them, and so does a recorder that records nothing.
+        # Measured by the review that asked for this: replace the `reached.append(...)` with `pass`
+        # and inject an acceptance into the `rolled-back` branch, and this test is **green** — the
+        # failure mode `AGENTS.md` describes as a recorder whose deletion empties the comparison.
+        # So the observer is first proven on a beat that does reach the acceptance.
         self._serve("g-live", rec, expired=False)
         self._table_is_present()
-        self._beat("g-live")
+        with counting():
+            self._beat("g-live")
+        self.assertEqual(
+            reached, [("g-live", False)],
+            f"the observer did not record a beat that certainly reaches the acceptance: {reached}. "
+            "Every assertion below compares against an empty list and would be satisfied by an "
+            "observer that records nothing at all.",
+        )
         mid = hp.load_state()
         self.assertEqual(mid["state"], "pending", f"the apply did not leave `pending`: {self.logs}")
+
+        # ### `pending`, with no authorization yet — `confirm()` has not run
         self.assertIsNone(mid["currentAuthorization"], "an unconfirmed apply promoted its own record")
-        hp.accept_artifact_authorization = count
-        try:
-            self._serve("g-live", rec, expired=True)
-            self._table_is_gone()
+        reached.clear()
+        self._serve("g-live", rec, expired=True)
+        self._table_is_gone()
+        with counting():
             self._beat("g-live")
-        finally:
-            hp.accept_artifact_authorization = real_accept
         self.assertEqual(
             reached, [],
             f"the beat reached the acceptance from `pending` with {reached}. The third condition is "
@@ -5114,8 +5141,40 @@ class TestTheExpiryEscapeOnAStateThatWasRun(unittest.TestCase):
         )
         self.assertEqual(hp.load_state()["state"], "confirmed", f"it did not confirm: {self.logs}")
 
-        # `rolled-back` — the other state a host carrying a `currentAuthorization` can be in. The
-        # first version of this test did not drive it at all while the docstring named it.
+        # ### `pending` **while carrying** an earlier generation's authorization
+        #
+        # ⚠️ This half was missing and the claim above named it. The first version drove `pending`
+        # only in the shape where `currentAuthorization` is `None` — which is not a host carrying an
+        # authorization at all, so it could not see an acceptance reached by one that is. The state
+        # is produced, not written: confirm one generation, then apply the next and stop there.
+        # Measured by the review: state `pending`, generation `g-next`, `currentAuthorization` still
+        # on `g-live`.
+        nxt = self.record(
+            "g-next", authorized_at="2026-09-22T00:00:00.000Z",
+            expires_at="2026-09-23T00:00:00.000Z", payload="e",
+        )
+        self._serve("g-next", nxt, expired=False)
+        self._table_is_present()
+        self._beat("g-next")
+        carried = hp.load_state()
+        self.assertEqual(carried["state"], "pending", f"the second apply did not leave `pending`: {carried['state']}")
+        self.assertEqual(carried["generation"], "g-next")
+        self.assertEqual(
+            carried["currentAuthorization"]["generation"], "g-live",
+            "this half needs a `pending` host that still carries the previous authorization",
+        )
+        reached.clear()
+        self._serve("g-next", nxt, expired=True)
+        self._table_is_gone()
+        with counting():
+            self._beat("g-next")
+        self.assertEqual(
+            reached, [],
+            f"the beat reached the acceptance from `pending`-while-carrying-an-authorization with "
+            f"{reached} — the shape the first version of this test could not see.",
+        )
+
+        # ### `rolled-back` — the remaining state a host carrying a `currentAuthorization` can be in
         self._table_is_present()
         hp.rollback("a test takes this host out of confirmed")
         rolled = hp.load_state()
@@ -5126,13 +5185,10 @@ class TestTheExpiryEscapeOnAStateThatWasRun(unittest.TestCase):
             "the rollback cleared the authorization, so this half tests nothing",
         )
         reached.clear()
-        hp.accept_artifact_authorization = count
-        try:
-            self._serve("g-live", rec, expired=True)
-            self._table_is_gone()
-            self._beat("g-live")
-        finally:
-            hp.accept_artifact_authorization = real_accept
+        self._serve("g-next", nxt, expired=True)
+        self._table_is_gone()
+        with counting():
+            self._beat("g-next")
         self.assertEqual(
             reached, [],
             f"the beat reached the acceptance from `rolled-back` with {reached} — see the docstring.",
@@ -5206,9 +5262,9 @@ class TestTheExpiryEscapeOnAStateThatWasRun(unittest.TestCase):
         used to say the latter: *"it can never accept N again"*. The guard compares `authorizedAt`,
         so a **freshly signed** authorization for the old generation is newer than the watermark and
         is accepted — which `test_a_newly_signed_older_generation_walks_back_in` below measures,
-        because an independent review predicted it and predicting is not measuring. Whether that is
-        wanted is a question for the publish path rather than for the agent: it is the mechanism by
-        which a rollback publish could work at all.
+        because an independent review predicted it and predicting is not measuring. Whether anything
+        should ever sign such an authorization is a question for the publish path, and nothing here
+        answers it; this repository's agent tests cannot see that path at all.
 
         The refusal must be the replay guard's. If this ever starts refusing for expiry instead, the
         assertion on the recorded reason is what will say so.
@@ -5248,8 +5304,18 @@ class TestTheExpiryEscapeOnAStateThatWasRun(unittest.TestCase):
         This test asserts what the agent does, not what it should do. It exists because the sentence
         above said "it can never accept N again" and that was wrong in a way no existing test could
         have contradicted — a review predicted this outcome and the prediction is now a measurement.
-        If a rollback publish is ever wanted, this is the mechanism it would use; if it is not
-        wanted, the fix belongs in the publish path and this test is what will go red for it.
+
+        ⚠️ It says nothing about publishing. The authorization here is constructed in the test and
+        `_serve` replaces both fetching and verification, so **a change confined to the publish path
+        cannot make this test red** — an earlier version of this paragraph claimed it would. What
+        this pins is one agent behaviour: the replay guard compares `authorizedAt`, so a newer
+        signature on an older generation passes it. Whether anything should ever produce such a
+        signature is a question for the publish path, and the test that would answer it does not
+        live here.
+
+        ℹ️ And the name says what it measures: `g-old` walks back in **across a newer watermark**.
+        It is not a rollback from an *installed* `g-new` — this host never applied `g-new`, only
+        accepted its authorization.
         """
         old = self.record("g-old")
         self._run_a_generation_to_confirmed("g-old", old)
