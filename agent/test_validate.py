@@ -6086,11 +6086,15 @@ class TestTheRoutePlanSurvivesARestart(unittest.TestCase):
 
         ## What it reads, exactly
 
-        **Single-target `ast.Assign` nodes whose target is a subscript with a constant string key.**
-        Nothing else. "Any constant-key subscript assignment" was the earlier description and a review
-        showed it too broad: annotated assignments, chained assignments, dict union and a direct
-        `__setitem__` all escape, as do `st.update({...})`, `st.setdefault(...)`, a key built at runtime
-        and a key held in a variable — each injected and each leaving this scan green.
+        **Single-target `ast.Assign` nodes whose target is a subscript with a constant string key, and
+        whose subscripted object is a bare name or a call on a bare name.** Nothing else.
+
+        "Any constant-key subscript assignment" was the first description and a review showed it too
+        broad; the holder restriction was missing from the second. What escapes: annotated assignments,
+        chained assignments, dict union, a direct `__setitem__`, `st.update({...})`, `st.setdefault(...)`,
+        a key built at runtime, a key held in a variable, and — because of the holder rule — any write
+        through an attribute or a deeper expression, `self.st["fresh"] = 1` and
+        `obj.state()["fresh"] = 1` among them. Each was injected and each left this scan green.
 
         The scan is deliberately not being grown to cover them: in this series every widening of a
         checking device produced a new escape, while every narrowing of a claim held. What is written

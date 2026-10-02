@@ -3747,12 +3747,21 @@ _EMPTY_STATE = {
     # They are cleared together in `_clear_commitment` and read by the same recovery. That much was
     # compared and holds.
     #
-    # ⚠️ **Two related gaps are open, not closed by this field.** `henryj-dev/heliopause#84`: the confirm
-    # path returns `_backup` to its empty value in memory and leaves `_route_restore` alone, so a later
-    # generation's rollback can undo a route it never declared — reproduced on the commit before this
-    # work as well, so it is live in the fleet. The same issue records that route planning and
-    # persistence run ahead of the locked `_timer is None` check, which a review could only reach by
-    # overlapping two applies artificially, since apply is synchronous through `handle_reply` today.
+    # ⚠️ **Two related gaps are open, not closed by this field** — `henryj-dev/heliopause#84`.
+    #
+    # The confirm path returns `_backup` to its empty value in memory and leaves `_route_restore` alone,
+    # so a later generation's rollback can undo a route it never declared. It reproduces on the commit
+    # before this work too, which makes it **pre-existing**; whether the revisions running in the fleet
+    # carry it and reach that path has not been checked, and an earlier version of this comment said
+    # "live in the fleet" without checking.
+    #
+    # The same issue records that route planning and persistence run ahead of the locked
+    # `_timer is None` check. That window is **reachable inside a single apply** — the rollback timer is
+    # on its own thread and `observed_routes()` is I/O, so it can fire between the read and the
+    # persistence. An earlier version here called it unreachable on the grounds that apply is
+    # synchronous through `handle_reply`, which is true of the apply path and says nothing about the
+    # timer. The consequence is bounded: the guard below the persistence stops any route command, so
+    # what is left is a stranded plan rather than a route written after a rollback.
     # @see TestTheRoutePlanSurvivesARestart
     # @see test_a_new_commitment_does_not_inherit_the_previous_route_plan
     "pendingRoutes": None,
