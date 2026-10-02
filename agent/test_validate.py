@@ -5870,8 +5870,16 @@ class TestConfirmDoesNotLeaveTheRoutePlanBehind(unittest.TestCase):
 
     The sibling window in #84 — planning and persistence running ahead of the locked timer check — is
     untouched by this. It is reachable inside one apply, because the rollback timer is on its own thread
-    and `observed_routes()` is I/O, and its consequence is a stranded plan rather than a route written
-    after a rollback. There is no test for it here.
+    and `observed_routes()` is I/O. There is no test for it here.
+
+    ⚠️ **Its consequence depends on how that rollback ended, and an earlier version of this paragraph
+    gave only the half that looks harmless.** It said "a stranded plan rather than a route written after
+    a rollback", which holds when the rollback **succeeds**. When nft restoration fails, `rollback`
+    re-arms a retry timer, and the guard the apply then meets is `if _timer is None` — "is a timer
+    armed", not "has a rollback already run". So the apply continues and writes routes *after* a
+    rollback, with `_nft_rollback_owed` set. A review reproduced `replace` then `del` with the real
+    apply and callback, on this commit and with the fix reverted alike: pre-existing, and outside what
+    this PR changes.
     """
 
     ROUTE = {"spec": {"dst": "203.0.113.0/24", "via": "203.0.113.1"}, "before": None}
@@ -5931,10 +5939,16 @@ class TestConfirmDoesNotLeaveTheRoutePlanBehind(unittest.TestCase):
         self.assertIsNone(hp.load_state().get("pendingRoutes"), "the durable half was not cleared")
 
     def test_the_next_generations_rollback_undoes_nothing_it_did_not_declare(self):
-        """The review's scenario end to end: confirm generation 1, then roll back generation 2.
+        """The review's scenario, with the commitments synthesised rather than applied.
 
         Generation 2 declares no routes, so a rollback of it must issue no route command. Before the
         fix it issued a `del` for generation 1's destination — the plan was still in the process.
+
+        ⚠️ This builds each commitment by hand and calls `rollback` directly; it does not run
+        `apply_artifact` or a real timer callback. It reaches the consumption point that matters
+        (`heliopause-pull.py:2218`), which is what it is for, and the review drove the same sequence
+        through the real apply and callback separately. "End to end" was the earlier description and
+        claimed more than it does.
         """
         hp.save_state({
             **hp._EMPTY_STATE, "generation": "generation-1", "state": "pending",
