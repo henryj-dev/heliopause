@@ -3454,29 +3454,56 @@ class TestTheWatermarkIsDurableBeforeAnySideEffect(unittest.TestCase):
     after (312 collected, 12 skipped on macOS). "proxy" is the tripwire that stayed behind,
     `TestSignedArtifactSeam.test_the_apply_path_still_mentions_the_watermark_before_the_host_half`.
 
-        mutation                                            proxy   ordering  refusal  others
-        a boundary call inserted before the acceptance       RED     RED       RED      0
-        `st["authorizationWatermark"] = record` deleted      green   RED       green    8
-        the `return` after a refused acceptance deleted      green   green     RED      1
-        `json.dump` drops that one key before writing        green   RED       green    13
+        mutation                                            proxy   ordering  refusal
+        `_preflight_host_artifact(artifact)` inserted        RED     RED       RED
+          immediately above the acceptance call
+        `st["authorizationWatermark"] = record` deleted      green   RED       green
+        the `return` after a refused acceptance deleted      green   green     RED
+        `json.dump` drops that one key before writing        green   RED       green
 
-    **The proxy caught one of the four.** It is red for the first only because that mutation moves
-    text — an inserted call puts `_preflight_host_artifact` earlier in the file than
-    `accept_artifact_authorization`, which is the one thing two `str.index` calls can see. The other
-    three leave the file's two positions exactly as they are: a write that never happens, a refusal
-    that does not stop, and a write that happens but does not settle all read as "accept is still
-    above preflight".
+    **The proxy caught one of the four, and only on a technicality.** The inserted call is a literal
+    occurrence of `_preflight_host_artifact` placed above `accept_artifact_authorization`, so it
+    moves the first index the proxy reads; a mutation that reordered execution without moving that
+    first occurrence would leave it green. The other three leave both positions exactly as they are:
+    a write that never happens, a refusal that does not stop, and a write that happens but does not
+    settle all read as "accept is still above preflight".
 
     The fourth is the one worth naming. `authorizationWatermark` is set on the document and the
     commit point observes it, so the ordering holds and only the last assertion — reading the file
-    back — goes red. `assertEqual(None, …)` with "recorded in the timeline but is not on disk". That
-    is the difference between *earlier in the sequence* and *durable*, and no reading of the source's
-    shape reaches it.
+    back — goes red. `assertEqual(None, …)` with "recorded in the timeline but is not on disk". The
+    difference it pins is between **entering the save function with the field set** and **the field
+    being readable afterwards**; a source position can speak to neither.
 
-    The row counts in the last column are other tests that also fail, not coverage this class adds:
-    `TestReplayWatermark` and `TestBackfillCurrentAuthorization` already hold the acceptance's own
-    behaviour. What they do not assert is the **order against a side effect**, which is why the
-    proxy existed and why this replaces it rather than being dropped.
+    The tests that also fail, by name, so that nobody has to guess which ones (`AGENTS.md`: write the
+    names, because a count lets the reader fill it with any two):
+
+        `st["authorizationWatermark"] = record` deleted — 8 others
+            TestBackfillCurrentAuthorization.test_a_re_authorization_that_fails_to_apply_does_not_become_the_adopted_one
+            TestBackfillCurrentAuthorization.test_an_absent_field_adopts_a_record_the_ruleset_was_never_applied_under
+            TestBackfillCurrentAuthorization.test_an_acceptance_leaves_something_for_confirm_to_promote
+            TestReplayWatermark.test_accepts_a_first_authorization_and_writes_the_watermark
+            TestReplayWatermark.test_accepts_a_newer_authorization (error, not failure)
+            TestReplayWatermark.test_refuses_a_different_artifact_at_the_same_timestamp
+            TestReplayWatermark.test_refuses_an_authorization_older_than_the_watermark
+            TestStateSchemaHasBothHalves.test_every_state_key_is_both_written_and_read
+
+        the `return` after a refused acceptance deleted — 1 other
+            TestRestartWhilePending.test_the_same_host_is_refused_when_nothing_was_adopted
+
+        `json.dump` drops that one key — 13 others
+            the eight above minus the schema test, plus
+            TestBackfillCurrentAuthorization.test_a_watermark_written_before_expiresAt_existed_still_arms_the_escape
+            TestBackfillCurrentAuthorization.test_adopts_the_watermark_when_the_three_conditions_hold
+            TestBackfillCurrentAuthorization.test_adopts_when_only_the_workload_half_rolled_back
+            TestBackfillCurrentAuthorization.test_says_it_could_not_persist_rather_than_claiming_it_did
+            TestBackfillCurrentAuthorization.test_the_adopted_record_arms_the_expiry_escape
+            TestReplayWatermark.test_still_refuses_a_different_artifact_when_only_the_new_field_is_ignored
+            TestStartupCallsTheBackfill.test_main_adopts_the_authorization_before_it_starts_beating
+
+    Those are not coverage this class adds: `TestReplayWatermark` and
+    `TestBackfillCurrentAuthorization` already hold the acceptance's own behaviour. What none of them
+    asserts is the **order against a side effect**, which is why the proxy existed and why this
+    replaces it rather than being dropped.
     """
 
     def setUp(self):
@@ -3497,18 +3524,31 @@ class TestTheWatermarkIsDurableBeforeAnySideEffect(unittest.TestCase):
             envelope, dict(TestBackfillCurrentAuthorization.REC), None, False,
         )
         # 🔑 **The real acceptance, put back explicitly.** This module installs
-        # `stub_artifact_verification()` at import and never restores it, so `hp.accept_artifact_authorization`
-        # is a stub answering `({}, "")` for the whole suite — the comment beside
-        # `_REAL_ACCEPT_AUTHORIZATION` says any test reaching it is testing the stub. The first version
-        # of this class said "the real acceptance" and used the stub: measured, the timeline came back
-        # `['preflight']` with no watermark anywhere and nothing on disk, because a stub that writes
-        # nothing still returns a non-None value and the path walks on.
+        # `stub_artifact_verification()` at import and never calls the restore function it returns,
+        # so a test that does not install something else gets a stub answering `({}, "")` — the
+        # comment beside `_REAL_ACCEPT_AUTHORIZATION` says any test reaching it is testing the stub.
+        # (It is not the stub "for the whole suite": several classes install the captured real one for
+        # their own duration, this among them, and `tearDown` restores whatever was in place on
+        # entry rather than the module's original — restoring that would take away the default the
+        # rest of the suite expects.)
+        #
+        # The first version of this class said "the real acceptance" and used the stub: measured, the
+        # timeline came back `['preflight']` with no watermark anywhere and nothing on disk, because
+        # a stub that writes nothing still returns a non-None value and the path walks on.
         hp.accept_artifact_authorization = _REAL_ACCEPT_AUTHORIZATION
         real_commit = self._real["_save_state_unlocked"]
 
         def commit(st):
-            if st.get("authorizationWatermark") is not None and "watermark" not in self.timeline:
-                self.timeline.append("watermark")
+            # Not "a watermark was written" but "**this** watermark was written". Any save carrying
+            # any non-`None` value satisfied the first reading, so a save from somewhere else could
+            # have credited the event while the acceptance's own record turned up on disk later and
+            # satisfied the closing assertion. That is a false positive waiting for a regression
+            # rather than a path today's baseline takes, and the narrower comparison costs nothing.
+            if st.get("authorizationWatermark") == TestBackfillCurrentAuthorization.REC:
+                if "watermark" not in self.timeline:
+                    self.timeline.append("watermark")
+            elif st.get("authorizationWatermark") is not None:
+                self.timeline.append("watermark:someone-else")
             return real_commit(st)
 
         hp._save_state_unlocked = commit
@@ -3537,12 +3577,13 @@ class TestTheWatermarkIsDurableBeforeAnySideEffect(unittest.TestCase):
     def test_the_watermark_is_written_before_the_first_boundary(self):
         """And it is on disk when the assertion runs, not merely earlier in the sequence."""
         self._beat()
-        self.assertIn("watermark", self.timeline, f"no watermark was ever recorded: {self.timeline}")
         self.assertIn("preflight", self.timeline, f"the apply path never reached a boundary: {self.timeline}")
         self.assertEqual(
             self.timeline[0], "watermark",
             f"a boundary ran before the watermark reached the disk: {self.timeline}. A crash in that "
-            "gap leaves the same authorization replayable, which is the whole reason for the order.",
+            "gap leaves the same authorization replayable, which is the whole reason for the order. "
+            "An empty timeline here means no save carried the acceptance's own record at all; a "
+            "`watermark:someone-else` entry means one carried a different record.",
         )
         self.assertEqual(
             hp.load_state().get("authorizationWatermark"),
@@ -3555,9 +3596,32 @@ class TestTheWatermarkIsDurableBeforeAnySideEffect(unittest.TestCase):
 
         Without this the ordering assertion is satisfied by a path that records and then applies
         regardless of whether the record succeeded.
+
+        The refusal has to be the acceptance's. An empty timeline and a non-`None` `lastRefusal`
+        together say only that *something* stopped before the boundaries — verification refusing a
+        step earlier produces exactly that pair, and then this test would be pinning a different
+        guard than the one it is named for. So the stub counts its own calls and the assertion
+        requires the path to have reached it.
+
+        Measured, because the hole was real: make verification refuse (it refuses by **raising**,
+        `heliopause-pull.py:5112-5116`) and remove the call-count assertion, and this test is
+        **green** — `timeline == []` holds because nothing ran, and `lastRefusal` is set because
+        `_record_refusal` runs on that branch too. With the assertion in place the same mutation is
+        red and says which guard stopped the beat.
         """
-        hp.accept_artifact_authorization = lambda record, watch, expired: (None, "stubbed: refused")
+        reached = []
+
+        def refuse(record, watch, expired):
+            reached.append(record.get("generation"))
+            return None, "stubbed: refused"
+
+        hp.accept_artifact_authorization = refuse
         self._beat()
+        self.assertEqual(
+            reached, [TestBackfillCurrentAuthorization.REC["generation"]],
+            f"the beat did not reach the acceptance ({reached}), so whatever stopped it was an "
+            "earlier guard and the assertions below would be about that guard instead.",
+        )
         self.assertEqual(
             self.timeline, [],
             f"a refused acceptance still reached {self.timeline}. The watermark is what makes a replay "
