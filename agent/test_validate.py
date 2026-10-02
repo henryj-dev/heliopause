@@ -3474,8 +3474,9 @@ class TestTheWatermarkIsDurableBeforeAnySideEffect(unittest.TestCase):
     difference it pins is between **entering the save function with the field set** and **the field
     being readable afterwards**; a source position can speak to neither.
 
-    The tests that also fail, by name, so that nobody has to guess which ones (`AGENTS.md`: write the
-    names, because a count lets the reader fill it with any two):
+    The tests that also failed, by name — what the runner printed on those three runs, not a
+    standing guarantee about the suite (`AGENTS.md`: write the names, because a count lets the reader
+    fill it with any two):
 
         `st["authorizationWatermark"] = record` deleted — 8 others
             TestBackfillCurrentAuthorization.test_a_re_authorization_that_fails_to_apply_does_not_become_the_adopted_one
@@ -3491,14 +3492,27 @@ class TestTheWatermarkIsDurableBeforeAnySideEffect(unittest.TestCase):
             TestRestartWhilePending.test_the_same_host_is_refused_when_nothing_was_adopted
 
         `json.dump` drops that one key — 13 others
-            the eight above minus the schema test, plus
+            TestBackfillCurrentAuthorization.test_a_re_authorization_that_fails_to_apply_does_not_become_the_adopted_one
             TestBackfillCurrentAuthorization.test_a_watermark_written_before_expiresAt_existed_still_arms_the_escape
             TestBackfillCurrentAuthorization.test_adopts_the_watermark_when_the_three_conditions_hold
             TestBackfillCurrentAuthorization.test_adopts_when_only_the_workload_half_rolled_back
+            TestBackfillCurrentAuthorization.test_an_absent_field_adopts_a_record_the_ruleset_was_never_applied_under
+            TestBackfillCurrentAuthorization.test_an_acceptance_leaves_something_for_confirm_to_promote
             TestBackfillCurrentAuthorization.test_says_it_could_not_persist_rather_than_claiming_it_did
             TestBackfillCurrentAuthorization.test_the_adopted_record_arms_the_expiry_escape
+            TestReplayWatermark.test_accepts_a_first_authorization_and_writes_the_watermark
+            TestReplayWatermark.test_refuses_a_different_artifact_at_the_same_timestamp
+            TestReplayWatermark.test_refuses_an_authorization_older_than_the_watermark
             TestReplayWatermark.test_still_refuses_a_different_artifact_when_only_the_new_field_is_ignored
             TestStartupCallsTheBackfill.test_main_adopts_the_authorization_before_it_starts_beating
+
+    ⚠️ The third list was written as *"the eight above minus the schema test, plus seven"* and that
+    came to **fourteen**, against a count of thirteen. Two of its members are not in the first list
+    (`test_accepts_a_newer_authorization` errored under the first mutation and does not fail under
+    this one; the schema test fails only under the first), so expressing one measured list as an
+    edit of another measured list was wrong in both directions at once. Both lists are copied from
+    the runner now. An independent review caught the arithmetic — the same arithmetic the file's own
+    rule about counts exists to prevent.
 
     Those are not coverage this class adds: `TestReplayWatermark` and
     `TestBackfillCurrentAuthorization` already hold the acceptance's own behaviour. What none of them
@@ -3539,11 +3553,16 @@ class TestTheWatermarkIsDurableBeforeAnySideEffect(unittest.TestCase):
         real_commit = self._real["_save_state_unlocked"]
 
         def commit(st):
-            # Not "a watermark was written" but "**this** watermark was written". Any save carrying
-            # any non-`None` value satisfied the first reading, so a save from somewhere else could
-            # have credited the event while the acceptance's own record turned up on disk later and
-            # satisfied the closing assertion. That is a false positive waiting for a regression
-            # rather than a path today's baseline takes, and the narrower comparison costs nothing.
+            # Not "a watermark was written" but "**this** record entered the save function". The
+            # distinction is not pedantry: this runs *before* `real_commit`, so it says nothing about
+            # the write settling — which is exactly why the closing assertion reads the file back,
+            # and why the `json.dump` mutation leaves this event intact while the field never lands.
+            #
+            # What the comparison fixes is a different hole: any save carrying any non-`None` value
+            # satisfied the first version, so a save from somewhere else could have credited the
+            # event while the acceptance's own record turned up on disk later and satisfied the
+            # closing assertion. A false positive waiting for a regression rather than a path
+            # today's baseline takes, and narrowing it costs nothing.
             if st.get("authorizationWatermark") == TestBackfillCurrentAuthorization.REC:
                 if "watermark" not in self.timeline:
                     self.timeline.append("watermark")
@@ -3575,7 +3594,16 @@ class TestTheWatermarkIsDurableBeforeAnySideEffect(unittest.TestCase):
         })
 
     def test_the_watermark_is_written_before_the_first_boundary(self):
-        """And it is on disk when the assertion runs, not merely earlier in the sequence."""
+        """And it is on disk when the assertion runs, not merely earlier in the sequence.
+
+        The record comparison in the observer carries its own load, measured with the mutation an
+        independent review wrote for it: put a *different* record (`g-other`, an older
+        `authorizedAt`) in the state before the beat and touch a boundary, and this test is **red**
+        on `watermark:someone-else` being first. Restore the observer's old `is not None` predicate
+        and the same setup is **green** — the wrong record supplies the early event and the
+        acceptance's own record still satisfies the closing disk assertion. That is the false
+        positive the comparison exists for, and it is reachable rather than hypothetical.
+        """
         self._beat()
         self.assertIn("preflight", self.timeline, f"the apply path never reached a boundary: {self.timeline}")
         self.assertEqual(
@@ -3607,7 +3635,8 @@ class TestTheWatermarkIsDurableBeforeAnySideEffect(unittest.TestCase):
         `heliopause-pull.py:5112-5116`) and remove the call-count assertion, and this test is
         **green** — `timeline == []` holds because nothing ran, and `lastRefusal` is set because
         `_record_refusal` runs on that branch too. With the assertion in place the same mutation is
-        red and says which guard stopped the beat.
+        red, and what it reports is that **no** acceptance call was observed — which narrows the
+        cause to something ahead of the acceptance without naming it.
         """
         reached = []
 
@@ -3619,8 +3648,11 @@ class TestTheWatermarkIsDurableBeforeAnySideEffect(unittest.TestCase):
         self._beat()
         self.assertEqual(
             reached, [TestBackfillCurrentAuthorization.REC["generation"]],
-            f"the beat did not reach the acceptance ({reached}), so whatever stopped it was an "
-            "earlier guard and the assertions below would be about that guard instead.",
+            f"expected one acceptance call carrying "
+            f"{TestBackfillCurrentAuthorization.REC['generation']!r}; observed {reached}. Empty "
+            "means an earlier guard stopped the beat and the assertions below would be about that "
+            "guard instead; a different generation or more than one call means the acceptance was "
+            "reached, but not once and not with what the verifier returned.",
         )
         self.assertEqual(
             self.timeline, [],
