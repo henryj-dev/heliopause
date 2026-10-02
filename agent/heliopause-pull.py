@@ -2506,7 +2506,7 @@ def apply_artifact(artifact, validated=None):
 
 def confirm(state):
     """Cancel the rollback timer. Called when a heartbeat lands while an apply is pending."""
-    global _timer, _backup
+    global _timer, _backup, _route_restore
     # This heartbeat has already reached the relay, which is the confirmation evidence. The drift
     # baseline was captured from the verified post-apply snapshot before `pending` became durable;
     # never replace it with a potentially stale telemetry cache value here.
@@ -2560,6 +2560,26 @@ def confirm(state):
         _timer.cancel()
         _timer = None
         _backup = _NO_BACKUP
+        # The route half of the same commitment, and it was being left behind. Issue #84.
+        #
+        # 🔴 A confirmed generation's plan stayed in memory, so the **next** generation's rollback
+        # consumed it: an independent review drove apply→confirm for one generation, then a
+        # route-free apply and its timer, and watched the agent `replace` and then `del` a
+        # destination the live generation had never declared.
+        #
+        # ## Why this is the only place that needed it, enumerated rather than assumed
+        #
+        # Every other way a commitment ends already empties it. `rollback` **consumes** it
+        # (`route_plan, _route_restore = _route_restore, []`) and puts it back only when the rollback
+        # did not settle, which is the retry it exists for. The two abandonments inside
+        # `apply_artifact` run *before* this generation's plan is set, so what they would clear is a
+        # previous generation's — and after this line there is no previous generation's plan left to
+        # clear. Adding resets there would be lines no mutation could make red.
+        #
+        # The sibling issue #84 also records a window where planning and persistence run ahead of the
+        # locked timer check. That is **not** closed by this line.
+        # @see TestConfirmDoesNotLeaveTheRoutePlanBehind
+        _route_restore = []
     state.update(fresh)
     log(f"generation {fresh['generation']} confirmed — rollback disarmed")
     return True
