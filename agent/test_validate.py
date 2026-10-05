@@ -8174,6 +8174,21 @@ class TestAnApplyStopsWhenARollbackIsStillOwed(unittest.TestCase):
         # a review measured it. The entry-guard test cannot serve as the control the way its comment
         # claimed, because it never writes routes at all. So this drives one apply that **does**
         # write the route and asserts the recorder saw it, with the owed rollback out of the way.
+        # 🔴 **Cancel and join the retry timer, do not just drop the reference.** The failed rollback
+        # above armed a real five-second `threading.Timer`; assigning `None` over it loses the handle
+        # while the thread lives, and teardown then cancels only the control apply's timer — so the
+        # abandoned callback can outlive this fixture and fire against restored globals or the next
+        # test's state. A review named it, and it is the same defect this session already paid for
+        # once in a watchdog (PR #91).
+        stale = hp._timer
+        if stale is not None:
+            stale.cancel()
+            stale.join(5)
+            self.assertFalse(
+                stale.is_alive(),
+                "the retry timer outlived a five-second join; it would fire after this fixture is "
+                "gone and the failure would read as unrelated",
+            )
         hp._nft_rollback_owed = None
         hp._timer = None
         hp._backup = hp._NO_BACKUP
@@ -8209,9 +8224,16 @@ class TestAnApplyStopsWhenARollbackIsStillOwed(unittest.TestCase):
         at `heliopause-pull.py:2378`, inside the `with _apply_lock:` opened at `:2375`, and
         `rollback()` wants that same lock. The run hung for ten minutes instead of failing, which
         this repository records as the worst outcome available: CI reports a job timeout with no
-        failing test name and it reads as infrastructure. Measured, and worth keeping because it also
-        says something about the agent — **a rollback cannot interleave at the kernel write at all**,
-        so that part of the apply is not in the window.
+        failing test name and it reads as infrastructure. Worth keeping for that.
+
+        ⚠️ It went on: "and worth keeping because it also says something about the agent — **a
+        rollback cannot interleave at the kernel write at all**, so that part of the apply is not in
+        the window". That is more than the deadlock shows, and the class docstring was corrected
+        while **this copy was left standing** — the two-places-one-fix shape this file keeps
+        recording, inside the change that is about a guard left asking one question too few. Mutual
+        exclusion stops a restore and the write running **together**; it does not stop a rollback
+        that takes the lock first, finishes, and leaves the marker set. That is exactly why the
+        guard inside that block (`:2376`) needs the second question.
         """
         rolled = []
         snapshots = [([], [], ""), ([{"table": TABLE}], [], "")]
@@ -8255,9 +8277,16 @@ class TestAnApplyStopsWhenARollbackIsStillOwed(unittest.TestCase):
 
         The re-arm condition is `if not ok or not saved:` (`heliopause-pull.py:2252`) — an `or`, so
         two outcomes reach it. Every other test in this class injects the first (`ok` false). This
-        injects the second: the restore succeeds and the state write fails, which leaves the durable
-        state at `prepared` rather than a rolled-back value and so can take a different later path.
-        A review pointed out that all four tests covered one side of that `or`.
+        injects the second: the restore succeeds and the state write fails. A review pointed out that
+        all four tests covered one side of that `or`.
+
+        ⚠️ **What this establishes is the entry guard's refusal, not the mid-apply one.** Measured by
+        that review: it stays green with **all three** mid-apply marker checks reverted, because the
+        re-armed timer alone satisfies the entry guard. And the first version of this docstring said
+        the fixture leaves the durable state at `prepared` — it leaves it at **`pending`**, since
+        `_arm_a_commitment` already completed an apply. Covering the mid-apply window for this side
+        of the `or` means injecting the save failure **inside one apply, after its entry guard**, and
+        that is recorded as open rather than claimed here.
 
         It is also the outcome the issue describes as hardest to read: the apply reports
         `(True, "pending", "")` for a generation `confirm()` will refuse, so the log looks ordinary.
