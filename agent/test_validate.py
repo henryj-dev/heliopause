@@ -6850,24 +6850,27 @@ class TestTheRoutePlanSurvivesARestart(unittest.TestCase):
     The three cases below are the three ways that surfaced, and each one is a restart: the state is
     saved, loaded back, and only then does recovery run.
 
-    ## 🔴 Three mutations this class does **not** catch — measured, not predicted
+    ## Three mutations this class did not catch — measured, one now closed
 
-    An independent post-hoc review predicted these would stay green and all three did. Reported
-    rather than quietly fixed, because the file's rule is that a green mutation is worth writing
-    down and hiding it only moves the finding to the next round:
+    An independent post-hoc review predicted these would stay green and all three did:
 
-        mutation                                              whole suite
-        `if not _persist_route_commitment(plan):` → `if False:`   green
-          (`heliopause-pull.py:2454` — the production apply
-           no longer persists the plan at all)
-        the recovery timer's delay `remaining` → `remaining + 300`  green
-        the failed-rollback rewrite of `pendingRoutes` deleted      green
+        mutation                                                   before      now
+        `if not _persist_route_commitment(plan):` → `if False:`     green       **RED**
+          (`heliopause-pull.py:2454` — the production apply                     one test:
+           no longer persists the plan at all)                                  test_the_production_apply_still_calls_that_persistence
+        the recovery timer's delay `remaining` → `remaining + 300`  green       green
+        the failed-rollback rewrite of `pendingRoutes` deleted      green       green
           (`:2248`)
 
-    The first is the one that matters, and it is the same shape as the finding that drove PR #86:
-    `test_the_apply_path_is_what_puts_the_plan_on_disk` calls `_persist_route_commitment` **directly**,
-    so it proves the helper works and not that `apply_artifact` still calls it. The route block could
-    stop persisting entirely and every test here would pass.
+    The first mattered most, and it was the same shape as the finding that drove PR #86:
+    `test_the_apply_path_is_what_puts_the_plan_on_disk` calls `_persist_route_commitment`
+    **directly**, so it proves the helper works and not that `apply_artifact` still calls it. The
+    route block could have stopped persisting entirely and every test here would have passed. The
+    test named above closes it by driving the real apply and reading the field back off the disk;
+    the mutation run verbatim now fails that test alone.
+
+    The other two are left open and recorded, which is the point of writing them down — hiding a
+    green mutation only moves the finding to the next round.
 
     The second is a gap the class already admits: the timer case uses a fake `threading.Timer` that
     records its delay and fires the callback by hand, and nothing asserts the delay. Hand-firing
@@ -6893,6 +6896,7 @@ class TestTheRoutePlanSurvivesARestart(unittest.TestCase):
         hp._nft_apply_json = lambda doc: (1, "stubbed: no kernel here")
         hp._ip_route = lambda args: (self.route_calls.append(args), (0, ""))[1]
         hp.log = lambda line: self.logged.append(str(line))
+        self._real_snapshot = hp.snapshot
         hp._timer = None
         hp._backup = hp._NO_BACKUP
         hp._nft_rollback_owed = None
@@ -6946,6 +6950,70 @@ class TestTheRoutePlanSurvivesARestart(unittest.TestCase):
         self.assertEqual(
             hp.load_state().get("pendingRoutes"), [dict(self.ROUTE)],
             "the apply path's own write of the plan did not survive the load",
+        )
+
+    def test_the_production_apply_still_calls_that_persistence(self):
+        """And the test above does not say so, which a post-hoc review of #82 measured.
+
+        The case above calls `_persist_route_commitment` **directly**. It proves the helper writes a
+        plan that survives a load; it says nothing about `apply_artifact` still calling it. Measured:
+        replace `if not _persist_route_commitment(plan):` with `if False:` in the apply's route block
+        and the whole file stays green — the route half could stop persisting entirely and every test
+        here would pass. Same shape as the finding that drove PR #86, where a class proved a stub
+        rather than the path.
+
+        So this drives the real `apply_artifact` with a declared route and asserts the **effect on
+        disk**, not that a call happened: a recorder on the helper would be satisfied by a wrapper
+        that records and discards, while the field being on the state file afterwards is the property
+        the restart path reads.
+
+        Four boundaries are stubbed, all of them things that leave the machine: the nft apply, the
+        two kernel reads it verifies against, and `_ip_route` for both reading the table and writing
+        the route.
+        """
+        route = {"dst": "203.0.113.0/24", "via": "203.0.113.1"}
+        hp.save_state(dict(hp._EMPTY_STATE))
+        # The kernel accepts the ruleset here, unlike this class's default — the route block sits
+        # after the nft apply and a refusing stub never reaches it.
+        hp._nft_apply_json = lambda doc: (0, "")
+        snapshots = iter((([], [], ""), ([{"table": TABLE}], [], "")))
+        hp.snapshot = lambda: next(snapshots)
+        with hp._host_observe_lock:
+            hp._host_observe_value = {
+                "observed": "sha256:" + "0" * 64, "detail": "",
+                "foreignFilters": [], "publishedPorts": [],
+            }
+            hp._host_observe_at = time.monotonic()
+
+        hp._ip_route = lambda args: (self.route_calls.append(args), (0, ""))[1]
+        # The table before the apply: nothing on this prefix, so the declared route is new and its
+        # `before` is None — the shape `_persist_route_commitment` has to record.
+        #
+        # ⚠️ `observed_routes` does **not** go through `_ip_route`. It runs `ip -j route show` as its
+        # own `subprocess.run`, which this class's stub does not cover — the first version of this
+        # test stubbed `_ip_route` and the apply rolled back with
+        # `route observation failed: [Errno 2] No such file or directory: 'ip'`. Counting the
+        # boundaries a function reaches means following them, not naming the one that looks right.
+        real_observed = hp.observed_routes
+        hp.observed_routes = lambda: []
+        try:
+            ok, state, detail = hp.apply_artifact({
+                "generation": "g-routes", "ruleset": VALID, "rulesetHash": VALID_HASH,
+                "confirmTimeoutSec": hp.NFT_CONFIRM_MIN_SEC,
+                # The guard must not cover the declared route: `plan_routes` refuses a route that
+                # overlaps the management range, correctly — "it would confirm while every operator
+                # was locked out". The first version of this test used the same prefix for both and
+                # got that refusal, which is the guard working, not the path under test.
+                "routes": [route], "routeGuard": ["198.51.100.0/24"],
+            })
+        finally:
+            hp.snapshot = self._real_snapshot
+            hp.observed_routes = real_observed
+        self.assertTrue(ok, f"the apply did not reach the route block: {state} — {detail} — {self.logged}")
+        self.assertEqual(
+            hp.load_state().get("pendingRoutes"), [{"spec": route, "before": None}],
+            f"the production apply did not persist its route plan: {self.logged}. The helper works "
+            "(the case above proves that); what this asserts is that `apply_artifact` still calls it.",
         )
 
     def test_a_restart_that_rolls_back_restores_the_route(self):
