@@ -2373,7 +2373,21 @@ def apply_artifact(artifact, validated=None):
     # running, rollback waits for this bounded subprocess and then removes what it committed. With
     # no lock here, restore can win first and a late nft commit can reinstall an unconfirmed table.
     with _apply_lock:
-        if _timer is None:
+        # The same pair as the other two guards (#84) — and **no test reaches this one.**
+        #
+        # Measured: reverting this half alone leaves the whole file green. The reason is structural,
+        # not an omission in the tests. The block above releases `_apply_lock` immediately before
+        # this one acquires it, with nothing between them to pause, so the only way to arrive here
+        # with a rollback owed is for **another thread** to take the lock in that instant — the
+        # timer thread this very block armed, which is a real production race and not a sequence a
+        # single-threaded test can place itself inside. Driving it would mean a near-zero confirm
+        # timeout and a bet on scheduling, and this repository records what a flaky or hanging test
+        # costs.
+        #
+        # So this line is **reasoning, not measurement**, and it is written down rather than left to
+        # look like the two guards beside it. A reviewer who reverts it and sees green is seeing that
+        # fact, not a dead line.
+        if _timer is None or _nft_rollback_owed is not None:
             return False, "rolled-back", "confirmation deadline elapsed before kernel apply"
         rc, err = _nft_apply_json(doc)
     if rc != 0:
@@ -2466,8 +2480,13 @@ def apply_artifact(artifact, validated=None):
                 # `_nft_rollback_owed` is the one that answers "is this commitment still the live
                 # one": `rollback()` sets it before touching anything and clears it only on the
                 # settled path, so it stays set through exactly the two outcomes the timer check
-                # misses. The entry guard (`:2338`) and `confirm()` (`:2517`) already ask both; these
-                # two mid-apply guards were the pair that did not.
+                # misses. The entry guard (`:2338`) and `confirm()` (`:2517`) already ask both.
+                #
+                # ⚠️ **Three mid-apply guards ask it now, not two.** This comment said "these two
+                # mid-apply guards were the pair that did not" — a completeness claim written
+                # without counting, and the third is the one before the kernel write (`:2376`). A
+                # review found it. The count is not decoration here: a guard left asking one
+                # question is the defect, and naming a number implies the others were checked.
                 if _timer is None or _nft_rollback_owed is not None:
                     return False, "rolled-back", "confirmation deadline elapsed before routes"
                 # Armed before the write, so a crash between the two still has the plan on disk and
