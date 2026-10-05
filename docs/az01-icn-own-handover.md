@@ -4,7 +4,33 @@
 stardust 런북 §0·§10(`11e86b7b`)이 정본이고, 이 문서는 **heliopause 가 하는 부분**만 적는다.
 운영 변경은 포함하지 않는다 — 읽고 결정하기 위한 문서다.
 
-작성 2026-10-05. 아래 「측정」은 전부 이 저장소 `main`(`8c94f36` 기준)에 대고 잰 것이다.
+작성 2026-10-05. 아래 「측정」과 **`파일:줄` 인용은 전부 이 저장소 `main`(`117fb1b`)에 대고 다시
+잰 것이다.**
+
+⚠️ **처음에는 `8c94f36` 으로 적혀 있었고, 그 뒤 고친 인용들이 현재 트리 기준이어서 한 문서에 두
+기준이 섞였다.** 독립 리뷰가 잡았다 — 틀린 인용을 고치면서 **기준을 안 봤다.** 전부 `117fb1b`
+으로 다시 재어 다섯을 고쳤다(아래 「인용 기준」).
+
+🔑 **`policy/` 인용은 이 기준으로 고정되지 않는다.** `policy/` 는 심링크이고 실체는 **다른
+저장소**다(AGENTS.md 가 적은 포크 클론 구조). 그 저장소가 최신화되면 이 문서의 커밋과 **무관하게**
+줄이 움직인다 — 실제로 `policy/az01.ts` 의 relay url 이 `:157` → `:165` 로 밀렸다. 그쪽 인용은
+**볼 때마다 다시 재야 한다.**
+
+### 인용 기준 — `117fb1b` 로 다시 잰 결과
+
+**35 개 인용을 전부 열어 봤다.** 어긋난 다섯:
+
+| 인용 | 가리켰던 것 | 맞는 자리 |
+|---|---|---|
+| `heliopause-pull.py:5075` | `if (` | **`:5136`** — 「confirmed but the table is absent」 로그 |
+| `heliopause-pull.py:4376` | 주석 한 줄 | **`:4426`** — `record["authorizedAt"] < prior.get(...)` |
+| `heliopause-pull.py:4226` | `workload = entry.get("workload")` | **`:4276`** — `target`·`host` 검사 |
+| `policy/dev.ts:1402` | `*/` | **`:1428`** — `export const BACKBONE_CALLERS` |
+| `policy/az01.ts:157` | 주석 한 줄 | **`:165`** — `url: "https://10.112.0.1:8443"` |
+
+⚠️ **「틀렸다」고 적은 문단 안의 인용(`:3952` · `:4226` · `env-spec.ts:182` ·
+`manager-server.ts:3397`)은 일부러 그대로 둔다** — 그 문단이 만드는 예시이고, 고치면 문단이
+무의미해진다.
 
 ## 0. 먼저: 코드 변경이 필요한가 — **아니다**
 
@@ -155,7 +181,7 @@ drop 이 실제로 보이는지다 — 그것이 설정과 결과를 잇는 한 
 
 - 재부팅은 `table inet heliopause` 를 지운다(커널 메모리).
 - 다음 하트비트에서 `handle_reply` 가 **상태는 `confirmed` 인데 테이블이 없는 것**을 보고
-  **적용 경로로 떨어진다**(`heliopause-pull.py:5075`, 「confirmed but the table is absent —
+  **적용 경로로 떨어진다**(`heliopause-pull.py:5136`, 「confirmed but the table is absent —
   re-applying」). 이 경로는 테스트로 고정돼 있다(`TestTheExpiryEscapeOnAStateThatWasRun`).
 - ⚠️ **「첫 하트비트가 복원한다」가 아니라 「첫 하트비트가 시도한다」다.** 그 앞에 조건이
   줄로 있다 — 커널 관측이 준비돼 있어야 하고(「refresh pending」이면 그 beat 은 반환한다),
@@ -269,7 +295,7 @@ heliopause 가 보낸 세대와 갈라지면 「확인된 세대」가 두 뜻�
   `generation: source.head.sha`). 이전 커밋을 발행하면 **그 커밋의 세대 id 가
   다시 발행된다.** 새로 생기는 것은 세대가 아니라 **인가의 발급 시각**이다(`:3498`).
   (첫 판은 「더 낮은 세대 id」라고 적었다. sha 에는 시간 순서가 없다 — 순서를 보는 것은
-  `authorizedAt` 이고 재생 검사가 그것을 비교한다, `heliopause-pull.py:4376`.)
+  `authorizedAt` 이고 재생 검사가 그것을 비교한다, `heliopause-pull.py:4426`.)
 - **「2인 승인과 OTP 가 따라온다」도 무조건이 아니다.** 승인 모드는 **설정**이다:
   `:3421` 이 `mayApproveOwn: maySoloApprove` 를 허용하고, `:3499` 가
   `plan.approval?.solo ? "solo-otp" : "two-person"` 으로 고르며, `:4238` 은 OTP 가 설정돼
@@ -281,7 +307,7 @@ heliopause 가 보낸 세대와 갈라지면 「확인된 세대」가 두 뜻�
 
 ### 한 세대의 뜻
 
-- 발행은 **호스트마다 따로** 서명한다(`heliopause-pull.py:4226` 이 `target` 과 `host` 를 둘 다
+- 발행은 **호스트마다 따로** 서명한다(`heliopause-pull.py:4276` 이 `target` 과 `host` 를 둘 다
   검사, `src/artifact-signature.ts:397` 이 매니페스트 호스트마다 하나씩 낸다). 세 페이로드가
   나오는 것은 **매니페스트에 호스트가 정확히 셋일 때**다.
 - (a) 는 **호스트마다 따로** 일어난다 — 한 호스트의 확인이 늦으면 그 호스트만 되돌아간다.
@@ -301,7 +327,7 @@ heliopause 가 보낸 세대와 갈라지면 「확인된 세대」가 두 뜻�
 
 ### 무엇이 끊기나
 
-`policy/dev.ts:1402` 의 `BACKBONE_CALLERS` 에 홈랩 게이트웨이의 backbone 주소가 **`/32` 로**
+`policy/dev.ts:1428` 의 `BACKBONE_CALLERS` 에 홈랩 게이트웨이의 backbone 주소가 **`/32` 로**
 들어가 있다(`#45` 로 발행 완료 — 그 전에는 `10.255.0.0/16` 이었고 좁힌 것이 그 PR 이다).
 
     export const BACKBONE_CALLERS = [
@@ -475,7 +501,7 @@ relay URL 은 **배포 사실**이고 이 저장소에 없다 — **env 두 자�
 **§2-a 의 「세 대를 다 enroll 한 뒤에 한 세대를 발행한다」와 정면으로 어긋난다.** 독립 리뷰가
 잡았다 — 이 문서에서 **한 자리를 고치고 그 쌍을 남긴 것이 세 번째**다.
 
-1. **URL 을 정한다** — 정책 모듈의 `cfg.relay.url`(`policy/az01.ts:157`,
+1. **URL 을 정한다** — 정책 모듈의 `cfg.relay.url`(`policy/az01.ts:165`,
    `https://10.112.0.1:8443`, 사용자 결정 2026-10-05)
 2. **PKI 발급 — 사용자 손이다.** CA 사설키를 만드는 일이고 에이전트가 하지 않는다.
    `heliopause-pki site <pkiDir> policy/az01.ts` 가 **CA + relay + 호스트마다 agent** 를 낸다
