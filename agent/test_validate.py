@@ -2202,6 +2202,11 @@ class TestWorkloadApply(unittest.TestCase):
     # "insufficient to distinguish an object deleted and recreated by flux; fail closed rather than
     # delete by name". So the property under test is **left untouched, and said so**, not merely
     # "did not crash".
+    #
+    # ⚠️ The first version claimed that while only checking that **no delete** was issued, which
+    # allows the object to be modified instead. A review inserted a read-and-replace before the
+    # incident and both tests still passed. "Untouched" now means `self.calls == []` — no kubectl
+    # invocation of any kind — which is what the sentence above was always asserting in words.
 
     def _state_with(self, records):
         """One pending workload commitment whose applied-record list is exactly `records`."""
@@ -2222,6 +2227,14 @@ class TestWorkloadApply(unittest.TestCase):
         self.cluster["util/hp-dev-p700"] = self.live(cnp(), uid="uid-new", rv="2")
         self._state_with(["util/hp-dev-p700"])          # a string, not a dict
         hp.rollback_workload("legacy record", "g1")
+        # 🔴 **No kubectl at all**, not merely no delete. A review inserted a mutation that reads the
+        # object and replaces it before recording the incident, and both of these tests still
+        # passed — "삭제 0" allows the object to be *modified*. `self.calls` holds every kubectl
+        # invocation, so this is the assertion that matches the sentence above it.
+        self.assertEqual(
+            self.calls, [],
+            f"the loop reached the cluster for a record it refuses by shape: {self.calls}",
+        )
         self.assertEqual(
             self.deleted, [],
             f"a record with no UID proof was acted on: {self.deleted}",
@@ -2248,8 +2261,18 @@ class TestWorkloadApply(unittest.TestCase):
         self._state_with([{"ref": None, "uid": "uid-new", "cluster": "dev", "generation": "g1"}])
         hp.rollback_workload("bad ref", "g1")
         self.assertEqual(
+            self.calls, [],
+            f"the loop reached the cluster for a record it refuses by shape: {self.calls}",
+        )
+        self.assertEqual(
             self.deleted, [],
             f"a record with an unusable ref was acted on: {self.deleted}",
+        )
+        # ⚠️ The commit for the first version claimed both tests assert the object is still there.
+        # Only the first one did. Added here rather than left as a claim.
+        self.assertIn(
+            "util/hp-dev-p700", self.cluster,
+            "the object was removed despite the record not naming it usably",
         )
         st = hp.load_state()
         self.assertEqual(
