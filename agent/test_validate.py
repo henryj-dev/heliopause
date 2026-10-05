@@ -2388,9 +2388,9 @@ class TestWorkloadApply(unittest.TestCase):
         "intentionally settled for automatic action" (`:3196-3217`). A budget that ran out says
         nothing about whether the restore would succeed — only that there was no time left.
 
-        The budget is `WORKLOAD_ROLLBACK_BUDGET_SEC` (`:320`), so setting it to zero makes
-        `_deadline_timeout` return `None` at the first replace. That drives the real deadline
-        arithmetic (`:824-829`) rather than stubbing the branch's own helper.
+        The budget is `WORKLOAD_ROLLBACK_BUDGET_SEC` (`:320`) and this drives the real deadline
+        arithmetic (`:824-829`) rather than stubbing the branch's own helper — see the comment below
+        for why the clock is advanced rather than the budget zeroed.
         """
         # The stored snapshot has to **differ** from the live object, or the loop takes the
         # already-safe shortcut at `:3152` and `continue`s — measured: it recorded `rolled-back`
@@ -2400,10 +2400,20 @@ class TestWorkloadApply(unittest.TestCase):
         previous["metadata"]["uid"] = "uid-old"
         previous["spec"]["description"] = "the policy this rollback would restore"
         self.cluster["util/hp-dev-p700"] = self.live(cnp(), uid="uid-old", rv="2")
-        self._state_with([{
-            "ref": "util/hp-dev-p700", "uid": "uid-old", "cluster": "dev",
-            "generation": "g1", "previous": previous,
-        }])
+        # 🔑 **Two records, because one cannot tell `break` from `continue`.** A review measured
+        # that: with a single record both exits satisfy every assertion, and the mutation stayed
+        # green. The second record is never read if the loop breaks.
+        self.cluster["util/hp-dev-second"] = self.live(cnp(), uid="uid-two", rv="3")
+        self._state_with([
+            {
+                "ref": "util/hp-dev-p700", "uid": "uid-old", "cluster": "dev",
+                "generation": "g1", "previous": previous,
+            },
+            {
+                "ref": "util/hp-dev-second", "uid": "uid-two", "cluster": "dev",
+                "generation": "g1", "previous": previous,
+            },
+        ])
         # ⚠️ Setting the budget to zero does **not** reach this branch — measured: the *read* uses
         # the same deadline (`:2669-2671`) and fails first with "cannot read … deadline elapsed".
         # The branch under test is the one **after** a successful read, so the budget has to run out
@@ -2439,10 +2449,27 @@ class TestWorkloadApply(unittest.TestCase):
             "exceeded its total budget", st["workloadDetail"],
             f"the detail does not name the budget: {st['workloadDetail']!r}",
         )
-        # It `break`s rather than `continue`s, so no replace was attempted at all.
         self.assertEqual(
             [c for c in self.calls if c[0] == "replace"], [],
             f"a replace ran after the budget was gone: {self.calls}",
+        )
+        # 🔴 **The armed retry, which the docstring claims.** A review removed the arming in an
+        # isolated probe and this test stayed green — the deadline in durable state and the live
+        # timer are two different things, and only the first was checked.
+        self.assertIsNotNone(
+            hp._wl_timer,
+            "no retry was armed, so the running agent will not come back to this rollback",
+        )
+        # And it **stops**: with `break` the second record is never looked at.
+        #
+        # ⚠️ Asserting on `self.calls` is not enough — measured: a `break` → `continue` mutation
+        # stayed green, because the second record's *read* fails on the same spent deadline before
+        # kubectl is reached, so no call is recorded either way. What does differ is the **detail**:
+        # carrying on adds that record's `cannot read` to it.
+        self.assertNotIn(
+            "hp-dev-second", st["workloadDetail"],
+            f"the loop carried on to the next record after the budget was gone: "
+            f"{st['workloadDetail']!r}",
         )
 
     def test_no_commitment_means_nothing_to_recover(self):
