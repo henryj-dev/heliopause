@@ -110,7 +110,7 @@ jobs:
           node <<'JS'
           const files = require("/tmp/pack.json")[0].files.map((f) => f.path);
           const forbidden = files.filter((f) =>
-            /^(policy|docs|pki|pki-prod|pki-signing|pki-util|artifacts|snapshots)\//.test(f) ||
+            /^(policy|docs|pki|pki-prod|pki-signing|pki-util|pki-az01|artifacts|snapshots)\//.test(f) ||
             /\.(key|pem|csr|p12|pfx|jks|keystore|der|p8|pk8)$/.test(f) ||
             /(^|\/)observe(-peers)?\.(log|targets)$/.test(f));
           if (forbidden.length) {

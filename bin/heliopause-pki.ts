@@ -65,7 +65,7 @@ const USAGE = lang === "ko" ? `사용법:
   heliopause-pki sign-csr <dir> <csr> <out> --name=HOST --expect-sha256=HEX [--days=N]`
   : `usage:
   heliopause-pki init   <dir>
-  heliopause-pki issue  <dir> <name> --role=relay|agent [--san=addr,addr] [--days=N]
+  heliopause-pki issue  <dir> <name> --role=relay|agent|operator [--san=addr,addr] [--days=N]
   heliopause-pki site   <dir> <site-module> [--relay-name=NAME] [--san=addr,addr]
   heliopause-pki status <dir>
   heliopause-pki renew  <dir> [--force]

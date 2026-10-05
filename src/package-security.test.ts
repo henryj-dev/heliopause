@@ -248,7 +248,10 @@ describe("what a worktree is given and what git is told to ignore", () => {
     // happens to omit exactly the entry whose absence is invisible: nothing fails, the fleet is
     // simply unreadable from a worktree. `pki` is the dev VPC and is the one the manager's
     // `HELIOPAUSE_CA_FILE` points at, so it is the key to `/api/site` for all three.
-    for (const name of ["pki", "pki-prod", "pki-util"]) {
+    // `pki-az01` joined on 2026-10-05 with that VPC's enrolment. It is named here for the reason
+    // the paragraph above gives: this list is the one that does not come from the lists under test,
+    // so a name vanishing from both of those still fails here.
+    for (const name of ["pki", "pki-prod", "pki-util", "pki-az01"]) {
       assert.ok(linked.includes(name), `${name} is not linked into new worktrees`);
     }
   });

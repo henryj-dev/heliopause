@@ -12,7 +12,7 @@ packages/web/.svelte-kit/
 # untracked changes in the main tree — and `git add -A` in a worktree would commit its siblings.
 .claude/worktrees/
 
-# The same seven names again, without the trailing slash. Not redundant: a worktree gets these as
+# The same names again, without the trailing slash. Not redundant: a worktree gets these as
 # **symlinks** into the main tree (`.claude/worktree-bootstrap.md`), and git treats a symlink as a
 # file, so `docs/` and `pki*/` below do not match one. Measured — all of them showed as untracked in
 # a fresh worktree, one `git add -A` away from committing host-absolute paths into `docs`, `policy`,
@@ -31,6 +31,7 @@ pki
 pki-prod
 pki-util
 pki-signing
+pki-az01
 
 # Private keys and issued certificates. `heliopause-pki` writes these, and the natural place to run
 # it is the repository root — so without these lines a CA key is one `git add -A` away from being
