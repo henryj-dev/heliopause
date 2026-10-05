@@ -3781,9 +3781,20 @@ _EMPTY_STATE = {
     # every version bounded the consequence by the branches it had looked at, and there was always
     # another branch. The issue is the place for that.
     #
-    # Both are **dormant on the fleet today**: the whole route block sits behind `if declared:`, and the
-    # deployed revision's own comment says routes are absent on every host. That is the deployed code's
-    # assertion, not a reading of today's artifacts.
+    # ⚠️ **No claim here about which hosts this is dormant on.** Two attempts stood in this spot and
+    # both were false. The first said "dormant on the fleet today", qualified in the next sentence by
+    # admitting nobody had read today's artifacts — a qualification that contradicts the claim rather
+    # than narrowing it, while the unconditional half is what a reader carries away. The second said
+    # "dormant on any host whose artifact declares no routes", which is still false: `if declared:`
+    # guards whether a route plan is *created*, and `rollback()` consumes `_route_restore`
+    # unconditionally, so a generation that declares no routes can still undo a plan an earlier one
+    # left — which is exactly what
+    # `TestConfirmDoesNotLeaveTheRoutePlanBehind.test_the_next_generations_rollback_undoes_nothing_it_did_not_declare`
+    # drives. The counterexample was in this repository's own tests while the sentence was written.
+    #
+    # No third version. A claim about reach needs a named test, and nothing here can test which
+    # artifacts the fleet is serving; both independent reviews that read this spot found the same
+    # defect one layer in, which is this file's recorded signal to delete rather than rewrite.
     # @see TestTheRoutePlanSurvivesARestart
     # @see test_a_new_commitment_does_not_inherit_the_previous_route_plan
     "pendingRoutes": None,
