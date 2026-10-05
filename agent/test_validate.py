@@ -3699,7 +3699,18 @@ class TestTheApplyPathReadsTheVerifiedArtifact(unittest.TestCase):
         """The envelope's generation **value**, recording the four operations overridden below.
 
         One of two layers. This one survives a read that bypasses the container — `dict.get(env, key)`,
-        `dict.__getitem__`, `pop` — **provided the value is then compared, stringified or interpolated.**
+        `dict.__getitem__`, `pop` — **provided the value is then used through one of this class's four
+        hooks**: `__eq__`, `__ne__`, `__str__` or `__format__`.
+
+        ⚠️ That said "provided the value is then **compared**, stringified or interpolated", which is
+        wider than the hooks. A review measured two comparisons that record nothing:
+
+            dict.get(env, "generation") < "z"                    touches=[] uses=[]
+            str.__eq__(dict.get(env, "generation"), "g-wanted")   touches=[] uses=[]
+
+        The first is `__lt__`, not overridden here; the second calls `str`'s own `__eq__` instead of
+        the subclass's. "Compared" covers both and the instrument does not. The four names were
+        already listed further down — this sentence is the one that generalised past them.
         A path can act on it without any of those: `startswith`, `hash` and `is` all reach past these
         overrides, which is why the earlier wording here ("what a path would have to do to act on it")
         was wrong. @see `_Envelope` for the measured table and the known escapes
@@ -3871,11 +3882,103 @@ class TestTheApplyPathReadsTheVerifiedArtifact(unittest.TestCase):
             "schemaVersion": hp.SCHEMA_VERSION, "generation": wanted, "gate": {"open": True},
         })
 
+    # ## A post-hoc review's mutation, run verbatim, and its prediction was wrong
+    #
+    # The review proposed replacing `handle_reply`'s comparison with
+    # `dict.get(envelope, "generation").startswith("g-wanted")` — a container bypass followed by a
+    # method this class does not override, so the observer sees nothing — and predicted
+    # `test_the_generation_compared_is_the_verifiers_not_the_envelopes` would **PASS** on both cases.
+    #
+    # Measured: **both cases FAIL**, and not through the observer:
+    #
+    #     verified matches, envelope does not → 'accept' not found in []
+    #       "the path stopped at the generation comparison although the **verified** artifact was
+    #        the wanted generation"
+    #     envelope matches, verified does not → 'accept' unexpectedly found in ['accept', 'preflight']
+    #       "the path proceeded although the verified artifact was a different generation"
+    #
+    # So the observer's blind spot is real and **this mutation** is caught by the behaviour rather
+    # than by the observer: the two cases disagree about which object holds the wanted generation,
+    # and reading the envelope gives the wrong decision in each.
+    #
+    # ⚠️ That is a statement about the mutation that was run. It read "two cases that differ only in
+    # which object holds the wanted generation **cannot both come out right** if the comparison reads
+    # the wrong one", which is a claim about every wrong-object read — and a later review named one
+    # that reads the wrong object and still decides both fixtures the way they expect. Two cases
+    # cannot rule out a predicate that happens to agree with them.
+    #
+    # Worth keeping because the review was right about the instrument and wrong about this test, and
+    # only running it told those apart.
+    def test_the_observer_records_the_reads_it_claims_to_see(self):
+        """The positive control. Every **other** path-observation assertion in this class compares a log
+        with `[]`.
+
+        ⚠️ Two earlier wordings. "Every other assertion" was wider than the ones this holds up —
+        the rest check that the path reached `accept`, that a refusal was logged against the
+        wanted generation, and that it reached the state file. "Every **observation** assertion"
+        then included **this test**, which asserts logs that are *not* empty: a sentence falsified
+        by the test it sits in. Hence "every other path-observation assertion".
+
+        ⚠️ An independent post-hoc review pointed out that nothing established the recorders work,
+        and **measured it**: disable both — `self.touches.append(...)` in `_Envelope` and
+        `self.uses.append(...)` in `_Claim`, keeping their return values — and the whole file stays
+        green. That is the empty-recorder failure `AGENTS.md` describes, where the central evidence
+        of a suite is a comparison against a list nothing fills.
+
+        So this drives each hook directly and asserts the exact recording. It touches no agent code:
+        it is about the instrument, not the path.
+        """
+        envelope = self._envelope("g-probe")
+        self.assertEqual(envelope.get("generation"), "g-probe")
+        self.assertEqual(envelope["generation"], "g-probe")
+        self.assertIn("generation", envelope)
+        list(envelope.items())
+        list(envelope.keys())
+        list(envelope.values())
+        list(iter(envelope))
+        envelope.copy()
+        self.assertEqual(
+            envelope.touches,
+            # `copy` is three entries, not one: `dict.copy` on a subclass goes back through the
+            # overridden `keys` and then subscripts each one. Measured — the first version of this
+            # expectation listed `copy` alone and the runner printed the two extra reads. They are
+            # the instrument behaving correctly, so the expectation moved rather than the code.
+            ["get", "subscript", "contains", "items", "keys", "values", "iter", "copy", "keys", "subscript"],
+            f"the envelope observer did not record its own hooks: {envelope.touches}. Every other "
+            "assertion in this class reads an empty list as evidence, and an observer that records "
+            "nothing produces that list for free.",
+        )
+        claim = envelope.get("generation")
+        # Cleared here because the assertions above already compared `_Claim` values — the log
+        # accumulates for the whole test and the first version of this expectation forgot that,
+        # counting two of its own earlier reads as part of the probe.
+        self.value_uses.clear()
+        self.assertEqual(claim, "g-probe")          # __eq__
+        self.assertNotEqual(claim, "g-other")       # __ne__
+        str(claim)                                  # __str__
+        f"{claim}"                                  # __format__ — and then `__str__` again
+        self.assertEqual(
+            # Five, not four: `__format__` with an empty spec goes on to call `__str__`, so the
+            # f-string records twice.
+            #
+            # ⚠️ Written as seven first. The run before this one showed seven, but that log still
+            # held two comparisons from the assertions above — I read the number off that output
+            # instead of measuring again after adding the `clear()`. Deriving an expectation from a
+            # previous measurement of a different setup is the mistake this file keeps recording,
+            # and it happened inside the test whose subject is not trusting an unverified reading.
+            self.value_uses,
+            ["compared", "compared", "stringified", "interpolated", "stringified"],
+            f"the value observer did not record its own hooks: {self.value_uses}",
+        )
+
     def test_a_refused_envelope_is_not_consulted_for_a_generation(self):
         """Verification raises, and none of the accesses the observer sees happen.
 
         Narrower than "never read", which is what this said before a review found four ways past the
         observer. @see `_Envelope` for the table of what is and is not seen.
+
+        The recorders are proven live by `test_the_observer_records_the_reads_it_claims_to_see`;
+        without that, the empty lists below are satisfied by an observer that records nothing.
         """
         envelope = self._envelope("g-forged")
         hp.fetch_artifact = lambda: envelope
@@ -6186,7 +6289,7 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         # distinct sentence to `incidents` and continue, and `rollback_workload` logs the collected ones.
         # Collecting the log here is the only observation needed; inserting counters into the agent to
         # measure a test would make the agent carry the test's apparatus.
-        # @see the ten branch witnesses at the end of the sweep
+        # @see the nine branch witnesses at the end of the sweep
         self._real_log = hp.log
         hp.log = lambda line: self.logged.append(str(line))
         hp._timer = None
@@ -6222,9 +6325,16 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         call and the assertion stayed true, because the call is still in the tree. The test could not
         tell a startup that adopts from one that returns first — which is the only thing it was for.
 
-        So it drives `main()`. `_stop` is set beforehand, so the heartbeat loop exits on its first
-        check and the startup prelude is the whole of what runs. The assertion is on the state file
-        afterwards: a host that confirmed under an older build has its authorization named.
+        So it drives `main()`. `_stop` is left **clear** and the heartbeat stub sets it, so the loop
+        runs exactly one beat — which is what lets the ordering be checked at all, and a watchdog
+        timer gives the loop a second way out so **a skipped beat** fails rather than hangs. (Only
+        that: the watchdog sets the event the loop checks, so it does nothing for synchronous work
+        that blocks or for a loop that stops checking. The measured case is the deletion of
+        `post_heartbeat(...)` from the loop.) (This said
+        `_stop` is set beforehand; that was true until the beat had to happen.) That one beat and the
+        startup prelude are the whole of what runs. Two assertions follow: the authorization the
+        **heartbeat saw**, which is the ordering, and the state file afterwards, which is the
+        adoption — a host that confirmed under an older build has its authorization named.
         """
         # The builder, not a hand-made dict: production writes `pendingAuthorization` and the watermark
         # together, and the first version of this fixture left the former `None` — a combination the
@@ -6257,7 +6367,24 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
             monitor_started.set()
 
         hp.monitor_loop = monitor
-        hp.post_heartbeat = counted("heartbeat")
+        # 🔑 **The heartbeat runs once, and records what the state looked like when it did.**
+        #
+        # ⚠️ This was `counted("heartbeat")` with `_stop` set before `main()`, so the loop
+        # (`heliopause-pull.py:5351`, `while not _stop.is_set()`) exited before its first beat and the
+        # heartbeat was **never called** — measured: the count came back `None`, not even 0. The test
+        # is named "before it starts beating" and the beating half was not happening at all, which an
+        # independent post-hoc review named. Counting a stub nobody calls is the shape this file warns
+        # about one layer up.
+        #
+        # So `_stop` is left clear and this stub sets it, which lets the loop run exactly one beat.
+        beats_saw = []
+
+        def heartbeat(*_a, **_kw):
+            reached["heartbeat"] = reached.get("heartbeat", 0) + 1
+            beats_saw.append(hp.load_state().get("currentAuthorization"))
+            hp._stop.set()
+
+        hp.post_heartbeat = heartbeat
         hp.recover_commitment = counted("recover")
         hp.recover_workload_commitment = counted("recover_workload")
         hp.reconcile_recovered_commitments = counted("reconcile")
@@ -6276,13 +6403,64 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         for k, v in env.items():
             setattr(hp, k, v)
         was_set = hp._stop.is_set()
-        hp._stop.set()
+        hp._stop.clear()  # the heartbeat stub sets it after one beat — see its comment above
+        # 🔴 **A deadline, because `hp.main()` is synchronous and has none.** With `_stop` cleared, the
+        # loop's only exit is the heartbeat stub setting it — so a regression that stops reaching the
+        # heartbeat would **hang here** instead of failing the count below. `AGENTS.md`: a hang is not
+        # a red. CI would report a job timeout with no failing test name and it would read as
+        # infrastructure. An independent review caught this in the same change that cleared `_stop`.
+        #
+        # The watchdog gives the loop a second way out, so the count assertion is what fails.
+        #
+        # Measured both ways. Deleting `post_heartbeat(...)` from the loop
+        # (`heliopause-pull.py:5357`) now fails in **10.1s** with
+        # `'heartbeat': None != 'heartbeat': 1` instead of waiting forever. And removing the stub's
+        # own `_stop.set()` — keeping the beat — still **passes** in 10.1s, because one beat happens
+        # inside the window; that mutation is of this harness rather than of the agent, and the
+        # watchdog is not meant to catch it.
+        # The watchdog does not touch `_stop` directly: it asks first. A callback already running
+        # cannot be cancelled, so the disarm flag is what keeps a late one from setting the **shared**
+        # event after this test has put it back.
+        disarmed = threading.Event()
+
+        def trip():
+            if not disarmed.is_set():
+                hp._stop.set()
+
+        watchdog = threading.Timer(10, trip)
+        watchdog.daemon = True
+        watchdog.start()
         try:
             code = hp.main()
             # A wait, not a join. If the monitor never runs this expires and the count below fails; it
             # does not pass quietly.
             monitor_started.wait(5)
         finally:
+            # 🔴 **Cancel *and* join, before `_stop` is restored.** `Timer.cancel()` only stops a
+            # callback that has not been dispatched yet: one already running can be paused just
+            # before its `Event.set()`, survive the cancel, and set the **shared** `_stop` after the
+            # line below clears it — leaking into whatever test runs next, for a reason that would
+            # read as unrelated. A review reproduced that race with a probe that paused the bound
+            # callback. It is the same hazard this class already asserts about the recovery timers
+            # ("restoring the saved value over it only dropped the reference"), and the watchdog
+            # added in the previous round did not get the same treatment.
+            #
+            # ℹ️ The disarm flag **narrows** that race rather than closing it: a callback already past
+            # its `disarmed.is_set()` check will still set the event. The window is the two statements
+            # of `trip`, against a ten-second timer the cancel almost always wins, and if it does not
+            # the join catches it. Written as a window rather than as "closed" — three sentences in a
+            # row in this class have claimed more than the code did.
+            #
+            # ⚠️ And the assertion is **not** here. It was, and a review named that a merge blocker:
+            # an `assertFalse` raising inside `finally` skips the restoration of all six patched
+            # functions, `signal.signal`, the env constants and `_stop` — contaminating every later
+            # test — and replaces any exception `hp.main()` had already raised as the reported
+            # failure. So this block only records, restores unconditionally, and the assertion is
+            # made after it.
+            disarmed.set()
+            watchdog.cancel()
+            watchdog.join(5)
+            watchdog_survived = watchdog.is_alive()
             (
                 hp.load_artifact_trust, hp.monitor_loop, hp.post_heartbeat,
                 hp.recover_commitment, hp.recover_workload_commitment,
@@ -6293,10 +6471,16 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
             if not was_set:
                 hp._stop.clear()
 
+        self.assertFalse(
+            watchdog_survived,
+            "the watchdog outlived a five-second join. It is disarmed, so it will not change `_stop` "
+            "now — but a callback that needs that long means `main()` did not return on its own, and "
+            "the counts below describe a run that was cut short rather than one that finished.",
+        )
         self.assertEqual(code, 0, "main() refused to start, so nothing below was exercised")
         self.assertEqual(
-            {k: reached.get(k) for k in ("recover", "recover_workload", "reconcile", "monitor")},
-            {"recover": 1, "recover_workload": 1, "reconcile": 1, "monitor": 1},
+            {k: reached.get(k) for k in ("recover", "recover_workload", "reconcile", "monitor", "heartbeat")},
+            {"recover": 1, "recover_workload": 1, "reconcile": 1, "monitor": 1, "heartbeat": 1},
             "the startup did not make every recovery call and reach the monitor, so this test cannot "
             "say the adoption happened during a startup that got that far",
         )
@@ -6307,6 +6491,14 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         # Calling one of them twice **is** caught, by the count.
         # @see test_the_backfill_still_precedes_the_recovery_paths for the one ordering claim that is
         #      pinned, and why it is a tripwire rather than the invariant
+        # The half this test is named for. Not "the adoption happened" but "it had happened by the
+        # time the host spoke": a beat carrying `currentAuthorization: None` is what `relay.ts`
+        # surfaces as a host that cannot name its authorization, so the order is the property.
+        self.assertEqual(
+            beats_saw, [TestBackfillCurrentAuthorization.REC],
+            f"the first heartbeat saw {beats_saw} — the host beat before adopting the authorization "
+            "it is already enforcing, which is the state the relay reports as unnameable.",
+        )
         self.assertEqual(
             hp.load_state()["currentAuthorization"], TestBackfillCurrentAuthorization.REC,
             "main() did not adopt the authorization already in force — every host keeps None",
@@ -6443,7 +6635,20 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
                 })
             # Reconciliation's two branches need the halves to **differ**: a failed host beside a live
             # workload, and a failed workload beside a live host.
-            pairs = [(failed[0], "confirmed")] + [(host, failed[0]) for host in live]
+            #
+            # ⚠️ The failed value is taken from `failed` **minus `live`**, not from `failed[0]`.
+            # `rollback-failed` is in both partitions — legitimately, since such a host still carries a
+            # ruleset and its rollback still failed — so `failed[0]` was `rollback-failed` and the pair
+            # built for `host == "rollback-failed"` had **both halves the same**, which is exactly the
+            # precondition the sentence above says these cases establish. An independent post-hoc
+            # review found it. Two of the eight reconciliation cases were not testing differing halves.
+            distinct = [s for s in failed if s not in live]
+            self.assertTrue(
+                distinct,
+                f"every failed state is also a live state ({failed} ⊆ {live}), so no case here can "
+                "put a failed half beside a live one — the two reconciliation branches need that",
+            )
+            pairs = [(distinct[0], "confirmed")] + [(host, distinct[0]) for host in live]
             for host, wl in pairs:
                 cases.append({
                     "name": f"reconcile_recovered_commitments ({host} host, {wl} workload, "
@@ -6558,25 +6763,32 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
             )
         # The workload half settles separately, and its success needs a readable answer from the cluster
         # boundary: with an unparseable one the objects stay on the retryable list and the settlement
-        # below is skipped. Measured — the branch was entered zero times while `rollback_workload` ran
-        # eighteen, and a `confirmed` written at the settlement survived.
-        self.assertIn(
-            "rolled-back", [after for _before, after in workload_transitions],
-            "no recovery path ever changed the workload state to 'rolled-back', so the workload success "
-            "tail did not run — check what the cluster stub answers when it is meant to succeed. "
-            f"Transitions seen: {sorted(set(workload_transitions))}",
-        )
+        # below is skipped. Measured when this was written — the branch was entered zero times while
+        # `rollback_workload` ran eighteen, and a `confirmed` written at the settlement survived.
+        #
+        # ⚠️ The assertion that caught that is **deleted**:
+        #
+        #     assertIn("rolled-back", [after for _before, after in workload_transitions])
+        #
+        # The `"replace succeeded (:3106)"` witness below already requires a case that replaced **and**
+        # settled, and settlement is what writes that transition. Measured — removing this alone left
+        # the whole file green, so it discriminated nothing the witness does not. The history stays
+        # here because it says what the witness is for; the duplicate assertion does not, and a line a
+        # reviewer can revert for free teaches that reverting such lines is free.
         # The two branches an absent object cannot reach. Without these, "the workload success tail runs"
         # was satisfied by settlements that had all taken the missing-object shortcut — nine of them, in
         # the sweep as it stood then — and `confirmed` written at either branch survived.
-        # ## Ten branch witnesses — a hand-written list, and it says so
+        # ## Nine branch witnesses — a hand-written list, and it says so
+        #
+        # (Ten until a review showed one was implied by two others. The heading said ten after that
+        # deletion, which is the kind of count this file keeps catching one place at a time.)
         #
         # Twice a branch was opened and the neighbouring ones left at zero: first the whole workload
         # success path, then six refusals between the read and the restore. Each line below is a witness
         # that one branch ran, so a case that stops reaching one fails here instead of quietly shrinking
         # the sweep.
         #
-        # ⚠️ **These are ten branches I went and read, not "the branches".** A review counted the loop and
+        # ⚠️ **These are nine branches I went and read, not "the branches".** A review counted the loop and
         # found **five more this sweep never enters** — a legacy record (`heliopause-pull.py:3048`), an
         # invalid reference (`:3052`), a read failure (`:3056`), an exception from the cleaner
         # (`:3069-3070`), and an exhausted replacement budget (`:3099`). Writing `confirmed` into any of
@@ -6586,13 +6798,24 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         # list is partial is not the same as the holes not being there.
         #
         # The device that claimed completeness instead of listing was removed in an earlier round for
-        # being wrong about its own scope. This one claims the ten it names.
+        # being wrong about its own scope. This one claims the nine it names — ten until a review showed
+        # one of them was implied by two others.
         #
-        # Five are refusals that change no state and call no boundary, so their witness is the sentence the
-        # agent logs. Five are observable as boundary calls or settlement.
+        # Two kinds, and the split is **not** given as a count. Some are refusals that change no state
+        # and call no boundary, so their witness is the sentence the agent logs; the rest are observable
+        # as boundary calls or settlement.
+        #
+        # ⚠️ This said "Five … Five", which still added to ten after the deletion below took one away. I
+        # then wrote "Five … Four" — also without counting, and also wrong: the entries do not divide
+        # that way. Each witness says in its own expression which kind it is, and a reader who wants the
+        # split can count nine lines faster than I managed to guess it twice.
+        # ⚠️ `"replace (:3102)": bool(self.replace_calls)` stood here and is **deleted**: an
+        # independent post-hoc review pointed out that both replace-outcome witnesses below already
+        # require `ev["replaced"]`, so this one discriminated nothing. Measured — removing it alone
+        # left the whole file green. It is nine witnesses now, not ten; the replace branch is still
+        # named, by the two that say which way it came out.
         witnesses = {
             "delete (:3088)": bool(self.delete_calls),
-            "replace (:3102)": bool(self.replace_calls),
             # Both sides of the replace outcome, read per case: the succeeding one settles the workload
             # half, the failing one does not. A global "some line lacked the incident text" was the first
             # version of this witness and it was satisfied by almost any log line at all.
@@ -6645,7 +6868,11 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         )
         self.assertTrue(self.nft_calls, "no case reached the kernel boundary")
         self.assertTrue(self.route_calls, "no case reached the route boundary")
-        self.assertTrue(self.kubectl_calls, "no case reached the cluster boundary")
+        # ⚠️ The cluster boundary had a third line here and it is **deleted**. The replace witnesses
+        # read `self.replace_calls`, which the cluster stub appends to only after appending to
+        # `self.kubectl_calls`, so a non-empty `kubectl_calls` is already implied. Measured — removing
+        # it alone left the whole file green. The asymmetry with its two neighbours is deliberate: nft
+        # and routes have no witness that implies them.
         self.assertTrue(self._timers_seen, "no timer was armed, so the cancel check proved nothing")
         for armed in self._timers_seen:
             armed.join(2)
