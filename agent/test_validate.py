@@ -3910,11 +3910,14 @@ class TestTheApplyPathReadsTheVerifiedArtifact(unittest.TestCase):
     # Worth keeping because the review was right about the instrument and wrong about this test, and
     # only running it told those apart.
     def test_the_observer_records_the_reads_it_claims_to_see(self):
-        """The positive control. Every **observation** assertion in this class compares a log with `[]`.
+        """The positive control. Every **other** path-observation assertion in this class compares a log
+        with `[]`.
 
-        (Not every assertion: the others check that the path reached `accept`, that a refusal was
-        logged against the wanted generation, and that it reached the state file. "Every other
-        assertion" was the first wording and it is wider than the ones this control holds up.)
+        ⚠️ Two earlier wordings. "Every other assertion" was wider than the ones this holds up —
+        the rest check that the path reached `accept`, that a refusal was logged against the
+        wanted generation, and that it reached the state file. "Every **observation** assertion"
+        then included **this test**, which asserts logs that are *not* empty: a sentence falsified
+        by the test it sits in. Hence "every other path-observation assertion".
 
         ⚠️ An independent post-hoc review pointed out that nothing established the recorders work,
         and **measured it**: disable both — `self.touches.append(...)` in `_Envelope` and
@@ -6324,7 +6327,10 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
 
         So it drives `main()`. `_stop` is left **clear** and the heartbeat stub sets it, so the loop
         runs exactly one beat — which is what lets the ordering be checked at all, and a watchdog
-        timer gives the loop a second way out so a regression fails rather than hangs. (This said
+        timer gives the loop a second way out so **a skipped beat** fails rather than hangs. (Only
+        that: the watchdog sets the event the loop checks, so it does nothing for synchronous work
+        that blocks or for a loop that stops checking. The measured case is the deletion of
+        `post_heartbeat(...)` from the loop.) (This said
         `_stop` is set beforehand; that was true until the beat had to happen.) That one beat and the
         startup prelude are the whole of what runs. Two assertions follow: the authorization the
         **heartbeat saw**, which is the ordering, and the state file afterwards, which is the
@@ -6421,7 +6427,21 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
             # does not pass quietly.
             monitor_started.wait(5)
         finally:
+            # 🔴 **Cancel *and* join, before `_stop` is restored.** `Timer.cancel()` only stops a
+            # callback that has not been dispatched yet: one already running can be paused just
+            # before its `Event.set()`, survive the cancel, and set the **shared** `_stop` after the
+            # line below clears it — leaking into whatever test runs next, for a reason that would
+            # read as unrelated. A review reproduced that race with a probe that paused the bound
+            # callback. It is the same hazard this class already asserts about the recovery timers
+            # ("restoring the saved value over it only dropped the reference"), and the watchdog
+            # added in the previous round did not get the same treatment.
             watchdog.cancel()
+            watchdog.join(5)
+            self.assertFalse(
+                watchdog.is_alive(),
+                "the watchdog is still waiting to fire; it would set `_stop` after this cleanup "
+                "clears it and the next test would start stopped",
+            )
             (
                 hp.load_artifact_trust, hp.monitor_loop, hp.post_heartbeat,
                 hp.recover_commitment, hp.recover_workload_commitment,
