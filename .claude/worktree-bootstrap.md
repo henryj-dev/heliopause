@@ -1,7 +1,7 @@
 # 새 워크트리 준비
 
 `EnterWorktree` 는 `.claude/settings.json` 의 `worktree.symlinkDirectories` 를 걸어 준다.
-**하지만 실측에서 안 걸린 적이 있다** — 새 워크트리에서 아래 여섯 개가 있는지 눈으로 보고,
+**하지만 실측에서 안 걸린 적이 있다** — 새 워크트리에서 아래 경로들이 있는지 눈으로 보고,
 없으면 이 명령을 돌린다.
 
 ```bash
@@ -13,7 +13,7 @@ done
 ls -ld node_modules policy pki pki-prod pki-util pki-signing pki-az01
 ```
 
-이 여섯은 **이 저장소가 배포되는 사이트에만 있는 것**이다. 공개 클론에는 애초에 없고, 없어도
+이것들은 **이 저장소가 배포되는 사이트에만 있는 것**이다. 공개 클론에는 애초에 없고, 없어도
 `npm test` · `npm run typecheck` · `npm run check:web` 는 `node_modules` 만 있으면 전부 돈다.
 아래는 그 사이트에서 작업할 때의 이야기다.
 
@@ -34,7 +34,7 @@ ls -ld node_modules policy pki pki-prod pki-util pki-signing pki-az01
 때」를 설명하던 것이고, 그걸 읽으면 **워크트리에서 그 문서를 찾지 않게 된다.** 거기에 설계 결정이
 들어 있다.
 
-## 왜 심링크인가 — 이 여섯은 **git 이 안 옮겨 준다**
+## 왜 심링크인가 — 이것들은 **git 이 안 옮겨 준다**
 
 전부 이 저장소에서 추적되지 않는다(이유는 `.gitignore` 의 주석에 적혀 있다). 워크트리
 체크아웃은 추적된 파일만 가져오므로 **새 워크트리는 이것들이 통째로 없는 상태로 시작한다.**
