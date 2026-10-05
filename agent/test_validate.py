@@ -8140,12 +8140,49 @@ class TestAnApplyStopsWhenARollbackIsStillOwed(unittest.TestCase):
         # one back. A second apply would be turned away by the entry guard before it ever reached
         # the route block — measured, the first version did exactly that and `observed_routes` was
         # never called.
+        # ## Who called this matters, so the stub asks
+        #
+        # 🔴 This counted every call and asserted exactly one. `observed_routes` is **also** read by
+        # the heartbeat telemetry path (`heliopause-pull.py:4610` · `:4624`, both inside
+        # `_read_host_observation`), so a call from there made the count two and the assertion failed
+        # on Linux CI while passing 13 runs on macOS — same code, different timing. Measured, PR #104.
+        #
+        # Weakening the assertion to "not empty" was the first idea and the wrong one: it would stop
+        # noticing a double rollback. So the stub classifies instead. The apply-path count keeps the
+        # original strength, and calls from the observation path are **recorded rather than
+        # asserted** — the cause above was inferred, not measured, and this is what turns it into a
+        # measurement when it next happens.
         paused = []
+        from_observation = []
+
+        def _came_from_observation():
+            f = sys._getframe(1)
+            while f is not None:
+                if f.f_code.co_name == "_read_host_observation":
+                    return True
+                f = f.f_back
+            return False
 
         def observe_then_roll_back():
+            if _came_from_observation():
+                from_observation.append("observed")
+                return []
             paused.append("observed")
+            # Only the apply-path call rolls back. A second rollback is not the scenario the issue
+            # describes, and this is the same classification doing the work — not a separate guard.
             self._rollback_that_does_not_settle()
             return []
+
+        def _say_if_the_background_called():
+            if from_observation:
+                print(
+                    f"\n[#87] observed_routes was read {len(from_observation)}× from "
+                    f"_read_host_observation during {self.id()} — this is the call that used to "
+                    f"break the count.",
+                    file=sys.stderr,
+                )
+
+        self.addCleanup(_say_if_the_background_called)
 
         hp.observed_routes = observe_then_roll_back
         hp._nft_apply_json = lambda _doc: (0, "")
@@ -8157,7 +8194,11 @@ class TestAnApplyStopsWhenARollbackIsStillOwed(unittest.TestCase):
             "confirmTimeoutSec": hp.NFT_CONFIRM_MIN_SEC,
             "routes": [self.ROUTE["spec"]], "routeGuard": ["198.51.100.0/24"],
         })
-        self.assertEqual(paused, ["observed"], "the apply never reached the route block")
+        self.assertEqual(
+            paused, ["observed"],
+            "the apply did not reach the route block exactly once on its own path "
+            f"(observation-path reads, not counted here: {len(from_observation)})",
+        )
         self.assertFalse(
             ok,
             f"the apply reported success after a rollback it did not settle: {state} — {detail}. In "
