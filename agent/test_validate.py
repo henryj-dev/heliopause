@@ -6996,8 +6996,20 @@ class TestTheRoutePlanSurvivesARestart(unittest.TestCase):
         having already cost this test a failed run.** Writing it as a description instead of four
         names is what let the two coexist.
 
-        What stays untested here: an existing route's backup (`observed_routes` returns `[]`, the
-        new-destination case) and an observation failure. Both are other tests' subjects.
+        What this case does not drive, and where that stands:
+
+        - **An existing route's backup.** `observed_routes` returns `[]` here, so the declared route
+          is a new destination and its `before` is `None`. The overwrite case has its own test,
+          `RouteApplyAndRestore.test_restores_the_route_it_overwrote`.
+        - **An observation failure.** `observed_routes` returning `None` makes the apply roll back
+          with "cannot read the route table before applying routes" — and **nothing in this file
+          tests that**. Searched: no test replaces `observed_routes` with one returning `None`, and
+          `RoutesFromJson` covers parsing rather than the apply's refusal.
+
+        ⚠️ This read *"Both are other tests' subjects"*, which is a coverage assurance and was half
+        false — one of the two had no test at all. A review named it as the round's blocker and it
+        was the right call: a sentence that sends a reader looking for a test that does not exist is
+        worse than saying the gap is open, because it closes the question.
         """
         route = {"dst": "203.0.113.0/24", "via": "203.0.113.1"}
         hp.save_state(dict(hp._EMPTY_STATE))
