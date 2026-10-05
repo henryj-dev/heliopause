@@ -6493,9 +6493,21 @@ class TestBackfillCurrentAuthorization(unittest.TestCase):
         # tests this file has replaced asserted a *property* by looking at text — positions, counts,
         # the presence of a string — and each was replaced by driving the behaviour. This does the
         # opposite: the property is driven above, and the source is read only to **derive the expected
-        # value**, so that rewording the log line cannot quietly empty the assertion. The
-        # `assertTrue(spoken, …)` below is its control: if the phrase ever disappears, the derivation
-        # fails loudly instead of matching nothing.
+        # value** rather than to stand in for the behaviour.
+        #
+        # ⚠️ **What the derivation covers is the literal format it was written against**, and no more.
+        # This said "rewording the log line cannot quietly empty the assertion", which is a guarantee
+        # about every rewording. A review defeated it: `f"adopted the \\"watermark\\" authorization …"`
+        # leaves backslashes in what `strip('f"')` extracts while the emitted message carries plain
+        # quotes, so the comparison stops matching, `spoken` is still non-empty, and a success line
+        # logged on a failed write would pass. Reproduced in memory, both halves — the defect alone
+        # fails `test_says_it_could_not_persist_rather_than_claiming_it_did`, and the defect plus that
+        # rewording passes it.
+        #
+        # So: `assertTrue(spoken, …)` below checks that **candidate lines were found at all**, which
+        # catches the phrase disappearing. It does not check that what was extracted equals what the
+        # agent emits, and a rewording that changes the quoting rather than the words slips between
+        # the two. That weakness predates this note; the note used to hide it.
         source = pathlib.Path(hp.__file__).read_text()
         body = source[source.index("def backfill_current_authorization("):]
         body = body[: body.index("\ndef ")]
@@ -8007,6 +8019,11 @@ class TestStateSchemaHasBothHalves(unittest.TestCase):
     apply and confirm instead of writing it,
     `TestRestartWhilePending.test_confirming_promotes_the_authorization_this_host_is_enforcing`, and
     this one. The hand-built fixture that hid it was replaced.
+
+    ℹ️ And this one fails for a reason worth naming: not a missing `currentAuthorization` write —
+    `backfill_current_authorization` still supplies one — but **`pendingAuthorization` becoming
+    unread**, since that promotion line was its only consumer. A review pointed that out. The
+    coarseness cuts the other way here: the check found the defect through the key next to it.
 
     What this still does that none of those can: it asks the question of **every key**, including the
     ones no behavioural test drives. A write-never field is findable by a behavioural test only where
