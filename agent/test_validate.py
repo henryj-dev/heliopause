@@ -1776,10 +1776,39 @@ class TestWorkloadApply(unittest.TestCase):
                 return 1, "", "Unable to connect to the server: dial tcp: i/o timeout"
             return None
         self.stub(handler)
+        # ## The rollback this triggers reads the object back, and that read fails too
+        #
+        # 🔴 This test already walked the branch that records such a failure
+        # (`heliopause-pull.py:3141`, `retryable.append(f"{ref}: {detail}")`) — measured once against
+        # main `0210d27` — and asserted nothing about it. Changing that line to `incidents.append`
+        # left the whole file green. Issue #80.
+        #
+        # The two lists are not interchangeable (`:3196-3217`): `retryable` yields
+        # `workloadState = "rollback-failed"`, a `workloadRollbackAt` deadline and an armed retry;
+        # `incidents` yields `"rollback-incident"`, **no** deadline and no retry, and the code calls
+        # that state "intentionally settled for automatic action". So the mutation turns *the
+        # cluster was unreachable for a moment* into *stop trying* — the host would stay un-rolled-
+        # back with a policy it could not verify, and nothing would come back for it.
+        #
+        # The start-state guard is here because this file has paid for a fixture that began at the
+        # value its assertion forbade, which compares a received value with itself.
+        self.assertNotEqual(
+            hp.load_state().get("workloadState"), "rollback-failed",
+            "the fixture already starts at the state this test is about to check for",
+        )
         ok, state, detail = hp.apply_workload(self.artifact())
         self.assertFalse(ok)
         self.assertEqual(state, "rolled-back")
         self.assertIn("cannot verify", detail)
+        st = hp.load_state()
+        self.assertEqual(
+            st["workloadState"], "rollback-failed",
+            f"an unreadable cluster was recorded as something other than retryable: {st}",
+        )
+        self.assertIsNotNone(
+            st["workloadRollbackAt"],
+            "no retry deadline was written, so nothing will come back for this host",
+        )
 
     def test_a_transient_read_error_is_not_reported_as_absence(self):
         # The same distinction at the level that decides it. `observed_objects` returning None is
