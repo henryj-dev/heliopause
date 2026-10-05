@@ -12,7 +12,7 @@ packages/web/.svelte-kit/
 # untracked changes in the main tree — and `git add -A` in a worktree would commit its siblings.
 .claude/worktrees/
 
-# The same seven names again, without the trailing slash. Not redundant: a worktree gets these as
+# The same names again, without the trailing slash. Not redundant: a worktree gets these as
 # **symlinks** into the main tree (`.claude/worktree-bootstrap.md`), and git treats a symlink as a
 # file, so `docs/` and `pki*/` below do not match one. Measured — all of them showed as untracked in
 # a fresh worktree, one `git add -A` away from committing host-absolute paths into `docs`, `policy`,

@@ -7,10 +7,10 @@
 ```bash
 # 메인 트리는 git 에게 묻는다 — 경로를 적어 두면 다른 클론에서 그 줄이 거짓말을 한다.
 MAIN="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"
-for d in node_modules policy pki pki-prod pki-util pki-signing; do
+for d in node_modules policy pki pki-prod pki-util pki-signing pki-az01; do
   [ -e "$d" ] || ln -s "$MAIN/$d" "$d"
 done
-ls -ld node_modules policy pki pki-prod pki-util pki-signing
+ls -ld node_modules policy pki pki-prod pki-util pki-signing pki-az01
 ```
 
 이 여섯은 **이 저장소가 배포되는 사이트에만 있는 것**이다. 공개 클론에는 애초에 없고, 없어도
