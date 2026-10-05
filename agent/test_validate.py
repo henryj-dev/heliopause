@@ -5110,23 +5110,31 @@ class TestTheRelayDeadlineBoundsTheWholeCall(unittest.TestCase):
           the three sites left as they are
         `resp.read(MAX_ARTIFACT_BYTES - len(raw))`       green    pieces — alone
           instead of the 65536 chunk
-        `_remaining` called once, that value used at     green    order — alone
+        `_remaining` called once, that value used at     **RED**  order — alone
           all three sites
         the request arming moved below `conn.request()`  green    order, exhausted
         the body arming moved below `resp.read(...)`     green    order, pieces
 
-    **Rows two through six are why this class exists**, and the last three were found by an
-    independent review **against the first version of this class**, which they left green:
+    ⚠️ That fourth row read **green** when this table was written, and the run it came from had
+    printed the tripwire as failing. Reusing one value deletes all three
+    `conn.sock.settimeout(_remaining(deadline` expressions, so the count goes to zero — of course the
+    tripwire sees it. A review re-ran it and counted zero. **I recorded the opposite of my own
+    measurement**, in the table whose subject is measurement, and the blanket sentence that followed
+    ("the tripwire is green for all five of the behavioural rows") was built on that one wrong cell.
+
+    **Rows two, three, five and six are why this class exists** — the behaviour changes and the words
+    stay put, so the tripwire is green for those four. Rows five and six were found by an independent
+    review **against the first version of this class**, which they left green:
 
     - *one value at three sites*: the first version asserted `armed == sorted(armed, reverse=True)`,
       which accepts **equal** values. One `_remaining` reused three times is non-increasing. The
       assertion is now strict between adjacent values, and exact against a clock this fixture owns.
     - *arming moved after its stage*: the first version kept armings and stages in separate lists and
-      compared counts, which cannot say which came first — so a stage running unbounded and then
-      being armed passed. There is one ordered trace now.
+      compared counts, which cannot say which came first — so a stage running on a stale timeout and
+      being armed afterwards passed. There is one ordered trace now.
 
     Both of those are the defect this class is for, dressed differently, and both were invisible to
-    it. The tripwire is green for all five of the behavioural rows: the words stay put.
+    it.
     """
 
     BUDGET = 1.0
@@ -5229,7 +5237,11 @@ class TestTheRelayDeadlineBoundsTheWholeCall(unittest.TestCase):
     def test_each_arming_precedes_its_stage_and_counts_down_from_one_budget(self):
         answer = hp.relay_request("POST", "/heartbeat", {"host": "h1"})
         self.assertEqual(answer, {"ok": True})
-        # The order, exactly. Arming *after* its stage leaves that stage unbounded, and the first
+        # The order, exactly. Arming *after* its stage means the stage ran on whatever timeout was
+        # already on the socket — the constructor's for the request, an earlier arming for the
+        # others — rather than on what is left of the budget. ("Leaves that stage unbounded" was
+        # the first wording; a review pointed out there is always *some* timeout in place. What
+        # these tests establish is that it is not refreshed from the remaining budget.) The first
         # version of this class could not see that — it kept armings and stages in separate lists and
         # compared counts. A review measured three such moves, all green.
         self.assertEqual(
@@ -5245,9 +5257,11 @@ class TestTheRelayDeadlineBoundsTheWholeCall(unittest.TestCase):
         for earlier, later in zip(armed, armed[1:]):
             self.assertLess(
                 later, earlier,
-                f"an arming did not shrink: {armed}. Equal values mean the budget restarted, which "
-                "is a per-stage timeout wearing the right words — and the tripwire's count of three "
-                "`_remaining(deadline` sites cannot tell the two apart.",
+                f"an arming did not shrink: {armed}. Equal values mean this arming did not account "
+                "for the time the earlier stages spent — the budget restarting and one computed "
+                "value being reused both look like this, and both are a per-stage timeout wearing "
+                "the right words. The restarting one keeps all three `_remaining(deadline` sites, so "
+                "the tripwire's count cannot tell it from the real thing.",
             )
         # Exact, because the clock is this fixture's own counter. Each stage spends SPENT_PER_STAGE,
         # so the first arming is the budget minus one stage (connect), the next minus two, and so on.
