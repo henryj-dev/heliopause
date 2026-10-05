@@ -3422,7 +3422,7 @@ class TestSignedArtifactSeam(unittest.TestCase):
         # comments stripped** — `_source()` names that function rather than reading the file, so a
         # handler elsewhere cannot satisfy it. What can: a `return` placed between the two strings,
         # or a second `except Exception` inside this function. ("The file's text" and "anywhere"
-        # were the first wording, and `_source()` is five lines up.)
+        # were the first wording, and `_source()` is at `:3373`.)
         #
         # ⚠️ Its comment used to read "The heartbeat thread is also the confirm path. An exception
         # escaping here kills the thread that would confirm this host's own ruleset." **That is false
@@ -3473,8 +3473,13 @@ class TestARefusedEnvelopeIsRecordedNotJustSurvived(unittest.TestCase):
     which **errors** rather than failing — the exception propagates out of the `hp.handle_reply` that
     test calls directly. **No refused-envelope test** drove the loop's actual entry point, so
     nothing asserted the recording, the message, or that the beat counted as handled. (`handle_reply_safely`
-    itself is driven: `TestReplyIsolation` calls it four times for malformed replies and asserts
-    its handled result. "Nothing drove the loop's actual entry point" was the first wording and it
+    itself is driven: `TestReplyIsolation` exercises two malformed or raising replies and one normal
+    one, asserting the wrapper's result each time.
+
+    ⚠️ That said **four** calls in that class. There are three; the fourth `handle_reply_safely`
+    in this file is `TestRestartWhilePending`'s, at `:1082`. I read four grep hits and attributed
+    all of them to one class — in the paragraph whose subject is a claim corrected for being
+    false, and a review caught it by reading the class boundaries. "Nothing drove the loop's actual entry point" was the first wording and it
     is false — a review found it by reading what was already there.)
     """
 
