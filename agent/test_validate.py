@@ -5049,10 +5049,11 @@ class TestRelayRequestDeadline(unittest.TestCase):
         self.assertIn("reading the response body", str(caught.exception))
         self.assertIn(str(hp.HTTP_TIMEOUT_SEC), str(caught.exception))
 
-    def test_the_relay_call_re_arms_the_socket_from_the_deadline(self):
-        # The call sites, as an absence. One `read(MAX_ARTIFACT_BYTES)` is a single call that keeps
-        # resetting the socket timeout internally — the body has to be read in pieces with the clock
-        # consulted between them, or the deadline above bounds nothing that matters.
+    def test_the_relay_call_still_names_the_deadline_at_three_sites(self):
+        # A tripwire, and named as one: a count of occurrences in the function's text. Three calls
+        # that all pass `deadline` satisfy it even if the clock never advances between them, and a
+        # fourth site added for a new stage makes it fail for being right.
+        # @see TestTheRelayDeadlineBoundsTheWholeCall for the property
         source = pathlib.Path(hp.__file__).read_text()
         body = source[source.index("def relay_request("):source.index("def post_heartbeat(")]
         self.assertIn("deadline = time.monotonic() + HTTP_TIMEOUT_SEC", body)
@@ -5063,6 +5064,202 @@ class TestRelayRequestDeadline(unittest.TestCase):
         self.assertNotIn(
             "resp.read(MAX_ARTIFACT_BYTES)", body,
             "one unbounded read is the defect — the body is read in pieces",
+        )
+
+
+class TestTheRelayDeadlineBoundsTheWholeCall(unittest.TestCase):
+    """One deadline covers the request, the status and every piece of the body — not one each.
+
+    ## What this replaces
+
+    `TestRelayRequestDeadline.test_the_relay_call_still_names_the_deadline_at_three_sites` counts
+    occurrences of `conn.sock.settimeout(_remaining(deadline` in the function's text and requires
+    three. Three sites that all mention `deadline` satisfy that count whether or not the clock
+    advances between them — which is the entire property. `settimeout(HTTP_TIMEOUT_SEC)` written out
+    three times would be the defect, and a textual count of a different string would not see it.
+
+    What the deadline is for is in the function's own docstring: a relay that answers slowly at every
+    stage must not hold the heartbeat thread for a multiple of `HTTP_TIMEOUT_SEC`, because that thread
+    is also the one that confirms this host's ruleset before the rollback timer fires.
+
+    ## How it is observed
+
+    No socket and no TLS. `http.client.HTTPSConnection` is replaced by a fake whose `sock.settimeout`
+    records what it is given, and whose stages consume a known amount of the budget. The recorded
+    values are then **decreasing**, and the last one is short by what the earlier stages spent. Under
+    a per-stage timeout all three would be the same number.
+
+    `HTTP_TIMEOUT_SEC` is patched small so the test costs a fraction of a second rather than ten.
+
+    ## Measured, three mutations
+
+    Each applied to `agent/heliopause-pull.py` alone and reverted; the file was green before and
+    after (326 collected, 12 skipped on macOS). "tripwire" is
+    `TestRelayRequestDeadline.test_the_relay_call_still_names_the_deadline_at_three_sites`.
+
+        mutation                                     tripwire  which tests went red
+        all three sites → `settimeout(               RED       ..._armed_from_what_is_left...,
+          HTTP_TIMEOUT_SEC)`                                   ..._exhausted_budget_raises...
+        `deadline` recomputed before the status      **green** ..._armed_from_what_is_left... — alone
+          read, the three sites left as they are
+        `resp.read(MAX_ARTIFACT_BYTES - len(raw))`   green     ..._read_in_pieces... — alone
+          instead of the 65536 chunk
+
+    **The second row is why this class exists.** All three sites still say
+    `_remaining(deadline, …)`, so the count is three and the tripwire is satisfied — and the budget
+    restarts in the middle of the call, which is exactly the defect. A per-stage timeout wearing the
+    right words is invisible to a text count and visible in one decreasing sequence.
+    """
+
+    BUDGET = 1.0
+    SPENT_PER_STAGE = 0.15
+
+    class _Sock:
+        def __init__(self, armed):
+            self.armed = armed
+
+        def settimeout(self, value):
+            self.armed.append(value)
+
+        def getpeercert(self, binary_form=False):
+            return b"not-a-cert"
+
+    class _Resp:
+        status = 200
+
+        def __init__(self, body, spend, reads):
+            self._body = body
+            self._spend = spend
+            self._reads = reads
+
+        def read(self, size):
+            self._reads.append(size)
+            self._spend()
+            piece, self._body = self._body[:size], self._body[size:]
+            return piece
+
+    def setUp(self):
+        self.armed = []
+        self.reads = []
+        self.stages = []
+        self._real = {
+            "HTTP_TIMEOUT_SEC": hp.HTTP_TIMEOUT_SEC,
+            "PINS": hp.PINS,
+            "RELAY_URL": hp.RELAY_URL,
+            "ssl_context": hp.ssl_context,
+        }
+        self._real_conn = hp.http.client.HTTPSConnection
+        hp.HTTP_TIMEOUT_SEC = self.BUDGET
+        hp.PINS = []  # the pin check is a different test's subject
+        hp.RELAY_URL = "https://relay.example/base"
+        hp.ssl_context = lambda: None
+        self.install(body=b'{"ok": true}')
+
+    def tearDown(self):
+        for name, value in self._real.items():
+            setattr(hp, name, value)
+        hp.http.client.HTTPSConnection = self._real_conn
+
+    def install(self, body, spend_per_stage=None, stage_spend=None):
+        """Put a fake connection in place. `stage_spend` overrides the per-stage cost by name."""
+        spend_per_stage = self.SPENT_PER_STAGE if spend_per_stage is None else spend_per_stage
+        stage_spend = stage_spend or {}
+        armed, reads, stages = self.armed, self.reads, self.stages
+        sock = self._Sock(armed)
+
+        def spend(stage):
+            stages.append(stage)
+            time.sleep(stage_spend.get(stage, spend_per_stage))
+
+        resp = self._Resp(body, lambda: spend("body"), reads)
+
+        class Fake:
+            def __init__(self, *_a, **_kw):
+                self.sock = sock
+
+            def connect(self):
+                spend("connect")
+
+            def request(self, *_a, **_kw):
+                spend("request")
+
+            def getresponse(self):
+                spend("status")
+                return resp
+
+            def close(self):
+                pass
+
+        hp.http.client.HTTPSConnection = Fake
+
+    def test_each_stage_is_armed_from_what_is_left_not_from_the_timeout(self):
+        answer = hp.relay_request("POST", "/heartbeat", {"host": "h1"})
+        self.assertEqual(answer, {"ok": True})
+        self.assertGreaterEqual(
+            len(self.armed), 3,
+            f"fewer than three arming calls, so a stage went unbounded: {self.armed}",
+        )
+        # Strictly decreasing — the property. Each value is what was left of one budget, so time
+        # spent in an earlier stage is gone from every later one.
+        self.assertEqual(
+            self.armed, sorted(self.armed, reverse=True),
+            f"the arming values did not decrease: {self.armed}. Equal values mean each stage got a "
+            "fresh timeout, which is what lets a slow relay hold this thread for a multiple of the "
+            "budget — and a textual count of three `_remaining(deadline` sites cannot tell the two "
+            "apart.",
+        )
+        self.assertLess(
+            self.armed[-1], self.BUDGET - self.SPENT_PER_STAGE,
+            f"the last stage was armed with {self.armed[-1]:.3f}s of a {self.BUDGET}s budget after "
+            f"earlier stages spent {self.SPENT_PER_STAGE}s each: {self.armed}",
+        )
+        # The known positive for the recorder: an empty list would satisfy the ordering assertion.
+        self.assertIn("body", self.stages, f"the body was never read: {self.stages}")
+
+    def test_an_exhausted_budget_raises_instead_of_arming_a_zero(self):
+        """`_remaining` has to refuse rather than hand `settimeout` a number that means non-blocking.
+
+        A socket reads a timeout of zero as "do not block", so a deadline already past would turn
+        into a read that cannot wait at all — which looks like an empty response rather than a
+        timeout. The budget is spent entirely in the first stage here.
+        """
+        self.install(body=b'{"ok": true}', stage_spend={"connect": self.BUDGET + 0.05})
+        with self.assertRaises(Exception) as caught:
+            hp.relay_request("POST", "/heartbeat", {"host": "h1"})
+        self.assertIn(
+            "sending the request", str(caught.exception),
+            f"the raise did not name the stage that found the budget gone: {caught.exception}",
+        )
+        self.assertEqual(
+            self.armed, [],
+            f"a timeout was armed from an exhausted budget: {self.armed} — `_remaining` is supposed "
+            "to raise before `settimeout` sees a value that means non-blocking",
+        )
+        self.assertNotIn("body", self.stages, f"it read a body anyway: {self.stages}")
+
+    def test_the_body_is_read_in_pieces_so_the_clock_is_consulted_between_them(self):
+        """The other half of the same defect, and the one the proxy asserted as an absence.
+
+        `resp.read(MAX_ARTIFACT_BYTES)` is a single call: `http.client` keeps resetting the socket
+        timeout internally for as long as bytes keep arriving, so one read can outlive any deadline
+        set before it. The loop's chunk size is what decides how often the clock is consulted.
+        """
+        payload = b'{"pad": "' + b"x" * 200_000 + b'"}'
+        self.install(body=payload, spend_per_stage=0.0)
+        hp.relay_request("GET", "/artifact")
+        self.assertGreater(
+            len(self.reads), 1,
+            f"the body came back in one read of {self.reads}, so nothing re-armed between pieces",
+        )
+        self.assertLessEqual(
+            max(self.reads), 65536,
+            f"a single read asked for {max(self.reads)} bytes: {self.reads}. The cap is what bounds "
+            "how long one read can keep the socket alive on its own.",
+        )
+        self.assertEqual(
+            len(self.armed), 2 + len(self.reads),
+            f"arming calls {len(self.armed)} do not match two stages plus {len(self.reads)} reads: "
+            f"{self.armed}",
         )
 
 
