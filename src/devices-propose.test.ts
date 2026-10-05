@@ -34,13 +34,26 @@ import { departedWithNotes, proposedRegistry } from "./device-propose.ts";
 /**
  * The real parser, or `undefined` when `policy/` is not linked.
  *
- * ⚠️ Not skipped silently. A worktree without the symlink runs the shape tests and **says** the
- * paste check did not run — this repository has measured the cost of a green that merely means
- * "nothing matched" (`AGENTS.md`, "수를 보라").
+ * ⚠️ Not skipped silently. A tree without the symlink runs the shape tests and **says** the paste
+ * check did not run — this repository has measured the cost of a green that merely means "nothing
+ * matched" (`AGENTS.md`, "수를 보라").
+ *
+ * ## Why the path is in a variable
+ *
+ * `await import("../policy/devices.ts")` **broke CI** and passed locally, which is the worst
+ * possible split. `tsconfig.json` includes `src/**` and `policy/` is not in the repository — it is
+ * a symlink into a build fork clone that exists on this machine and on no runner. So `tsc --noEmit`
+ * resolved it here and answered `TS2307: Cannot find module` there. Measured by pointing a throwaway
+ * file at a path that exists nowhere and watching typecheck fail the same way.
+ *
+ * A specifier held in a variable is not resolved at type level, which is the honest description of
+ * this module: **optional at build time, and the only judge of the paste when it is present.** The
+ * `catch` already carried that meaning at runtime; the literal path contradicted it at type time.
  */
+const PARSER = "../policy/devices.ts";
 let parse: ((v: unknown) => ApprovedDevice[]) | undefined;
 try {
-  ({ parseApprovedDevices: parse } = (await import("../policy/devices.ts")) as {
+  ({ parseApprovedDevices: parse } = (await import(PARSER)) as {
     parseApprovedDevices: (v: unknown) => ApprovedDevice[];
   });
 } catch {
