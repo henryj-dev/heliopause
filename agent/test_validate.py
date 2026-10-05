@@ -3699,7 +3699,18 @@ class TestTheApplyPathReadsTheVerifiedArtifact(unittest.TestCase):
         """The envelope's generation **value**, recording the four operations overridden below.
 
         One of two layers. This one survives a read that bypasses the container — `dict.get(env, key)`,
-        `dict.__getitem__`, `pop` — **provided the value is then compared, stringified or interpolated.**
+        `dict.__getitem__`, `pop` — **provided the value is then used through one of this class's four
+        hooks**: `__eq__`, `__ne__`, `__str__` or `__format__`.
+
+        ⚠️ That said "provided the value is then **compared**, stringified or interpolated", which is
+        wider than the hooks. A review measured two comparisons that record nothing:
+
+            dict.get(env, "generation") < "z"                    touches=[] uses=[]
+            str.__eq__(dict.get(env, "generation"), "g-wanted")   touches=[] uses=[]
+
+        The first is `__lt__`, not overridden here; the second calls `str`'s own `__eq__` instead of
+        the subclass's. "Compared" covers both and the instrument does not. The four names were
+        already listed further down — this sentence is the one that generalised past them.
         A path can act on it without any of those: `startswith`, `hash` and `is` all reach past these
         overrides, which is why the earlier wording here ("what a path would have to do to act on it")
         was wrong. @see `_Envelope` for the measured table and the known escapes
@@ -3871,11 +3882,88 @@ class TestTheApplyPathReadsTheVerifiedArtifact(unittest.TestCase):
             "schemaVersion": hp.SCHEMA_VERSION, "generation": wanted, "gate": {"open": True},
         })
 
+    # ## A post-hoc review's mutation, run verbatim, and its prediction was wrong
+    #
+    # The review proposed replacing `handle_reply`'s comparison with
+    # `dict.get(envelope, "generation").startswith("g-wanted")` — a container bypass followed by a
+    # method this class does not override, so the observer sees nothing — and predicted
+    # `test_the_generation_compared_is_the_verifiers_not_the_envelopes` would **PASS** on both cases.
+    #
+    # Measured: **both cases FAIL**, and not through the observer:
+    #
+    #     verified matches, envelope does not → 'accept' not found in []
+    #       "the path stopped at the generation comparison although the **verified** artifact was
+    #        the wanted generation"
+    #     envelope matches, verified does not → 'accept' unexpectedly found in ['accept', 'preflight']
+    #       "the path proceeded although the verified artifact was a different generation"
+    #
+    # So the observer's blind spot is real and the **behaviour** closes it: two cases that differ
+    # only in which object holds the wanted generation cannot both come out right if the comparison
+    # reads the wrong one. Worth keeping because the review was right about the instrument and wrong
+    # about the test, and only running it told them apart.
+    def test_the_observer_records_the_reads_it_claims_to_see(self):
+        """The positive control. Every other assertion in this class compares a log with `[]`.
+
+        ⚠️ An independent post-hoc review pointed out that nothing established the recorders work,
+        and **measured it**: disable both — `self.touches.append(...)` in `_Envelope` and
+        `self.uses.append(...)` in `_Claim`, keeping their return values — and the whole file stays
+        green. That is the empty-recorder failure `AGENTS.md` describes, where the central evidence
+        of a suite is a comparison against a list nothing fills.
+
+        So this drives each hook directly and asserts the exact recording. It touches no agent code:
+        it is about the instrument, not the path.
+        """
+        envelope = self._envelope("g-probe")
+        self.assertEqual(envelope.get("generation"), "g-probe")
+        self.assertEqual(envelope["generation"], "g-probe")
+        self.assertIn("generation", envelope)
+        list(envelope.items())
+        list(envelope.keys())
+        list(envelope.values())
+        list(iter(envelope))
+        envelope.copy()
+        self.assertEqual(
+            envelope.touches,
+            # `copy` is three entries, not one: `dict.copy` on a subclass goes back through the
+            # overridden `keys` and then subscripts each one. Measured — the first version of this
+            # expectation listed `copy` alone and the runner printed the two extra reads. They are
+            # the instrument behaving correctly, so the expectation moved rather than the code.
+            ["get", "subscript", "contains", "items", "keys", "values", "iter", "copy", "keys", "subscript"],
+            f"the envelope observer did not record its own hooks: {envelope.touches}. Every other "
+            "assertion in this class reads an empty list as evidence, and an observer that records "
+            "nothing produces that list for free.",
+        )
+        claim = envelope.get("generation")
+        # Cleared here because the assertions above already compared `_Claim` values — the log
+        # accumulates for the whole test and the first version of this expectation forgot that,
+        # counting two of its own earlier reads as part of the probe.
+        self.value_uses.clear()
+        self.assertEqual(claim, "g-probe")          # __eq__
+        self.assertNotEqual(claim, "g-other")       # __ne__
+        str(claim)                                  # __str__
+        f"{claim}"                                  # __format__ — and then `__str__` again
+        self.assertEqual(
+            # Five, not four: `__format__` with an empty spec goes on to call `__str__`, so the
+            # f-string records twice.
+            #
+            # ⚠️ Written as seven first. The run before this one showed seven, but that log still
+            # held two comparisons from the assertions above — I read the number off that output
+            # instead of measuring again after adding the `clear()`. Deriving an expectation from a
+            # previous measurement of a different setup is the mistake this file keeps recording,
+            # and it happened inside the test whose subject is not trusting an unverified reading.
+            self.value_uses,
+            ["compared", "compared", "stringified", "interpolated", "stringified"],
+            f"the value observer did not record its own hooks: {self.value_uses}",
+        )
+
     def test_a_refused_envelope_is_not_consulted_for_a_generation(self):
         """Verification raises, and none of the accesses the observer sees happen.
 
         Narrower than "never read", which is what this said before a review found four ways past the
         observer. @see `_Envelope` for the table of what is and is not seen.
+
+        The recorders are proven live by `test_the_observer_records_the_reads_it_claims_to_see`;
+        without that, the empty lists below are satisfied by an observer that records nothing.
         """
         envelope = self._envelope("g-forged")
         hp.fetch_artifact = lambda: envelope
