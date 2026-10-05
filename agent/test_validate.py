@@ -6274,7 +6274,7 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         # distinct sentence to `incidents` and continue, and `rollback_workload` logs the collected ones.
         # Collecting the log here is the only observation needed; inserting counters into the agent to
         # measure a test would make the agent carry the test's apparatus.
-        # @see the ten branch witnesses at the end of the sweep
+        # @see the nine branch witnesses at the end of the sweep
         self._real_log = hp.log
         hp.log = lambda line: self.logged.append(str(line))
         hp._timer = None
@@ -6345,7 +6345,24 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
             monitor_started.set()
 
         hp.monitor_loop = monitor
-        hp.post_heartbeat = counted("heartbeat")
+        # 🔑 **The heartbeat runs once, and records what the state looked like when it did.**
+        #
+        # ⚠️ This was `counted("heartbeat")` with `_stop` set before `main()`, so the loop
+        # (`heliopause-pull.py:5351`, `while not _stop.is_set()`) exited before its first beat and the
+        # heartbeat was **never called** — measured: the count came back `None`, not even 0. The test
+        # is named "before it starts beating" and the beating half was not happening at all, which an
+        # independent post-hoc review named. Counting a stub nobody calls is the shape this file warns
+        # about one layer up.
+        #
+        # So `_stop` is left clear and this stub sets it, which lets the loop run exactly one beat.
+        beats_saw = []
+
+        def heartbeat(*_a, **_kw):
+            reached["heartbeat"] = reached.get("heartbeat", 0) + 1
+            beats_saw.append(hp.load_state().get("currentAuthorization"))
+            hp._stop.set()
+
+        hp.post_heartbeat = heartbeat
         hp.recover_commitment = counted("recover")
         hp.recover_workload_commitment = counted("recover_workload")
         hp.reconcile_recovered_commitments = counted("reconcile")
@@ -6364,7 +6381,7 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         for k, v in env.items():
             setattr(hp, k, v)
         was_set = hp._stop.is_set()
-        hp._stop.set()
+        hp._stop.clear()  # the heartbeat stub sets it after one beat — see its comment above
         try:
             code = hp.main()
             # A wait, not a join. If the monitor never runs this expires and the count below fails; it
@@ -6383,8 +6400,8 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
 
         self.assertEqual(code, 0, "main() refused to start, so nothing below was exercised")
         self.assertEqual(
-            {k: reached.get(k) for k in ("recover", "recover_workload", "reconcile", "monitor")},
-            {"recover": 1, "recover_workload": 1, "reconcile": 1, "monitor": 1},
+            {k: reached.get(k) for k in ("recover", "recover_workload", "reconcile", "monitor", "heartbeat")},
+            {"recover": 1, "recover_workload": 1, "reconcile": 1, "monitor": 1, "heartbeat": 1},
             "the startup did not make every recovery call and reach the monitor, so this test cannot "
             "say the adoption happened during a startup that got that far",
         )
@@ -6395,6 +6412,14 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         # Calling one of them twice **is** caught, by the count.
         # @see test_the_backfill_still_precedes_the_recovery_paths for the one ordering claim that is
         #      pinned, and why it is a tripwire rather than the invariant
+        # The half this test is named for. Not "the adoption happened" but "it had happened by the
+        # time the host spoke": a beat carrying `currentAuthorization: None` is what `relay.ts`
+        # surfaces as a host that cannot name its authorization, so the order is the property.
+        self.assertEqual(
+            beats_saw, [TestBackfillCurrentAuthorization.REC],
+            f"the first heartbeat saw {beats_saw} — the host beat before adopting the authorization "
+            "it is already enforcing, which is the state the relay reports as unnameable.",
+        )
         self.assertEqual(
             hp.load_state()["currentAuthorization"], TestBackfillCurrentAuthorization.REC,
             "main() did not adopt the authorization already in force — every host keeps None",
@@ -6531,7 +6556,20 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
                 })
             # Reconciliation's two branches need the halves to **differ**: a failed host beside a live
             # workload, and a failed workload beside a live host.
-            pairs = [(failed[0], "confirmed")] + [(host, failed[0]) for host in live]
+            #
+            # ⚠️ The failed value is taken from `failed` **minus `live`**, not from `failed[0]`.
+            # `rollback-failed` is in both partitions — legitimately, since such a host still carries a
+            # ruleset and its rollback still failed — so `failed[0]` was `rollback-failed` and the pair
+            # built for `host == "rollback-failed"` had **both halves the same**, which is exactly the
+            # precondition the sentence above says these cases establish. An independent post-hoc
+            # review found it. Two of the eight reconciliation cases were not testing differing halves.
+            distinct = [s for s in failed if s not in live]
+            self.assertTrue(
+                distinct,
+                f"every failed state is also a live state ({failed} ⊆ {live}), so no case here can "
+                "put a failed half beside a live one — the two reconciliation branches need that",
+            )
+            pairs = [(distinct[0], "confirmed")] + [(host, distinct[0]) for host in live]
             for host, wl in pairs:
                 cases.append({
                     "name": f"reconcile_recovered_commitments ({host} host, {wl} workload, "
@@ -6646,14 +6684,18 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
             )
         # The workload half settles separately, and its success needs a readable answer from the cluster
         # boundary: with an unparseable one the objects stay on the retryable list and the settlement
-        # below is skipped. Measured — the branch was entered zero times while `rollback_workload` ran
-        # eighteen, and a `confirmed` written at the settlement survived.
-        self.assertIn(
-            "rolled-back", [after for _before, after in workload_transitions],
-            "no recovery path ever changed the workload state to 'rolled-back', so the workload success "
-            "tail did not run — check what the cluster stub answers when it is meant to succeed. "
-            f"Transitions seen: {sorted(set(workload_transitions))}",
-        )
+        # below is skipped. Measured when this was written — the branch was entered zero times while
+        # `rollback_workload` ran eighteen, and a `confirmed` written at the settlement survived.
+        #
+        # ⚠️ The assertion that caught that is **deleted**:
+        #
+        #     assertIn("rolled-back", [after for _before, after in workload_transitions])
+        #
+        # The `"replace succeeded (:3106)"` witness below already requires a case that replaced **and**
+        # settled, and settlement is what writes that transition. Measured — removing this alone left
+        # the whole file green, so it discriminated nothing the witness does not. The history stays
+        # here because it says what the witness is for; the duplicate assertion does not, and a line a
+        # reviewer can revert for free teaches that reverting such lines is free.
         # The two branches an absent object cannot reach. Without these, "the workload success tail runs"
         # was satisfied by settlements that had all taken the missing-object shortcut — nine of them, in
         # the sweep as it stood then — and `confirmed` written at either branch survived.
@@ -6664,7 +6706,7 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         # that one branch ran, so a case that stops reaching one fails here instead of quietly shrinking
         # the sweep.
         #
-        # ⚠️ **These are ten branches I went and read, not "the branches".** A review counted the loop and
+        # ⚠️ **These are nine branches I went and read, not "the branches".** A review counted the loop and
         # found **five more this sweep never enters** — a legacy record (`heliopause-pull.py:3048`), an
         # invalid reference (`:3052`), a read failure (`:3056`), an exception from the cleaner
         # (`:3069-3070`), and an exhausted replacement budget (`:3099`). Writing `confirmed` into any of
@@ -6674,13 +6716,18 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         # list is partial is not the same as the holes not being there.
         #
         # The device that claimed completeness instead of listing was removed in an earlier round for
-        # being wrong about its own scope. This one claims the ten it names.
+        # being wrong about its own scope. This one claims the nine it names — ten until a review showed
+        # one of them was implied by two others.
         #
         # Five are refusals that change no state and call no boundary, so their witness is the sentence the
         # agent logs. Five are observable as boundary calls or settlement.
+        # ⚠️ `"replace (:3102)": bool(self.replace_calls)` stood here and is **deleted**: an
+        # independent post-hoc review pointed out that both replace-outcome witnesses below already
+        # require `ev["replaced"]`, so this one discriminated nothing. Measured — removing it alone
+        # left the whole file green. It is nine witnesses now, not ten; the replace branch is still
+        # named, by the two that say which way it came out.
         witnesses = {
             "delete (:3088)": bool(self.delete_calls),
-            "replace (:3102)": bool(self.replace_calls),
             # Both sides of the replace outcome, read per case: the succeeding one settles the workload
             # half, the failing one does not. A global "some line lacked the incident text" was the first
             # version of this witness and it was satisfied by almost any log line at all.
@@ -6733,7 +6780,11 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         )
         self.assertTrue(self.nft_calls, "no case reached the kernel boundary")
         self.assertTrue(self.route_calls, "no case reached the route boundary")
-        self.assertTrue(self.kubectl_calls, "no case reached the cluster boundary")
+        # ⚠️ The cluster boundary had a third line here and it is **deleted**. The replace witnesses
+        # read `self.replace_calls`, which the cluster stub appends to only after appending to
+        # `self.kubectl_calls`, so a non-empty `kubectl_calls` is already implied. Measured — removing
+        # it alone left the whole file green. The asymmetry with its two neighbours is deliberate: nft
+        # and routes have no witness that implies them.
         self.assertTrue(self._timers_seen, "no timer was armed, so the cancel check proved nothing")
         for armed in self._timers_seen:
             armed.join(2)
