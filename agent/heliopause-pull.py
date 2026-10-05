@@ -2380,9 +2380,26 @@ def apply_artifact(artifact, validated=None):
         # this one acquires it, with nothing between them to pause, so the only way to arrive here
         # with a rollback owed is for **another thread** to take the lock in that instant — the
         # timer thread this very block armed, which is a real production race and not a sequence a
-        # single-threaded test can place itself inside. Driving it would mean a near-zero confirm
-        # timeout and a bet on scheduling, and this repository records what a flaky or hanging test
-        # costs.
+        # single-threaded test can place itself inside.
+        #
+        # ⚠️ It also said "driving it would mean a near-zero confirm timeout and a bet on
+        # scheduling". That is wrong, and a review disproved it with a **lock seam**: replace
+        # `_apply_lock` with a wrapper whose first `__exit__` runs the real `rollback()` after
+        # releasing, and the apply walks into this block owing one, deterministically and on one
+        # thread. Reverting the marker check then lets exactly one kernel write through before the
+        # final guard refuses — the measurement this comment first claimed could not be made.
+        #
+        # The test is not written, and that is a choice to record rather than a limit: a seam that
+        # schedules the interleaving drives the harness's ordering, not the agent's, and the review
+        # said so plainly. It would show this guard answers correctly **under an ordering we
+        # injected**, not that the suite reaches it. That may still be worth having; it is open.
+        #
+        # ⚠️ A round earlier this comment reported the opposite — that a review had measured the
+        # guard reachable and my structural reasoning was wrong. On being asked for the sequence the
+        # review **withdrew** that measurement, saying its code was gone and the objection above was
+        # correct. The first ask was mangled by my own shell before it arrived, so what came back was
+        # an answer to a different question; the re-run is what produced both the withdrawal and the
+        # seam. Two opposite claims in two rounds, from asking twice.
         #
         # So this line is **reasoning, not measurement**, and it is written down rather than left to
         # look like the two guards beside it. A reviewer who reverts it and sees green is seeing that
