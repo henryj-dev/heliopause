@@ -2190,6 +2190,83 @@ class TestWorkloadApply(unittest.TestCase):
         self.assertEqual(self.deleted, [("util/hp-dev-p700", "uid-new", "2")])
         self.assertEqual(hp.load_state()["workloadState"], "rolled-back")
 
+    # ## Two records the rollback loop refuses by shape alone — issue #80
+    #
+    # Both are reached without any cluster response: the loop looks at the record and continues
+    # before it reads anything. Measured against main `0210d27` with `sys.settrace` counting line
+    # executions across the whole module: `heliopause-pull.py:3133` (legacy) and `:3137` (bad ref)
+    # were each visited **zero** times by 331 tests.
+    #
+    # What they protect is the same in both cases and worth stating once: a record that cannot be
+    # tied to a specific object must not be acted on. The legacy branch's own comment says it —
+    # "insufficient to distinguish an object deleted and recreated by flux; fail closed rather than
+    # delete by name". So the property under test is **left untouched, and said so**, not merely
+    # "did not crash".
+
+    def _state_with(self, records):
+        """One pending workload commitment whose applied-record list is exactly `records`."""
+        hp.save_state({
+            **hp._EMPTY_STATE,
+            "generation": "g1", "state": "rolled-back",
+            "workloadState": "pending", "workloadGeneration": "g1",
+            "workloadApplied": records,
+            "workloadRollbackAt": time.time() + 120,
+        })
+
+    def test_a_record_from_an_older_agent_is_left_untouched(self):
+        """A bare name, which is what agents before this mechanism wrote.
+
+        `:3133`. The object may have been deleted and recreated by flux since, so the name alone
+        does not identify what this agent applied.
+        """
+        self.cluster["util/hp-dev-p700"] = self.live(cnp(), uid="uid-new", rv="2")
+        self._state_with(["util/hp-dev-p700"])          # a string, not a dict
+        hp.rollback_workload("legacy record", "g1")
+        self.assertEqual(
+            self.deleted, [],
+            f"a record with no UID proof was acted on: {self.deleted}",
+        )
+        self.assertIn(
+            "util/hp-dev-p700", self.cluster,
+            "the object was removed despite the record not identifying it",
+        )
+        st = hp.load_state()
+        self.assertEqual(
+            st["workloadState"], "rollback-incident",
+            f"refusing by shape was not recorded as an incident: {st['workloadState']}",
+        )
+        self.assertIn(
+            "legacy state has no UID/generation proof", st["workloadDetail"],
+            f"the detail does not say why it was left alone: {st['workloadDetail']!r}",
+        )
+
+    def test_a_record_whose_ref_is_not_a_string_is_left_untouched(self):
+        """`:3137`. Distinct from the legacy case: the record *is* a dict, but its `ref` is not
+        usable as an object reference, so there is nothing to read or restore.
+        """
+        self.cluster["util/hp-dev-p700"] = self.live(cnp(), uid="uid-new", rv="2")
+        self._state_with([{"ref": None, "uid": "uid-new", "cluster": "dev", "generation": "g1"}])
+        hp.rollback_workload("bad ref", "g1")
+        self.assertEqual(
+            self.deleted, [],
+            f"a record with an unusable ref was acted on: {self.deleted}",
+        )
+        st = hp.load_state()
+        self.assertEqual(
+            st["workloadState"], "rollback-incident",
+            f"refusing by shape was not recorded as an incident: {st['workloadState']}",
+        )
+        self.assertIn(
+            "invalid workload rollback record", st["workloadDetail"],
+            f"the detail does not name the reason: {st['workloadDetail']!r}",
+        )
+        # The two branches must not be interchangeable: this one is a dict, so the legacy wording
+        # would mean the loop took the wrong exit and the test would still have seen no deletion.
+        self.assertNotIn(
+            "legacy state has no UID/generation proof", st["workloadDetail"],
+            "the dict record exited through the legacy branch, so this test checks the wrong one",
+        )
+
     def test_no_commitment_means_nothing_to_recover(self):
         hp.recover_workload_commitment()
         self.assertIsNone(hp._wl_timer)
