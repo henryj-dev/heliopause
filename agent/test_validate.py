@@ -6497,7 +6497,7 @@ class TestBackfillCurrentAuthorization(unittest.TestCase):
         #
         # ⚠️ **What the derivation covers is the literal format it was written against**, and no more.
         # This said "rewording the log line cannot quietly empty the assertion", which is a guarantee
-        # about every rewording. A review defeated it: `f"adopted the \\"watermark\\" authorization …"`
+        # about every rewording. A review defeated it: `f"adopted the \"watermark\" authorization …"`
         # leaves backslashes in what `strip('f"')` extracts while the emitted message carries plain
         # quotes, so the comparison stops matching, `spoken` is still non-empty, and a success line
         # logged on a failed write would pass. Reproduced in memory, both halves — the defect alone
