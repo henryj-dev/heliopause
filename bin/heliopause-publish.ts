@@ -11,7 +11,7 @@ import { createHash, createPrivateKey, createPublicKey } from "node:crypto";
 import { closeSync, constants, fstatSync, openSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { planPublish, type PublishHost } from "../src/publish.ts";
+import { assertProtectedAllowed, planPublish, PublishError, type PublishHost } from "../src/publish.ts";
 import {
   signAuthorizedArtifactBundle,
   artifactSigningKeyId,
@@ -113,7 +113,7 @@ const propose = flagValue("--propose");
 if (!siteArg || !dirArg) {
   console.error(
     "usage: heliopause-publish <site-module> <artifact-dir> --break-glass --target=NAME --signing-key=FILE --key-id=sha256:... [--authorization-ttl-sec=900] [--allow-dirty] [--dry-run]\n" +
-      "       heliopause-publish <site-module> <vpc-name> --propose=<manager-url> [--pki=DIR] [--operator=NAME]\n" +
+      "       heliopause-publish <site-module> <vpc-name> --propose=<manager-url> [--pki=DIR] [--operator=NAME] [--allow-protected]\n" +
       "\n" +
       "  --policies=FILE overlays an exact-id JSON policy document created by heliopause-policy.\n" +
       "\n" +
@@ -351,16 +351,48 @@ async function readMembership(): Promise<SelectorMembership | undefined> {
 
 const membership = await readMembership();
 
+// ## The protected-host opt-in, read before the plan is built
+//
+// 🔴 **A misspelled flag must not read as absent.** This is the whole opt-in, and this file does not
+// validate flag names — so `--allow-protexted` would be silently ignored, the gate below would
+// refuse, and the operator would see a refusal they thought they had answered. Checking the
+// near-miss shape is cheap; validating every flag in this file is a bigger change than this one.
+const allowProtected = flags.has("--allow-protected");
+for (const f of flags) {
+  // `--allow[-_]?prot` and not `…protect`: the first version of this check required the whole word
+  // and so **missed `--allow-protexted`**, which is the typo the test was written around. A prefix
+  // that stops before the letters people transpose is the one that catches them.
+  if (f !== "--allow-protected" && /^--allow[-_]?prot/i.test(f)) {
+    console.error(`${f} is not a flag — did you mean --allow-protected?`);
+    process.exit(2);
+  }
+}
+
 // Stamped once here rather than inside the planner, which stays pure so it can be tested without
 // a clock.
 const plan = planPublish({
   ...site,
   generation,
   issuedAt: new Date().toISOString(),
+  ...(allowProtected ? { allowProtected: true } : {}),
   // The site module may inject its own; an explicit `--membership-from` reading wins because it came
   // from the cluster rather than from a file.
   ...(membership ? { resolvePods: podsFromMembership(membership) } : {}),
 });
+
+// ## The protected-host gate
+//
+// Before anything is proposed or written. `plan.artifacts` rather than the site's host list: that is
+// what this generation actually reaches, so a host the site names but this plan excludes does not
+// demand a flag nobody needs.
+try {
+  assertProtectedAllowed(site.cfg, plan.artifacts.map((a) => a.host), allowProtected);
+} catch (e) {
+  if (!(e instanceof PublishError)) throw e;
+  console.error(`\n${e.message}`);
+  console.error(`  Re-run with --allow-protected if that is what you mean.`);
+  process.exit(1);
+}
 
 console.log(`generation ${generation}  (${plan.artifacts.length} hosts)`);
 for (const a of plan.artifacts) {
@@ -529,6 +561,9 @@ if (flags.has("--dry-run")) {
   const authorizedAt = new Date();
   const signed = signAuthorizedArtifactBundle({
     target,
+    // Carried here too, though nobody approves a break-glass bundle: the gate above already refused
+    // without the flag, so this records *which* of the two shapes was signed. A signed artifact that
+    // did not say whether a human opted in is one the next reader has to guess about.
     bundle: bundleFromPlan(plan),
     authorizedAt,
     expiresAt: new Date(authorizedAt.getTime() + ttlSec * 1000),

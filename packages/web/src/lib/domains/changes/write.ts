@@ -20,6 +20,15 @@ export function publishBody(hash: string, otp: string): string {
   return JSON.stringify({ hash, otp });
 }
 
-export function proposeBody(target: string): string {
-  return JSON.stringify({ target });
+/**
+ * `allowProtected` is omitted unless it is true, so the ordinary body is byte-for-byte what it was.
+ *
+ * The server reads it with `=== true` and refuses a plan reaching a protected host without it
+ * (409 + `needsAllowProtected`). It is a second call rather than a checkbox shown up front: the
+ * page cannot know which hosts are protected until the server has rendered the plan, so asking
+ * beforehand would mean asking on every propose — and a confirmation that always appears is one
+ * people click without reading.
+ */
+export function proposeBody(target: string, allowProtected = false): string {
+  return JSON.stringify(allowProtected ? { target, allowProtected: true } : { target });
 }

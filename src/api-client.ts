@@ -187,7 +187,11 @@ export interface PlanView {
   generation: string;
   proposedBy: string;
   proposedAt: string;
-  summary: { hosts: Array<{ host: string; stage: string; ruleCount: number; rulesetHash: string }> };
+  summary: {
+    hosts: Array<{ host: string; stage: string; ruleCount: number; rulesetHash: string }>;
+    /** See `PlanSummary.allowProtected`. Absent on a manager that predates the opt-in. */
+    allowProtected?: true;
+  };
   approval: { by: string; at: string } | null;
   publishedAt: string | null;
   /** VPC this plan was proposed for. Absent on older managers. */
@@ -209,6 +213,15 @@ export function printPlan(p: PlanView): void {
       // operator ran exactly this, read "not yet", and had approved nothing.
       : `approved   — not yet. A different operator must run: heliopause-approve <url> ${p.hash} --approve`,
   );
+  // Before the host rows, not after. The rows are what an approver scans, and a warning printed
+  // underneath them is read once the decision is already made — if it is read at all.
+  if (p.summary.allowProtected) {
+    console.log(
+      `protected  🔴 this plan reaches a protected host and the proposer opted in ` +
+        `(--allow-protected). Protected hosts run their own VPC's relay: a policy that locks one ` +
+        `out cannot be corrected from inside that VPC.`,
+    );
+  }
   for (const h of p.summary.hosts) {
     // "total rules", against `heliopause-publish`'s "policy rules". Different measures of the same
     // generation — this one includes the baseline and conntrack rules — and both labels say which so

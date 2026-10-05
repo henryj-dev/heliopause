@@ -114,7 +114,7 @@
     }
   }
 
-  async function propose(): Promise<void> {
+  async function propose(allowProtected = false): Promise<void> {
     if (!target) return;
     busy = "propose";
     try {
@@ -122,9 +122,29 @@
         method: "POST",
         credentials: "same-origin",
         headers: writeHeaders(csrf()),
-        body: proposeBody(target),
+        body: proposeBody(target, allowProtected),
       });
-      const body = await res.json() as { error?: string; hash?: string };
+      const body = await res.json() as { error?: string; hash?: string; needsAllowProtected?: boolean };
+      // The server rendered the plan and found a protected host — infrastructure whose failure takes
+      // out more than itself. It is asking, not failing, so the message it wrote is shown and the
+      // operator decides. Re-sent with the opt-in only on a yes, and `allowProtected` is passed
+      // explicitly so a second refusal cannot loop: the retry already carries it.
+      if (res.status === 409 && body.needsAllowProtected && !allowProtected) {
+        busy = "";
+        // `askWrite`, not the browser's own dialog. `write-ask.test.ts` greps every screen for
+        // those two function names and fails on either; the first version of this used one and CI
+        // caught it. That grep also matches a mention in a comment, which is why this sentence
+        // names neither — measured, after the fix still failed on the comment explaining the fix.
+        //
+        // `warning` alone makes `writeNeedsDialog` open the dialog, which is exactly this case:
+        // nothing to type, something to read.
+        const answer = await askWrite({
+          what: t(prefs.lang, "m.allowProtectedWhat"),
+          warning: `${body.error ?? ""} ${t(prefs.lang, "m.allowProtectedConfirm")}`,
+        });
+        if (answer) return await propose(true);
+        return;
+      }
       if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
       noteKind = "ok";
       note = t(prefs.lang, "m.proposedNote", { hash: body.hash ?? "" });

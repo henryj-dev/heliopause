@@ -173,3 +173,46 @@ describe("validating a bundle off the wire", () => {
     refusal(() => validateBundle({ manifest: { generation: "g" } }));
   });
 });
+
+// ## The protected-host opt-in travels in the bundle
+//
+// Not decoration: the opt-in is in the content address, which is what stops an approval given for a
+// plan *without* the flag from being replayed onto the same generation *with* it. The manager cannot
+// check the claim — it holds no policy — so being in the hash and being printed is the whole of what
+// it buys. See `assertProtectedAllowed` in `publish.ts`.
+describe("the protected-host opt-in", () => {
+  it("changes the content address", () => {
+    // 🔴 The property. Reverting `allowProtected` out of `PlanBundle` fails here, and so does
+    // carrying it anywhere outside the hashed bytes.
+    assert.notEqual(
+      bundleHash(bundle()),
+      bundleHash(bundle({ allowProtected: true })),
+    );
+  });
+
+  it("is absent rather than false when nobody opted in", () => {
+    // So a generation with no protected host hashes exactly as it did before this field existed —
+    // adding it invalidated nothing already pending.
+    assert.ok(!("allowProtected" in validateBundle(JSON.parse(JSON.stringify(bundle())))));
+    assert.equal(
+      validateBundle(JSON.parse(JSON.stringify(bundle({ allowProtected: true })))).allowProtected,
+      true,
+    );
+  });
+
+  // ⚠️ This one is about *rejection* only — it stays green on a reader that drops **every** opt-in.
+  // What catches that is the preservation assertion in the test above, and an independent review
+  // pointed out that the first version of this comment claimed both.
+  it("drops anything looser than exactly true", () => {
+    // The field is only ever read as "a person said yes", so `"yes"`, `1` and `false` must not
+    // become that. Dropped rather than refused: a bundle is also how a pending plan is re-read, and
+    // a reader stricter than the writer turns stored plans into errors.
+    for (const loose of ["true", 1, "yes", false, null, {}]) {
+      const tampered = { ...JSON.parse(JSON.stringify(bundle())), allowProtected: loose };
+      assert.ok(
+        !("allowProtected" in validateBundle(tampered)),
+        `allowProtected: ${JSON.stringify(loose)} became an opt-in`,
+      );
+    }
+  });
+});

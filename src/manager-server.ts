@@ -69,7 +69,7 @@ import {
 import { CONSOLE_ENTRY, consoleAppPath, policyAppPath } from "./app-shell.ts";
 
 import { allSitePolicies, buildScreen, type Screen } from "./policy-screen.ts";
-import { planPublish } from "./publish.ts";
+import { assertProtectedAllowed, planPublish, protectedHostsIn, PublishError } from "./publish.ts";
 import { editableFiles, parsePolicySource, screenSiteOf, type PolicySource } from "./policy-source.ts";
 import { compareRoutes, readyToApply, type RouteDecl } from "./routes.ts";
 import { lookupPolicies } from "./policy-lookup.ts";
@@ -1366,11 +1366,49 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     const issuedAt = previous && sameCommit(previous.generation, source.head.sha)
       ? previous.proposedAt
       : now().toISOString();
+    // ## The worker cannot opt in to protected hosts — it leaves them out
+    //
+    // This is the automated proposer, and `protectedHosts` exists for exactly it: "an automated
+    // batch that forgets the flag skips them instead of breaking the network it runs on"
+    // (`config.ts`). A flag it could set itself would not be an opt-in, it would be a default with
+    // extra steps, so there is no way to pass one here.
+    //
+    // Leaving them out rather than refusing the whole proposal: the worker proposes on a timer, and
+    // a site whose gateway is protected would otherwise have *no* automatic proposals at all — the
+    // five other hosts would stop being offered because of the sixth.
+    //
+    // ⚠️ **That only holds when the protected host is neither the sole canary nor the workload
+    // applier**, and the first version of this comment claimed it unconditionally. An independent
+    // review measured the three ways `planPublish` then refuses the filtered plan: no canary
+    // (`publish.ts` staging check), an applier that is no longer among the hosts — which fires
+    // **before** the empty-workload early return, so it bites even with no workload policies — and
+    // an empty host list. dev is fine (its canary and applier are both `k3s-01`, and `gw-01` is
+    // `gateway`); prod and util have one host which is also the canary, so the filter empties the
+    // list; a site whose applier is its protected gateway gets nothing proposed at all.
+    //
+    // Those are refusals, not silent skips, and the invariants hold by rejection. But "the other
+    // hosts still get proposed" is not true in general and should not be read that way.
+    //
+    // The gateway then stays on its old generation, which `status` shows. That is visible; a
+    // generation that quietly included it would not be.
+    // ⚠️ **No test covers this filter.** Two reviews confirmed it: deleting these lines leaves the
+    // whole suite green. The CLI gate is covered by `publish-cli.test.ts` (it runs the binary) and
+    // the console gate by `manager-protected-gate.test.ts` (it injects `policySource.fetch`), but
+    // the worker needs more than an injected renderer — its propose path also requires the
+    // enrollment and policy-write options and a seeded merge state, which is a new harness rather
+    // than a test. Left as a known gap on purpose, and said out loud rather than implied covered.
+    const skipped = protectedHostsIn(site.cfg, site.hosts.map((h) => (h as { id: string }).id));
+    if (skipped.length > 0) {
+      log(
+        `policy worker leaves out protected host(s) ${skipped.join(", ")} — propose by hand to include them`,
+        `정책 워커가 보호 호스트 ${skipped.join(", ")} 를 제외한다 — 포함하려면 손으로 제안할 것`,
+      );
+    }
     const plan = planPublish({
       cfg: site.cfg,
       generation: source.head.sha,
       issuedAt,
-      hosts: site.hosts,
+      hosts: site.hosts.filter((h) => !skipped.includes((h as { id: string }).id)),
       ...(site.workload ? { workload: site.workload } : {}),
       ...(site.workloadBaselines ? { workloadBaselines: site.workloadBaselines } : {}),
       ...(site.resolveService ? { resolveService: site.resolveService } : {}),
@@ -3288,12 +3326,16 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       if (!opts.policySource) {
         return send(res, 404, { error: "this deployment does not carry a policy repository" });
       }
-      let body: { target?: string };
+      let body: { target?: string; allowProtected?: unknown };
       try {
         body = JSON.parse(await readBody(req)) as typeof body;
       } catch (e) {
         return send(res, 400, { error: `bad request body: ${(e as Error).message}` });
       }
+      // `=== true` and nothing looser. A console that sent `"true"` or `1` meant yes, but a reader
+      // that accepts those also accepts whatever a different client sends by accident, and this one
+      // field is the whole opt-in.
+      const consoleAllowProtected = body.allowProtected === true;
       const target = opts.relays.find((r) => r.name === body.target);
       if (!target) {
         return send(res, 400, {
@@ -3386,12 +3428,24 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
           generation: source.head.sha,
           issuedAt: now().toISOString(),
           hosts: site.hosts,
+          ...(consoleAllowProtected ? { allowProtected: true } : {}),
           ...(site.workload ? { workload: site.workload } : {}),
           ...(site.workloadBaselines ? { workloadBaselines: site.workloadBaselines } : {}),
           ...(site.resolveService ? { resolveService: site.resolveService } : {}),
         } as Parameters<typeof planPublish>[0]);
+        // The console *can* opt in — unlike the worker above, there is a person at the other end of
+        // this request. It is a separate `try` from the render so the refusal does not arrive as
+        // "the policy did not render", which would send them to the policy instead of to the button.
+        assertProtectedAllowed(
+          site.cfg, plan.artifacts.map((a) => a.host), consoleAllowProtected,
+        );
         bundle = bundleFromPlan(plan);
       } catch (e) {
+        if (e instanceof PublishError) {
+          // 409 and not 400: the request was well-formed and the policy rendered. What is missing is
+          // a decision, and the console turns this into the confirmation it then re-sends.
+          return send(res, 409, { error: (e as Error).message, needsAllowProtected: true });
+        }
         // The renderer's own sentence. "This rule names a port the workload does not listen on" and
         // "the policy repository is unreachable" send an operator to completely different places.
         return send(res, 400, { error: `the policy did not render: ${(e as Error).message}` });
@@ -4465,6 +4519,8 @@ function summarise(b: PlanBundle): PlanSummary {
           rulesetHash: e.rulesetHash,
         };
       }),
+    // Read off the bundle, which is the bytes that arrived — the same rule the host rows follow.
+    ...(b.allowProtected ? { allowProtected: true as const } : {}),
   };
 }
 

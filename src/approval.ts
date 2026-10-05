@@ -72,6 +72,18 @@ export interface Plan {
  */
 export interface PlanSummary {
   hosts: Array<{ host: string; stage: string; ruleCount: number; rulesetHash: string }>;
+  /**
+   * Present and `true` when the proposer opted in to touching protected hosts.
+   *
+   * The whole point of carrying the opt-in is that **the second operator is told.** The hash
+   * changing already stops an approval from being replayed across the two shapes, but a hash is not
+   * a sentence — this is what `printPlan` turns into one. Omitted when absent so a summary for a
+   * generation with no protected host is unchanged.
+   *
+   * It says the proposer *said yes*, not that the plan is safe. Which hosts are protected is a fact
+   * about the policy, and the manager holds none — see `assertProtectedAllowed`.
+   */
+  allowProtected?: true;
 }
 
 export interface ApprovalLimits {

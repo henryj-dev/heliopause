@@ -202,6 +202,46 @@ describe("the renderer's answer is untrusted input", () => {
     refuses((p) => { p.schemaVersion = POLICY_SOURCE_SCHEMA + 1; }, /schema/);
   });
 
+  it("refuses a protectedHosts that is present and not an array", () => {
+    // The propose paths in `manager-server.ts` read this field to decide whether a generation
+    // reaches a gateway, and they have only what crossed this wire. A string or a number there is a
+    // payload saying something this reader cannot act on.
+    //
+    // Reverting the check in `parsePolicySource` fails here.
+    refuses((p) => {
+      ((p.site as Record<string, unknown>).cfg as Record<string, unknown>).protectedHosts = "gw-01";
+    }, /protectedHosts/);
+  });
+
+  it("reads an absent protectedHosts as none declared, so a hand-written site module still serves", () => {
+    // 🔴 This expectation was the other way round first, and the renderer's own tests said no.
+    //
+    // I refused absence, citing `agent/heliopause-pull.py:2454` ("the difference between 'nothing
+    // is protected' and 'we did not say'"). That rule does not transfer: there the sender always
+    // writes the field so absence means loss, while here the renderer does not require
+    // `defineConfig` — `policy-render-service.test.ts` serves `cfg: {}` literally — so absence means
+    // the module never declared any. Ten of its tests failed and they were right to.
+    //
+    // Defaulted rather than left `undefined` so the propose paths get an array either way.
+    const payload = wire();
+    delete ((payload.site as Record<string, unknown>).cfg as Record<string, unknown>).protectedHosts;
+    assert.deepEqual(parsePolicySource(payload).site.cfg.protectedHosts, []);
+  });
+
+  it("keeps a declared protectedHosts as given", () => {
+    // The known positive for the default above: it fails on a reader that throws the real value
+    // away, and the gate would otherwise protect nothing while every test stayed green.
+    //
+    // ⚠️ It is **not** a reversion detector for the parser block, and was listed as one by mistake —
+    // an independent review measured that it passes with the whole block removed, because the old
+    // parser already passed `cfg` through untouched. What the block adds is the refusal below and
+    // the default; this test guards neither.
+    const payload = wire();
+    ((payload.site as Record<string, unknown>).cfg as Record<string, unknown>).protectedHosts =
+      ["^gw-01\\."];
+    assert.deepEqual(parsePolicySource(payload).site.cfg.protectedHosts, ["^gw-01\\."]);
+  });
+
   it("carries the renderer's build across the wire", () => {
     // The whole point of the field: the manager holds this next to its own and can finally say
     // whether the process that evaluated the policy is the code it thinks it is.

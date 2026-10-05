@@ -364,6 +364,14 @@ export const MESSAGES = {
   "m.approveNote": { en: "approved by {who}", ko: "{who} 가 승인했다" },
   "m.publishNote": { en: "published {generation} to {target} — serving {serving}", ko: "{generation} 을 {target} 에 발행했다 — 지금 제공하는 세대 {serving}" },
   "m.proposedNote": { en: "proposed {hash}", ko: "{hash} 를 제안했다" },
+  "m.allowProtectedWhat": {
+    en: "propose including a protected host",
+    ko: "보호 호스트를 포함해 제안",
+  },
+  "m.allowProtectedConfirm": {
+    en: "Propose anyway, including that host? It runs the relay for its own VPC, so a policy that locks it out cannot be corrected from inside that VPC.",
+    ko: "그 호스트를 포함해 그대로 제안할까요? 자기 VPC 의 릴레이를 돌리는 호스트라, 잠기면 그 VPC 안에서는 고칠 수 없습니다.",
+  },
   "m.plansCount": { en: "{n} plan(s) · publishable for {ttl}s from proposal", ko: "플랜 {n}건 · 제안부터 {ttl}초 동안 발행 가능" },
   "m.stageAwaiting": { en: "awaiting approval", ko: "승인 대기" },
   "m.stageApproved": { en: "approved · not published", ko: "승인됨 · 배포 전" },
