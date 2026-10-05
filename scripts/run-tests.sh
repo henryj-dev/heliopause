@@ -39,11 +39,31 @@ run() {
   failed+=("$label")
 }
 
-# The root suite. `policy/*.test.ts` matches nothing in a clean checkout and `node --test` passes an
+# The root suite. The policy glob matches nothing in a clean checkout and `node --test` passes an
 # unmatched glob over in silence — that is deliberate upstream behaviour, and the reason AGENTS.md
 # tells you to read the test *count* rather than the colour.
+#
+# ## `HELIOPAUSE_POLICY_DIR` — which checkout of the policy repository to run
+#
+# Unset, this is `policy`, which is what every checkout has had: a symlink into whichever clone
+# holds that repository. Setting it points the glob somewhere else without touching this file.
+#
+# 🔴 **The directory's parent must hold the canonical `src/`.** This is a constraint of the policy
+# repository, not of this variable: its files import `../src/*.ts`, and Node resolves that from
+# where the file physically is. Measured 2026-10-06 against main, with the local `policy` symlink
+# pointing into a retired clone: `node --test "policy/*.test.ts"` printed 107 collected, 91 passing,
+# **16 failing** — 15 of them because that clone's `MAX_WATCH_SELECTORS` is 32 where this repository
+# has 64, and one because it has no `BASELINE_NEVER_NAMESPACE` export. Pointing this variable at a
+# clone in the wrong place reproduces that exactly.
+#
+# The deployed renderer already satisfies the constraint and is the shape to copy: it clones the
+# policy repository into `/opt/heliopause/policy`, next to the image's own `src/`, so `../src` there
+# is the canonical one. @see stardust-deploy's `policy-render.yaml`
+#
+# ⚠️ Pointing it at a directory is not a promise that the tests there pass — it decides **which**
+# tests run. Read the count, as the paragraph above says.
 run "src + examples + policy" \
-  node --test "src/*.test.ts" "examples/*.test.ts" "policy/*.test.ts"
+  node --test "src/*.test.ts" "examples/*.test.ts" "${HELIOPAUSE_POLICY_DIR:-policy}/*.test.ts"
 
 # `--if-present` is kept: a workspace may legitimately have no suite. It is also why the workspace
 # list is spelled out here — see `scripts/check-workspace-suites.sh`, which fails when a workspace

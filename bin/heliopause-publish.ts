@@ -289,7 +289,12 @@ async function readMembership(): Promise<SelectorMembership | undefined> {
   // Resolved against *this* process's cwd before being handed on. `heliopause-status` resolves a
   // relative `--pki` against its own, and the two are not the same when it runs as a child — measured:
   // `--pki=./pki` became `/private/tmp/pki` and the read failed with a path the operator never typed.
-  const pki = resolve(flagValue("--pki") ?? "./pki");
+  // `HELIOPAUSE_PKI_DIR` sits between the flag and the old default, so an explicit `--pki` still
+  // wins and a checkout that sets neither behaves exactly as before. It exists because each VPC has
+  // its own CA (`src/pki.ts:293-297`) and those directories live outside this repository — keeping
+  // the location in the environment rather than in a symlink is what makes a second machine
+  // possible without editing the tree.
+  const pki = resolve(flagValue("--pki") ?? process.env.HELIOPAUSE_PKI_DIR ?? "./pki");
   try {
     // `heliopause-status` exits 1 when the fleet has problems — a silent host, a drift — and that is
     // correct for a human at a terminal. Here it made `--membership-from` unusable exactly when it

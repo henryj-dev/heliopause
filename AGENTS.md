@@ -212,6 +212,39 @@ python3 scripts/git-hooks/test-pre-commit.py              # 실패 0 (사람 통
 `gen-workload-rbac.test.ts` 가 `does not provide an export named 'BASELINE_NEVER_NAMESPACE'` 로
 죽었다 — 이 저장소에는 그 export 가 몇 달째 있다.
 
+## 🔑 그런데 **배포된 렌더러에는 이 드리프트가 없다** — 구조가 다르다
+
+2026-10-06 실측(`stardust-deploy` 기본 브랜치의 `policy-render.yaml`, 읽기만): 렌더러 파드의
+initContainer 가 정책 저장소를 **`/opt/heliopause/policy`** 로 clone 하고, 이미지의 정본 `src/`
+가 **`/opt/heliopause/src`** 에 있다(`packaging/Dockerfile.manager:85`). 그래서 **거기서는
+정책의 `../src` 가 정본**이다. 매니페스트 주석도 「이미지 안(`/opt/heliopause`)이어야 한다」고
+적는다.
+
+→ **16 실패는 운영 문제가 아니라 로컬 체크아웃의 모양 문제다.** 같은 상대 경로가 두 환경에서
+다른 것을 가리키고, **운영 쪽이 이미 맞다.**
+
+### `HELIOPAUSE_POLICY_DIR` · `HELIOPAUSE_PKI_DIR`
+
+| 변수 | 쓰는 곳 | 설정하지 않으면 |
+|---|---|---|
+| `HELIOPAUSE_POLICY_DIR` | `scripts/run-tests.sh` 의 정책 글롭 | **`policy`** — 지금까지와 같다 |
+| `HELIOPAUSE_PKI_DIR` | `heliopause-publish` 의 `--pki` 기본값 | **`./pki`** — 지금까지와 같다 |
+
+⚠️ **「설정하지 않으면 지금 동작 그대로」는 설정하지 않은 체크아웃에만 참이다.** 둘 다
+`?? 기본값` 이므로 **값을 준 환경은 기본값이 바뀌어도 물려받지 않는다.**
+
+🔴 **그리고 `HELIOPAUSE_POLICY_DIR` 에는 없앨 수 없는 제약이 있다: 그 디렉토리의 부모에 정본
+`src/` 가 있어야 한다.** 정책 파일이 `../src/*.ts` 로 import 하고 Node 가 그것을 **파일이 실제
+놓인 자리**에서 풀기 때문이다. 경로를 변수로 바꾸는 것은 **그 제약을 없애지 못하고 자리만 옮긴다**
+— 컨테이너가 `/opt/heliopause/policy` 로 마운트하는 이유가 바로 이것이고, 그것이 따라야 할
+모양이다.
+
+⚠️ **패키지 이름으로 import 하게 하는 방법은 측정해 보고 접었다.** `heliopause` 는 Node 의
+self-reference 로 풀리지만 그 기준이 **가장 가까운 `package.json` 의 `name`** 이고, 은퇴한 클론의
+`package.json` 도 `name: heliopause` 다 — **같은 낡은 `src` 로 풀린다.** 그리고 런타임 이미지는
+`src/`·`packages/i18n/`·`bin/` 세 파일·web build 만 복사해 **`package.json` 이 없다**(`:85-92`).
+그 기제는 컨테이너에서 성립하지 않는다.
+
 읽는 방향이 중요하다. 이 실패는 **이 저장소의 결함이 아니고**, 반대로 그 초록불도 이 저장소에
 대한 것이 **아니었다**. 렌더러를 고치고 `policy` 스위트가 초록인 것을 보고 「정책까지 통과했다」
 고 읽으면 안 된다 — 그 86개는 다른 클론의 렌더러를 검사한 것이다. 위의 「`policy/` 가 없으면
