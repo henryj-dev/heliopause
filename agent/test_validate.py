@@ -2335,6 +2335,116 @@ class TestWorkloadApply(unittest.TestCase):
             "the dict record exited through the legacy branch, so this test checks the wrong one",
         )
 
+    # ## The last two of issue #80's five, and neither is reached by record shape
+    #
+    # Measured against main with `sys.settrace` counting line executions across the whole module:
+    # `heliopause-pull.py:3154` (the cleaner raising) and `:3184` (the budget gone) were the two
+    # still at **zero** after PRs #106 and #107 closed the other three.
+
+    def test_an_object_the_cleaner_cannot_read_is_still_checked_for_ownership(self):
+        """`:3154`. The cleaner raising must not be read as "this record is already safe".
+
+        The comparison above that `except` is a **shortcut**: an object whose cleaned form equals the
+        stored snapshot needs no restoring, so the loop `continue`s. If a `KeyError` there were
+        allowed to take the same exit, an object the agent **cannot even describe** would be treated
+        as settled — the one case where falling through to the ownership and UID checks matters most.
+
+        `_clean_workload_object` indexes `obj["metadata"]["uid"]` (`:2757-2766`), so a live object
+        with no `uid` makes it raise. That is not a contrived input: it is what a partially-written
+        object looks like.
+        """
+        broken = self.live(cnp(), uid="uid-new", rv="2")
+        del broken["metadata"]["uid"]                   # the cleaner indexes this
+        self.cluster["util/hp-dev-p700"] = broken
+        self._state_with([{
+            "ref": "util/hp-dev-p700", "uid": "uid-new", "cluster": "dev",
+            "generation": "g1", "previous": {"metadata": {"uid": "uid-new"}},
+        }])
+        hp.rollback_workload("cleaner raised", "g1")
+        st = hp.load_state()
+        # 🔑 The point is that it did **not** take the already-safe exit. That exit is silent — it
+        # `continue`s with nothing recorded — so "it reached the ownership check" is what
+        # distinguishes them, and the ownership check says so in the detail.
+        self.assertEqual(
+            st["workloadState"], "rollback-incident",
+            f"the unreadable object took the already-safe exit and was recorded as settled: {st}",
+        )
+        self.assertIn(
+            "util/hp-dev-p700", st["workloadDetail"],
+            f"nothing was recorded for the record whose object could not be cleaned: "
+            f"{st['workloadDetail']!r}",
+        )
+        self.assertEqual(
+            self.deleted, [],
+            f"an object the agent cannot describe was deleted: {self.deleted}",
+        )
+
+    def test_a_rollback_whose_budget_is_gone_is_retryable_not_an_incident(self):
+        """`:3184`. Running out of the total budget is a *transient* failure, and the difference
+        decides whether anything comes back for this host.
+
+        `retryable` yields `rollback-failed` with a `workloadRollbackAt` deadline and an armed
+        retry; `incidents` yields `rollback-incident`, no deadline, and the source calls that
+        "intentionally settled for automatic action" (`:3196-3217`). A budget that ran out says
+        nothing about whether the restore would succeed — only that there was no time left.
+
+        The budget is `WORKLOAD_ROLLBACK_BUDGET_SEC` (`:320`), so setting it to zero makes
+        `_deadline_timeout` return `None` at the first replace. That drives the real deadline
+        arithmetic (`:824-829`) rather than stubbing the branch's own helper.
+        """
+        # The stored snapshot has to **differ** from the live object, or the loop takes the
+        # already-safe shortcut at `:3152` and `continue`s — measured: it recorded `rolled-back`
+        # and never reached the budget check. A different description is the smallest difference
+        # that still leaves the UID matching, which the UID check below requires.
+        previous = cnp()
+        previous["metadata"]["uid"] = "uid-old"
+        previous["spec"]["description"] = "the policy this rollback would restore"
+        self.cluster["util/hp-dev-p700"] = self.live(cnp(), uid="uid-old", rv="2")
+        self._state_with([{
+            "ref": "util/hp-dev-p700", "uid": "uid-old", "cluster": "dev",
+            "generation": "g1", "previous": previous,
+        }])
+        # ⚠️ Setting the budget to zero does **not** reach this branch — measured: the *read* uses
+        # the same deadline (`:2669-2671`) and fails first with "cannot read … deadline elapsed".
+        # The branch under test is the one **after** a successful read, so the budget has to run out
+        # **between** the read and the replace. Advancing the clock once, at the read, is what puts
+        # the loop there.
+        real_time, spent = time.time, []
+
+        def clock():
+            now = real_time()
+            return now + hp.WORKLOAD_ROLLBACK_BUDGET_SEC + 1 if spent else now
+
+        def note_the_read(args, stdin=None):
+            if "get" in args and "ciliumnetworkpolicy" in args:
+                spent.append(True)          # from here on, the budget reads as gone
+            return None
+
+        self.stub(note_the_read)
+        hp.time.time = clock
+        try:
+            hp.rollback_workload("budget gone", "g1")
+        finally:
+            hp.time.time = real_time
+        st = hp.load_state()
+        self.assertEqual(
+            st["workloadState"], "rollback-failed",
+            f"running out of budget was settled instead of retried: {st['workloadState']}",
+        )
+        self.assertIsNotNone(
+            st["workloadRollbackAt"],
+            "no retry deadline was written, so a restart would not pick this rollback up",
+        )
+        self.assertIn(
+            "exceeded its total budget", st["workloadDetail"],
+            f"the detail does not name the budget: {st['workloadDetail']!r}",
+        )
+        # It `break`s rather than `continue`s, so no replace was attempted at all.
+        self.assertEqual(
+            [c for c in self.calls if c[0] == "replace"], [],
+            f"a replace ran after the budget was gone: {self.calls}",
+        )
+
     def test_no_commitment_means_nothing_to_recover(self):
         hp.recover_workload_commitment()
         self.assertIsNone(hp._wl_timer)
