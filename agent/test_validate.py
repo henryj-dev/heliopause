@@ -6809,6 +6809,22 @@ class TestConfirmDoesNotLeaveTheRoutePlanBehind(unittest.TestCase):
         hp._timer.start()
         hp.rollback("generation-2 rolled back having declared no routes")
 
+        # ## The positive witness, and why "no route commands" needed one
+        #
+        # ⚠️ An independent post-hoc review of #85 found that the assertion below is satisfied by a
+        # rollback that **returns immediately** — it checks only that no route command was issued,
+        # and a rollback that does nothing issues none. Measured: put `return True` at the top of
+        # `rollback()` and this test stays green while twelve others go red, so the mutation is not
+        # harmless; it is invisible *here*. The claim the test is named for needs the rollback to
+        # have actually run, so these two lines say it did.
+        settled = hp.load_state()
+        self.assertEqual(
+            settled["state"], "rolled-back",
+            f"the rollback did not settle ({settled['state']}), so 'it touched no routes' is about a "
+            "rollback that did not happen — see the measurement above.",
+        )
+        self.assertIsNone(hp._timer, "the rollback left its timer armed, so it did not run to the end")
+
         self.assertEqual(
             self.route_calls, [],
             f"generation-2's rollback touched routes it never declared: {self.route_calls}. That is "
@@ -6819,14 +6835,45 @@ class TestConfirmDoesNotLeaveTheRoutePlanBehind(unittest.TestCase):
 class TestTheRoutePlanSurvivesARestart(unittest.TestCase):
     """The route half of the commitment reaches the disk and comes back. Issue #71.
 
-    `apply_routes`'s docstring says "what to undo reaches the disk before the thing that would need
-    undoing happens", and calls that "the whole reason this host can be restarted mid-apply". It was not
-    true of the route half: `pendingRoutes` was absent from `_EMPTY_STATE`, and `_load_state_unlocked`
-    rebuilds the document from that dict's keys, so every write of the field was dropped on the next
-    read. `recover_commitment`'s recovery read always saw `None`.
+    `_persist_route_commitment`'s docstring (`heliopause-pull.py:1915`) says "what to undo reaches the
+    disk before the thing that would need undoing happens", and calls that "the whole reason this host
+    can be restarted mid-apply". It was not true of the route half: `pendingRoutes` was absent from
+    `_EMPTY_STATE`, and `_load_state_unlocked` rebuilds the document from that dict's keys, so every
+    write of the field was dropped on the next read. `recover_commitment`'s recovery read always saw
+    `None`.
+
+    ⚠️ This attributed both the quotation and the `st["pendingRoutes"]` write to `apply_routes`. Both
+    belong to `_persist_route_commitment`, which `apply_routes` calls — an independent review caught
+    it. It changes nothing about execution and everything about where a reader looks for the
+    obligation, which is the point of naming a function in a docstring at all.
 
     The three cases below are the three ways that surfaced, and each one is a restart: the state is
     saved, loaded back, and only then does recovery run.
+
+    ## 🔴 Three mutations this class does **not** catch — measured, not predicted
+
+    An independent post-hoc review predicted these would stay green and all three did. Reported
+    rather than quietly fixed, because the file's rule is that a green mutation is worth writing
+    down and hiding it only moves the finding to the next round:
+
+        mutation                                              whole suite
+        `if not _persist_route_commitment(plan):` → `if False:`   green
+          (`heliopause-pull.py:2454` — the production apply
+           no longer persists the plan at all)
+        the recovery timer's delay `remaining` → `remaining + 300`  green
+        the failed-rollback rewrite of `pendingRoutes` deleted      green
+          (`:2248`)
+
+    The first is the one that matters, and it is the same shape as the finding that drove PR #86:
+    `test_the_apply_path_is_what_puts_the_plan_on_disk` calls `_persist_route_commitment` **directly**,
+    so it proves the helper works and not that `apply_artifact` still calls it. The route block could
+    stop persisting entirely and every test here would pass.
+
+    The second is a gap the class already admits: the timer case uses a fake `threading.Timer` that
+    records its delay and fires the callback by hand, and nothing asserts the delay. Hand-firing
+    proves what the callback does, never when it would have run.
+
+    The third is acknowledged in the failed-rollback case's own docstring.
     """
 
     ROUTE = {"spec": {"dst": "203.0.113.0/24", "via": "203.0.113.1"}, "before": None}
@@ -7081,9 +7128,19 @@ class TestTheRoutePlanSurvivesARestart(unittest.TestCase):
             elif isinstance(holder, ast.Call) and isinstance(holder.func, ast.Name):
                 where = f"{holder.func.id}()"
             else:
-                # A nested write — `doc["a"]["b"] = …`. It cannot be the shape this test is about: the
-                # key it sets is not a top-level key of the document, and `doc["a"]` has to exist
-                # already, which means `a` is either in the schema or lost before this line runs.
+                # A write through something this scanner does not name: `doc["a"]["b"] = …`, but
+                # also `self.st["fresh"] = …` and `obj.state()["fresh"] = …`.
+                #
+                # ⚠️ This used to claim the skipped writes "cannot be the shape this test is about"
+                # because the key is not top-level and `doc["a"]` must already exist. That holds for
+                # the nested-subscript case and **not** for the other two: an attribute or a method
+                # result can perfectly well be a persisted root document, and a field written only
+                # that way would be invisible here. The class docstring lists those escapes
+                # correctly; this comment contradicted it, which an independent review caught.
+                #
+                # No second dropped root field is hiding behind the limitation today — that was
+                # checked — but the limitation is real and saying otherwise is what makes a reader
+                # stop looking.
                 continue
             assigned.add((where, target.slice.value))
         self.assertIn(

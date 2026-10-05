@@ -3781,9 +3781,16 @@ _EMPTY_STATE = {
     # every version bounded the consequence by the branches it had looked at, and there was always
     # another branch. The issue is the place for that.
     #
-    # Both are **dormant on the fleet today**: the whole route block sits behind `if declared:`, and the
-    # deployed revision's own comment says routes are absent on every host. That is the deployed code's
-    # assertion, not a reading of today's artifacts.
+    # Both are dormant **on any host whose artifact declares no routes**: the whole route block sits
+    # behind `if declared:`. Whether that covers the fleet is not something this file can say — the
+    # deployed revision's own comment claims routes are absent everywhere, and a comment is the
+    # previous author's reading rather than today's artifacts, which nobody has read for this.
+    #
+    # ⚠️ This used to say "dormant **on the fleet today**", with the qualification about artifacts in
+    # the following sentence. An independent review named the problem: the qualification does not
+    # rescue the claim, it contradicts it, and the unconditional half is what a reader carries away —
+    # which lowers the urgency of behaviour that is deployed and unfixed. The conditional form is the
+    # one the evidence supports.
     # @see TestTheRoutePlanSurvivesARestart
     # @see test_a_new_commitment_does_not_inherit_the_previous_route_plan
     "pendingRoutes": None,
