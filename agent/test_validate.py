@@ -5049,10 +5049,11 @@ class TestRelayRequestDeadline(unittest.TestCase):
         self.assertIn("reading the response body", str(caught.exception))
         self.assertIn(str(hp.HTTP_TIMEOUT_SEC), str(caught.exception))
 
-    def test_the_relay_call_re_arms_the_socket_from_the_deadline(self):
-        # The call sites, as an absence. One `read(MAX_ARTIFACT_BYTES)` is a single call that keeps
-        # resetting the socket timeout internally — the body has to be read in pieces with the clock
-        # consulted between them, or the deadline above bounds nothing that matters.
+    def test_the_relay_call_still_names_the_deadline_at_three_sites(self):
+        # A tripwire, and named as one: a count of occurrences in the function's text. Three calls
+        # that all pass `deadline` satisfy it even if the clock never advances between them, and a
+        # fourth site added for a new stage makes it fail for being right.
+        # @see TestTheRelayDeadlineBoundsTheWholeCall for the property
         source = pathlib.Path(hp.__file__).read_text()
         body = source[source.index("def relay_request("):source.index("def post_heartbeat(")]
         self.assertIn("deadline = time.monotonic() + HTTP_TIMEOUT_SEC", body)
@@ -5063,6 +5064,267 @@ class TestRelayRequestDeadline(unittest.TestCase):
         self.assertNotIn(
             "resp.read(MAX_ARTIFACT_BYTES)", body,
             "one unbounded read is the defect — the body is read in pieces",
+        )
+
+
+class TestTheRelayDeadlineBoundsTheWholeCall(unittest.TestCase):
+    """One deadline covers the request, the status and every piece of the body — not one each.
+
+    ## What this replaces
+
+    `TestRelayRequestDeadline.test_the_relay_call_still_names_the_deadline_at_three_sites` counts
+    occurrences of `conn.sock.settimeout(_remaining(deadline` in the function's text and requires
+    three. Three sites that all mention `deadline` satisfy that count whether or not the clock
+    advances between them, and whether or not each arming happens **before** the stage it bounds —
+    and those two are the entire property.
+
+    ⚠️ This used to add that "`settimeout(HTTP_TIMEOUT_SEC)` written out three times would be the
+    defect, and a textual count of a different string would not see it". The count **does** see that
+    substitution — its expected string disappears, which is the tripwire RED in the first row of the
+    table below. The sentence contradicted a measurement three paragraphs down from itself. The real
+    blind spots are the second and third rows: the words stay and the behaviour changes.
+
+    What the deadline is for is in the function's own docstring: a relay that answers slowly at every
+    stage must not hold the heartbeat thread for a multiple of `HTTP_TIMEOUT_SEC`, because that thread
+    is also the one that confirms this host's ruleset before the rollback timer fires.
+
+    ## How it is observed
+
+    No socket and no TLS. `http.client.HTTPSConnection` is replaced by a fake whose `sock.settimeout`
+    records what it is given, and whose stages consume a known amount of the budget. The recorded
+    values are then **decreasing**, and the last one is short by what the earlier stages spent. Under
+    a per-stage timeout all three would be the same number.
+
+    `HTTP_TIMEOUT_SEC` is patched small so the test costs a fraction of a second rather than ten.
+
+    ## Measured, six mutations
+
+    Each applied to `agent/heliopause-pull.py` alone and reverted; the file was green before and
+    after (326 collected, 12 skipped on macOS). "tripwire" is
+    `TestRelayRequestDeadline.test_the_relay_call_still_names_the_deadline_at_three_sites`; the three
+    tests here are shortened to *order*, *exhausted* and *pieces*.
+
+        mutation                                        tripwire  red here
+        all three sites → `settimeout(HTTP_TIMEOUT_SEC)` RED      order, exhausted
+        `deadline` recomputed before the status read,    green    order — alone
+          the three sites left as they are
+        `resp.read(MAX_ARTIFACT_BYTES - len(raw))`       green    pieces — alone
+          instead of the 65536 chunk
+        `_remaining` called once, that value used at     **RED**  order — alone
+          all three sites
+        the request arming moved below `conn.request()`  green    order, exhausted
+        the body arming moved below `resp.read(...)`     green    order, pieces
+
+    ⚠️ That fourth row read **green** when this table was written, and the run it came from had
+    printed the tripwire as failing. Reusing one value deletes all three
+    `conn.sock.settimeout(_remaining(deadline` expressions, so the count goes to zero — of course the
+    tripwire sees it. A review re-ran it and counted zero. **I recorded the opposite of my own
+    measurement**, in the table whose subject is measurement, and the blanket sentence that followed
+    ("the tripwire is green for all five of the behavioural rows") was built on that one wrong cell.
+
+    **Rows two, three, five and six are why this class exists** — the behaviour changes and the words
+    stay put, so the tripwire is green for those four. Rows five and six were found by an independent
+    review **against the first version of this class**, which they left green:
+
+    - *one value at three sites*: the first version asserted `armed == sorted(armed, reverse=True)`,
+      which accepts **equal** values. One `_remaining` reused three times is non-increasing. The
+      assertion is now strict between adjacent values, and exact against a clock this fixture owns.
+    - *arming moved after its stage*: the first version kept armings and stages in separate lists and
+      compared counts, which cannot say which came first — so a stage running on a stale timeout and
+      being armed afterwards passed. There is one ordered trace now.
+
+    Both of those are the defect this class is for, dressed differently, and both were invisible to
+    it.
+    """
+
+    BUDGET = 1.0
+    SPENT_PER_STAGE = 0.15
+
+    def setUp(self):
+        # 🔑 **One ordered trace, and a clock this test owns.**
+        #
+        # ⚠️ The first version kept three separate lists (armed values, stage names, read sizes) and
+        # asserted aggregate counts. A review measured what that cannot see: moving each arming to
+        # **after** its stage — the request arming below `conn.request()`, the status arming below
+        # `getresponse()`, the body arming below `resp.read()` — left all three tests **green**, and
+        # the tripwire's three occurrences with them. Separate lists cannot say that arming came
+        # first, which is the only thing arming is for.
+        #
+        # It also used `time.sleep`, so "decreasing" depended on real elapsed time and the test cost
+        # most of a second. `time.monotonic` is now a counter this fixture advances, which makes the
+        # expected values exact rather than approximate.
+        self.trace = []
+        self.reads = []
+        self._real = {
+            "HTTP_TIMEOUT_SEC": hp.HTTP_TIMEOUT_SEC,
+            "PINS": hp.PINS,
+            "RELAY_URL": hp.RELAY_URL,
+            "ssl_context": hp.ssl_context,
+        }
+        self._real_conn = hp.http.client.HTTPSConnection
+        self._real_monotonic = hp.time.monotonic
+        hp.HTTP_TIMEOUT_SEC = self.BUDGET
+        hp.PINS = []  # the pin check is a different test's subject
+        hp.RELAY_URL = "https://relay.example/base"
+        hp.ssl_context = lambda: None
+        self.now = 1000.0
+        hp.time.monotonic = lambda: self.now
+        self.install(body=b'{"ok": true}')
+
+    def tearDown(self):
+        for name, value in self._real.items():
+            setattr(hp, name, value)
+        hp.http.client.HTTPSConnection = self._real_conn
+        hp.time.monotonic = self._real_monotonic
+
+    def install(self, body, spend_per_stage=None, stage_spend=None):
+        """Put a fake connection in place. `stage_spend` overrides a stage's cost by name."""
+        spend_per_stage = self.SPENT_PER_STAGE if spend_per_stage is None else spend_per_stage
+        stage_spend = stage_spend or {}
+        test = self
+
+        def spend(stage):
+            test.trace.append(("did", stage))
+            test.now += stage_spend.get(stage, spend_per_stage)
+
+        class Sock:
+            def settimeout(self, value):
+                test.trace.append(("armed", round(value, 6)))
+
+            def getpeercert(self, binary_form=False):
+                return b"not-a-cert"
+
+        class Resp:
+            status = 200
+
+            def __init__(self):
+                self._left = body
+
+            def read(self, size):
+                test.reads.append(size)
+                spend("body")
+                piece, self._left = self._left[:size], self._left[size:]
+                return piece
+
+        resp, sock = Resp(), Sock()
+
+        class Fake:
+            def __init__(self, *_a, **_kw):
+                self.sock = sock
+
+            def connect(self):
+                spend("connect")
+
+            def request(self, *_a, **_kw):
+                spend("request")
+
+            def getresponse(self):
+                spend("status")
+                return resp
+
+            def close(self):
+                test.trace.append(("did", "close"))
+
+        hp.http.client.HTTPSConnection = Fake
+
+    def armed_values(self):
+        return [v for kind, v in self.trace if kind == "armed"]
+
+    def shape(self):
+        """The trace with arming values replaced by the word, so the order can be asserted exactly."""
+        return [stage if kind == "did" else "armed" for kind, stage in self.trace]
+
+    def test_each_arming_precedes_its_stage_and_counts_down_from_one_budget(self):
+        answer = hp.relay_request("POST", "/heartbeat", {"host": "h1"})
+        self.assertEqual(answer, {"ok": True})
+        # The order, exactly. Arming *after* its stage means the stage ran on whatever timeout was
+        # already on the socket — the constructor's for the request, an earlier arming for the
+        # others — rather than on what is left of the budget. ("Leaves that stage unbounded" was
+        # the first wording; a review pointed out there is always *some* timeout in place. What
+        # these tests establish is that it is not refreshed from the remaining budget.) The first
+        # version of this class could not see that — it kept armings and stages in separate lists and
+        # compared counts. A review measured three such moves, all green.
+        self.assertEqual(
+            self.shape(),
+            ["connect", "armed", "request", "armed", "status", "armed", "body", "armed", "body",
+             "close"],
+            f"the call did not arm before each stage: {self.shape()}",
+        )
+        # And the values count down from one budget. **Strictly** — `sorted(reverse=True)` was the
+        # first assertion here and it accepts equal values, so computing `_remaining` once and using
+        # it at all three sites passed it. Measured by the same review.
+        armed = self.armed_values()
+        for earlier, later in zip(armed, armed[1:]):
+            self.assertLess(
+                later, earlier,
+                f"an arming did not shrink: {armed}. Equal values mean this arming did not account "
+                "for the time the earlier stages spent — the budget restarting and one computed "
+                "value being reused both look like this, and both are a per-stage timeout wearing "
+                "the right words. The restarting one keeps all three `_remaining(deadline` sites, so "
+                "the tripwire's count cannot tell it from the real thing.",
+            )
+        # Exact, because the clock is this fixture's own counter. Each stage spends SPENT_PER_STAGE,
+        # so the first arming is the budget minus one stage (connect), the next minus two, and so on.
+        self.assertEqual(
+            armed,
+            [round(self.BUDGET - n * self.SPENT_PER_STAGE, 6) for n in (1, 2, 3, 4)],
+            f"the armings are not one budget minus what the earlier stages spent: {armed}",
+        )
+
+    def test_an_exhausted_budget_raises_before_the_stage_it_was_arming(self):
+        """`_remaining` refuses rather than handing `settimeout` a value that means non-blocking.
+
+        ⚠️ Zero does not mean "expired" to a socket — it selects non-blocking mode, and what happens
+        next depends on whether data is already buffered. This said it "looks like an empty response
+        rather than a timeout", which a review called more than is guaranteed: unavailable data can
+        raise instead, and this recording fake models neither outcome. What is certain is that zero
+        changes the **mode** rather than representing expiry, and that is reason enough for
+        `_remaining` to raise.
+
+        The budget is spent entirely by connect, so the request is the stage that finds it gone — and
+        the assertion is that the request **never ran**, not merely that something raised.
+        """
+        self.install(body=b'{"ok": true}', stage_spend={"connect": self.BUDGET + 0.05})
+        with self.assertRaises(Exception) as caught:
+            hp.relay_request("POST", "/heartbeat", {"host": "h1"})
+        self.assertIn(
+            "sending the request", str(caught.exception),
+            f"the raise did not name the stage that found the budget gone: {caught.exception}",
+        )
+        self.assertEqual(
+            self.shape(), ["connect", "close"],
+            f"the call got past connect on an exhausted budget: {self.shape()}. Nothing may be armed "
+            "and no stage may run — a request sent first and refused afterwards satisfies a check on "
+            "the exception alone, which a review measured.",
+        )
+
+    def test_the_body_is_read_in_pieces_so_the_clock_is_consulted_between_them(self):
+        """The other half of the same defect, and the one the proxy asserted as an absence.
+
+        `resp.read(MAX_ARTIFACT_BYTES)` is a single call: `http.client` keeps resetting the socket
+        timeout internally for as long as bytes keep arriving, so one read can outlive any deadline
+        set before it. The loop's chunk size is what decides how often the clock is consulted.
+        """
+        payload = b'{"pad": "' + b"x" * 200_000 + b'"}'
+        self.install(body=payload, spend_per_stage=0.0)
+        hp.relay_request("GET", "/artifact")
+        # ⚠️ The size cap is what catches an unbounded read, **not** a count of reads: an oversized
+        # read is still followed by an EOF read, so more than one read happens either way. A review
+        # measured that `len(self.reads) > 1` survives the single-large-read mutation, and that
+        # assertion is gone — it read as independent protection and was not.
+        self.assertLessEqual(
+            max(self.reads), 65536,
+            f"a single read asked for {max(self.reads)} bytes: {self.reads}. The cap is what bounds "
+            "how long one read can keep the socket alive on its own.",
+        )
+        self.assertEqual(
+            self.shape().count("armed"), len(self.reads) + 2,
+            f"arming calls do not match two stages plus {len(self.reads)} reads: {self.shape()}",
+        )
+        # And the last read was armed before it, not after — the ordering the counts cannot say.
+        self.assertEqual(
+            self.shape()[-3:], ["armed", "body", "close"],
+            f"the last read was not armed before it: {self.shape()[-4:]}",
         )
 
 
