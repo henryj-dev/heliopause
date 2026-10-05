@@ -12,6 +12,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync, appendFileSync } from "node:fs";
+import { contains } from "./test-util.ts";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -247,5 +248,58 @@ describe("heliopause-publish — the generation id", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// ## The protected-host gate, at the CLI
+//
+// 🔴 These exist because an independent review pointed out that the unit tests for
+// `assertProtectedAllowed` call the helper directly — so **removing the call from this CLI left them
+// all green**. A gate is only tested where it is wired.
+describe("heliopause-publish — the protected-host gate", () => {
+  /** The fixture site with its one host declared protected. */
+  const guardedSite = () => {
+    const dir = siteRepo();
+    writeFileSync(
+      join(dir, "site.ts"),
+      SITE.replace(
+        "baseline: [{ desc:",
+        'protectedHosts: ["^h-a$"],\n    baseline: [{ desc:',
+      ),
+    );
+    git(dir, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "protect");
+    return dir;
+  };
+
+  it("refuses without --allow-protected, and names the host", () => {
+    // Reverting `assertProtectedAllowed(...)` out of `bin/heliopause-publish.ts` fails here.
+    const r = publish(guardedSite());
+    assert.ok(r.failed, "published to a protected host without the flag");
+    contains(r.out, "h-a");
+    contains(r.out, "protected host");
+    contains(r.out, "--allow-protected");
+  });
+
+  it("proceeds with --allow-protected", () => {
+    // The known negative. Without it the refusal above would also pass on a CLI that refused every
+    // publish, and nothing in the fleet could be published at all.
+    const r = publish(guardedSite(), "--allow-protected");
+    assert.ok(!r.failed, `refused even with the flag:\n${r.out}`);
+    contains(r.out, "generation ");
+  });
+
+  it("publishes an unprotected site with no flag", () => {
+    // The other known negative: the gate must not fire for the ordinary case.
+    const r = publish(siteRepo());
+    assert.ok(!r.failed, `refused an unprotected site:\n${r.out}`);
+  });
+
+  it("refuses a misspelled flag instead of silently ignoring it", () => {
+    // This file does not validate flag names, so `--allow-protexted` would be dropped and the
+    // operator would see a refusal they thought they had answered. Reverting the near-miss check
+    // fails here — the run would refuse with the gate's message rather than the typo's.
+    const r = publish(guardedSite(), "--allow-protexted");
+    assert.ok(r.failed, "accepted a misspelled flag");
+    contains(r.out, "did you mean --allow-protected");
   });
 });

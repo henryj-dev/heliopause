@@ -536,7 +536,13 @@ export function tableRef(cfg: Config): string {
   return `inet ${cfg.tableName}`;
 }
 
-/** Does this host require an explicit opt-in to apply? */
-export function isProtectedHost(cfg: Config, host: string): boolean {
+/**
+ * Does this host require an explicit opt-in to apply?
+ *
+ * Takes the one field it reads rather than a whole `Config`: the callers that matter propose from
+ * the policy renderer's wire shape, which is narrower than `Config` and would otherwise have to
+ * cast. See `assertProtectedAllowed` in `publish.ts`, which is where the refusal lives.
+ */
+export function isProtectedHost(cfg: Pick<Config, "protectedHosts">, host: string): boolean {
   return cfg.protectedHosts.some((p) => new RegExp(p).test(host));
 }

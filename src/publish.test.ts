@@ -7,7 +7,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { contains } from "./test-util.ts";
 import { defineConfig } from "./config.ts";
-import { planPublish, PublishError, type PublishHost } from "./publish.ts";
+import { assertProtectedAllowed, planPublish, PublishError, type PublishHost } from "./publish.ts";
 import { normalizePolicy, type Policy } from "./policy.ts";
 import { isSingleAddress } from "./nft.ts";
 import type { ServiceSelector } from "./cilium.ts";
@@ -676,5 +676,75 @@ describe("planPublish — the workload half", () => {
     );
     const objects = (JSON.parse(plan.workload!.json) as { items: Array<{ metadata: { namespace: string } }> }).items;
     assert.equal(objects[0]!.metadata.namespace, "arc-runners");
+  });
+});
+
+// ## The protected-host opt-in
+//
+// These are the tests the three gate sites cite. Each gate is named here so reverting one produces a
+// failure that says which one — `AGENTS.md` asks for that by name rather than by count, because a
+// count lets the next reader fill in whichever test they assume.
+describe("assertProtectedAllowed", () => {
+  const guarded = defineConfig({
+    tableName: "heliopause",
+    internalSupernet: "10.0.0.0/8",
+    baseline: [{ desc: "management SSH", proto: "tcp", ports: "22", srcCidrs: [] }],
+    protectedHosts: ["^gw-01\\."],
+  });
+
+  it("refuses a plan that reaches a protected host", () => {
+    // The gate itself. Reverting the check in `assertProtectedAllowed` fails here.
+    //
+    // Caught by hand rather than through `assert.throws`. Two reasons, both measured while writing
+    // this: `contains` asserts and returns void, so it cannot be a validator (one that returns
+    // `undefined` fails with "expected the validation function to return true"), and
+    // `assert.throws` returns `undefined` rather than the error, so binding its result and testing
+    // `instanceof` fails too. `thrown` starts as a value that is not a `PublishError`, so a gate
+    // that stops throwing fails here rather than passing on an unset variable.
+    let thrown: unknown = null;
+    try {
+      assertProtectedAllowed(guarded, ["k3s-01.dev", "gw-01.dev"], false);
+    } catch (e) {
+      thrown = e;
+    }
+    assert.ok(thrown instanceof PublishError, "did not refuse");
+    contains(thrown.message, "gw-01.dev");
+  });
+
+  it("names which hosts, not that one of them was protected", () => {
+    // `protectedHostsIn` exists for this: "a protected host" sends nobody anywhere. Reverting it to
+    // a boolean check fails here.
+    let thrown: unknown = null;
+    try {
+      assertProtectedAllowed(guarded, ["gw-01.a", "mailer-01.a", "gw-01.b"], false);
+    } catch (e) {
+      thrown = e;
+    }
+    assert.ok(thrown instanceof PublishError, "did not refuse");
+    contains(thrown.message, "gw-01.a, gw-01.b");
+    assert.ok(!thrown.message.includes("mailer-01"), "named a host that is not protected");
+  });
+
+  it("passes when the caller opted in", () => {
+    assert.doesNotThrow(() => assertProtectedAllowed(guarded, ["gw-01.dev"], true));
+  });
+
+  it("passes when no host is protected", () => {
+    // The known negative. Without it the two refusals above would also pass on a gate that refused
+    // everything, and every publish in the fleet would need a flag.
+    assert.doesNotThrow(() => assertProtectedAllowed(guarded, ["k3s-01.dev", "mailer-01.dev"], false));
+  });
+
+  it("treats an empty protectedHosts as protecting nothing", () => {
+    assert.doesNotThrow(() => assertProtectedAllowed(cfg, ["gw-01.dev"], false));
+  });
+
+  it("does not refuse inside planPublish, so the policy screen can still render", () => {
+    // 🔴 The reason the gate is a separate function. `policy-screen.ts` calls `planPublish` to draw
+    // the console's policy view, and prod and util — whose only host is a protected gateway — are
+    // the sites most worth looking at. Moving the check into `planPublish` fails here.
+    const plan = planPublish({ ...input([host("gw-01.dev", "canary")]), cfg: guarded });
+    assert.equal(plan.artifacts.length, 1);
+    assert.equal(plan.artifacts[0]!.host, "gw-01.dev");
   });
 });

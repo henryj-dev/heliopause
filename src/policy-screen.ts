@@ -31,7 +31,16 @@ import type { PolicyPageMeta, SiteSections } from "./policy-ui.ts";
 
 /** The shape `heliopause-publish` exports. Structural, so this module does not import a bin. */
 export interface ScreenSite {
-  cfg: Parameters<typeof baselineRows>[0];
+  /**
+   * `protectedHosts` is named explicitly rather than left to the derived shape.
+   *
+   * Everything else here is `Parameters<typeof …>` because this type exists to feed the row
+   * builders, and whatever they read is what the wire has to carry. `protectedHosts` is read by
+   * nothing on this screen — it is carried because **the propose paths in `manager-server.ts` need
+   * it and they only have what crossed the wire.** Leaving it to inference would mean the gate
+   * silently had nothing to evaluate, which is the state this field was added to end.
+   */
+  cfg: Parameters<typeof baselineRows>[0] & { protectedHosts: readonly string[] };
   hosts: Parameters<typeof hostRows>[0]["hosts"];
   workload?: unknown[];
   workloadBaselines?: unknown[];

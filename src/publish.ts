@@ -8,7 +8,7 @@
 
 import { createHash } from "node:crypto";
 import { bundleFromPlan, writeBundle } from "./bundle.ts";
-import { defineConfig, type Config } from "./config.ts";
+import { defineConfig, isProtectedHost, type Config } from "./config.ts";
 import type { EgressItem, InputItem, Skipped } from "./nft.ts";
 import { managementGuard, type RouteDecl } from "./routes.ts";
 
@@ -108,6 +108,11 @@ export interface PublishInput {
    * by host would mean deciding which node "owns" a cluster-wide object, which is the question
    * `workload.applier` already answers.
    */
+  /**
+   * The caller opted in to touching protected hosts. Recorded onto the plan; see
+   * `PublishPlan.allowProtected`. Not a refusal — that is `assertProtectedAllowed`.
+   */
+  allowProtected?: boolean;
   workload?: CiliumItem[];
   /** Namespace posture rules; unlike workload flows these have no source or destination. */
   workloadBaselines?: WorkloadBaseline[];
@@ -159,9 +164,87 @@ export interface PublishPlan {
   artifacts: PublishedArtifact[];
   /** Absent when no policy needed this layer. */
   workload?: PublishedWorkload;
+  /**
+   * Present and `true` when the caller opted in to touching protected hosts.
+   *
+   * On the **plan** rather than threaded through each writer, because threading it is how it gets
+   * forgotten: an independent review counted five `bundleFromPlan` callers and found two — public
+   * `writePublish` and the e2e harness behind it — that had no way to pass it. A plan that carries
+   * its own answer cannot be bundled without it.
+   *
+   * `planPublish` records it and does not act on it. The refusal is `assertProtectedAllowed`, at the
+   * proposing callers, for the reason that function documents.
+   */
+  allowProtected?: true;
 }
 
 export class PublishError extends Error {}
+
+/**
+ * Just the one field, because the callers do not all have a whole `Config`.
+ *
+ * The console and the policy worker propose from what crossed the renderer's wire, and that is a
+ * `ScreenSite` — a narrowed shape carrying what the screen reads. Taking `Config` here would force
+ * those two to cast, and a cast is how a type stops being a check: the object genuinely is not a
+ * `Config`, and saying it is would hide the next field that goes missing from the wire.
+ */
+type ProtectedHostsOnly = Pick<Config, "protectedHosts">;
+
+/**
+ * Which of these hosts `cfg.protectedHosts` covers, in the order given.
+ *
+ * Separate from `isProtectedHost` so a caller reports *which* hosts it refused over rather than
+ * that one of them was protected: "gw-01.prod-icn-vtr" is actionable and "a protected host" is not.
+ */
+export function protectedHostsIn(cfg: ProtectedHostsOnly, hostIds: readonly string[]): string[] {
+  return hostIds.filter((h) => isProtectedHost(cfg, h));
+}
+
+/**
+ * Refuse a plan that touches a protected host unless the caller said so out loud.
+ *
+ * ## Why this is a separate function and not a check inside `planPublish`
+ *
+ * `planPublish` has four callers and only three of them are proposing: the fourth is
+ * `policy-screen.ts`, which renders the console's policy view. A refusal inside `planPublish` would
+ * make the screen fail to load for exactly the sites that most need looking at — prod and util,
+ * whose only host is a protected gateway. So the gate lives at the proposing callers, and rendering
+ * stays something you can always do.
+ *
+ * ## This is a guard against forgetting, not an authorisation check
+ *
+ * It runs where `cfg` is — an operator's workstation, or the manager rendering from the policy
+ * renderer's JSON. **The manager cannot evaluate it from a submitted bundle**: it holds no policy
+ * (`manager-server.ts` says so in its own header, and that is deliberate), so `protectedHosts` is
+ * not a thing it knows. A bundle that claims the opt-in is taken at its word.
+ *
+ * What stops a wrong claim is the second operator: the opt-in travels in the bundle, so it is in the
+ * plan hash and `--show` prints it. The approver is told that this generation reaches a gateway, and
+ * an approval given for a plan without the flag cannot be replayed onto one with it.
+ *
+ * ## History
+ *
+ * This existed and was lost. `src/agent.ts:120` (deleted in `12d39c3`, the 2026-08-15 audit response
+ * that moved to signed artifacts) held `isProtectedHost(cfg, host) && !opts.allowProtected` and
+ * returned `"${host} is a protected host — pass allowProtected to apply to it"`. That file was the
+ * push transport's applier; under pull the agent fetches its own artifact and there is no such
+ * caller, so the check had nowhere to live and stopped running. `prod.ts` and `util.ts` have said
+ * "an apply here needs allowProtected" the whole time.
+ */
+export function assertProtectedAllowed(
+  cfg: ProtectedHostsOnly,
+  hostIds: readonly string[],
+  allowProtected: boolean | undefined,
+): void {
+  if (allowProtected) return;
+  const hit = protectedHostsIn(cfg, hostIds);
+  if (hit.length === 0) return;
+  throw new PublishError(
+    `${hit.join(", ")} ${hit.length === 1 ? "is a protected host" : "are protected hosts"} — ` +
+      `pass allowProtected to include ${hit.length === 1 ? "it" : "them"}. ` +
+      `Protected hosts are the ones whose failure takes out more than themselves.`,
+  );
+}
 
 /**
  * Render every host and build the manifest. Pure — no clock, no filesystem, no git.
@@ -296,6 +379,10 @@ export function planPublish(input: PublishInput): PublishPlan {
     },
     artifacts,
     ...(workload ? { workload } : {}),
+    // Recorded, not acted on. `planPublish` must not refuse here — `policy-screen.ts` renders the
+    // console's policy view through this function, and the sites whose only host is a protected
+    // gateway are the ones most worth looking at.
+    ...(input.allowProtected ? { allowProtected: true as const } : {}),
   };
 }
 

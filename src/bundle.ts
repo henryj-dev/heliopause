@@ -50,6 +50,19 @@ export interface PlanBundle {
    * bundle cannot be talked into writing a `.nft` file from a workload entry or the reverse.
    */
   workload: Record<string, string>;
+  /**
+   * Present and `true` only when the proposer opted in to touching protected hosts.
+   *
+   * Omitted rather than `false` when they did not: a bundle for a generation with no protected host
+   * hashes the same as it did before this field existed, so adding the field did not invalidate
+   * anything already pending.
+   *
+   * It travels **so the approver is told.** The manager cannot check it — it holds no policy, so
+   * `protectedHosts` is not a thing it can evaluate (see `assertProtectedAllowed`). Being in the
+   * bundle puts it in the plan hash, which is what stops an approval of a plan without the flag
+   * from being replayed onto one with it.
+   */
+  allowProtected?: true;
 }
 
 /** Build a bundle from a plan the renderer produced. */
@@ -58,7 +71,29 @@ export function bundleFromPlan(plan: PublishPlan): PlanBundle {
   for (const a of plan.artifacts) rulesets[a.host] = a.json;
   const workload: Record<string, string> = {};
   if (plan.workload) workload[plan.workload.applier] = plan.workload.json;
-  return { manifest: plan.manifest, rulesets, workload };
+  // Read off the plan rather than taken as a parameter.
+  //
+  // It was a parameter first, and an independent review counted the callers: five direct ones, of
+  // which public `writePublish` (and `scripts/e2e-render.mjs` indirectly through it) had **no way
+  // to pass it**. A plan that carries its own answer cannot be bundled without it, and there is no
+  // call site left that could forget.
+  //
+  // ⚠️ **That is about the bundle, not about written artifacts.** A second review measured it:
+  // `writeBundle` below writes the manifest, the rulesets and the workload documents and nothing
+  // else, so two plans differing only in this flag write byte-identical files. The opt-in reaches
+  // the **plan hash** (`bundleHash`) and therefore the approver, which is where it does its work —
+  // it does not reach the artifact on disk. The first version of this comment said "an artifact
+  // written that way could never record the opt-in" as though the other paths did; none of them do.
+  //
+  // Persisting it would change the artifact format, which every agent parses. Out of scope here.
+  //
+  // Spread rather than `allowProtected: plan.allowProtected`: an explicit `undefined` key is still
+  // a key, and `JSON.stringify` drops it — so the two would hash alike and compare unequal under
+  // `deepEqual`. Absent means absent in both.
+  return {
+    manifest: plan.manifest, rulesets, workload,
+    ...(plan.allowProtected ? { allowProtected: true as const } : {}),
+  };
 }
 
 /**
@@ -83,6 +118,19 @@ export function bundleHash(b: PlanBundle): string {
       feed(h, map[host]!);
     }
   }
+  // 🔴 Fed only when true, and that is not a shortcut.
+  //
+  // This digest is an explicit list of fields, not the object — so adding `allowProtected` to the
+  // type put it nowhere near the hash, and the test that says the address changes is what caught
+  // that. It has to be fed here or the opt-in is decoration.
+  //
+  // Feeding it unconditionally (`"allowProtected"` + `"0"`/`"1"`) would move **every** hash in the
+  // fleet, which is what the `heliopause-bundle-v1` tag above exists to make impossible without a
+  // version bump. Feeding it only when set leaves a bundle that nobody opted in for hashing exactly
+  // as it did before this field existed, and gives the opted-in shape a different address — which is
+  // the whole property: an approval of the plan without the flag cannot be replayed onto the plan
+  // with it.
+  if (b.allowProtected) feed(h, "allowProtected");
   return "sha256:" + h.digest("hex");
 }
 
@@ -260,5 +308,14 @@ export function validateBundle(b: unknown): PlanBundle {
     }
   }
 
-  return { manifest, rulesets, workload: work };
+  // Narrowed to exactly `true`, and dropped otherwise. This field is only ever read as "the proposer
+  // said yes", so anything else — `"yes"`, `1`, `false` — must not become that. Refusing instead of
+  // dropping would be worse: a bundle is also how a *pending* plan is re-read, and a stricter reader
+  // than the writer turns stored plans into errors.
+  const optIn = (b as Partial<PlanBundle>).allowProtected === true;
+
+  return {
+    manifest, rulesets, workload: work,
+    ...(optIn ? { allowProtected: true as const } : {}),
+  };
 }

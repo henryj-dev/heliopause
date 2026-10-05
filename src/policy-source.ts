@@ -206,6 +206,45 @@ export function parsePolicySource(raw: unknown): PolicySource {
   if (!isObject(site)) bad("site must be an object");
   const s = site as Record<string, unknown>;
   if (!isObject(s.cfg)) bad("site.cfg must be an object");
+  // `protectedHosts` is normalised here, because the propose paths in `manager-server.ts` read it to
+  // decide whether a generation reaches a gateway and they have only what crossed this wire.
+  //
+  // ## Defaulted when absent, and that is not the same call as the agent's
+  //
+  // `agent/heliopause-pull.py:2454` refuses an absent protected-range rather than reading it as
+  // "none to protect", and the first version of this check copied that. It does not transfer. There,
+  // the sender always writes the field, so absence means the field was **lost**. Here absence means
+  // the site module never **declared** it: `defineConfig` emits it (defaulting to `[]`), but the
+  // renderer does not require `defineConfig` — a hand-written `export const site = { cfg: {}, hosts:
+  // [] }` is a shape it serves, and `policy-render-service.test.ts` serves exactly that. For such a
+  // module `[]` is the right answer, not an error.
+  //
+  // ⚠️ "A declared value cannot disappear in transit" is what this comment said first, and that is
+  // **false.** `collectPolicySource` serialises with `JSON.stringify`, which emits only a value's
+  // **own enumerable** properties and honours a custom `toJSON`. So a declared `protectedHosts`
+  // is lost whenever it is not an own enumerable property of `cfg`:
+  //
+  //     Object.defineProperty(cfg, "protectedHosts", { value: [...] })   // non-enumerable
+  //     Object.create({ protectedHosts: [...] })                         // inherited
+  //     cfg.toJSON = () => ({ ...everything but this })                  // custom serialiser
+  //
+  // Two reviews found these one at a time — the second found the inherited case after the first
+  // had found the other two, and the comment then listed exactly the two it knew. **Naming the
+  // rule beats listing the shapes**: `JSON.stringify` keeps own enumerable properties, and anything
+  // else is lost. `defineConfig` output is a plain object literal and has none of these.
+  //
+  // So absence is genuinely ambiguous for hand-written shapes, and this reader cannot tell the two
+  // apart. That is a reason the gate is **a guard against forgetting and not an authorisation
+  // check** — which is what `assertProtectedAllowed` says of itself, and why the second operator
+  // being told is the part that carries weight.
+  //
+  // A non-array that is *present* is still refused — that is a payload saying something this reader
+  // cannot act on, which is the case the agent's rule is actually about.
+  const rawProtected = (s.cfg as Record<string, unknown>).protectedHosts;
+  if (rawProtected !== undefined && !Array.isArray(rawProtected)) {
+    bad("site.cfg.protectedHosts must be an array when present");
+  }
+  if (rawProtected === undefined) (s.cfg as Record<string, unknown>).protectedHosts = [];
   if (!Array.isArray(s.hosts)) bad("site.hosts must be an array");
   for (const name of ["zones", "devices", "objects", "coverage", "workload"] as const) {
     if (s[name] !== undefined && !Array.isArray(s[name])) bad(`site.${name} must be an array when present`);
