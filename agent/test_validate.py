@@ -8003,6 +8003,246 @@ class TestTheRoutePlanSurvivesARestart(unittest.TestCase):
         )
 
 
+class TestAnApplyStopsWhenARollbackIsStillOwed(unittest.TestCase):
+    """Issue #84's remaining window: a rollback that did not settle must stop the apply behind it.
+
+    ## The two questions
+
+    The apply's mid-course guards asked `_timer is None` — "is a timer armed". After a rollback has
+    run that is the wrong question, because a rollback whose **restoration** failed, or whose
+    **result-save** failed, re-arms a timer of its own for the retry
+    (`heliopause-pull.py:2251-2258`, `if not ok or not saved:`). The apply then saw a timer, decided
+    its commitment was live, and carried on — writing routes *after* a rollback had run against them,
+    and in the save-failure case reporting `(True, "pending", "")` for a generation that can never be
+    confirmed, because `confirm()` refuses while a rollback is owed.
+
+    `_nft_rollback_owed` is the question that distinguishes them. `rollback()` sets it before
+    touching anything and clears it **only** on the settled path, so it stays set through exactly the
+    two outcomes the timer check misses. The apply's entry guard (`:2338`) and `confirm()` (`:2517`)
+    already ask both; the two mid-apply guards were the pair that asked one.
+
+    ## Measured before writing this
+
+    Adding `or _nft_rollback_owed is not None` to both guards left the whole file green — **326
+    tests, and none of them saw the change.** That is the gap these tests close, and it is why #84
+    stayed open after #85 closed its other half.
+
+    ## Each half, reverted on its own
+
+        guard reverted to `_timer is None`     what went red
+        the route guard (`:2459`)              test_no_route_is_written_after_a_rollback_that_did_not_settle
+        the final guard (`:2486`)              test_a_route_less_apply_stops_at_the_final_guard_too
+
+    ⚠️ The second row took three attempts, and the first two are worth keeping:
+
+    1. Pausing inside `_nft_apply_json` **deadlocked** — the kernel write is at `:2378`, inside the
+       `with _apply_lock:` opened at `:2375`, and `rollback()` wants that lock. The run hung for ten
+       minutes rather than failing. It also says something about the agent: a rollback **cannot**
+       interleave at the kernel write, so that part of the apply is outside this window.
+    2. With the pause moved to the post-apply `snapshot()` the test passed — and **still did not see
+       the guard**. Reverting the final half left the file green, because the apply walked past the
+       guard and was turned away later by the verification instead: `cannot persist verified nft
+       pending state` rather than `confirmation deadline elapsed during apply`. `assertFalse(ok)`
+       cannot tell a refusal from a different refusal. The test now asserts the **detail**.
+    """
+
+    ROUTE = {"spec": {"dst": "203.0.113.0/24", "via": "203.0.113.1"}, "before": None}
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._state_file = hp.STATE_FILE
+        hp.STATE_FILE = os.path.join(self.tmp, "state.json")
+        self._real = {n: getattr(hp, n) for n in (
+            "_nft_apply_json", "_ip_route", "log", "snapshot", "observed_routes",
+            "_save_state_unlocked",
+        )}
+        self._globals = {n: getattr(hp, n) for n in (
+            "_timer", "_backup", "_nft_rollback_owed", "_route_restore",
+        )}
+        self.route_calls = []
+        self.logged = []
+        hp.log = lambda line: self.logged.append(str(line))
+        hp._ip_route = lambda args: (self.route_calls.append(args), (0, ""))[1]
+        hp.observed_routes = lambda: []
+        hp._timer = None
+        hp._backup = hp._NO_BACKUP
+        hp._nft_rollback_owed = None
+        hp._route_restore = []
+        hp.save_state(dict(hp._EMPTY_STATE))
+
+    def tearDown(self):
+        if hp._timer is not None:
+            hp._timer.cancel()
+            hp._timer.join(5)
+        for name, value in self._real.items():
+            setattr(hp, name, value)
+        for name, value in self._globals.items():
+            setattr(hp, name, value)
+        hp.STATE_FILE = self._state_file
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _arm_a_commitment(self):
+        """The state and globals an apply awaiting confirmation leaves, written by that apply."""
+        hp._nft_apply_json = lambda _doc: (0, "")
+        snapshots = iter((([], [], ""), ([{"table": TABLE}], [], "")))
+        hp.snapshot = lambda: next(snapshots)
+        ok, state, detail = hp.apply_artifact({
+            "generation": "g-first", "ruleset": VALID, "rulesetHash": VALID_HASH,
+            "confirmTimeoutSec": hp.NFT_CONFIRM_MIN_SEC,
+        })
+        self.assertTrue(ok, f"the first apply did not arm a commitment: {state} — {detail}")
+        self.assertIsNotNone(hp._timer, "no rollback timer was armed, so there is nothing to roll back")
+
+    def _rollback_that_does_not_settle(self):
+        """Drive the real `rollback()` into its re-arming branch and leave it there."""
+        hp._nft_apply_json = lambda _doc: (1, "stubbed: the restore fails")
+        self.assertFalse(
+            hp.rollback("a restore that fails", "g-first"),
+            "the rollback reported success, so it settled and this case tests nothing",
+        )
+        self.assertIsNotNone(
+            hp._nft_rollback_owed,
+            "the rollback cleared what it owes, so it took the settled path",
+        )
+        self.assertIsNotNone(hp._timer, "the rollback did not re-arm, so no timer misleads the apply")
+
+    def test_a_second_apply_is_refused_while_the_rollback_is_owed(self):
+        """The entry guard's case, and it already held — the known positive for the two below."""
+        self._arm_a_commitment()
+        self._rollback_that_does_not_settle()
+        # The second apply snapshots before its entry guard, so it needs its own pair; the iterator
+        # `_arm_a_commitment` installed has two and spent both.
+        snapshots = iter((([{"table": TABLE}], [], ""), ([{"table": TABLE}], [], "")))
+        hp.snapshot = lambda: next(snapshots)
+        ok, state, detail = hp.apply_artifact({
+            "generation": "g-second", "ruleset": VALID, "rulesetHash": VALID_HASH,
+            "confirmTimeoutSec": hp.NFT_CONFIRM_MIN_SEC,
+        })
+        self.assertFalse(ok, f"a second apply ran while a rollback was owed: {state} — {detail}")
+        self.assertIn("already awaiting confirmation", detail)
+
+    def test_no_route_is_written_after_a_rollback_that_did_not_settle(self):
+        """The window itself: the apply is already past its entry guard when the rollback happens.
+
+        `observed_routes` is where the apply pauses — it is called after the entry guard and before
+        the route commitment, so a rollback firing from the timer thread lands exactly in the gap the
+        issue describes. The real `rollback` runs there, re-arms, and the apply then has to stop.
+        """
+        # No pre-armed commitment: this apply arms its own, and the rollback below rolls **that**
+        # one back. A second apply would be turned away by the entry guard before it ever reached
+        # the route block — measured, the first version did exactly that and `observed_routes` was
+        # never called.
+        paused = []
+
+        def observe_then_roll_back():
+            paused.append("observed")
+            self._rollback_that_does_not_settle()
+            return []
+
+        hp.observed_routes = observe_then_roll_back
+        hp._nft_apply_json = lambda _doc: (0, "")
+        snapshots = iter((([], [], ""), ([{"table": TABLE}], [], "")))
+        hp.snapshot = lambda: next(snapshots)
+        self.route_calls.clear()
+        ok, state, detail = hp.apply_artifact({
+            "generation": "g-first", "ruleset": VALID, "rulesetHash": VALID_HASH,
+            "confirmTimeoutSec": hp.NFT_CONFIRM_MIN_SEC,
+            "routes": [self.ROUTE["spec"]], "routeGuard": ["198.51.100.0/24"],
+        })
+        self.assertEqual(paused, ["observed"], "the apply never reached the route block")
+        self.assertFalse(
+            ok,
+            f"the apply reported success after a rollback it did not settle: {state} — {detail}. In "
+            "the save-failure outcome that is a `pending` for a generation `confirm()` will refuse, "
+            "so the host reports progress it cannot finish.",
+        )
+        self.assertEqual(
+            self.route_calls, [],
+            f"routes were written after a rollback ran against them: {self.route_calls}",
+        )
+
+    def test_a_route_less_apply_stops_at_the_final_guard_too(self):
+        """The second guard, reached on its own.
+
+        ⚠️ Reverting the route guard alone turns the test above red; reverting **this** guard alone
+        left the whole file green, measured. Two guards and only one carrying load is the shape this
+        repository prescribes either a test or a deletion for — and a deletion would be wrong here,
+        because an nft-only artifact never enters the route block and so never passes the first one.
+
+        The pause point has to run between the entry guard and the final guard for an artifact with
+        no routes, **and outside `_apply_lock`**. The post-apply `snapshot()` is both.
+
+        ⚠️ The first version paused inside `_nft_apply_json` and **deadlocked** — the kernel write is
+        at `heliopause-pull.py:2378`, inside the `with _apply_lock:` opened at `:2375`, and
+        `rollback()` wants that same lock. The run hung for ten minutes instead of failing, which
+        this repository records as the worst outcome available: CI reports a job timeout with no
+        failing test name and it reads as infrastructure. Measured, and worth keeping because it also
+        says something about the agent — **a rollback cannot interleave at the kernel write at all**,
+        so that part of the apply is not in the window.
+        """
+        rolled = []
+        snapshots = [([], [], ""), ([{"table": TABLE}], [], "")]
+
+        def snapshot_then_roll_back():
+            answer = snapshots.pop(0) if snapshots else ([{"table": TABLE}], [], "")
+            if not rolled and not snapshots:
+                # The second call: the post-apply read, after the lock around the write is released.
+                rolled.append("mid-verify")
+                self._rollback_that_does_not_settle()
+            return answer
+
+        hp._nft_apply_json = lambda _doc: (0, "")
+        hp.snapshot = snapshot_then_roll_back
+        ok, state, detail = hp.apply_artifact({
+            "generation": "g-first", "ruleset": VALID, "rulesetHash": VALID_HASH,
+            "confirmTimeoutSec": hp.NFT_CONFIRM_MIN_SEC,
+        })
+        self.assertEqual(rolled, ["mid-verify"], "the rollback never fired inside the apply")
+        self.assertFalse(
+            ok,
+            f"the apply settled while a rollback was owed: {state} — {detail}. This is the outcome "
+            "that reports `pending` for a generation `confirm()` will refuse.",
+        )
+        # 🔑 **The reason, not just the refusal.** With the guard asking only `_timer is None` the
+        # apply walks past it and is turned away later by the post-apply verification instead — a
+        # different refusal for a different reason, and `assertFalse(ok)` alone cannot tell them
+        # apart. Measured: reverting this guard's half left the whole file green until this
+        # assertion existed.
+        self.assertEqual(
+            detail, "confirmation deadline elapsed during apply",
+            f"the apply was refused by something other than the guard under test: {detail}",
+        )
+        self.assertNotEqual(
+            hp.load_state().get("state"), "pending",
+            f"a pending state was written for a generation that cannot be confirmed: {hp.load_state()}",
+        )
+
+    def test_the_refusal_names_the_rollback_rather_than_the_deadline(self):
+        """Not cosmetic: the two reasons send an operator to different places.
+
+        The guard's message says the confirmation deadline elapsed, and in this outcome it has not —
+        a rollback is owed. The message is shared with the deadline case because the guard is, so
+        this test pins what the log says, which is where the distinction has to live.
+        """
+        def observe_then_roll_back():
+            self._rollback_that_does_not_settle()
+            return []
+
+        hp.observed_routes = observe_then_roll_back
+        hp._nft_apply_json = lambda _doc: (0, "")
+        snapshots = iter((([], [], ""), ([{"table": TABLE}], [], "")))
+        hp.snapshot = lambda: next(snapshots)
+        hp.apply_artifact({
+            "generation": "g-first", "ruleset": VALID, "rulesetHash": VALID_HASH,
+            "confirmTimeoutSec": hp.NFT_CONFIRM_MIN_SEC,
+            "routes": [self.ROUTE["spec"]], "routeGuard": ["198.51.100.0/24"],
+        })
+        self.assertTrue(
+            any("rollback" in line.lower() for line in self.logged),
+            f"nothing in the log names the rollback that stopped this apply: {self.logged}",
+        )
+
+
 class TestStateSchemaHasBothHalves(unittest.TestCase):
     """Every key in `_EMPTY_STATE` is written somewhere and read somewhere.
 

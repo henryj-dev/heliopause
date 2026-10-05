@@ -2455,7 +2455,20 @@ def apply_artifact(artifact, validated=None):
                 rollback("cannot persist the route rollback plan")
                 return False, "rolled-back", "cannot persist the route rollback plan"
             with _apply_lock:
-                if _timer is None:
+                # ## Two questions, not one. Issue #84.
+                #
+                # `_timer is None` asks "is a timer armed". That is the wrong question after a
+                # rollback has run: a rollback whose restoration or whose result-save failed
+                # **re-arms** a timer of its own for the retry (`:2258`), so this guard saw a timer
+                # and let the apply carry on writing routes *after* the rollback. Measured as three
+                # outcomes in #84, two of which reach here.
+                #
+                # `_nft_rollback_owed` is the one that answers "is this commitment still the live
+                # one": `rollback()` sets it before touching anything and clears it only on the
+                # settled path, so it stays set through exactly the two outcomes the timer check
+                # misses. The entry guard (`:2338`) and `confirm()` (`:2517`) already ask both; these
+                # two mid-apply guards were the pair that did not.
+                if _timer is None or _nft_rollback_owed is not None:
                     return False, "rolled-back", "confirmation deadline elapsed before routes"
                 # Armed before the write, so a crash between the two still has the plan on disk and
                 # `recover_commitment` puts it back.
@@ -2471,7 +2484,8 @@ def apply_artifact(artifact, validated=None):
     expired = False
     pending_failed = False
     with _apply_lock:
-        if _timer is None:
+        # The same pair as the route guard above, for the same reason. @see issue #84
+        if _timer is None or _nft_rollback_owed is not None:
             return False, "rolled-back", "confirmation deadline elapsed during apply"
         remaining = deadline - time.time()
         if remaining <= 0:
