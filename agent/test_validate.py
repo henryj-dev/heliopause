@@ -1787,11 +1787,23 @@ class TestWorkloadApply(unittest.TestCase):
         # `workloadState = "rollback-failed"`, a `workloadRollbackAt` deadline and an armed retry;
         # `incidents` yields `"rollback-incident"`, **no** deadline and no retry, and the code calls
         # that state "intentionally settled for automatic action". So the mutation turns *the
-        # cluster was unreachable for a moment* into *stop trying* — the host would stay un-rolled-
-        # back with a policy it could not verify, and nothing would come back for it.
+        # cluster was unreachable for a moment* into *stop trying*: once the state persists, the
+        # workload rollback is settled as an incident and its automatic retries stop.
         #
-        # The start-state guard is here because this file has paid for a fixture that began at the
-        # value its assertion forbade, which compares a received value with itself.
+        # ⚠️ It first said "the host would stay un-rolled-back with a policy it could not verify,
+        # and nothing would come back for it". That is wider than this establishes — the **host**
+        # firewall is left on its prior ruleset, because the host apply follows workload success;
+        # and this fixture fakes a successful create without keeping a cluster object. A review
+        # named both. The scope is the workload rollback, not the host's ruleset.
+        #
+        # The start-state guard below is the habit this file has paid for — a fixture that begins at
+        # the value its assertion forbids compares a received value with itself.
+        #
+        # ⚠️ **Here it is redundant, and that is recorded rather than hidden.** A review measured it:
+        # setUp writes `workloadState = None` and the apply overwrites it with `prepared` before any
+        # rollback, so this fixture cannot begin at `rollback-failed`. It is kept because it costs
+        # one call and would fire if setUp changed, but the justification above does not apply to
+        # it — claiming otherwise would be the kind of sentence this file keeps deleting.
         self.assertNotEqual(
             hp.load_state().get("workloadState"), "rollback-failed",
             "the fixture already starts at the state this test is about to check for",
@@ -1807,8 +1819,12 @@ class TestWorkloadApply(unittest.TestCase):
         )
         self.assertIsNotNone(
             st["workloadRollbackAt"],
-            "no retry deadline was written, so nothing will come back for this host",
+            "no retry deadline was written, so a restart would not retry this rollback",
         )
+        # ⚠️ Not "nothing will come back": arming the in-process retry hangs off `retryable`, not off
+        # this field (`heliopause-pull.py:3226-3227`), so a running agent keeps its timer either way.
+        # What the durable deadline decides is whether **restart recovery** picks the rollback up.
+        # A review drew that line; the first wording erased it.
 
     def test_a_transient_read_error_is_not_reported_as_absence(self):
         # The same distinction at the level that decides it. `observed_objects` returning None is
