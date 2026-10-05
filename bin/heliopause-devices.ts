@@ -19,6 +19,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { fetchRegistrations, lastSeenColumn, TruncatedRead, userRows } from "../src/cf-devices.ts";
+import { departedWithNotes, proposedRegistry } from "../src/device-propose.ts";
 import { deviceRows } from "../src/device-view.ts";
 import { TRUST_LABEL, zoneOf } from "../src/zones.ts";
 import type { Site } from "./heliopause-publish.ts";
@@ -184,47 +185,16 @@ if (has("--propose")) {
   // lose the thing a reviewer actually approves against: a device sitting in the lowest-trust zone
   // is one the site has said nothing about, and approving it into a rule scoped to the management
   // range is the mistake that annotation exists to make visible before the paste rather than after.
-  const sorted = read.registrations
-    .slice()
-    .sort((a, b) => a.v4.localeCompare(b.v4, undefined, { numeric: true }));
-
-  // 🔴 `notes` is not in Cloudflare — it is the argument an approval needed, and `ApprovedDevice`
-  // declares it for exactly that ("Why this device is in policy at all"). Carried over by deviceId
-  // from the rows already approved. Without this the block looks complete and silently deletes the
-  // reasons; it came within one hand-transcription of happening.
-  const notesById = new Map(
-    (loaded.devices ?? [])
-      .filter((d: { notes?: string }) => d.notes)
-      .map((d: { deviceId: string; notes?: string }) => [d.deviceId, d.notes as string]),
-  );
-
-  const rows = sorted.map((r) => {
-    const kept = notesById.get(r.deviceId);
-    return {
-      deviceId: r.deviceId,
-      deviceName: r.deviceName,
-      userEmail: r.userEmail,
-      v4: r.v4,
-      v6: r.v6,
-      ...(kept ? { notes: kept } : {}),
-    };
-  });
-
-  // `1` as a literal, and that is not laziness.
-  //
-  // It was `loaded.devicesSchemaVersion ?? 1` first, with a comment about not hard-coding a version
-  // — and typechecking refused it, because `Site` carries no such field. Looking for where the
-  // version actually lives found the answer: `policy/devices.ts` **refuses** anything but 1
-  // ("devices.json must have schemaVersion 1 and a devices array"). So a file this command emits
-  // can only ever be version 1; emitting what was loaded would be reading a value that cannot
-  // differ, and the day it can differ this parser rejects it anyway. The constraint lives there.
-  const doc = { schemaVersion: 1, devices: rows };
+  // The document itself comes from `proposedRegistry`, not from code written here. A review found
+  // out why that matters: when this transform was inline, its test had reimplemented it, and
+  // mutating **this block** five ways left all five tests green. `@see src/device-propose.ts`
+  const doc = proposedRegistry(read.registrations, loaded.devices ?? []);
 
   console.log(`\n// read from Cloudflare at ${readAt} — review before approving`);
-  console.log(`// paste this over policy/devices.json:`);
+  console.log(`// paste this over policy/devices.json — the JSON object only, not these comments:`);
   console.log(JSON.stringify(doc, null, 2));
 
-  const dropped = [...notesById.keys()].filter((id) => !sorted.some((r) => r.deviceId === id));
+  const dropped = departedWithNotes(read.registrations, loaded.devices ?? []);
   if (dropped.length > 0) {
     // Said out loud rather than left to the diff. These rows are leaving, and their `notes` go with
     // them — that is correct when the device is gone, and worth seeing before the paste.
@@ -232,7 +202,7 @@ if (has("--propose")) {
   }
 
   console.log(`\n// zones — the column to approve against (not part of the file):`);
-  for (const r of sorted) {
+  for (const r of doc.devices) {
     const z = zoneOf(loaded.zones ?? [], r.v4);
     console.log(`//   ${r.v4.padEnd(15)} ${z ? `${z.id} (${TRUST_LABEL[z.trust]})` : "no zone"}`);
   }
