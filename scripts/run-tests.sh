@@ -56,9 +56,11 @@ run() {
 # has 64, and one because it has no `BASELINE_NEVER_NAMESPACE` export. Pointing this variable at a
 # clone in the wrong place reproduces that exactly.
 #
-# The deployed renderer already satisfies the constraint and is the shape to copy: it clones the
-# policy repository into `/opt/heliopause/policy`, next to the image's own `src/`, so `../src` there
-# is the canonical one. @see stardust-deploy's `policy-render.yaml`
+# The renderer's **configured layout** satisfies the constraint and is the shape to copy: its
+# manifest clones the policy repository into `/opt/heliopause/policy`, next to the image's own
+# `src/`, so `../src` there is the canonical one. Read from the manifest and the Dockerfile — which
+# image is running, at which commit, is a separate question this does not answer.
+# @see stardust-deploy's `policy-render.yaml`
 #
 # ⚠️ Pointing it at a directory is not a promise that the tests there pass — it decides **which**
 # tests run. Read the count, as the paragraph above says.

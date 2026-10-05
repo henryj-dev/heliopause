@@ -212,7 +212,7 @@ python3 scripts/git-hooks/test-pre-commit.py              # 실패 0 (사람 통
 `gen-workload-rbac.test.ts` 가 `does not provide an export named 'BASELINE_NEVER_NAMESPACE'` 로
 죽었다 — 이 저장소에는 그 export 가 몇 달째 있다.
 
-## 🔑 그런데 **배포된 렌더러에는 이 드리프트가 없다** — 구조가 다르다
+## 🔑 그런데 **렌더러의 설정된 배치는 이 드리프트를 피한다** — 구조가 다르다
 
 2026-10-06 실측(`stardust-deploy` 기본 브랜치의 `policy-render.yaml`, 읽기만): 렌더러 파드의
 initContainer 가 정책 저장소를 **`/opt/heliopause/policy`** 로 clone 하고, 이미지의 정본 `src/`
