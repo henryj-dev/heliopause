@@ -19,6 +19,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { fetchRegistrations, lastSeenColumn, TruncatedRead, userRows } from "../src/cf-devices.ts";
+import { departedWithNotes, proposedRegistry } from "../src/device-propose.ts";
 import { deviceRows } from "../src/device-view.ts";
 import { TRUST_LABEL, zoneOf } from "../src/zones.ts";
 import type { Site } from "./heliopause-publish.ts";
@@ -166,27 +167,45 @@ for (const c of unapprovedOutside) {
 }
 
 if (has("--propose")) {
-  // Every live registration, in the shape the site module takes. Deliberately the whole set rather
-  // than only the changes: a reviewer comparing two full blocks in a diff sees removals, which a
-  // list of additions would hide.
+  // Every live registration, in the shape the registry file takes. Deliberately the whole set
+  // rather than only the changes: a reviewer comparing two full blocks in a diff sees removals,
+  // which a list of additions would hide.
   //
-  // Each line carries the zone its address lands in. That is the column a reviewer approves
-  // against: a device sitting in the lowest-trust zone is one the site has said nothing about, and
-  // approving it into a rule scoped to the management range is the mistake this annotation exists
-  // to make visible before it is pasted rather than after.
-  const lines = read.registrations
-    .slice()
-    .sort((a, b) => a.v4.localeCompare(b.v4, undefined, { numeric: true }))
-    .map((r) => {
-      const z = zoneOf(loaded.zones ?? [], r.v4);
-      const tag = z ? `${z.id} (${TRUST_LABEL[z.trust]})` : "no zone";
-      return (
-        `  { deviceId: ${JSON.stringify(r.deviceId)}, deviceName: ${JSON.stringify(r.deviceName)}, ` +
-        `userEmail: ${JSON.stringify(r.userEmail)}, v4: ${JSON.stringify(r.v4)}, v6: ${JSON.stringify(r.v6)} },` +
-        `  // ${tag}`
-      );
-    });
-  console.log(`\n// read from Cloudflare at ${readAt} — review before approving\nexport const DEVICES: ApprovedDevice[] = [\n${lines.join("\n")}\n];`);
+  // ## Two blocks, because JSON cannot carry the zone column
+  //
+  // This printed a TypeScript array until 2026-10-06 — `export const DEVICES: ApprovedDevice[] =
+  // [ { deviceId: "…" } ]` — and the workflow told the operator that "the block printed above is
+  // what to commit". It was not: the rows moved to `devices.json` (see `policy/dev.ts`, "The rows
+  // moved to devices.json, and why") and the output did not follow, so what it printed could not be
+  // pasted anywhere. Twice it was transcribed by hand instead, and the second time a `notes` field
+  // was nearly lost in the process.
+  //
+  // So: the first block is the file, byte for byte, and the second is the zone column as a comment
+  // table. The column cannot be merged into the first — JSON has no comments, and dropping it would
+  // lose the thing a reviewer actually approves against: a device sitting in the lowest-trust zone
+  // is one the site has said nothing about, and approving it into a rule scoped to the management
+  // range is the mistake that annotation exists to make visible before the paste rather than after.
+  // The document itself comes from `proposedRegistry`, not from code written here. A review found
+  // out why that matters: when this transform was inline, its test had reimplemented it, and
+  // mutating **this block** five ways left all five tests green. `@see src/device-propose.ts`
+  const doc = proposedRegistry(read.registrations, loaded.devices ?? []);
+
+  console.log(`\n// read from Cloudflare at ${readAt} — review before approving`);
+  console.log(`// paste this over policy/devices.json — the JSON object only, not these comments:`);
+  console.log(JSON.stringify(doc, null, 2));
+
+  const dropped = departedWithNotes(read.registrations, loaded.devices ?? []);
+  if (dropped.length > 0) {
+    // Said out loud rather than left to the diff. These rows are leaving, and their `notes` go with
+    // them — that is correct when the device is gone, and worth seeing before the paste.
+    console.log(`\n// ⚠️ leaving, and their notes go too: ${dropped.join(", ")}`);
+  }
+
+  console.log(`\n// zones — the column to approve against (not part of the file):`);
+  for (const r of doc.devices) {
+    const z = zoneOf(loaded.zones ?? [], r.v4);
+    console.log(`//   ${r.v4.padEnd(15)} ${z ? `${z.id} (${TRUST_LABEL[z.trust]})` : "no zone"}`);
+  }
 }
 
 // Only what policy could name decides the exit code. The rest is printed and does not gate — see
