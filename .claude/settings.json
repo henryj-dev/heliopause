@@ -7,7 +7,8 @@
       "pki",
       "pki-prod",
       "pki-util",
-      "pki-signing"
+      "pki-signing",
+      "pki-az01"
     ]
   },
   "hooks": {
