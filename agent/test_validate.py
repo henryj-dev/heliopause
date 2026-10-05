@@ -3417,12 +3417,218 @@ class TestSignedArtifactSeam(unittest.TestCase):
         preflight_at = src.index("_preflight_host_artifact")
         self.assertLess(accept_at, preflight_at, "the watermark is advanced after the host half is touched")
 
-    def test_a_refused_envelope_returns_instead_of_raising(self):
-        # The heartbeat thread is also the confirm path. An exception escaping here kills the thread
-        # that would confirm this host's own ruleset — M7, one level up.
+    def test_a_refused_envelope_still_mentions_both_halves_of_the_catch(self):
+        # A tripwire, and named as one. Two `assertIn`s on **`handle_reply`'s own source with
+        # comments stripped** — `_source()` names that function rather than reading the file, so a
+        # handler elsewhere cannot satisfy it. What can: a `return` placed between the two strings,
+        # or a second `except Exception` inside this function. ("The file's text" and "anywhere"
+        # were the first wording, and `_source()` is at `:3373`.)
+        #
+        # ⚠️ Its comment used to read "The heartbeat thread is also the confirm path. An exception
+        # escaping here kills the thread that would confirm this host's own ruleset." **That is false
+        # for this code**: the loop calls `handle_reply_safely` (`heliopause-pull.py:5382`), whose own
+        # `except Exception` keeps the thread alive whether or not the inner catch exists. What the
+        # inner catch decides is not survival but **whether an operator can see the refusal** — the
+        # outer one logs "refused after an internal validation failure" and never calls
+        # `_record_refusal`. That is this repository's recorded defect, where `lastRefusal` stayed
+        # `None` through roughly 450 refusals and the fleet view had nothing to surface.
+        # @see TestARefusedEnvelopeIsRecordedNotJustSurvived
         src = self._source()
         self.assertIn('log(f"refusing artifact for generation', src)
         self.assertIn("except Exception as e:", src)
+
+
+class TestARefusedEnvelopeIsRecordedNotJustSurvived(unittest.TestCase):
+    """A bad envelope becomes a refusal an operator can read, through the loop's own entry point.
+
+    ## What this replaces, and what the proxy's comment got wrong
+
+    `TestSignedArtifactSeam.test_a_refused_envelope_still_mentions_both_halves_of_the_catch` asserts
+    two strings appear in the file. Its comment said an exception escaping `handle_reply` "kills the
+    thread that would confirm this host's own ruleset" — and the loop does not call `handle_reply`.
+    It calls `handle_reply_safely` (`heliopause-pull.py:5382`), whose `except Exception` keeps the
+    thread alive through the `ValueError` this class raises — and through anything else deriving
+    from `Exception`. (Not "everything": `SystemExit` and the rest of `BaseException` go past it.
+    That wording was the first version of this paragraph, which is the same kind of overshoot it
+    was written to correct.) So for the refusal under test survival was never the property.
+
+    The property is the **difference between the two catches**:
+
+        inner, `handle_reply:5113`          outer, `handle_reply_safely:5243`
+        logs "refusing artifact for         logs "refused after an internal validation failure"
+          generation {wanted}: {e}"
+        calls `_record_refusal`             **does not**
+        the beat is handled                 returns False
+
+    So without the inner catch a malformed or unsigned envelope is still survived and is **invisible**:
+    no `lastRefusal`, nothing for `relay.ts` to surface. That is this repository's own measured
+    incident — `lastRefusal` stayed `None` through roughly 450 refusals while a gateway refused every
+    sixteen seconds with no ruleset loaded, and the fleet view stayed clean the whole time.
+
+    ## Measured, before writing this
+
+    Deleting the inner `try`/`except` from `handle_reply` makes the whole file fail in two places:
+    the tripwire above (its strings are gone) and
+    `TestTheApplyPathReadsTheVerifiedArtifact.test_a_refused_envelope_is_not_consulted_for_a_generation`,
+    which **errors** rather than failing — the exception propagates out of the `hp.handle_reply` that
+    test calls directly. **No refused-envelope test** drove the loop's actual entry point, so
+    nothing asserted the recording, the message, or that the beat counted as handled. (`handle_reply_safely`
+    itself is driven: `TestReplyIsolation` exercises two malformed or raising replies and one normal
+    one, asserting the wrapper's result each time.
+
+    ⚠️ That said **four** calls in that class. There are three; the fourth `handle_reply_safely`
+    in this file is `TestRestartWhilePending`'s, at `:1082`. I read four grep hits and attributed
+    all of them to one class — in the paragraph whose subject is a claim corrected for being
+    false, and a review caught it by reading the class boundaries. "Nothing drove the loop's actual entry point" was the first wording and it
+    is false — a review found it by reading what was already there.)
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._state_file = hp.STATE_FILE
+        hp.STATE_FILE = os.path.join(self.tmp, "state.json")
+        self._real = {
+            n: getattr(hp, n) for n in ("fetch_artifact", "verify_artifact_envelope", "log")
+        }
+        self.logged = []
+        hp.log = lambda line: self.logged.append(str(line))
+        hp.fetch_artifact = lambda: {"payload": "signed"}
+        hp.save_state(dict(hp._EMPTY_STATE))
+
+    def tearDown(self):
+        for name, value in self._real.items():
+            setattr(hp, name, value)
+        hp.STATE_FILE = self._state_file
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _beat_through_the_loops_entry(self):
+        return hp.handle_reply_safely(hp.load_state(), {
+            "schemaVersion": hp.SCHEMA_VERSION, "generation": "g-wanted", "gate": {"open": True},
+        })
+
+    def test_a_bad_signature_is_recorded_as_a_refusal_and_counts_as_handled(self):
+        def refuse(_envelope, now=None):
+            raise ValueError("signature does not verify")
+
+        hp.verify_artifact_envelope = refuse
+        handled = self._beat_through_the_loops_entry()
+
+        self.assertTrue(
+            handled,
+            f"the beat came back unhandled: {self.logged}. A refusal that reaches the outer catch is "
+            "survived but not recorded, which is the shape of the 450-refusal silence.",
+        )
+        # No separate non-`None` check: `json.dumps(None)` is `"null"`, so the assertion below
+        # already fails for an absent refusal and a reviewer who reverts the extra line sees green.
+        refusal = hp.load_state().get("lastRefusal")
+        self.assertIn(
+            "signature does not verify", json.dumps(refusal),
+            f"the recorded refusal does not say why, or there is none: {refusal} — {self.logged}",
+        )
+        self.assertTrue(
+            any("refusing artifact for generation g-wanted" in line for line in self.logged),
+            f"the refusal was not logged against the wanted generation: {self.logged}",
+        )
+        # The negative that tells the two catches apart. Without it, every assertion above is also
+        # satisfied by a path that recorded the refusal and *then* let the outer catch report it.
+        self.assertFalse(
+            any("internal validation failure" in line for line in self.logged),
+            f"the outer catch reported this, so the inner one did not handle it: {self.logged}",
+        )
+
+    def test_the_outer_catch_says_something_different_when_it_is_the_one_that_fires(self):
+        """The positive control for an assertion made by absence.
+
+        The test above requires that `"internal validation failure"` is **not** logged. Nothing
+        establishes that this logger would record that line if the outer catch did fire — and a
+        review named that gap: an absence assertion whose observation has never been seen working is
+        satisfied for free.
+
+        So this makes the outer catch fire and asserts the pair the other test asserts the negation
+        of: that message present, and `False` returned.
+
+        ⚠️ Finding a raise point took a measurement. The first version raised from `fetch_artifact`,
+        which has **its own** `try` (`heliopause-pull.py:5096`) and logs `cannot fetch artifact for
+        generation …` — so the outer catch never saw it and this control failed, correctly, saying
+        so. `_preflight_host_artifact` is called with no handler around it, which is why verification
+        and acceptance have to succeed first here.
+        """
+        artifact = {
+            "generation": "g-wanted", "ruleset": VALID, "rulesetHash": VALID_HASH,
+            "confirmTimeoutSec": hp.NFT_CONFIRM_MIN_SEC,
+        }
+        hp.verify_artifact_envelope = lambda _e, now=None: (
+            artifact, dict(TestBackfillCurrentAuthorization.REC), {}, False,
+        )
+        real_accept, real_preflight = hp.accept_artifact_authorization, hp._preflight_host_artifact
+        hp.accept_artifact_authorization = lambda *_a, **_kw: ({}, "")
+
+        def explode(_artifact):
+            raise ValueError("preflight blew up past the verification catch")
+
+        hp._preflight_host_artifact = explode
+        try:
+            handled = self._beat_through_the_loops_entry()
+        finally:
+            hp.accept_artifact_authorization = real_accept
+            hp._preflight_host_artifact = real_preflight
+        self.assertTrue(
+            any("internal validation failure" in line for line in self.logged),
+            f"the outer catch did not report, so the other test's absence assertion is not watching "
+            f"anything: {self.logged}",
+        )
+        self.assertFalse(handled, "the outer catch reported but the beat still counted as handled")
+
+    def test_a_second_beat_still_works_after_a_refusal(self):
+        """The survival half, made concrete rather than asserted about a thread.
+
+        `handle_reply_safely` would survive a propagating exception too, so this does not distinguish
+        the two catches. What it pins is narrower than "nothing broken behind it", which is how this
+        read first: the next beat **verifies, accepts and reaches preflight**, and the refusal is
+        cleared rather than left for an operator to read as current. The beat still ends at a stubbed
+        preflight error, so nothing here says an apply would succeed — only that the refusal did not
+        leave the path blocked before that point.
+        """
+        def refuse(_envelope, now=None):
+            raise ValueError("signature does not verify")
+
+        hp.verify_artifact_envelope = refuse
+        self.assertTrue(self._beat_through_the_loops_entry())
+        self.assertIsNotNone(hp.load_state().get("lastRefusal"))
+
+        # The next beat verifies, and the refusal is cleared rather than left to be read as current.
+        artifact = {
+            "generation": "g-wanted", "ruleset": VALID, "rulesetHash": VALID_HASH,
+            "confirmTimeoutSec": hp.NFT_CONFIRM_MIN_SEC,
+        }
+        hp.verify_artifact_envelope = lambda _e, now=None: (
+            artifact, dict(TestBackfillCurrentAuthorization.REC), {}, False,
+        )
+        reached = []
+        real_accept, real_preflight = hp.accept_artifact_authorization, hp._preflight_host_artifact
+        hp.accept_artifact_authorization = lambda *_a, **_kw: (reached.append("accept"), ({}, ""))[1]
+        hp._preflight_host_artifact = lambda _a: (
+            reached.append("preflight"), (None, None, "stubbed: no kernel here"))[1]
+        try:
+            self.assertTrue(
+                self._beat_through_the_loops_entry(),
+                f"the beat after a refusal did not complete: {self.logged}",
+            )
+        finally:
+            hp.accept_artifact_authorization = real_accept
+            hp._preflight_host_artifact = real_preflight
+        # How far it got. Without this the closing assertion is satisfied by a beat that cleared the
+        # refusal and then left at the first opportunity — a review named that, and "the next beat
+        # works" would then mean "the next beat returned".
+        self.assertEqual(
+            reached, ["accept", "preflight"],
+            f"the second beat did not walk the path: {reached} — {self.logged}",
+        )
+        self.assertIsNone(
+            hp.load_state().get("lastRefusal"),
+            "the refusal outlived the beat that verified — an operator reads a stale refusal as the "
+            "host's current state",
+        )
 
 
 class TestTheWatermarkIsDurableBeforeAnySideEffect(unittest.TestCase):
