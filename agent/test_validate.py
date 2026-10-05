@@ -6488,6 +6488,14 @@ class TestBackfillCurrentAuthorization(unittest.TestCase):
         # whole job is "the success line must not appear when the write failed" could no longer see the
         # success line. A negative assertion against a literal is worth exactly as much as the literal,
         # and nothing tied them together. Now the literal comes from the function being tested.
+        #
+        # 🔑 **This reads the source on purpose and is not a proxy awaiting conversion.** The proxy
+        # tests this file has replaced asserted a *property* by looking at text — positions, counts,
+        # the presence of a string — and each was replaced by driving the behaviour. This does the
+        # opposite: the property is driven above, and the source is read only to **derive the expected
+        # value**, so that rewording the log line cannot quietly empty the assertion. The
+        # `assertTrue(spoken, …)` below is its control: if the phrase ever disappears, the derivation
+        # fails loudly instead of matching nothing.
         source = pathlib.Path(hp.__file__).read_text()
         body = source[source.index("def backfill_current_authorization("):]
         body = body[: body.index("\ndef ")]
@@ -7986,14 +7994,24 @@ class TestTheRoutePlanSurvivesARestart(unittest.TestCase):
 class TestStateSchemaHasBothHalves(unittest.TestCase):
     """Every key in `_EMPTY_STATE` is written somewhere and read somewhere.
 
-    🔴 **This is the check that would have found the defect this file's other new tests describe.**
-    `currentAuthorization` was declared, initialised, and read in three places for months, and
-    assigned in none. Nothing failed: the key existed, reads returned `None`, and `None` raises
-    nothing. The behavioural tests could not see it either — the one covering the expiry escape set
-    the field by hand, so it passed against a state the program could not produce.
+    **This was the only check that would have found the defect this file's other tests describe, and
+    it is no longer the only one.** `currentAuthorization` was declared, initialised, and read in
+    three places for months, and assigned in none. Nothing failed: the key existed, reads returned
+    `None`, and `None` raises nothing. The behavioural tests could not see it either — the one
+    covering the expiry escape set the field by hand, so it passed against a state the program could
+    not produce.
 
-    What makes a write-never field findable is not another assertion about behaviour. It is asking
-    the schema whether each half of each key exists at all.
+    ⚠️ Both halves of that are now historical, and the sentence used to be written as though they
+    were not. Measured 2026-10-05: deleting `confirm()`'s promotion line again fails **eight** tests
+    — six in `TestTheExpiryEscapeOnAStateThatWasRun`, which builds its state by running a real
+    apply and confirm instead of writing it,
+    `TestRestartWhilePending.test_confirming_promotes_the_authorization_this_host_is_enforcing`, and
+    this one. The hand-built fixture that hid it was replaced.
+
+    What this still does that none of those can: it asks the question of **every key**, including the
+    ones no behavioural test drives. A write-never field is findable by a behavioural test only where
+    one happens to exist; the schema half exists for the rest, and that is why this is a source-level
+    check on purpose rather than a proxy waiting to be converted.
 
     ## Read the source with `ast`, not a regex
 
