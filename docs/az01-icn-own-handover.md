@@ -723,3 +723,273 @@ during the handshake, before any authorisation decision"*). PKI 를 공유하면
 
 매니저 env 는 **배포 사실**이므로 **stardust-deploy 매니페스트**가 갖는다. heliopause 쪽
 작업이 아니고, 이 문서는 **그 단계가 발행보다 앞에 있어야 한다**는 것만 정한다.
+
+## 11. 재구축 당일 — 정책 저장소 쪽 체크리스트
+
+2026-10-05 작성. 명령은 전부 이 세션에서 **실제로 돌려 본 것**이고, 돌려 보지 않은 자리는
+그렇게 적었다.
+
+도구가 사는 곳: `~/github/henryj-dev/heliopause`(또는 그 워크트리). `policy/` 는 심링크이고
+실체는 `~/github/mack-erel/heliopause/policy` 이다 — **거기서 커밋한다.**
+
+---
+
+## A. 끊기는 것 — Pi 재설치 직후
+
+끊기는 것은 **az01 이 아니라 dev 의 MESH** 다. `policy/dev.ts` 의 `BACKBONE_CALLERS` 에 홈랩
+게이트웨이의 backbone `/32` 가 들어가 있고, 그 주소의 신원이 `wg0.conf` 의 Registration ID 다.
+재설치하면 그 ID 와 주소가 바뀐다.
+
+**그래서 A 의 발행 대상은 `dev-icn-vtr` 다. az01 발행으로는 안 고쳐진다.**
+
+#### A-1. 새 `wg0` 값을 받는다 — **사람이 읽어야 한다**
+
+```bash
+# gw-01 (Pi) 에서
+sudo grep -i 'Registration ID' /etc/wireguard/wg0.conf
+ip -4 -o addr show dev wg0
+```
+
+⚠️ **최근성으로 찾을 수 없다.** 이 기기에는 heartbeat 를 보낼 데몬이 없다(`warp-cli` 도
+`cloudflared` 도 없고 `wg-quick@wg0` 하나뿐) — `last_seen_at` 이 링크된 순간에서 멈추므로
+Cloudflare 목록에서 「최근 것」으로 고르면 **틀린 기기를 고른다.**
+
+받을 것: **Registration ID(= `deviceId`)** 와 **배정된 v4·v6**.
+
+#### A-2. `devices.json` — 손으로 고치지 말고 도구가 인쇄한 블록을 쓴다
+
+```bash
+cd ~/github/henryj-dev/heliopause
+node bin/heliopause-devices.ts policy/dev.ts \
+  --account "$HELIOPAUSE_CF_ACCOUNT" --token-file <토큰파일> --propose
+```
+
+`--propose` 가 **커밋할 블록을 그대로 인쇄한다.** 종료 코드로 읽는다:
+
+| 코드 | 뜻 | 할 일 |
+|---|---|---|
+| `0` | 레지스트리 == Cloudflare 활성 전체 | 아무것도 안 해도 된다 |
+| `2` | **Cloudflare 읽기를 믿을 수 없다**(`TruncatedRead`) | 정책 문제가 **아니다.** 다시 읽는다 |
+| 그 외 | 어긋남 | **인쇄된 블록을 `policy/devices.json` 에 커밋** |
+
+🔴 **`2` 를 어긋남으로 읽지 말 것.** 부분적인 답을 완전한 것으로 승인하지 않기 위해 분리된
+코드다 — 그 상태에서 블록을 커밋하면 살아 있는 기기를 지운다.
+
+이 도구를 쓰는 이유: 손으로 고치면 **주소로 행을 고르게 되고**, 주소는 재배정되므로 같은 주소가
+다른 기기일 수 있다. 도구는 `deviceId` 로 맞춘다.
+
+#### A-3. `BACKBONE_CALLERS` 의 `/32` 를 새 주소로
+
+`policy/dev.ts` 의 그 블록(2026-10-05 기준 `:1399`):
+
+```ts
+export const BACKBONE_CALLERS = [
+  ...Object.values(CLUSTER_CALLER_SOURCES).map((addr) => `${addr}/32`),
+  // `gw-01.dev-icn-own` — unmeasured for these listeners; see above.   ← 이 줄도 고친다
+  "10.255.0.65/32",                                                      ← 새 주소로
+] as const;
+```
+
+🔴 **주석의 `dev-icn-own` 을 `az01-icn-own` 으로 같이 고친다.** 개명이 놓친 자리이고, 주소를
+바꾸는 그 편집이 그것을 고칠 자연스러운 자리다.
+
+A-2 와 A-3 은 **한 커밋**이 낫다 — 같은 기기에 대한 두 자리이고, 하나만 들어가면 `devices` 는
+초록인데 MESH 는 끊긴 상태가 된다.
+
+⚠️ **실제로는 그렇게 못 할 수 있다 (2026-10-05 실측).** A-2 의 행은 다섯 필드이고, 재설치 뒤
+전달되는 것은 보통 **등록 id 와 메시 주소뿐**이다 — `deviceName` 과 `v6` 는 Cloudflare 가 정하고
+그것을 아는 것은 A-2 의 도구다. 그 도구에는 토큰이 필요하다.
+
+그러면 **A-3 을 먼저 넣는 것이 안전한 쪽**이다:
+
+| | `devices` 게이트 | MESH |
+|---|---|---|
+| A-3 만 | 🔴 적색(옛 행) — **보인다** | ✅ 새 주소 |
+| A-2 만 | ✅ 초록 | 🔴 죽은 주소 — **안 보인다** |
+
+한 커밋 규칙이 막으려던 것은 아래 줄이고, 그 목적은 A-3→A-2 순서로도 지켜진다.
+
+#### A-4. dev 발행
+
+```bash
+cd ~/github/henryj-dev/heliopause
+node bin/heliopause-publish.ts policy/dev.ts dev-icn-vtr \
+  --propose=https://10.17.0.10:30444 --pki=pki --operator=ops-henry-review
+```
+
+그 다음 **다른 운영자**가:
+
+```bash
+node bin/heliopause-approve.ts https://10.17.0.10:30444 <plan-sha256> --approve \
+  --pki=pki --operator=ops-henry
+```
+
+🔴 **승인 전에 `--show` 를 돌려 볼 것.** 그것 없이 승인하면 해시 비교일 뿐이고 규칙을 보지 않는다:
+
+```bash
+node bin/heliopause-approve.ts https://10.17.0.10:30444 <plan-sha256> --show \
+  --pki=pki --operator=ops-henry-review
+```
+
+봐야 하는 것: **`gw-01.dev-icn-vtr` 외의 호스트가 「no rule changed」인가.** MESH 출처만 바뀌는
+변경이므로 그 외가 움직이면 멈춘다.
+
+⚠️ 제안은 `ops-henry-review`, 승인은 `ops-henry`. `ops-ci` 는 **매니저에 등록돼 있지 않다.**
+그리고 **자기 승인은 CLI 로 불가능**하다(인증서에 역할 주장이 없다) — 브라우저 경로에 OTP 가 있다.
+
+#### A-5. 반영 확인
+
+```bash
+node bin/heliopause-status.ts https://10.17.0.10:30444 --site=dev-icn-vtr \
+  --pki=pki --operator=ops-henry-review
+```
+
+**전파는 단계를 탄다.** 첫 조회에서 옛 세대가 보이는 것은 정상이다 — `waiting on canary` 가
+뜬다. 2026-10-05 실측으로 canary 확정 → general 4대 → `gw-01`(마지막)까지 **약 6분**이었다.
+**6대 전부 `confirmed` 에 새 세대가 될 때까지 기다린 뒤에** 다음으로 간다.
+
+```bash
+# devices 게이트도 돌린다 (스케줄만 기다리지 말 것)
+gh workflow run devices --repo tiny-universe/heliopause-deploy
+```
+
+판정 기준:
+
+- `status` 가 **`no problems`** 이고 6대 세대가 같다.
+- `devices` 잡이 **`approved registry matches Cloudflare`** 를 인쇄한다.
+  🔴 **「UNAPPROVED 0」이 초록 조건이 아니다.** 행을 지우고 안 넣으면 **실패 사유만 바뀌고
+  적색은 그대로**다 — 2026-09-27~10-05 에 그것을 초록으로 오독한 적이 있다. **수를 보라**
+  (`12 = 12` 처럼 양쪽이 같아야 한다).
+- 🔴 **최종 확인은 그 호스트에서 리스너에 실제로 닿아 보는 것.** 등록이 `active` 인 것은 도달
+  가능과 다르다 — backbone 등록 61건 중 도달 가능이 **3건**이었던 실측이 있다.
+
+#### A-6. 옛 Cloudflare 등록 폐기 — **마지막에**
+
+A-2 보다 먼저 지우면 **대조할 상대가 없다.** A-5 가 초록인 뒤에 한다.
+
+---
+
+### B. az01 첫 발행 — **정책 저장소 밖 선행조건이 있다**
+
+#### B-0. 🔴 이것들이 먼저다. 없으면 발행이 시작조차 안 된다
+
+| # | 무엇 | 어디 | 없으면 |
+|---|---|---|---|
+| 1 | `HELIOPAUSE_RELAYS` 에 `az01-icn-own=<url>=<pkiDir>` | **매니저** 매니페스트 | 제안이 **`unknown target`** 으로 거부(`manager-server.ts:3251`) |
+| 2 | `HELIOPAUSE_POLICY_SITES` 에 `az01-icn-own=./az01.ts` | **렌더러** 매니페스트 | 렌더러가 그 사이트를 모른다 |
+| 3 | **az01 전용 CA · 운영자 인증서 · `pkiDir`** | PKI | **각 VPC 가 자기 CA 를 가진다**(V39). PKI 하나를 공유하면 한 VPC 만 닿고 나머지는 「도달 불가」로 보고된다 |
+| 4 | 에이전트 `HELIOPAUSE_TARGET` = `az01-icn-own` | 3대 | 1번 이름과 **바이트로 같아야** 한다 |
+| 5 | 앱 토큰 스코프 `*.az01-icn-own` | 매니저 | `enrollment-store.ts:921-924` 가 첫 점 뒤를 **정확한 문자열**로 비교 — `*.az01-any-own` 은 거부된다. **발급 후 변경은 재발급** |
+
+**1·2·4 는 같은 문자열이어야 한다** — `env-spec.ts:260-262`: 「이름은 존의 신원 전체」로
+CA·`HELIOPAUSE_TARGET`·사이트 모듈·호스트 id 마지막 레이블을 묶는다. 어긋나면 **다섯이 동시에**
+어긋난다. 09-28 사고가 `env-spec.ts:300` 에 「두 이름이 한 모듈을 가리키는 것」으로 기록돼 있다.
+
+⚠️ 2·3·5 는 **stardust-deploy·PKI 쪽**이고 이 체크리스트의 범위 밖이다. **없는 채로 B-1 을
+시작하면 거부 메세지를 보고 나서 알게 된다.**
+
+#### B-1. 발행 전 — enroll 뒤에 할 것 하나
+
+🔴 **`gw-01` 의 `gw_base` nftables 테이블을 제거한다.** 교환 #236 에 계획으로 적혀 있고,
+**필터가 둘이면 충돌한다**(web-01, 왕복 212 에서 겪음). `az01.ts` 는 `expectedFilters: []` 이므로
+**제거될 때까지 「예상 밖」으로 뜨고 그것이 옳은 읽기다.**
+
+#### B-2. 렌더를 먼저 본다 — canary 가 Pi 를 지켜 주지 않는다
+
+```bash
+cd ~/github/henryj-dev/heliopause
+node bin/heliopause-publish.ts policy/az01.ts az01-icn-own     # 제안 없이 = 렌더만
+```
+
+기대값(2026-10-05 실측):
+
+```
+storage-01.az01-icn-own   canary   ruleCount=0  input=6   skipped=0
+k3s-01.az01-icn-own       general  ruleCount=0  input=6   skipped=0
+gw-01.az01-icn-own        gateway  ruleCount=5  input=11  skipped=0
+```
+
+게이트웨이 input 체인 11줄 = 기준선 6(loopback·established·관리 SSH·ICMPv6·ICMP·DHCP 갱신)
++ DHCP 67 · DNS 53/udp · DNS 53/tcp · TFTP 69 · HTTP 80.
+
+🔴 **Pi 의 규칙은 여기서 보는 것이 전부다.** `rollout.ts:3-6` 대로 canary 의 보호는 **canary 를
+잠그는** 정책에만 든다. 이 사이트에서 고유한 전부(DHCP·DNS·TFTP·HTTP·forward)가 Pi 에 있고
+`storage-01` 에는 없으므로, **Pi 만 깨뜨리는 정책은 canary 를 통과해 `gateway` 단계에서 적용된다.**
+
+#### B-3. `forward.guardInternal` 의 전제를 Pi 에서 측정
+
+```bash
+# gw-01 (Pi) 에서 — WAN 쪽 인터페이스 이름으로
+sysctl net.ipv4.conf.<wan-iface>.rp_filter
+```
+
+`1` 이 아니면 **그 가드는 주소 기반이라 기대대로 막지 않는다.** dev 는 이것을 재고 나서 켰다
+(`dev.ts:149`). **Pi 에서는 아직 재지 않았고 인터페이스도 다르다.**
+
+#### B-4. 발행과 확인
+
+```bash
+node bin/heliopause-publish.ts policy/az01.ts az01-icn-own \
+  --propose=https://10.17.0.10:30444 --pki=pki --operator=ops-henry-review
+# 다른 운영자가 --show 로 보고 --approve
+node bin/heliopause-status.ts https://10.17.0.10:30444 --site=az01-icn-own \
+  --pki=pki --operator=ops-henry-review
+```
+
+⚠️ **매니저 주소는 dev 의 것과 같다**(제안·승인은 매니저로 간다). relay 주소
+`https://10.112.0.1:8443` 는 **에이전트가 하트비트를 보내는 곳**이고 다른 것이다.
+
+단계 순서: **`storage-01`(canary) → `k3s-01`(general) → `gw-01`(gateway)**.
+`ROLLOUT_ORDER` 가 `canary → general → gateway` 이고 `gateway` 가 마지막이다(`protocol.ts:363`).
+
+🔴 **`gateway` 단계가 열리는 순간이 relay 주소 확인이다.** 그때까지 두 노드가 **같은 주소로**
+확정을 보냈으므로, 보냈다면 그 주소는 답한다. 답하지 않으면 **방화벽이 이미 적용된 상태에서**
+모든 하트비트가 TLS 실패하고 되돌릴 아티팩트는 그 연결로 온다(`dev.ts:136`).
+
+#### ⚠️ `protectedHosts` 는 **이 저장소에서 집행되지 않는다** — 적어 둔다
+
+`az01.ts:149` 가 `protectedHosts: ["^gw-01\\."]` 를 선언하고, `src/config.ts:183-188` 은
+「`allowProtected` 를 넘기지 않으면 적용이 **거부된다**」고 적는다. 2026-10-05 실측으로 그
+거부는 **없다**:
+
+    isProtectedHost  →  src/config.ts:540 에 정의, src/index.ts:104 에서 재export.
+                        그 외 호출자 0 (src/ · bin/ · agent/ · packages/)
+    allowProtected   →  src/config.ts 의 그 주석에만 등장. CLI 플래그가 아니다
+    publish·approve 의 플래그 목록에 --allow-protected 없음
+
+**그러므로 당일에 `--allow-protected` 같은 것을 찾지 말 것.** 없다. 그리고 **그 선언이 Pi 를
+막아 주지 않는다** — 「선언을 집행으로 읽기」의 전형이고, 이 저장소가 반복해 기록하는 모양이다.
+
+🔴 **대신 사람이 그 자리에 선다.** 실제로 Pi 를 지키는 것은 ① B-2 의 렌더 확인 ② 2인 승인 +
+OTP ③ `gateway` 를 마지막 단계로 둔 것, 이 셋이다. 선언은 **플릿 뷰의 표시**로만 쓰인다
+(`site-view.ts:100`, `policy-ui.ts:331`).
+
+(별건으로 보고했다. 고치는 쪽이 맞는지 — 집행을 넣는지 주석을 내리는지 — 는 사용자 판단이다.)
+
+#### B-5. 재부팅 검증은 3대 `confirmed` **뒤에**
+
+`docs/az01-icn-own-handover.md` §6-2. 확정이 셋 다 오기 전에 재부팅하면 확정 전 롤백
+타이머와 경합한다.
+
+---
+
+### 당일에 안 해도 되는 것
+
+**라우트 선언(`10.112.0.0/16 dev wg0`)과 `dev-routes.test.ts` 6→7.** 넣으면 `missing: 1` 로
+검사가 깨진다 — `ok` 판정은 **선언과 실측 라우트 둘 다** 필요하다. `LIVE` fixture 행이 먼저
+들어가야 하고, 그 행은 재구축 뒤 `gw-01.dev-icn-vtr` 의 `ip -j route show` **원문**이다.
+#238 때 받은 원문은 `10.113` 이라 쓸 수 없다. 교환 #292 §7③ 로 묻고 있다.
+
+추측해 넣으면 #238 이 경고한 **「기계와 어긋난 fixture 가 통과하는 상태」**가 된다.
+
+---
+
+### 돌려 보지 않은 명령 — 적어 둔다
+
+- **A-1 · B-1 · B-3** 은 호스트에서 돌리는 것이고, 이 세션은 러너·호스트 접속 금지라 **형태만**
+  적었다. 인터페이스 이름(`<wan-iface>`)은 실물에서 확인할 것.
+- **A-2** 의 `heliopause-devices.ts` 는 `devices.yml` 이 돌리는 그 형태를 그대로 옮겼고, 이
+  세션에서 직접 돌리지는 않았다(Cloudflare 토큰을 다루지 않는다).
+- **B-4 의 az01 제안**은 돌려 보지 않았다 — B-0 이 없으면 `unknown target` 으로 거부된다.
+- 그 외(`publish --propose`·`approve --show`·`status --site`·`publish` 렌더만·`gh workflow run
+  devices`)는 **2026-10-05 에 실제로 돌렸다.**
