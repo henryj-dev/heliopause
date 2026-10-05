@@ -8101,6 +8101,25 @@ class TestAnApplyStopsWhenARollbackIsStillOwed(unittest.TestCase):
         self.assertTrue(ok, f"the first apply did not arm a commitment: {state} — {detail}")
         self.assertIsNotNone(hp._timer, "no rollback timer was armed, so there is nothing to roll back")
 
+    @staticmethod
+    def _came_from_observation():
+        """Did this call arrive through the heartbeat telemetry read, or through the apply?
+
+        `observed_routes` has three call sites: the apply's pause point (`heliopause-pull.py:2471`)
+        and two inside `_read_host_observation` (`:4610` · `:4624`). A stub that counts every call
+        cannot tell them apart, which is why one broke on Linux CI and not on macOS.
+
+        @see test_the_caller_classifier_tells_the_two_paths_apart — the deterministic check. It and
+        the stub call **this** function rather than each holding a copy, so reverting the branch
+        below cannot be cancelled out by the expectation moving with it.
+        """
+        f = sys._getframe(1)
+        while f is not None:
+            if f.f_code.co_name == "_read_host_observation":
+                return True
+            f = f.f_back
+        return False
+
     def _rollback_that_does_not_settle(self):
         """Drive the real `rollback()` into its re-arming branch and leave it there."""
         hp._nft_apply_json = lambda _doc: (1, "stubbed: the restore fails")
@@ -8140,12 +8159,46 @@ class TestAnApplyStopsWhenARollbackIsStillOwed(unittest.TestCase):
         # one back. A second apply would be turned away by the entry guard before it ever reached
         # the route block — measured, the first version did exactly that and `observed_routes` was
         # never called.
+        # ## Who called this matters, so the stub asks
+        #
+        # 🔴 This counted every call and asserted exactly one. `observed_routes` is **also** read by
+        # the heartbeat telemetry path (`heliopause-pull.py:4610` · `:4624`, both inside
+        # `_read_host_observation`), so a call from there is **enough** to make the count two.
+        #
+        # ⚠️ What was measured (PR #104): the assertion failed on Linux CI with
+        # `['observed', 'observed']` while 13 runs on macOS passed, on identical code. **Which
+        # caller supplied the second call was not measured** — the Linux process was gone. This
+        # comment first said it was, and a review caught that.
+        #
+        # Weakening the assertion to "not empty" was the first idea and the wrong one: it would stop
+        # noticing a double rollback. So the stub classifies instead. The apply-path count keeps the
+        # original strength, and calls from the observation path are **recorded rather than
+        # asserted** — the cause above was inferred, not measured, and this is what turns it into a
+        # measurement when it next happens.
         paused = []
+        from_observation = []
 
         def observe_then_roll_back():
+            if self._came_from_observation():
+                from_observation.append("observed")
+                return []
             paused.append("observed")
+            # Only the apply-path call rolls back. A second rollback is not the scenario the issue
+            # describes, and this is the same classification doing the work — not a separate guard.
             self._rollback_that_does_not_settle()
             return []
+
+        def _say_if_the_background_called():
+            if from_observation:
+                print(
+                    f"\n[#87] observed_routes was read {len(from_observation)}× from "
+                    f"_read_host_observation during {self.id()} — the call that can make a "
+                    f"counting assertion read two. Whether it is what broke the Linux run is still "
+                    f"not established; this records that it happens at all.",
+                    file=sys.stderr,
+                )
+
+        self.addCleanup(_say_if_the_background_called)
 
         hp.observed_routes = observe_then_roll_back
         hp._nft_apply_json = lambda _doc: (0, "")
@@ -8157,7 +8210,11 @@ class TestAnApplyStopsWhenARollbackIsStillOwed(unittest.TestCase):
             "confirmTimeoutSec": hp.NFT_CONFIRM_MIN_SEC,
             "routes": [self.ROUTE["spec"]], "routeGuard": ["198.51.100.0/24"],
         })
-        self.assertEqual(paused, ["observed"], "the apply never reached the route block")
+        self.assertEqual(
+            paused, ["observed"],
+            "the apply did not reach the route block exactly once on its own path "
+            f"(observation-path reads, not counted here: {len(from_observation)})",
+        )
         self.assertFalse(
             ok,
             f"the apply reported success after a rollback it did not settle: {state} — {detail}. In "
@@ -8270,6 +8327,41 @@ class TestAnApplyStopsWhenARollbackIsStillOwed(unittest.TestCase):
         self.assertNotEqual(
             hp.load_state().get("state"), "pending",
             f"a pending state was written for a generation that cannot be confirmed: {hp.load_state()}",
+        )
+
+    def test_the_caller_classifier_tells_the_two_paths_apart(self):
+        """The classifier the test above relies on, checked without waiting for Linux scheduling.
+
+        🔴 Without this, reverting the classifier's one branch — making it answer False even with
+        `_read_host_observation` on the stack — stayed **green** on macOS, because the observation
+        path never calls the stub here. A review pointed out that green proves less than it looks:
+        a misclassified observation call landing after the commitment is armed but before the kernel
+        guard could itself supply the single `paused` entry, trigger the rollback, and leave the
+        apply refused with no route written — every assertion satisfied. So green neither showed
+        that no observation call happened nor that a run with one would fail.
+
+        This drives both answers directly, so the branch is load-bearing on every platform.
+        """
+        seen = []
+
+        def classify():
+            return "observation" if self._came_from_observation() else "apply"
+
+        # The classifier reads `co_name`, so a frame with that name is the mechanism itself, not a
+        # stand-in for it: this is how the real telemetry read reaches `observed_routes` (the two
+        # call sites at `heliopause-pull.py:4610` and `:4624` are both inside that function).
+        def _read_host_observation():
+            seen.append(classify())
+
+        def straight_from_the_apply():
+            seen.append(classify())
+
+        _read_host_observation()
+        straight_from_the_apply()
+        seen.append(classify())          # and from the test body, which is also not the apply path
+        self.assertEqual(
+            seen, ["observation", "apply", "apply"],
+            "the classifier cannot tell the telemetry read from the apply's own call",
         )
 
     def test_the_other_unsettled_outcome_stops_the_apply_too(self):
