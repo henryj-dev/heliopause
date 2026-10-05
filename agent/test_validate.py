@@ -3897,12 +3897,24 @@ class TestTheApplyPathReadsTheVerifiedArtifact(unittest.TestCase):
     #     envelope matches, verified does not → 'accept' unexpectedly found in ['accept', 'preflight']
     #       "the path proceeded although the verified artifact was a different generation"
     #
-    # So the observer's blind spot is real and the **behaviour** closes it: two cases that differ
-    # only in which object holds the wanted generation cannot both come out right if the comparison
-    # reads the wrong one. Worth keeping because the review was right about the instrument and wrong
-    # about the test, and only running it told them apart.
+    # So the observer's blind spot is real and **this mutation** is caught by the behaviour rather
+    # than by the observer: the two cases disagree about which object holds the wanted generation,
+    # and reading the envelope gives the wrong decision in each.
+    #
+    # ⚠️ That is a statement about the mutation that was run. It read "two cases that differ only in
+    # which object holds the wanted generation **cannot both come out right** if the comparison reads
+    # the wrong one", which is a claim about every wrong-object read — and a later review named one
+    # that reads the wrong object and still decides both fixtures the way they expect. Two cases
+    # cannot rule out a predicate that happens to agree with them.
+    #
+    # Worth keeping because the review was right about the instrument and wrong about this test, and
+    # only running it told those apart.
     def test_the_observer_records_the_reads_it_claims_to_see(self):
-        """The positive control. Every other assertion in this class compares a log with `[]`.
+        """The positive control. Every **observation** assertion in this class compares a log with `[]`.
+
+        (Not every assertion: the others check that the path reached `accept`, that a refusal was
+        logged against the wanted generation, and that it reached the state file. "Every other
+        assertion" was the first wording and it is wider than the ones this control holds up.)
 
         ⚠️ An independent post-hoc review pointed out that nothing established the recorders work,
         and **measured it**: disable both — `self.touches.append(...)` in `_Envelope` and
@@ -6310,9 +6322,13 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         call and the assertion stayed true, because the call is still in the tree. The test could not
         tell a startup that adopts from one that returns first — which is the only thing it was for.
 
-        So it drives `main()`. `_stop` is set beforehand, so the heartbeat loop exits on its first
-        check and the startup prelude is the whole of what runs. The assertion is on the state file
-        afterwards: a host that confirmed under an older build has its authorization named.
+        So it drives `main()`. `_stop` is left **clear** and the heartbeat stub sets it, so the loop
+        runs exactly one beat — which is what lets the ordering be checked at all, and a watchdog
+        timer gives the loop a second way out so a regression fails rather than hangs. (This said
+        `_stop` is set beforehand; that was true until the beat had to happen.) That one beat and the
+        startup prelude are the whole of what runs. Two assertions follow: the authorization the
+        **heartbeat saw**, which is the ordering, and the state file afterwards, which is the
+        adoption — a host that confirmed under an older build has its authorization named.
         """
         # The builder, not a hand-made dict: production writes `pendingAuthorization` and the watermark
         # together, and the first version of this fixture left the former `None` — a combination the
@@ -6382,12 +6398,30 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
             setattr(hp, k, v)
         was_set = hp._stop.is_set()
         hp._stop.clear()  # the heartbeat stub sets it after one beat — see its comment above
+        # 🔴 **A deadline, because `hp.main()` is synchronous and has none.** With `_stop` cleared, the
+        # loop's only exit is the heartbeat stub setting it — so a regression that stops reaching the
+        # heartbeat would **hang here** instead of failing the count below. `AGENTS.md`: a hang is not
+        # a red. CI would report a job timeout with no failing test name and it would read as
+        # infrastructure. An independent review caught this in the same change that cleared `_stop`.
+        #
+        # The watchdog gives the loop a second way out, so the count assertion is what fails.
+        #
+        # Measured both ways. Deleting `post_heartbeat(...)` from the loop
+        # (`heliopause-pull.py:5357`) now fails in **10.1s** with
+        # `'heartbeat': None != 'heartbeat': 1` instead of waiting forever. And removing the stub's
+        # own `_stop.set()` — keeping the beat — still **passes** in 10.1s, because one beat happens
+        # inside the window; that mutation is of this harness rather than of the agent, and the
+        # watchdog is not meant to catch it.
+        watchdog = threading.Timer(10, hp._stop.set)
+        watchdog.daemon = True
+        watchdog.start()
         try:
             code = hp.main()
             # A wait, not a join. If the monitor never runs this expires and the count below fails; it
             # does not pass quietly.
             monitor_started.wait(5)
         finally:
+            watchdog.cancel()
             (
                 hp.load_artifact_trust, hp.monitor_loop, hp.post_heartbeat,
                 hp.recover_commitment, hp.recover_workload_commitment,
@@ -6699,7 +6733,10 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         # The two branches an absent object cannot reach. Without these, "the workload success tail runs"
         # was satisfied by settlements that had all taken the missing-object shortcut — nine of them, in
         # the sweep as it stood then — and `confirmed` written at either branch survived.
-        # ## Ten branch witnesses — a hand-written list, and it says so
+        # ## Nine branch witnesses — a hand-written list, and it says so
+        #
+        # (Ten until a review showed one was implied by two others. The heading said ten after that
+        # deletion, which is the kind of count this file keeps catching one place at a time.)
         #
         # Twice a branch was opened and the neighbouring ones left at zero: first the whole workload
         # success path, then six refusals between the read and the restore. Each line below is a witness
@@ -6719,8 +6756,14 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         # being wrong about its own scope. This one claims the nine it names — ten until a review showed
         # one of them was implied by two others.
         #
-        # Five are refusals that change no state and call no boundary, so their witness is the sentence the
-        # agent logs. Five are observable as boundary calls or settlement.
+        # Two kinds, and the split is **not** given as a count. Some are refusals that change no state
+        # and call no boundary, so their witness is the sentence the agent logs; the rest are observable
+        # as boundary calls or settlement.
+        #
+        # ⚠️ This said "Five … Five", which still added to ten after the deletion below took one away. I
+        # then wrote "Five … Four" — also without counting, and also wrong: the entries do not divide
+        # that way. Each witness says in its own expression which kind it is, and a reader who wants the
+        # split can count nine lines faster than I managed to guess it twice.
         # ⚠️ `"replace (:3102)": bool(self.replace_calls)` stood here and is **deleted**: an
         # independent post-hoc review pointed out that both replace-outcome witnesses below already
         # require `ev["replaced"]`, so this one discriminated nothing. Measured — removing it alone
