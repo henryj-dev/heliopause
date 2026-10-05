@@ -166,27 +166,76 @@ for (const c of unapprovedOutside) {
 }
 
 if (has("--propose")) {
-  // Every live registration, in the shape the site module takes. Deliberately the whole set rather
-  // than only the changes: a reviewer comparing two full blocks in a diff sees removals, which a
-  // list of additions would hide.
+  // Every live registration, in the shape the registry file takes. Deliberately the whole set
+  // rather than only the changes: a reviewer comparing two full blocks in a diff sees removals,
+  // which a list of additions would hide.
   //
-  // Each line carries the zone its address lands in. That is the column a reviewer approves
-  // against: a device sitting in the lowest-trust zone is one the site has said nothing about, and
-  // approving it into a rule scoped to the management range is the mistake this annotation exists
-  // to make visible before it is pasted rather than after.
-  const lines = read.registrations
+  // ## Two blocks, because JSON cannot carry the zone column
+  //
+  // This printed a TypeScript array until 2026-10-06 — `export const DEVICES: ApprovedDevice[] =
+  // [ { deviceId: "…" } ]` — and the workflow told the operator that "the block printed above is
+  // what to commit". It was not: the rows moved to `devices.json` (see `policy/dev.ts`, "The rows
+  // moved to devices.json, and why") and the output did not follow, so what it printed could not be
+  // pasted anywhere. Twice it was transcribed by hand instead, and the second time a `notes` field
+  // was nearly lost in the process.
+  //
+  // So: the first block is the file, byte for byte, and the second is the zone column as a comment
+  // table. The column cannot be merged into the first — JSON has no comments, and dropping it would
+  // lose the thing a reviewer actually approves against: a device sitting in the lowest-trust zone
+  // is one the site has said nothing about, and approving it into a rule scoped to the management
+  // range is the mistake that annotation exists to make visible before the paste rather than after.
+  const sorted = read.registrations
     .slice()
-    .sort((a, b) => a.v4.localeCompare(b.v4, undefined, { numeric: true }))
-    .map((r) => {
-      const z = zoneOf(loaded.zones ?? [], r.v4);
-      const tag = z ? `${z.id} (${TRUST_LABEL[z.trust]})` : "no zone";
-      return (
-        `  { deviceId: ${JSON.stringify(r.deviceId)}, deviceName: ${JSON.stringify(r.deviceName)}, ` +
-        `userEmail: ${JSON.stringify(r.userEmail)}, v4: ${JSON.stringify(r.v4)}, v6: ${JSON.stringify(r.v6)} },` +
-        `  // ${tag}`
-      );
-    });
-  console.log(`\n// read from Cloudflare at ${readAt} — review before approving\nexport const DEVICES: ApprovedDevice[] = [\n${lines.join("\n")}\n];`);
+    .sort((a, b) => a.v4.localeCompare(b.v4, undefined, { numeric: true }));
+
+  // 🔴 `notes` is not in Cloudflare — it is the argument an approval needed, and `ApprovedDevice`
+  // declares it for exactly that ("Why this device is in policy at all"). Carried over by deviceId
+  // from the rows already approved. Without this the block looks complete and silently deletes the
+  // reasons; it came within one hand-transcription of happening.
+  const notesById = new Map(
+    (loaded.devices ?? [])
+      .filter((d: { notes?: string }) => d.notes)
+      .map((d: { deviceId: string; notes?: string }) => [d.deviceId, d.notes as string]),
+  );
+
+  const rows = sorted.map((r) => {
+    const kept = notesById.get(r.deviceId);
+    return {
+      deviceId: r.deviceId,
+      deviceName: r.deviceName,
+      userEmail: r.userEmail,
+      v4: r.v4,
+      v6: r.v6,
+      ...(kept ? { notes: kept } : {}),
+    };
+  });
+
+  // `1` as a literal, and that is not laziness.
+  //
+  // It was `loaded.devicesSchemaVersion ?? 1` first, with a comment about not hard-coding a version
+  // — and typechecking refused it, because `Site` carries no such field. Looking for where the
+  // version actually lives found the answer: `policy/devices.ts` **refuses** anything but 1
+  // ("devices.json must have schemaVersion 1 and a devices array"). So a file this command emits
+  // can only ever be version 1; emitting what was loaded would be reading a value that cannot
+  // differ, and the day it can differ this parser rejects it anyway. The constraint lives there.
+  const doc = { schemaVersion: 1, devices: rows };
+
+  console.log(`\n// read from Cloudflare at ${readAt} — review before approving`);
+  console.log(`// paste this over policy/devices.json:`);
+  console.log(JSON.stringify(doc, null, 2));
+
+  const dropped = [...notesById.keys()].filter((id) => !sorted.some((r) => r.deviceId === id));
+  if (dropped.length > 0) {
+    // Said out loud rather than left to the diff. These rows are leaving, and their `notes` go with
+    // them — that is correct when the device is gone, and worth seeing before the paste.
+    console.log(`\n// ⚠️ leaving, and their notes go too: ${dropped.join(", ")}`);
+  }
+
+  console.log(`\n// zones — the column to approve against (not part of the file):`);
+  for (const r of sorted) {
+    const z = zoneOf(loaded.zones ?? [], r.v4);
+    console.log(`//   ${r.v4.padEnd(15)} ${z ? `${z.id} (${TRUST_LABEL[z.trust]})` : "no zone"}`);
+  }
 }
 
 // Only what policy could name decides the exit code. The rest is printed and does not gate — see
