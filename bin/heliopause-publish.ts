@@ -264,6 +264,26 @@ function generationId(siteDir: string, sitePath: string, policyPath?: string): s
   return `${head}-dirty-${h.digest("hex").slice(0, 8)}`;
 }
 
+/**
+ * Where this invocation's PKI directory is: the flag, then the environment, then `./pki`.
+ *
+ * 🔴 **One function because there are two call sites.** The first version of this change set the
+ * environment fallback at the membership read and left the `--propose` path on
+ * `flagValue("--pki") ?? "./pki"`, so a machine that set `HELIOPAUSE_PKI_DIR` could read the fleet
+ * and then fail to propose — the half that needs an operator certificate. A review found it. Having
+ * one function means the next caller cannot pick up only half of the precedence.
+ *
+ * Each VPC has its own CA (`src/pki.ts:293-297`) and those directories live outside this
+ * repository, which is why the location belongs in the environment rather than in a symlink.
+ *
+ * An **empty** value is treated as unset. `resolve("")` is the working directory, which is not a
+ * PKI directory anybody means — and the shell side of this pair (`${HELIOPAUSE_POLICY_DIR:-policy}`
+ * in `scripts/run-tests.sh`) already falls back on empty, so matching it keeps one rule rather than
+ * two. A review measured that difference.
+ */
+const pkiDir = (): string =>
+  resolve(flagValue("--pki") || process.env.HELIOPAUSE_PKI_DIR || "./pki");
+
 const sitePath = resolve(siteArg);
 const siteUrl = pathToFileURL(sitePath).href;
 const mod = (await import(siteUrl)) as { site?: Site };
@@ -294,7 +314,7 @@ async function readMembership(): Promise<SelectorMembership | undefined> {
   // its own CA (`src/pki.ts:293-297`) and those directories live outside this repository — keeping
   // the location in the environment rather than in a symlink is what makes a second machine
   // possible without editing the tree.
-  const pki = resolve(flagValue("--pki") ?? process.env.HELIOPAUSE_PKI_DIR ?? "./pki");
+  const pki = pkiDir();
   try {
     // `heliopause-status` exits 1 when the fleet has problems — a silent host, a drift — and that is
     // correct for a human at a terminal. Here it made `--membership-from` unusable exactly when it
@@ -456,7 +476,7 @@ if (flags.has("--dry-run")) {
   // every relay.
   const { bundleFromPlan } = await import("../src/bundle.ts");
   const { api, ApiError, operatorCreds, printPlan } = await import("../src/api-client.ts");
-  const creds = operatorCreds(resolve(flagValue("--pki") ?? "./pki"), flagValue("--operator"));
+  const creds = operatorCreds(pkiDir(), flagValue("--operator"));
   const bundle = bundleFromPlan(plan);
   console.log(`\nproposing to ${propose} as ${creds.name} (target ${dirArg})`);
   try {
