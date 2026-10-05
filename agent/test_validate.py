@@ -6809,6 +6809,17 @@ class TestConfirmDoesNotLeaveTheRoutePlanBehind(unittest.TestCase):
         hp._timer.start()
         hp.rollback("generation-2 rolled back having declared no routes")
 
+        # ## The two settling mutations a review wrote for these assertions, run verbatim
+        #
+        #     `confirm()`'s `_route_restore = []` deleted   → the route-command assertion fails;
+        #                                                     both settlement assertions pass first
+        #     only `_timer = None` after `_timer.cancel()`  → the timer-reference assertion fails;
+        #       deleted in `rollback()`                       settlement passes
+        #
+        # So neither new assertion shadows the other, and the first measurement is also the
+        # counterexample to a claim deleted from `heliopause-pull.py` in this commit: generation 2
+        # declares no routes and still issues `del 203.0.113.0/24`.
+        #
         # ## The positive witness, and why "no route commands" needed one
         #
         # ⚠️ An independent post-hoc review of #85 found that the assertion below is satisfied by a
@@ -6823,7 +6834,10 @@ class TestConfirmDoesNotLeaveTheRoutePlanBehind(unittest.TestCase):
             f"the rollback did not settle ({settled['state']}), so 'it touched no routes' is about a "
             "rollback that did not happen — see the measurement above.",
         )
-        self.assertIsNone(hp._timer, "the rollback left its timer armed, so it did not run to the end")
+        # The reference, not the thread. A review was explicit that this proves the rollback cleared
+        # its own handle and **not** that the timer thread has finished — the stronger reading was in
+        # this message's first version ("so it did not run to the end").
+        self.assertIsNone(hp._timer, "the rollback did not release its timer reference")
 
         self.assertEqual(
             self.route_calls, [],
@@ -6843,9 +6857,14 @@ class TestTheRoutePlanSurvivesARestart(unittest.TestCase):
     `None`.
 
     ⚠️ This attributed both the quotation and the `st["pendingRoutes"]` write to `apply_routes`. Both
-    belong to `_persist_route_commitment`, which `apply_routes` calls — an independent review caught
-    it. It changes nothing about execution and everything about where a reader looks for the
-    obligation, which is the point of naming a function in a docstring at all.
+    belong to `_persist_route_commitment`, and its caller is **`apply_artifact`**
+    (`heliopause-pull.py:2454`), which persists the plan and only then calls `apply_routes`.
+
+    Two reviews were needed for one sentence: the first caught the misattributed quotation, and the
+    correction then named `apply_routes` as the caller, which it is not. **No behavioural test can
+    fail for either version** — that is what makes a sentence like this cost a review round instead
+    of a test run, and the reason a docstring names a function at all is to put a reader in the right
+    place when the behaviour is not where they expected.
 
     The three cases below are the three ways that surfaced, and each one is a restart: the state is
     saved, loaded back, and only then does recovery run.
@@ -6967,9 +6986,18 @@ class TestTheRoutePlanSurvivesARestart(unittest.TestCase):
         that records and discards, while the field being on the state file afterwards is the property
         the restart path reads.
 
-        Four boundaries are stubbed, all of them things that leave the machine: the nft apply, the
-        two kernel reads it verifies against, and `_ip_route` for both reading the table and writing
-        the route.
+        Four functions are stubbed, each because it leaves the machine, and named rather than
+        described: `_nft_apply_json`, `snapshot` (called twice — before and after), `observed_routes`
+        and `_ip_route`.
+
+        ⚠️ The first version of this list said `_ip_route` covered "both reading the table and
+        writing the route". It does not read the table — `observed_routes` does, through its own
+        `subprocess.run`, which is **the same misconception the comment ten lines below records
+        having already cost this test a failed run.** Writing it as a description instead of four
+        names is what let the two coexist.
+
+        What stays untested here: an existing route's backup (`observed_routes` returns `[]`, the
+        new-destination case) and an observation failure. Both are other tests' subjects.
         """
         route = {"dst": "203.0.113.0/24", "via": "203.0.113.1"}
         hp.save_state(dict(hp._EMPTY_STATE))
