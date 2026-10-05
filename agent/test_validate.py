@@ -6418,7 +6418,16 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
         # own `_stop.set()` — keeping the beat — still **passes** in 10.1s, because one beat happens
         # inside the window; that mutation is of this harness rather than of the agent, and the
         # watchdog is not meant to catch it.
-        watchdog = threading.Timer(10, hp._stop.set)
+        # The watchdog does not touch `_stop` directly: it asks first. A callback already running
+        # cannot be cancelled, so the disarm flag is what keeps a late one from setting the **shared**
+        # event after this test has put it back.
+        disarmed = threading.Event()
+
+        def trip():
+            if not disarmed.is_set():
+                hp._stop.set()
+
+        watchdog = threading.Timer(10, trip)
         watchdog.daemon = True
         watchdog.start()
         try:
@@ -6435,13 +6444,23 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
             # callback. It is the same hazard this class already asserts about the recovery timers
             # ("restoring the saved value over it only dropped the reference"), and the watchdog
             # added in the previous round did not get the same treatment.
+            #
+            # ℹ️ The disarm flag **narrows** that race rather than closing it: a callback already past
+            # its `disarmed.is_set()` check will still set the event. The window is the two statements
+            # of `trip`, against a ten-second timer the cancel almost always wins, and if it does not
+            # the join catches it. Written as a window rather than as "closed" — three sentences in a
+            # row in this class have claimed more than the code did.
+            #
+            # ⚠️ And the assertion is **not** here. It was, and a review named that a merge blocker:
+            # an `assertFalse` raising inside `finally` skips the restoration of all six patched
+            # functions, `signal.signal`, the env constants and `_stop` — contaminating every later
+            # test — and replaces any exception `hp.main()` had already raised as the reported
+            # failure. So this block only records, restores unconditionally, and the assertion is
+            # made after it.
+            disarmed.set()
             watchdog.cancel()
             watchdog.join(5)
-            self.assertFalse(
-                watchdog.is_alive(),
-                "the watchdog is still waiting to fire; it would set `_stop` after this cleanup "
-                "clears it and the next test would start stopped",
-            )
+            watchdog_survived = watchdog.is_alive()
             (
                 hp.load_artifact_trust, hp.monitor_loop, hp.post_heartbeat,
                 hp.recover_commitment, hp.recover_workload_commitment,
@@ -6452,6 +6471,12 @@ class TestStartupCallsTheBackfill(unittest.TestCase):
             if not was_set:
                 hp._stop.clear()
 
+        self.assertFalse(
+            watchdog_survived,
+            "the watchdog outlived a five-second join. It is disarmed, so it will not change `_stop` "
+            "now — but a callback that needs that long means `main()` did not return on its own, and "
+            "the counts below describe a run that was cut short rather than one that finished.",
+        )
         self.assertEqual(code, 0, "main() refused to start, so nothing below was exercised")
         self.assertEqual(
             {k: reached.get(k) for k in ("recover", "recover_workload", "reconcile", "monitor", "heartbeat")},
