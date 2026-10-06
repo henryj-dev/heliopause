@@ -25,9 +25,11 @@
 //
 //     ⚠️ This read "`forward` is never touched" long after the chain existed. That was not a small
 //     slip: a false entry in a list of safety invariants makes the true ones unreadable too, since
-//     a reader cannot tell which kind they are holding. What the old line was protecting — routed
-//     traffic and container/VM networking are not newly denied — still holds, by `accept`, not by
-//     absence.
+//     a reader cannot tell which kind they are holding. And the old line's second half does not
+//     survive narrowing: what `accept` buys is only that this chain adds no default-deny on that
+//     hook. Its configured rules do deny — `forwardRules` drops invalid packets and traffic
+//     entering `internalSupernet` from outside it. So routed and container/VM traffic is *not*
+//     guaranteed unaffected; read `ForwardConfig` for what a given site denies there.
 //
 //     @see the forward chain > keeps the chain policy accept even when input drops
 //     @see the forward chain > is absent on a host the config does not name
