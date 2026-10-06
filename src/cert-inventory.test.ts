@@ -246,6 +246,30 @@ describe("certificateInventory", () => {
   });
 });
 
+describe("dates on the wire", () => {
+  it("normalises a parseable date, so a padded one is not reported as a digest beside a real state", () => {
+    const padded = new Date(inDays(23)).toUTCString() + " ".repeat(600);
+    const r = certificateInventory(base({
+      relays: [relay("dev", [host("web-01.dev", { ...facts({ notAfter: padded, notBefore: padded }), observedAt: padded })])],
+    }));
+    const a = r.certificates.find((c) => c.kind === "agent")!;
+    assert.equal(a.state, "renew");
+    assert.equal(a.notAfter, new Date(padded).toISOString());
+    assert.equal(a.notBefore, new Date(padded).toISOString());
+    assert.equal(a.observedAt, new Date(padded).toISOString());
+  });
+
+  it("digests a date it cannot parse and reports the row unknown", () => {
+    const junk = "x".repeat(600);
+    const r = certificateInventory(base({
+      relays: [relay("dev", [host("web-01.dev", { ...facts({ notAfter: junk }), observedAt: NOW.toISOString() })])],
+    }));
+    const a = r.certificates.find((c) => c.kind === "agent")!;
+    assert.match(a.notAfter, /^sha256:/);
+    assert.deepEqual([a.state, a.daysLeft], ["unknown", null]);
+  });
+});
+
 describe("prose", () => {
   it("leaves 512 characters alone and cuts 513 to exactly 512, marked", () => {
     assert.equal(prose("a".repeat(512)), "a".repeat(512));

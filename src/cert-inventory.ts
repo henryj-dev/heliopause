@@ -148,6 +148,22 @@ function ident(s: unknown): string | null {
   return s.length <= MAX_WIRE_STRING ? s : digest(s);
 }
 
+/**
+ * A date as it goes on the wire: ISO 8601 when it parses, the `ident` of the original when it does not.
+ *
+ * Normalised rather than passed through `ident` alone. A date that parses but is padded past the
+ * limit would otherwise be judged from the original (`renew`, 23 days) and reported as a digest —
+ * a row whose expiry cannot be read beside a state that says it was. stardust found that shape.
+ * Normalising makes the reported date the one the state was judged from.
+ */
+function wireDate(d: unknown): string | null {
+  if (typeof d === "string") {
+    const t = new Date(d);
+    if (!Number.isNaN(t.getTime())) return t.toISOString();
+  }
+  return ident(d);
+}
+
 /** Whether a relay's agent-certificate reading has the shape this module reads. */
 function isAgentReading(c: unknown): c is CertFacts & { observedAt: string } {
   if (!c || typeof c !== "object") return false;
@@ -195,8 +211,8 @@ export function certificateInventory(input: InventoryInput): CertificateReport {
       // Every field, not only the names: an agent row is what a relay told the manager, and a relay's
       // answer is input like any other.
       serial: ident(facts.serial), sha256: ident(facts.sha256),
-      notBefore: ident(facts.notBefore), notAfter: ident(facts.notAfter), daysLeft, state,
-      source, observedBy: ident(observedBy), observedAt: ident(observedAt), stale,
+      notBefore: wireDate(facts.notBefore)!, notAfter: wireDate(facts.notAfter)!, daysLeft, state,
+      source, observedBy: ident(observedBy), observedAt: wireDate(observedAt)!, stale,
     });
   };
   const lack = (kind: CertKind, vpc: string | null, host: string | null, reason: string) =>
