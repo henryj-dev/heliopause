@@ -35,19 +35,35 @@
 ```bash
 /usr/bin/node --version                                   # 22.18.0 이상
 
-d=$(mktemp -d) && trap 'rm -rf "$d"' EXIT
-printf 'const n: number = 1; process.exit(n - 1);\n' > "$d/strip-probe.ts"
-/usr/bin/node "$d/strip-probe.ts" && echo "타입 스트리핑 OK" || echo "이 node 로는 안 된다"
+(
+  d=$(mktemp -d) || exit 1
+  trap 'rm -rf "$d"' EXIT
+  printf 'const n: number = 1; process.exit(n - 1);\n' > "$d/strip-probe.ts" || exit 1
+  if /usr/bin/node "$d/strip-probe.ts"; then
+    echo "타입 스트리핑 OK"
+  else
+    echo "이 node 로는 안 된다" >&2
+    exit 1
+  fi
+)
 ```
 
 🔑 **릴레이 진입점으로 확인하지 말 것.** `--help` 핸들러가 **없다**(`bin/heliopause-relay.ts` 는
 `--lang` 만 본다) — 설정이 없으면 env 누락으로 죽고, 있으면 **릴레이를 실제로 기동하려 든다.** 그리고
-`| head` 는 node 의 종료 코드를 가린다. 위 프로브는 **종료 코드로 답하고**, 자기만의 디렉터리를
-`mktemp -d` 로 만들어 `trap` 으로 지운다.
+`| head` 는 node 의 종료 코드를 가린다. 위 프로브는 **실패를 종료 코드 1 로 돌려주고**, 자기만의
+디렉터리를 `mktemp -d` 로 만들어 `trap` 으로 지운다. **서브셸로 감싸** 호출한 셸의 trap 을 건드리지
+않고, `mktemp` 나 쓰기가 실패하면 **거기서 멈춘다.**
 
-⚠️ 이 프로브는 처음 `/tmp/strip-probe.ts` 에 쓰고 지웠고, **바로 아래 줄이 「부작용이 없다」고
-적고 있었다.** 그 경로에 이미 있는 파일을 덮어쓰고 지우며 동시 실행끼리 간섭한다 — **고치면서
-만든 모순**이고 독립 리뷰가 잡았다.
+⚠️ 이 프로브는 세 판에 걸쳐 세 번 틀렸고, **매번 그것을 설명하는 문장이 함께 틀렸다**:
+
+| 판 | 명령 | 같이 적혀 있던 문장 |
+|---|---|---|
+| 1 | `heliopause-relay.ts --help \| head -3` | 「확인」 — 실제로는 **릴레이를 기동하려 들고** `head` 가 종료 코드를 가린다 |
+| 2 | `/tmp/strip-probe.ts` 에 쓰고 지움 | 「**부작용이 없고**」 — 네 줄 아래에 적혀 있었다 |
+| 3 | `mktemp -d && trap … EXIT`, 양쪽 `echo` | 「**종료 코드로 답하고**」 — 두 분기가 다 `echo` 로 끝나 **항상 0** 이다 |
+
+3판은 그 외에도 **호출한 셸의 EXIT trap 을 갈아치우고**, `mktemp` 가 실패하면 `$d` 가 비어 **`/strip-probe.ts`
+에 쓴다.** 위 형태는 독립 리뷰가 쓴 것을 그대로 썼다.
 
 🔑 **경로도 맞아야 한다.** 유닛이 `/usr/bin/node` 를 **절대 경로로** 쓴다. tarball 로 `/usr/local` 에
 깔면 심볼릭 링크를 걸어야 하고, 안 걸면 `203/EXEC` 다.
