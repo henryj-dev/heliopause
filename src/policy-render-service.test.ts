@@ -1583,6 +1583,17 @@ export const site = {
         // renderer now refuses, at the site that produced it, a payload it used to serve and let the
         // manager reject. Before this change the response was 200 with a shape the far side would not
         // accept — "healthy and unconsumable", which is the state the validator exists to prevent.
+        //
+        // **Pinned by a mutation** (run by the independent review, not by me): removing the
+        // evaluation-time validation makes this fail —
+        //
+        //     ✖ stays up when a module breaks in a way no guard had named
+        //       serialisableButInvalid: beta — 200 !== 503
+        //
+        // and with the validation in place, startup logs the validator's own error and readiness
+        // reports serving **1/2**. So the shape reaches the path it names rather than passing for
+        // some neighbouring reason — which is the check the removed `replacedProbeParser` shape
+        // failed (#126).
         name: "serialisableButInvalid",
         body:
           'export const site = { cfg: { protectedHosts: "bad" }, hosts: [{ id: "h1.beta", stage: "canary", items: [] }] };\n',

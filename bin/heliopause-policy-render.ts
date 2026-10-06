@@ -969,19 +969,30 @@ async function evaluated(
   // ⚠️ That is **one of three** behaviour changes here; the others are the validator below and the
   // `.then` poisoning this seam closes on this path. All three are named in the commit message.
   //
-  // ## What can make this throw — two things, and I first named only one
+  // ## Three **observed** triggers — the list is not closed, and saying it was is how this comment
+  // has been wrong twice
   //
   // 1. **A poisoned `Object.prototype.toJSON`.** `JSON.stringify` calls a `toJSON` it finds on the
   //    value, inherited ones included, so capturing the function does not close this.
   // 2. **A replaced `JSON.parse`.** `readCoverageProbes` reads `coverage-*.json` with an
   //    **uncaptured** `JSON.parse` (`src/policy-screen.ts:146`), so a module that replaces the global
   //    chooses what a probe contains — a `BigInt` survives collection and throws here.
+  // 3. **`Array.prototype.toJSON`**, replacing nothing in (1) or (2):
   //
-  // 🔴 The first version of this comment said a probe file **cannot** be the trigger, and backed it
-  // with a measurement: values returned by the original parser all stringify. That measurement is
-  // correct and the conclusion was not — **the parser itself is replaceable**, which is this
-  // repository's own rule about captures applied to a call I had not captured. Independent review
-  // reproduced it.
+  //        Array.prototype.toJSON = function (key) { return key === "probes" ? 1n : this; };
+  //
+  //    Measured through the renderer: collection succeeds, serialisation throws, **both** sites
+  //    answer 503.
+  //
+  // 🔴 **Each version of this comment named the triggers it knew and read as a complete list.** First
+  // "a probe file cannot be the trigger" — backed by a correct measurement (values from the original
+  // parser all stringify) and a wrong conclusion, because **the parser is replaceable**. Then "two
+  // things", which (3) refutes. Independent review produced both counterexamples.
+  //
+  // 🔑 So the thing to carry is the **shape**, not the list: `JSON.stringify` asks the value — and
+  // everything the value inherits from — for a `toJSON`, and every prototype in that chain is
+  // something a module in this realm can write. Any new entry here is another instance of that, not
+  // a new kind of problem. **The list stays open on purpose.**
   //
   // ⚠️ **Only the first has a test here.** `poisonedToJSON` is a shape in the matrix below; the
   // replaced-parser case is measured (a global swap does reach `readCoverageProbes`, and the probe
