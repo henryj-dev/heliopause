@@ -25,8 +25,9 @@ const DAY_MS = 86_400_000;
  * `unknown` when the date does not parse. Not `ok`: a certificate this code cannot read is one it
  * cannot vouch for, and defaulting the other way is how a check reports health it never measured.
  *
- * `daysLeft` is whole days, rounded down, so a certificate with 7.9 days left is critical — the
- * renewal has to happen inside the window, not on its last afternoon.
+ * `daysLeft` is whole days, rounded down while the certificate is valid — 7.9 days left is critical,
+ * because the renewal has to happen inside the window, not on its last afternoon. Once expired it is
+ * the whole days since, negated: 0 for the first day, -1 for the second.
  */
 export function certState(
   notAfter: string | Date | null | undefined,

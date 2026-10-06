@@ -17,7 +17,9 @@
 // Where the agents cannot be counted — the relay did not answer, or answered without a manifest —
 // `missing` carries one entry for them with `host: null`, and `expected.byKind.agent` counts only the
 // relays that could be read. It is then a lower bound, and `expected − observed` is not
-// `missing.length`; `complete` is what says the report is whole.
+// `missing.length`; `complete` is what says the report is whole. The same holds for a CA file holding
+// more than one certificate (a rotation): the first is a row, and `missing` notes that the others'
+// expiry is not read — so `complete` stays false for as long as the bundle is in place.
 //
 // ## What the consumer can rely on — two rules, not the whole contract
 //
@@ -177,7 +179,8 @@ export function prose(s: string): string {
   const mark = "…[truncated]";
   if (s.length <= MAX_WIRE_STRING) return s;
   let head = s.slice(0, MAX_WIRE_STRING - mark.length);
-  // Not half of a surrogate pair: a lone surrogate is not valid UTF-8 on the way out.
+  // Not half of a surrogate pair: `JSON.stringify` escapes a lone one, so the bytes stay valid, but
+  // the consumer would parse back a string holding half a character.
   if (/[\uD800-\uDBFF]$/.test(head)) head = head.slice(0, -1);
   return head + mark;
 }
@@ -304,8 +307,9 @@ export function certificateProblems(report: CertificateReport): string[] {
   for (const c of report.certificates) {
     if (c.state === "ok") continue;
     const where = [c.vpc, c.host ?? c.cn].filter(Boolean).join(" ");
-    const when = c.daysLeft === null ? "an unreadable expiry" : c.daysLeft < 0
-      ? `expired ${-c.daysLeft} day(s) ago` : `${c.daysLeft} day(s) left`;
+    const when = c.daysLeft === null ? "an unreadable expiry"
+      : c.state === "expired" ? (c.daysLeft === 0 ? "expired less than a day ago" : `expired ${-c.daysLeft} day(s) ago`)
+      : `${c.daysLeft} day(s) left`;
     out.push(`${c.kind} certificate ${where} (${c.source}): ${c.state} — ${when}, notAfter ${c.notAfter}`);
   }
   return out;

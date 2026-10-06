@@ -145,7 +145,7 @@ describe("certificateInventory", () => {
     assert.equal(breaksLengthOrKindRule(r), null);
   });
 
-  it("names the CAs a bundle file holds beyond the first", () => {
+  it("reports that a CA bundle file holds more certificates than the first", () => {
     const r = certificateInventory(base({
       vpcFiles: [{ vpc: "dev", client: facts(), ca: facts({ cn: "heliopause-ca" }), caBlocks: 2 }],
     }));
@@ -300,5 +300,14 @@ describe("certificateProblems", () => {
     assert.match(lines.find((l) => l.includes("renew.dev"))!, /renew — 25 day\(s\) left/);
     assert.match(lines.find((l) => l.includes("critical.dev"))!, /critical — 5 day\(s\) left/);
     assert.match(lines.find((l) => l.includes("expired.dev"))!, /expired — expired 2 day\(s\) ago/);
+  });
+
+  it("does not say \"0 day(s) left\" about a certificate that expired within the day", () => {
+    const r = certificateInventory(base({
+      relays: [relay("dev", [host("just.dev", { ...facts({ notAfter: new Date(NOW.getTime() - 3_600_000).toISOString() }), observedAt: NOW.toISOString() })])],
+    }));
+    const line = certificateProblems(r).find((l) => l.includes("just.dev"))!;
+    assert.match(line, /expired — expired less than a day ago/);
+    assert.doesNotMatch(line, /left/);
   });
 });

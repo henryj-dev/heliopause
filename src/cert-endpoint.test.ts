@@ -159,12 +159,17 @@ describe("GET /api/certificates", () => {
     // The production shape: the relay closes an idle socket after 5 s and the console polls every
     // 10 s, so every poll but the first opens a new connection. A client that resumes the TLS session
     // there is handed an empty peer certificate. Shortened here so the socket closes between polls.
+    const saved = relayServer.keepAliveTimeout;
     relayServer.keepAliveTimeout = 50;
-    const relayRow = async () => (await call(managerPort, "/api/certificates", { as: "operator-ops" }))
-      .body.certificates.find((c: any) => c.kind === "relay-server" && c.vpc === "dev");
-    assert.ok(await relayRow(), "first poll");
-    await new Promise((r) => setTimeout(r, 300));
-    assert.ok(await relayRow(), "second poll, on a new connection, lost the relay certificate");
+    try {
+      const relayRow = async () => (await call(managerPort, "/api/certificates", { as: "operator-ops" }))
+        .body.certificates.find((c: any) => c.kind === "relay-server" && c.vpc === "dev");
+      assert.ok(await relayRow(), "first poll");
+      await new Promise((r) => setTimeout(r, 300));
+      assert.ok(await relayRow(), "second poll, on a new connection, lost the relay certificate");
+    } finally {
+      relayServer.keepAliveTimeout = saved;
+    }
   });
 
   it("reports its own certificates, the CA and the known operators from their files", async () => {

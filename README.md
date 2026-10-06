@@ -616,11 +616,13 @@ heartbeat, each relay's server certificate as the manager saw it on the wire, th
 certificate and CA per VPC, its server certificate both as served and as on disk (they differ after a
 rotation the process has not been restarted for), and the operators' public certificates in
 `HELIOPAUSE_KNOWN_OPERATORS_DIR`. Not the public (SNI) console certificate: cert-manager issues and
-renews that one, and it is watched where cert-manager's certificates are. Each row carries `state` — `ok`, `renew` (inside the
+renews that one, and the issued certificate is watched where cert-manager's certificates are — the copy
+the manager holds in memory and serves is not, and a refresh that fails keeps serving the old one. Each row carries `state` — `ok`, `renew` (inside the
 `RENEW_BEFORE_DAYS` window), `critical` (7 days), `expired` or `unknown` — and the thresholds travel in
 the report. The expected set is derived from configuration, not from what answered: an unreachable
-relay, or one without a manifest, makes the report `complete: false` and is named in `missing` along
-with an entry for the agents behind it. Those agents cannot be counted, so `expected.byKind.agent` is
+relay makes the report `complete: false` and is named in `missing` along with an entry for the agents
+behind it; a relay that answers without a manifest keeps its certificate row and adds only that agents
+entry. Those agents cannot be counted, so `expected.byKind.agent` is
 then a lower bound — read `complete`, not the totals. **This scope is fleet-wide: the hostname pattern
 does not narrow it**, because a monitor that sees part of the fleet reports the rest as healthy by
 omission, and the CA, manager and operator rows have no hostname to match. That is a deliberate

@@ -941,18 +941,20 @@ function getFleetView(
 }
 
 /**
- * The connection pool for relay calls: no TLS session resumption.
+ * The agent for relay calls: connections kept alive as the global agent keeps them, TLS sessions not
+ * resumed.
  *
  * A resumed TLS 1.3 session hands the client an empty `getPeerCertificate()`, and the relay's
  * certificate is read from exactly that (`onPeer` below). With the global agent, every poll after the
  * relay's 5 s keep-alive had closed the socket resumed — and the console polls every 10 s — so the
  * relay's expiry was readable on the first poll only. Measured in review of #127: the second
  * `/api/certificates` six seconds after the first reported the relay certificate as unreadable.
- * A full handshake per relay call costs nothing at this rate.
+ * A new connection then does a full handshake, which costs nothing at this rate. Only the session cache
+ * matters here — keep-alive is kept so a burst of calls still reuses one connection, as before.
  *
  * @see cert-endpoint.test.ts "still reads the relay's certificate after the connection has closed"
  */
-const relayAgent = new Agent({ maxCachedSessions: 0 });
+const relayAgent = new Agent({ keepAlive: true, maxCachedSessions: 0 });
 
 /**
  * One request to one relay, with that VPC's credentials.
@@ -1546,7 +1548,8 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
   };
 
   /**
-   * Every certificate the deployment depends on, from one round of relay polls.
+   * The certificates this deployment's own PKI issues, from one round of relay polls. Not the public
+   * (SNI) certificate — see `cert-inventory.ts`.
    *
    * The client certificates are read the way `pollRelays` reads them (`loadRelayCreds`), so what is
    * reported is what the next relay call will present — not a guess at which file that is.
@@ -1562,7 +1565,10 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
           caBlocks: pemCertificateCount(creds.ca),
         };
       } catch (e) {
-        return { vpc: r.name, client: { error: prose((e as Error).message) }, ca: await readCertFile(join(r.pkiDir, "ca.pem")) };
+        const caFile = join(r.pkiDir, "ca.pem");
+        let caBlocks: number | undefined;
+        try { caBlocks = pemCertificateCount(await readFile(caFile)); } catch { /* reported by readCertFile below */ }
+        return { vpc: r.name, client: { error: prose((e as Error).message) }, ca: await readCertFile(caFile), caBlocks };
       }
     }));
     let operators: Array<{ file: string; reading: FileReading }> | null = null;
