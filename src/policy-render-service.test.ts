@@ -1554,8 +1554,13 @@ export const site = {
         // rather than asking for it.
         //
         // The seam serialises each evaluation and resolves the **string**, so there is no `.then` to
-        // read. `beta` still fails — it threw — and `alpha` is now unaffected, which is the property
-        // that was wanted all along.
+        // read. `beta` still fails — it threw — and `alpha` now answers `/source` normally, which is
+        // the property that was wanted all along.
+        //
+        // ⚠️ **`/source`, not every route.** `readiness()` still resolves a plain object, so
+        // `/readyz` goes 503 under this same module — the poisoning is closed on this path and open
+        // on that one. An earlier version of this comment and of AGENTS.md said it was closed, full
+        // stop; independent review reproduced the `/readyz` half.
         //
         // **Measured, not reasoned.** Reverting just that one line to resolve an object
         // (`resolve({ wire } as unknown as string)`) turns this back:
@@ -1568,6 +1573,19 @@ export const site = {
         // closes the operations that read a value; it does not close the one that writes it.
         name: "poisonedThen",
         body: 'Object.defineProperty(Object.prototype, "then", { get() { throw new Error("broken then"); }, configurable: true });\nthrow new Error("bad beta");\n',
+        beta: 503, alpha: 200,
+      },
+      {
+        // ## Serialisable and still refused — the validator is the third behaviour change
+        //
+        // `protectedHosts: "bad"` is a string, so it writes fine; `parsePolicySource` refuses it
+        // (`src/policy-source.ts:245`). Running that validator inside the evaluation step means the
+        // renderer now refuses, at the site that produced it, a payload it used to serve and let the
+        // manager reject. Before this change the response was 200 with a shape the far side would not
+        // accept — "healthy and unconsumable", which is the state the validator exists to prevent.
+        name: "serialisableButInvalid",
+        body:
+          'export const site = { cfg: { protectedHosts: "bad" }, hosts: [{ id: "h1.beta", stage: "canary", items: [] }] };\n',
         beta: 503, alpha: 200,
       },
       {

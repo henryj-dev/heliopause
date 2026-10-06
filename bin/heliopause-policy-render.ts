@@ -939,7 +939,17 @@ async function evaluated(
   // call is a gate, not a conversion.
   //
   // ⚠️ That in-place default is a defect in its own right on the manager's side; it is filed rather
-  // than fixed here, because that function has callers this change does not survey.
+  // than fixed here (#123), because that function has callers this change does not survey.
+  //
+  // 🔴 **Calling it here is a behaviour change, and naming it took a review.** A payload that
+  // serialises but fails validation — `cfg.protectedHosts: "bad"` is a string, so it writes fine and
+  // `parsePolicySource` refuses it (`src/policy-source.ts:245`) — used to be served with a 200 and
+  // rejected at the far end. Now this site fails here: `/source` answers 503, readiness counts it as
+  // not serving, and startup verification reports it. That is the intended direction — "healthy and
+  // unconsumable" is the state a validator exists to prevent — but it is a third change in behaviour,
+  // not a refactor.
+  //
+  // @see src/policy-render-service.test.ts "no guard had named" — shape `serialisableButInvalid`
   void parsePolicySource(parseWire(wire));
   cached.set(sitePath, { stamp, wire });
   log(`evaluated ${name ?? label} at ${source.head.sha ?? "unknown"}${source.head.dirty ? " (dirty)" : ""}`);
@@ -956,15 +966,30 @@ async function evaluated(
   // site, at evaluation**, instead of reaching the cache and throwing later in `send` on a request
   // unrelated to the commit that introduced it.
   //
-  // ⚠️ That is the one **behaviour change** here, and it is deliberate.
+  // ⚠️ That is **one of three** behaviour changes here; the others are the validator below and the
+  // `.then` poisoning this seam closes on this path. All three are named in the commit message.
   //
-  // ⚠️ **A probe file cannot be what triggers it, and the first version of this comment said it
-  // could.** `readCoverageProbes` builds probes with `JSON.parse` on `coverage-*.json`, so every
-  // value it yields is a plain object, array, string, number, boolean or null — all of which
-  // stringify. Measured: a parsed probe object round-trips, and the only way to make that call throw
-  // is a poisoned `Object.prototype.toJSON`, which is the **module's** doing and reaches every
-  // `JSON.stringify` in the process, not a property of the probe file. The reachable trigger is the
-  // module, which is why the capture above says so.
+  // ## What can make this throw — two things, and I first named only one
+  //
+  // 1. **A poisoned `Object.prototype.toJSON`.** `JSON.stringify` calls a `toJSON` it finds on the
+  //    value, inherited ones included, so capturing the function does not close this.
+  // 2. **A replaced `JSON.parse`.** `readCoverageProbes` reads `coverage-*.json` with an
+  //    **uncaptured** `JSON.parse` (`src/policy-screen.ts:146`), so a module that replaces the global
+  //    chooses what a probe contains — a `BigInt` survives collection and throws here.
+  //
+  // 🔴 The first version of this comment said a probe file **cannot** be the trigger, and backed it
+  // with a measurement: values returned by the original parser all stringify. That measurement is
+  // correct and the conclusion was not — **the parser itself is replaceable**, which is this
+  // repository's own rule about captures applied to a call I had not captured. Independent review
+  // reproduced it.
+  //
+  // ⚠️ **Only the first has a test here.** `poisonedToJSON` is a shape in the matrix below; the
+  // replaced-parser case is measured (a global swap does reach `readCoverageProbes`, and the probe
+  // comes back holding a `BigInt`) but **no test drives it through this renderer** — the fixture
+  // that should have left `/source?site=beta` at 503 answered 200, and why is unresolved. Filed as
+  // **#126** with the hypotheses rather than left as a claim with nothing holding it.
+  //
+  // @see src/policy-render-service.test.ts "no guard had named" — shape `poisonedToJSON`
   //
   // @see src/policy-render-service.test.ts "survives a module that replaces the globals it will be described with"
   return wire;
