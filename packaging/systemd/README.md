@@ -8,12 +8,42 @@
 | `heliopause-agent-applier.conf` | 지정된 Cilium 적용자 한 대만 쓰는 kubeconfig 가시성 drop-in |
 | `heliopause-enroll.service` · `.timer` | 호스트가 로컬 키로 CSR을 만들고 승인된 인증서를 회수 |
 | `heliopause-agent.path` | 회수된 `agent.pem` 이 나타나는 순간 에이전트를 켠다 — 등록으로 부팅하는 호스트용 |
-| `heliopause-relay.service` | 각 VPC의 gw (node 22+, `DynamicUser`, 무권한) |
+| `heliopause-relay.service` | 각 VPC의 gw (**node 22.6+** — 아래 §0, `DynamicUser`, 무권한) |
 | `heliopause-revocation-writer.service` · `.socket` | relay가 직접 수정할 수 없는 단조 폐기목록 writer |
 | `heliopause-revocations.conf` | 잠긴 writer 계정과 relay socket 제출 보조그룹 (`sysusers.d`) |
 | `agent.env.example` · `relay.env.example` | `/etc/heliopause/`에 놓을 환경파일 |
 
-## 0. 인증서 — 먼저
+## 0. gw 의 node — **인증서보다 먼저**
+
+에이전트는 python3 이고 **node 가 필요 없다.** 릴레이만 필요하고, 하한은 **22 가 아니라 22.6** 이다:
+
+```
+package.json   "node": ">=22.6.0"
+```
+
+유닛이 `.ts` 를 **직접** 실행하기 때문이다(`ExecStart=/usr/bin/node /opt/heliopause/bin/heliopause-relay.ts`),
+그리고 유닛에 `NODE_OPTIONS` 도 `--experimental-strip-types` 도 **없다** — 그래서 타입 스트리핑이
+**플래그 없이 켜지는** 버전이어야 한다.
+
+⚠️ **22.6~22.x 에서 플래그 없이 되는지는 이 저장소에서 측정되지 않았다.** CI 는 `node-version: "22"`
+를 쓰므로 러너가 주는 22.x 에서 돈다는 것만 말한다. 그래서 **설치 직후 첫 확인이 이것이어야 한다**:
+
+```bash
+/usr/bin/node --version                                   # 22.6.0 이상
+/usr/bin/node /opt/heliopause/bin/heliopause-relay.ts --help 2>&1 | head -3
+```
+
+둘째 줄이 `ERR_UNKNOWN_FILE_EXTENSION` 이나 타입 구문 오류를 내면 **그 node 로는 안 된다.** 릴레이를
+enable 하기 전에 알아야 하고, enable 한 뒤에 알면 `203/EXEC` 나 기동 실패로 읽힌다.
+
+🔑 **경로도 맞아야 한다.** 유닛이 `/usr/bin/node` 를 **절대 경로로** 쓴다. tarball 로 `/usr/local` 에
+깔면 심볼릭 링크를 걸어야 하고, 안 걸면 `203/EXEC` 다.
+
+**Bun 은 안 된다.** 유닛 주석이 그 이유를 측정으로 적는다 — Bun 은 `requestCert` 를 집행하지만 peer
+인증서를 읽을 수 없어, 릴레이가 어느 에이전트가 부르는지 알 수 없고 모든 하트비트의 `host` 가 검증되지
+않은 주장이 된다.
+
+## 1. 인증서 — 그다음
 
 **외부 PKI가 필요하지 않다.** heliopause가 자체 발급한다.
 
