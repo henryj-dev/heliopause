@@ -290,6 +290,36 @@ describe("the renderer answers with a policy the manager can parse", () => {
     }
   });
 
+  it("answers the same payload on a cache miss and a cache hit", async () => {
+    // The evaluation step serialises the whole `PolicySource` and its caller parses it back, so a
+    // served answer has crossed a wire boundary that did not exist before. This is the known
+    // positive for that boundary: the first request evaluates and round-trips, the second is served
+    // from the cache without re-evaluating, and the two have to be the same payload.
+    //
+    // Byte equality, not field spot-checks. What this guards against is a conversion that drops or
+    // reshapes something nobody thought to assert on — `repo.probes` is exactly such a field,
+    // carried past `toWire` and into the serialiser untouched.
+    const dir = checkout();
+    let started: Started | undefined;
+    try {
+      started = await start(dir);
+      const first = await fetchSource(started.port);
+      assert.equal(first.status, 200);
+      const miss = await first.text();
+      const second = await fetchSource(started.port);
+      assert.equal(second.status, 200);
+      const hit = await second.text();
+      assert.equal(hit, miss, "the cached answer differs from the evaluated one");
+      // A known positive for the comparison itself: two empty bodies would satisfy `assert.equal`,
+      // so the test has to show it compared a payload rather than nothing.
+      assert.ok(miss.length > 100, `the payload was too small to be a source: ${miss.length} bytes`);
+      assert.match(miss, /"schemaVersion"/);
+    } finally {
+      started?.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("sees an edit to the policy file when the site module has not been touched", async () => {
     // The defect this exists for, in production for eleven hours on 2026-08-16: the cache was keyed
     // on the site module's mtime alone, on the stated assumption that "mtime is what git-sync
@@ -1515,9 +1545,59 @@ export const site = {
         beta: 503, alpha: 503,
       },
       {
+        // ## `alpha: 200` — and that number changed when the evaluation seam landed
+        //
+        // It was `503`: the poisoning reached the healthy site. Promise resolution reads `.then` off
+        // whatever it resolves, so resolving a `PolicySource` **object** ran the poisoned getter on
+        // every site's evaluation, not just the one that poisoned it. That is the cross-site
+        // contamination row in AGENTS.md's eleventh-round table, and `503` here recorded the defect
+        // rather than asking for it.
+        //
+        // The seam serialises each evaluation and resolves the **string**, so there is no `.then` to
+        // read. `beta` still fails — it threw — and `alpha` now answers `/source` normally, which is
+        // the property that was wanted all along.
+        //
+        // ⚠️ **`/source`, not every route.** `readiness()` still resolves a plain object, so
+        // `/readyz` goes 503 under this same module — the poisoning is closed on this path and open
+        // on that one. An earlier version of this comment and of AGENTS.md said it was closed, full
+        // stop; independent review reproduced the `/readyz` half.
+        //
+        // **Measured, not reasoned.** Reverting just that one line to resolve an object
+        // (`resolve({ wire } as unknown as string)`) turns this back:
+        //
+        //     ✖ stays up when a module breaks in a way no guard had named
+        //       AssertionError: poisonedThen: alpha — actual 503, expected 200
+        //
+        // ⚠️ `poisonedToJSON` above keeps `alpha: 503`, and the difference is the point: `toJSON` is
+        // called **by the serialisation itself**, so moving to bytes cannot close it. A byte boundary
+        // closes the operations that read a value; it does not close the one that writes it.
         name: "poisonedThen",
         body: 'Object.defineProperty(Object.prototype, "then", { get() { throw new Error("broken then"); }, configurable: true });\nthrow new Error("bad beta");\n',
-        beta: 503, alpha: 503,
+        beta: 503, alpha: 200,
+      },
+      {
+        // ## Serialisable and still refused — the validator is the third behaviour change
+        //
+        // `protectedHosts: "bad"` is a string, so it writes fine; `parsePolicySource` refuses it
+        // (`src/policy-source.ts:245`). Running that validator inside the evaluation step means the
+        // renderer now refuses, at the site that produced it, a payload it used to serve and let the
+        // manager reject. Before this change the response was 200 with a shape the far side would not
+        // accept — "healthy and unconsumable", which is the state the validator exists to prevent.
+        //
+        // **Pinned by a mutation** (run by the independent review, not by me): removing the
+        // evaluation-time validation makes this fail —
+        //
+        //     ✖ stays up when a module breaks in a way no guard had named
+        //       serialisableButInvalid: beta — 200 !== 503
+        //
+        // and with the validation in place, startup logs the validator's own error and readiness
+        // reports serving **1/2**. So the shape reaches the path it names rather than passing for
+        // some neighbouring reason — which is the check the removed `replacedProbeParser` shape
+        // failed (#126).
+        name: "serialisableButInvalid",
+        body:
+          'export const site = { cfg: { protectedHosts: "bad" }, hosts: [{ id: "h1.beta", stage: "canary", items: [] }] };\n',
+        beta: 503, alpha: 200,
       },
       {
         name: "lateThrowFromModuleTimer",
