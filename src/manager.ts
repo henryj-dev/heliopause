@@ -73,7 +73,9 @@ export type RelayResult =
       name: string; url: string; ok: true; view: FleetView;
       /**
        * The server certificate this relay presented on the call that produced `view`. `null` when
-       * the TLS layer handed back nothing readable; absent from results built without a connection.
+       * the TLS layer handed back nothing readable — which a resumed TLS session does on every call,
+       * so relay calls disable resumption (`relayAgent` in manager-server.ts). Absent from results
+       * built without a connection.
        */
       relayCert?: CertFacts | null;
     }

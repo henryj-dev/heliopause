@@ -1,4 +1,6 @@
-// Every certificate this deployment depends on, with how long each has left — `GET /api/certificates`.
+// The certificates this deployment's own PKI issues and depends on, with how long each has left —
+// `GET /api/certificates`. Not the manager's public (SNI) certificate: cert-manager issues and renews
+// that one, and stardust's cert-drift already watches cert-manager certificates directly.
 //
 // Pure: the manager gathers the readings (relay polls, its own files, the certificate it is serving)
 // and this decides what they add up to. The interesting cases are the incomplete ones — a relay that
@@ -12,12 +14,23 @@
 // VPC; one agent per host in each relay's manifest), and every expected item without a row is named
 // in `missing`. A consumer alerts on `complete: false`, not on a count it has to remember.
 //
-// ## What the consumer can rely on
+// Where the agents cannot be counted — the relay did not answer, or answered without a manifest —
+// `missing` carries one entry for them with `host: null`, and `expected.byKind.agent` counts only the
+// relays that could be read. It is then a lower bound, and `expected − observed` is not
+// `missing.length`; `complete` is what says the report is whole.
 //
-// stardust's cert-drift rejects a whole report when any string exceeds `MAX_WIRE_STRING` or a `kind`
-// does not match `^[a-z][a-z-]{0,31}$`, so both are properties of every report this returns. Strings
-// that identify something are never truncated — two truncated names can collide — they are replaced
-// by a digest of the original instead. Only explanatory text is shortened.
+// ## What the consumer can rely on — two rules, not the whole contract
+//
+// stardust's cert-drift discards a whole report on several conditions. This module guarantees two of
+// them for every report: no string longer than `MAX_WIRE_STRING`, and every `kind` matching
+// `^[a-z][a-z-]{0,31}$`. Strings that identify something are never truncated — two truncated names can
+// collide — they are replaced by a digest of the original instead; only explanatory text is shortened.
+//
+// It does **not** guarantee the rest. The cert-drift deployed with stardust #23 also discarded a
+// report carrying a null `cn` or an `unknown` row (null `daysLeft`, unparseable `notAfter`), and this
+// module emits both on purpose — a certificate with several CNs has no single name, and an expiry that
+// cannot be read is reported rather than dropped. The authority on what the consumer accepts is its
+// own fixture, not this comment.
 
 import { createHash } from "node:crypto";
 import { CERT_THRESHOLDS, certState, type CertFacts, type CertState } from "./cert-watch.ts";
@@ -28,7 +41,11 @@ export const CERTIFICATE_REPORT_SCHEMA = 1;
 /** The longest string any report carries. Set by the consumer's validation, not by this code. */
 export const MAX_WIRE_STRING = 512;
 
-/** An agent reading older than this is reported but flagged: heartbeats arrive every few seconds. */
+/**
+ * An agent reading older than this is reported but flagged. The agent beats every 15 s by default;
+ * a host configured for an interval longer than this (the agent allows up to an hour) always reads
+ * stale.
+ */
 export const AGENT_READING_STALE_SEC = 600;
 
 export const CERT_KINDS = [
@@ -39,7 +56,11 @@ export type CertKind = (typeof CERT_KINDS)[number];
 export type CertSource = "wire" | "loaded" | "file";
 
 export interface CertificateRow {
-  /** Unique within one report, stable across reports for the same thing. Use this as the name. */
+  /**
+   * Unique within one report. Use this as the name. Stable across reports while the set does not
+   * change: it is built from the VPC, the host (or, without one, the CN) and the source, so a renamed
+   * relay or CA gets a new id, and a `#n` suffix follows the order of the rows it disambiguates.
+   */
   id: string;
   kind: CertKind;
   vpc: string | null;
@@ -91,8 +112,11 @@ export interface InventoryInput {
   now: Date;
   /** One per configured relay, in configuration order — reachable or not. */
   relays: readonly RelayResult[];
-  /** Per configured VPC: the client certificate presented to its relay, and its CA. */
-  vpcFiles: ReadonlyArray<{ vpc: string; client: FileReading; ca: FileReading }>;
+  /**
+   * Per configured VPC: the client certificate presented to its relay, and its CA. `caBlocks` is how
+   * many certificates the CA file holds; only the first is read, so more than one is a gap to report.
+   */
+  vpcFiles: ReadonlyArray<{ vpc: string; client: FileReading; ca: FileReading; caBlocks?: number }>;
   manager: {
     /** The certificate this process is serving — fixed at start. */
     loaded: CertFacts;
@@ -110,18 +134,36 @@ const isFacts = (r: FileReading): r is CertFacts => !("error" in r);
 
 const digest = (s: string) => `sha256:${createHash("sha256").update(s).digest("hex")}`;
 
-/** An identifying string, kept whole when it fits and replaced by its digest when it does not. */
+/**
+ * An identifying string, kept whole when it fits and replaced by its digest when it does not.
+ *
+ * Takes anything because some of what it is handed came from a relay's JSON: a value that is not a
+ * string is digested too, so a malformed answer cannot carry an oversized array or object through.
+ */
 function ident(s: string): string;
-function ident(s: string | null): string | null;
-function ident(s: string | null): string | null {
-  if (s === null) return null;
+function ident(s: unknown): string | null;
+function ident(s: unknown): string | null {
+  if (s === null || s === undefined) return null;
+  if (typeof s !== "string") return digest(JSON.stringify(s) ?? String(s));
   return s.length <= MAX_WIRE_STRING ? s : digest(s);
+}
+
+/** Whether a relay's agent-certificate reading has the shape this module reads. */
+function isAgentReading(c: unknown): c is CertFacts & { observedAt: string } {
+  if (!c || typeof c !== "object") return false;
+  const r = c as Record<string, unknown>;
+  return (r.cn === null || typeof r.cn === "string")
+    && ["serial", "sha256", "notBefore", "notAfter", "observedAt"].every((k) => typeof r[k] === "string");
 }
 
 /** Explanatory text, shortened to fit. Never used for anything a consumer keys on. */
 export function prose(s: string): string {
   const mark = "…[truncated]";
-  return s.length <= MAX_WIRE_STRING ? s : s.slice(0, MAX_WIRE_STRING - mark.length) + mark;
+  if (s.length <= MAX_WIRE_STRING) return s;
+  let head = s.slice(0, MAX_WIRE_STRING - mark.length);
+  // Not half of a surrogate pair: a lone surrogate is not valid UTF-8 on the way out.
+  if (/[\uD800-\uDBFF]$/.test(head)) head = head.slice(0, -1);
+  return head + mark;
 }
 
 const zero = (): Record<CertKind, number> =>
@@ -171,11 +213,21 @@ export function certificateInventory(input: InventoryInput): CertificateReport {
     if (r.relayCert) add("relay-server", r.name, null, r.relayCert, "wire", "manager", at, false);
     else lack("relay-server", r.name, null, "relay answered but its certificate could not be read");
 
+    // No manifest — a relay just restarted, or refusing the bundle on disk — lists no hosts, which
+    // would otherwise read as a VPC with no agents to watch.
+    if (r.view.generation === null) {
+      lack("agent", r.name, null, "relay has no manifest loaded — the agents behind it cannot be counted");
+      continue;
+    }
     for (const h of r.view.hosts) {
       expected.agent++;
-      const c = h.agentCert ?? null;
-      if (!c) {
+      const c: unknown = h.agentCert ?? null;
+      if (c === null) {
         lack("agent", r.name, h.host, "no heartbeat certificate recorded by the relay since it started");
+        continue;
+      }
+      if (!isAgentReading(c)) {
+        lack("agent", r.name, h.host, "the relay's certificate reading for this host is malformed");
         continue;
       }
       const ageSec = (now.getTime() - new Date(c.observedAt).getTime()) / 1000;
@@ -190,6 +242,10 @@ export function certificateInventory(input: InventoryInput): CertificateReport {
     expected.ca++;
     if (isFacts(f.ca)) add("ca", f.vpc, null, f.ca, "file", "manager", at, false);
     else lack("ca", f.vpc, null, f.ca.error);
+    // A CA file holding the old and new CA during a rotation: the second one's expiry is not read.
+    if ((f.caBlocks ?? 1) > 1) {
+      lack("ca", f.vpc, null, `the CA file holds ${f.caBlocks} certificates; only the first is reported`);
+    }
   }
 
   expected["manager-server"] += 2;
@@ -200,7 +256,7 @@ export function certificateInventory(input: InventoryInput): CertificateReport {
   for (const o of input.operators ?? []) {
     expected.operator++;
     if (isFacts(o.reading)) add("operator", null, null, o.reading, "file", "manager", at, false);
-    else lack("operator", null, ident(o.file), o.reading.error);
+    else lack("operator", null, null, `${o.file}: ${o.reading.error}`);
   }
 
   const observed = zero();

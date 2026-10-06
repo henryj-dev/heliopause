@@ -35,8 +35,9 @@ export function certState(
   const when = notAfter instanceof Date ? notAfter : notAfter ? new Date(notAfter) : null;
   if (!when || Number.isNaN(when.getTime())) return { state: "unknown", daysLeft: null };
   const ms = when.getTime() - now.getTime();
+  // Expired: whole days since, negated — a certificate one second past its end is 0 days, not -1.
+  if (ms <= 0) return { state: "expired", daysLeft: -Math.floor(-ms / DAY_MS) || 0 };
   const daysLeft = Math.floor(ms / DAY_MS);
-  if (ms <= 0) return { state: "expired", daysLeft };
   if (daysLeft <= CRITICAL_DAYS) return { state: "critical", daysLeft };
   if (daysLeft <= RENEW_BEFORE_DAYS) return { state: "renew", daysLeft };
   return { state: "ok", daysLeft };
@@ -52,7 +53,12 @@ export interface CertFacts {
   notAfter: string;
 }
 
-/** Facts from a PEM certificate. Throws on anything that is not one. */
+/** How many certificates a PEM file holds. `certFactsFromPem` reads only the first. */
+export function pemCertificateCount(pem: string | Buffer): number {
+  return (String(pem).match(/-----BEGIN CERTIFICATE-----/g) ?? []).length;
+}
+
+/** Facts from the first certificate in a PEM file. Throws on anything that is not one. */
 export function certFactsFromPem(pem: string | Buffer): CertFacts {
   const x = new X509Certificate(pem);
   return {

@@ -26,8 +26,13 @@ describe("certState", () => {
   });
 
   it("calls a certificate past notAfter expired, including the instant itself", () => {
-    assert.equal(certState(inDays(0), NOW).state, "expired");
+    assert.deepEqual(certState(inDays(0), NOW), { state: "expired", daysLeft: 0 });
     assert.deepEqual(certState(inDays(-2), NOW), { state: "expired", daysLeft: -2 });
+  });
+
+  it("counts whole days since expiry, so one second past is 0 days ago and not 1", () => {
+    assert.deepEqual(certState(new Date(NOW.getTime() - 1000), NOW), { state: "expired", daysLeft: 0 });
+    assert.deepEqual(certState(inDays(-1.5), NOW), { state: "expired", daysLeft: -1 });
   });
 
   it("is unknown — not ok — for a date it cannot read", () => {
@@ -87,7 +92,8 @@ describe("certFactsFromPeer", () => {
   });
 
   it("refuses an incomplete presentation rather than recording half of it", () => {
-    // `getPeerCertificate()` returns `{}` when the peer sent nothing.
+    // `getPeerCertificate()` returns `{}` when the peer sent nothing — and, on the client side, when
+    // the TLS session was resumed (see `relayAgent` in manager-server.ts).
     assert.equal(certFactsFromPeer({}), null);
     assert.equal(certFactsFromPeer(null), null);
     assert.equal(certFactsFromPeer({ ...peer, valid_to: undefined }), null);

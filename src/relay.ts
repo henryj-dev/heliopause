@@ -732,8 +732,8 @@ export function handleHeartbeat(
   }
 
   state.lastSeen[certCN] = at;
-  // Filed exactly where the status is filed — after the manifest check above — so a host gets a row
-  // here if and only if it gets one in `statuses`. A beat without a readable certificate leaves the
+  // Filed where the status is filed — after the manifest check above — so a host gets a row here only
+  // if it gets one in `statuses`. A beat without a readable certificate leaves the
   // previous reading in place: that reading still says when it was taken, and its absence is not
   // evidence of a newer certificate.
   if (presented) state.agentCerts[certCN] = { ...presented, observedAt: at };

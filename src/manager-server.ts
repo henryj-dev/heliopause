@@ -46,7 +46,7 @@
 // directory, and `heliopause-status` reads a relay directly. Verified by killing it and using all
 // three.
 
-import { createServer, request, type Server } from "node:https";
+import { Agent, createServer, request, type Server } from "node:https";
 import { createSecureContext, type SecureContext, type TLSSocket } from "node:tls";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { readFile, readdir, realpath } from "node:fs/promises";
@@ -145,7 +145,7 @@ import { certificateIsRevoked } from "./certificate-revocation.ts";
 import { MAX_REVOCATION_ROWS, serializeRevocationSnapshot } from "./revocation-snapshot.ts";
 import { daysUntilExpiry } from "./cert-api.ts";
 import type { CertBundle } from "./cert-api.ts";
-import { certFactsFromPeer, certFactsFromPem, type CertFacts } from "./cert-watch.ts";
+import { certFactsFromPeer, certFactsFromPem, pemCertificateCount, type CertFacts } from "./cert-watch.ts";
 import { certificateInventory, certificateProblems, prose, type CertificateReport, type FileReading } from "./cert-inventory.ts";
 import type { CertificateRevocation } from "./enrollment-store.ts";
 
@@ -941,6 +941,20 @@ function getFleetView(
 }
 
 /**
+ * The connection pool for relay calls: no TLS session resumption.
+ *
+ * A resumed TLS 1.3 session hands the client an empty `getPeerCertificate()`, and the relay's
+ * certificate is read from exactly that (`onPeer` below). With the global agent, every poll after the
+ * relay's 5 s keep-alive had closed the socket resumed — and the console polls every 10 s — so the
+ * relay's expiry was readable on the first poll only. Measured in review of #127: the second
+ * `/api/certificates` six seconds after the first reported the relay certificate as unreadable.
+ * A full handshake per relay call costs nothing at this rate.
+ *
+ * @see cert-endpoint.test.ts "still reads the relay's certificate after the connection has closed"
+ */
+const relayAgent = new Agent({ maxCachedSessions: 0 });
+
+/**
  * One request to one relay, with that VPC's credentials.
  *
  * Shared by the read and write paths deliberately. The certificate selection is the part that is easy
@@ -989,6 +1003,7 @@ function relayCall<T>(
         port: url.port,
         path: url.pathname,
         method,
+        agent: relayAgent,
         cert: tls.cert,
         key: tls.key,
         ca: tls.ca,
@@ -1540,7 +1555,12 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     const vpcFiles = await Promise.all(opts.relays.map(async (r) => {
       try {
         const creds = await loadRelayCreds(r);
-        return { vpc: r.name, client: certReading(creds.cert, r.pkiDir), ca: certReading(creds.ca, join(r.pkiDir, "ca.pem")) };
+        return {
+          vpc: r.name,
+          client: certReading(creds.cert, r.pkiDir),
+          ca: certReading(creds.ca, join(r.pkiDir, "ca.pem")),
+          caBlocks: pemCertificateCount(creds.ca),
+        };
       } catch (e) {
         return { vpc: r.name, client: { error: prose((e as Error).message) }, ca: await readCertFile(join(r.pkiDir, "ca.pem")) };
       }

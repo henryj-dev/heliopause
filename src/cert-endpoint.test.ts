@@ -23,6 +23,7 @@ const operatorsDir = join(dir, "known-operators");
 const store = join(dir, "enrollment.json");
 const closers: Array<() => void> = [];
 let relayPort = 0;
+let relayServer: Awaited<ReturnType<typeof startRelay>>["server"];
 let managerPort = 0;
 
 const issue = (...a: string[]) => execFileSync("node", ["bin/heliopause-pki.ts", "issue", pki, ...a], { stdio: "pipe" });
@@ -92,6 +93,7 @@ before(async () => {
     log: () => {},
   });
   relay.state.manifest = manifest;
+  relayServer = relay.server;
   relayPort = (relay.server.address() as { port: number }).port;
   closers.push(() => relay.server.close());
 
@@ -153,6 +155,18 @@ describe("GET /api/certificates", () => {
     assert.equal(relay.cn, "gw-01.dev");
   });
 
+  it("still reads the relay's certificate after the connection has closed", async () => {
+    // The production shape: the relay closes an idle socket after 5 s and the console polls every
+    // 10 s, so every poll but the first opens a new connection. A client that resumes the TLS session
+    // there is handed an empty peer certificate. Shortened here so the socket closes between polls.
+    relayServer.keepAliveTimeout = 50;
+    const relayRow = async () => (await call(managerPort, "/api/certificates", { as: "operator-ops" }))
+      .body.certificates.find((c: any) => c.kind === "relay-server" && c.vpc === "dev");
+    assert.ok(await relayRow(), "first poll");
+    await new Promise((r) => setTimeout(r, 300));
+    assert.ok(await relayRow(), "second poll, on a new connection, lost the relay certificate");
+  });
+
   it("reports its own certificates, the CA and the known operators from their files", async () => {
     const { body } = await call(managerPort, "/api/certificates", { as: "operator-ops" });
     const one = (kind: string, source: string, vpc: string | null = null) =>
@@ -172,7 +186,7 @@ describe("GET /api/certificates", () => {
     assert.deepEqual(gaps, [
       "agent dev k3s-01.dev",
       "agent prod -",
-      "operator - broken.pem",
+      "operator - -",
       "relay-server prod -",
     ]);
     assert.deepEqual(body.expected.byKind, {

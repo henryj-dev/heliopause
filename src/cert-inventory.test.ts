@@ -33,12 +33,17 @@ const base = (over: Partial<InventoryInput> = {}): InventoryInput => ({
 });
 
 /**
- * stardust cert-drift's acceptance rule, restated here as the contract this module must meet: any
- * string over 512 characters, or any `kind` outside `^[a-z][a-z-]{0,31}$`, makes it discard the whole
- * report. Restated rather than imported — it lives in another repository — and pinned by its own
- * known positives below, so a validator that accepts everything cannot make the other tests pass.
+ * Two of stardust cert-drift's reasons to discard a whole report — any string over 512 characters, any
+ * `kind` outside `^[a-z][a-z-]{0,31}$` — and only those two. A **partial** restatement: the
+ * consumer's type rules (a string `cn`, a numeric `daysLeft`, a parseable `notAfter`) are not here,
+ * and the cert-drift deployed with stardust #23 discarded reports this module produces on purpose for
+ * exactly those. Passing this says nothing about whether stardust accepts a report; stardust's own
+ * fixture, run against this module, is the authority on that.
+ *
+ * Pinned by its own known positives below, so a check that accepts everything cannot make the other
+ * tests pass.
  */
-function consumerRejects(report: unknown): string | null {
+function breaksLengthOrKindRule(report: unknown): string | null {
   const kind = /^[a-z][a-z-]{0,31}$/;
   const walk = (v: unknown, path: string): string | null => {
     if (typeof v === "string") return v.length > MAX_WIRE_STRING ? `${path}: ${v.length} characters` : null;
@@ -57,17 +62,17 @@ function consumerRejects(report: unknown): string | null {
   return walk(report, "$");
 }
 
-describe("the consumer's acceptance rule, as restated here", () => {
-  it("rejects what stardust rejects — the known positives that keep the other tests honest", () => {
-    assert.equal(consumerRejects({ s: "a".repeat(512) }), null);
-    assert.match(consumerRejects({ s: "a".repeat(513) }) ?? "", /513 characters/);
-    assert.match(consumerRejects({ rows: [{ kind: "agent-v2" }] }) ?? "", /agent-v2/);
-    assert.match(consumerRejects({ rows: [{ kind: "relay_server" }] }) ?? "", /relay_server/);
-    assert.equal(consumerRejects({ rows: [{ kind: "relay-server" }] }), null);
+describe("the length and kind rules, as restated here", () => {
+  it("rejects over-long strings and bad kinds — the known positives that keep the other tests honest", () => {
+    assert.equal(breaksLengthOrKindRule({ s: "a".repeat(512) }), null);
+    assert.match(breaksLengthOrKindRule({ s: "a".repeat(513) }) ?? "", /513 characters/);
+    assert.match(breaksLengthOrKindRule({ rows: [{ kind: "agent-v2" }] }) ?? "", /agent-v2/);
+    assert.match(breaksLengthOrKindRule({ rows: [{ kind: "relay_server" }] }) ?? "", /relay_server/);
+    assert.equal(breaksLengthOrKindRule({ rows: [{ kind: "relay-server" }] }), null);
   });
 
   it("accepts every kind this module can emit", () => {
-    for (const k of CERT_KINDS) assert.equal(consumerRejects({ kind: k }), null, k);
+    for (const k of CERT_KINDS) assert.equal(breaksLengthOrKindRule({ kind: k }), null, k);
   });
 });
 
@@ -81,7 +86,7 @@ describe("certificateInventory", () => {
       agent: 1, "relay-server": 1, "manager-client": 1, "manager-server": 2, ca: 1, operator: 0,
     });
     assert.deepEqual(r.observed.byKind, r.expected.byKind);
-    assert.equal(consumerRejects(r), null);
+    assert.equal(breaksLengthOrKindRule(r), null);
   });
 
   it("names a host the relay lists but has no certificate for, and is then incomplete", () => {
@@ -94,7 +99,7 @@ describe("certificateInventory", () => {
     assert.equal(r.observed.byKind.agent, 0);
   });
 
-  it("does not shrink when a relay is unreachable — the relay and its agents are named as missing", () => {
+  it("names an unreachable relay and its uncounted agents as missing; the agent count is then a lower bound", () => {
     const r = certificateInventory(base({
       relays: [
         relay("dev", [host("web-01.dev", { ...facts(), observedAt: NOW.toISOString() })]),
@@ -108,6 +113,45 @@ describe("certificateInventory", () => {
     );
     assert.match(r.missing[0]!.reason, /ECONNREFUSED/);
     assert.equal(r.expected.byKind["relay-server"], 2);
+    // Only dev's host is counted: prod's are behind the relay that did not answer.
+    assert.equal(r.expected.byKind.agent, 1);
+  });
+
+  it("does not read a relay without a manifest as a VPC with no agents", () => {
+    const empty = relay("dev", []);
+    (empty as { view: { generation: string | null } }).view.generation = null;
+    const r = certificateInventory(base({ relays: [empty] }));
+    assert.equal(r.complete, false);
+    assert.deepEqual(r.missing.map((m) => [m.kind, m.vpc, m.host]), [["agent", "dev", null]]);
+    assert.match(r.missing[0]!.reason, /no manifest/);
+  });
+
+  it("sends a malformed reading from a relay to missing rather than throwing or passing it through", () => {
+    const bad: unknown[] = [{}, "abc", { ...facts(), serial: 123, observedAt: NOW.toISOString() }, { ...facts(), cn: ["y".repeat(600)], observedAt: NOW.toISOString() }];
+    const r = certificateInventory(base({
+      relays: [relay("dev", bad.map((c, i) => host(`h${i}.dev`, c as HostView["agentCert"])))],
+    }));
+    assert.deepEqual(r.missing.map((m) => m.host), ["h0.dev", "h1.dev", "h2.dev", "h3.dev"]);
+    assert.ok(r.missing.every((m) => /malformed/.test(m.reason)));
+    assert.equal(r.observed.byKind.agent, 0);
+    assert.equal(breaksLengthOrKindRule(r), null);
+  });
+
+  it("digests an identifying value that is not a string instead of carrying it through", () => {
+    const r = certificateInventory(base({
+      relays: [relay("dev", [host(["z".repeat(600)] as unknown as string, { ...facts(), observedAt: NOW.toISOString() })])],
+    }));
+    assert.match(r.certificates.find((c) => c.kind === "agent")!.host!, /^sha256:[0-9a-f]{64}$/);
+    assert.equal(breaksLengthOrKindRule(r), null);
+  });
+
+  it("names the CAs a bundle file holds beyond the first", () => {
+    const r = certificateInventory(base({
+      vpcFiles: [{ vpc: "dev", client: facts(), ca: facts({ cn: "heliopause-ca" }), caBlocks: 2 }],
+    }));
+    assert.equal(r.observed.byKind.ca, 1);
+    assert.deepEqual(r.missing.map((m) => [m.kind, m.vpc]), [["ca", "dev"]]);
+    assert.match(r.missing[0]!.reason, /holds 2 certificates/);
   });
 
   it("reports the manager's serving and on-disk certificates separately, so a missed restart shows", () => {
@@ -139,7 +183,9 @@ describe("certificateInventory", () => {
     }));
     assert.equal(r.expected.byKind.operator, 2);
     assert.equal(r.observed.byKind.operator, 1);
-    assert.deepEqual(r.missing.map((m) => [m.kind, m.host]), [["operator", "broken.pem"]]);
+    // The file name goes in the reason, not in `host`: a consumer reads `host` as a host name.
+    assert.deepEqual(r.missing.map((m) => [m.kind, m.host]), [["operator", null]]);
+    assert.match(r.missing[0]!.reason, /^broken\.pem: not a certificate$/);
   });
 
   it("gives two operator files carrying one CN two different ids", () => {
@@ -162,7 +208,7 @@ describe("certificateInventory", () => {
     const hosts = r.certificates.filter((c) => c.kind === "agent").map((c) => c.host!);
     assert.equal(hosts[0], at512);
     assert.match(hosts[1]!, /^sha256:[0-9a-f]{64}$/);
-    assert.equal(consumerRejects(r), null);
+    assert.equal(breaksLengthOrKindRule(r), null);
   });
 
   it("does not let two long names that differ only past the limit collide", () => {
@@ -178,7 +224,7 @@ describe("certificateInventory", () => {
     assert.notEqual(rows[0]!.id, rows[1]!.id);
   });
 
-  it("meets the consumer's rule even when every input is hostile", () => {
+  it("keeps every string within 512 characters and every kind valid even when every input is hostile", () => {
     const huge = "x".repeat(5_000);
     const r = certificateInventory({
       now: NOW,
@@ -192,7 +238,7 @@ describe("certificateInventory", () => {
       manager: { loaded: facts({ cn: huge }), file: { error: huge } },
       operators: [{ file: huge, reading: { error: huge } }, { file: huge, reading: facts({ cn: huge }) }],
     });
-    assert.equal(consumerRejects(r), null);
+    assert.equal(breaksLengthOrKindRule(r), null);
     // And still a report: the unreadable expiry is `unknown`, not dropped and not `ok`.
     assert.equal(r.certificates.find((c) => c.kind === "agent")!.state, "unknown");
     const ids = r.certificates.map((c) => c.id);
@@ -206,6 +252,12 @@ describe("prose", () => {
     const cut = prose("a".repeat(513));
     assert.equal(cut.length, 512);
     assert.match(cut, /…\[truncated\]$/);
+  });
+
+  it("does not cut through a surrogate pair", () => {
+    const keep = 512 - "…[truncated]".length;
+    const cut = prose("a".repeat(keep - 1) + "😀" + "b".repeat(100));
+    assert.equal(cut, "a".repeat(keep - 1) + "…[truncated]");
   });
 });
 

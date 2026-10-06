@@ -607,20 +607,26 @@ outside the pattern returns an empty list rather than a refusal, so the route ca
 where the boundary is. Any other route answers 403 naming the token, and an
 unknown, expired or revoked token answers 401 saying only that. **An app token cannot sign, upload,
 reject or revoke anything** — short of `enrollment:host-deregister`, the worst a leaked one can do is
-mint node tokens inside its hostname pattern, read the CSR queue and read certificate expiries, and a certificate still requires an operator holding a one-time code.
+mint node tokens inside its hostname pattern, read the CSR queue, and — with `certificates:read` —
+enumerate every host name in every VPC with its certificate's expiry, and a certificate still requires an operator holding a one-time code.
 
-**`certificates:read` reaches `GET /api/certificates`** — every certificate the deployment depends
-on and how long each has left: each agent's client certificate as its relay saw it on the latest
+**`certificates:read` reaches `GET /api/certificates`** — the certificates this deployment's own PKI
+issues and depends on, and how long each has left: each agent's client certificate as its relay saw it on the latest
 heartbeat, each relay's server certificate as the manager saw it on the wire, the manager's own client
 certificate and CA per VPC, its server certificate both as served and as on disk (they differ after a
 rotation the process has not been restarted for), and the operators' public certificates in
-`HELIOPAUSE_KNOWN_OPERATORS_DIR`. Each row carries `state` — `ok`, `renew` (inside the
+`HELIOPAUSE_KNOWN_OPERATORS_DIR`. Not the public (SNI) console certificate: cert-manager issues and
+renews that one, and it is watched where cert-manager's certificates are. Each row carries `state` — `ok`, `renew` (inside the
 `RENEW_BEFORE_DAYS` window), `critical` (7 days), `expired` or `unknown` — and the thresholds travel in
-the report. The expected set is derived from configuration, not from what answered, so an unreachable
-relay is `complete: false` with the gap named in `missing` rather than a shorter list. **This scope is
-fleet-wide: the hostname pattern does not narrow it**, because a monitor that sees part of the fleet
-reports the rest as healthy by omission, and the CA, manager and operator rows have no hostname to
-match. Every string is at most 512 characters; an identifying one that would be longer is replaced by
+the report. The expected set is derived from configuration, not from what answered: an unreachable
+relay, or one without a manifest, makes the report `complete: false` and is named in `missing` along
+with an entry for the agents behind it. Those agents cannot be counted, so `expected.byKind.agent` is
+then a lower bound — read `complete`, not the totals. **This scope is fleet-wide: the hostname pattern
+does not narrow it**, because a monitor that sees part of the fleet reports the rest as healthy by
+omission, and the CA, manager and operator rows have no hostname to match. That is a deliberate
+exception to the boundary above: a `certificates:read` token, whatever its pattern, is told every VPC's
+name and every host name in every relay's manifest, along with certificate serials and fingerprints and
+the manager's own file paths in `missing[].reason`. Every string is at most 512 characters; an identifying one that would be longer is replaced by
 its SHA-256 rather than cut, so two rows cannot collide. Operators reach the same report at
 `/api/certificates` with their certificate or session, and the fleet view lists every certificate in
 `renew` or worse under `problems`.
