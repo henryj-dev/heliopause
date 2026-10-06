@@ -93,19 +93,60 @@ HELIOPAUSE_ARTIFACT_SIGNING_KEY_FILE=/etc/heliopause/artifact-signing.key
 **에이전트** — 공개키만, 링별 디렉터리로.
 
 ```
-/etc/heliopause/trust/manager/       artifact-signing.pub
-/etc/heliopause/trust/break-glass/   break-glass.pub
+/etc/heliopause/trust/manager/       manager.pub        ← 이름은 예시다. 아래를 볼 것
+/etc/heliopause/trust/break-glass/   break-glass.pub    ← 같다
 
 HELIOPAUSE_MANAGER_SIGNING_KEYS_DIR=/etc/heliopause/trust/manager
 HELIOPAUSE_BREAK_GLASS_KEYS_DIR=/etc/heliopause/trust/break-glass
 ```
 
-디렉터리는 심볼릭 링크가 아니어야 하고 group/other 쓰기가 없어야 하며, 안의 파일도 같다. 에이전트는
-**기동 시** 둘 다 읽는다 — 권한이 틀렸거나 Ed25519 가 아닌 파일이 있으면 거기서 종료한다. 세대가
-도착할 때가 아니라. 롤아웃 중에 키링이 틀렸다는 것을 알게 되는 것이 이 순서가 막는 일이다.
+🔑 **파일 이름은 임의다.** 에이전트는 디렉터리의 **모든 파일**을 읽는다(`.` 로 시작하는 것만
+건너뛴다). 위의 두 이름은 예시이고, 요구가 아니다 — 위 생성 절은 `artifact-signing.pub` 으로
+만들지만 **함대에는 `manager.pub` 로 깔려 있고 둘 다 맞다.** 생성 때의 이름과 배치 때의 이름이
+같아야 할 이유가 없다. 이
+문단은 오래 `artifact-signing.pub` 만 적어 두어, 실측과 어긋난 쪽이 **문서가 낡은 것인지 설치가
+틀린 것인지** 가릴 수 없게 만들었다.
 
-**두 링 모두 필요하다.** break-glass 를 안 쓸 작정이어도 그렇다. 디렉터리가 없는 것과 링이 빈 것은
-검증기에게 같은 것이고, 그러면 설정되지 않은 호스트와 아무것도 신뢰하지 않는 호스트를 구별할 수 없다.
+코드가 실제로 검사하는 것은 **권한·크기·개수·알고리즘**이다(`agent/heliopause-pull.py:4047-4075`):
+
+| 검사 | 값 |
+|---|---|
+| 디렉터리 | 심볼릭 링크 아님 · group/other 쓰기 없음 |
+| 각 파일 | 정규 파일 · 심볼릭 링크 아님 · group/other 쓰기 없음 |
+| 파일 크기 | **64 KiB** 이하 |
+| 링별 개수 | **8개**(`MAX_SIGNING_KEYS_PER_CLASS`, `:298`) 이하 |
+| 파싱 | `openssl pkey -pubin` 이 읽어 DER 로 내고, 그 DER 이 **4096 바이트** 이하 |
+| **알고리즘** | 🔴 **Ed25519 여야 한다** — DER 이 **정확히 44 바이트**이고 **Ed25519 OID**(DER 바이트 `06 03 2b 65 70`)를 담아야 한다(`:4073-4075`) |
+
+에이전트는 **기동 시** 둘 다 읽는다 — 위 중 하나라도 틀린 파일이 있으면 거기서 종료한다. 세대가
+도착할 때가 아니라.
+
+⚠️ 이 표는 처음 **알고리즘 줄 없이** 적혀 있었고, 그러면서 원래 있던 「Ed25519 가 아닌 파일이 있으면
+종료한다」를 지웠다 — **RSA·EC 키가 권한·크기·파싱을 다 통과하고도 기동에서 죽는다.** 표로 바꾸면서
+요구 하나를 없앤 셈이고, 독립 리뷰가 잡았다. 롤아웃 중에 키링이 틀렸다는 것을 알게 되는 것이 이 순서가 막는 일이다.
+
+**두 링의 디렉터리는 모두 있어야 한다.** break-glass 를 안 쓸 작정이어도 그렇다 — 두 변수가 모두
+설정돼야 하고, 가리키는 디렉터리가 없으면 `os.lstat` 에서 죽는다(`:4046-4049`).
+
+⚠️ 여기에는 오래 「**디렉터리가 없는 것과 링이 빈 것은 검증기에게 같은 것**」이라고 적혀 있었다.
+**그건 틀렸다.** 검사는 **두 링의 합계**에 걸린다(`:4085-4088`):
+
+```python
+rows  = _load_artifact_key_dir(MANAGER_SIGNING_KEYS_DIR, "manager")
+rows += _load_artifact_key_dir(BREAK_GLASS_KEYS_DIR, "break-glass")
+if not rows:
+    raise ValueError("no artifact signing public key is configured")
+```
+
+| 상황 | 결과 |
+|---|---|
+| 변수가 비었거나 디렉터리가 없다 | **실패** |
+| 디렉터리는 둘 다 있고 **한 링이 빈다**, 다른 쪽에 키가 있다 | **통과한다** |
+| 디렉터리는 둘 다 있고 **둘 다 빈다** | 실패 |
+
+그래서 **결론(두 디렉터리가 다 있어야 한다)은 맞고 이유가 틀렸다.** 틀린 이유를 적어 두면, 한 링을
+비워 두고 통과한 호스트를 보고 **검증기가 고장 났다고 읽게 된다.** 독립 리뷰가 잡았다 — 내가 바로
+위 표를 다시 쓰면서 **이 문장을 읽지 않았다.**
 
 ## 교체 — 순서가 전부다
 

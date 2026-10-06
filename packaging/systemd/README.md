@@ -8,12 +8,71 @@
 | `heliopause-agent-applier.conf` | 지정된 Cilium 적용자 한 대만 쓰는 kubeconfig 가시성 drop-in |
 | `heliopause-enroll.service` · `.timer` | 호스트가 로컬 키로 CSR을 만들고 승인된 인증서를 회수 |
 | `heliopause-agent.path` | 회수된 `agent.pem` 이 나타나는 순간 에이전트를 켠다 — 등록으로 부팅하는 호스트용 |
-| `heliopause-relay.service` | 각 VPC의 gw (node 22+, `DynamicUser`, 무권한) |
+| `heliopause-relay.service` | 각 VPC의 gw (**node 22.18+** — 아래 §0, `DynamicUser`, 무권한) |
 | `heliopause-revocation-writer.service` · `.socket` | relay가 직접 수정할 수 없는 단조 폐기목록 writer |
 | `heliopause-revocations.conf` | 잠긴 writer 계정과 relay socket 제출 보조그룹 (`sysusers.d`) |
 | `agent.env.example` · `relay.env.example` | `/etc/heliopause/`에 놓을 환경파일 |
 
-## 0. 인증서 — 먼저
+## 0. gw 의 node — **인증서보다 먼저**
+
+에이전트는 python3 이고 **node 가 필요 없다.** 릴레이만 필요하다.
+
+유닛이 `.ts` 를 **직접** 실행하고(`ExecStart=/usr/bin/node /opt/heliopause/bin/heliopause-relay.ts`)
+유닛에 `NODE_OPTIONS` 도 `--experimental-strip-types` 도 **없다** — 그래서 타입 스트리핑이 **플래그
+없이 켜지는** 버전이어야 한다. node 22 계열에서 그것은 **22.18.0** 부터다(Node 공식 문서).
+
+🔴 **이 저장소는 하한을 적어 두지 않는다.** `package.json` 에 `engines` 가 **없고**, `Dockerfile.manager`
+에도 없다. 말하는 자리는 CI 뿐이고(`.github/workflows/ci.yml` 의 `node-version: "22"` 네 군데),
+그것은 **러너가 주는 22.x 에서 돈다**는 뜻이지 하한이 아니다. 그러므로 **22.18.0 은 Node 쪽 사실이고
+이 저장소의 선언이 아니다.**
+
+⚠️ 이 문단은 한동안 「하한은 22.6 이고 `package.json` 이 `>=22.6.0` 을 고정한다」고 적혀 있었다.
+**그 핀은 존재하지 않았고 그 수도 틀렸다** — 22.6~22.17 은 이 유닛을 그대로 돌릴 수 없다. 독립
+리뷰가 잡았다.
+
+설치 직후 확인 둘:
+
+```bash
+/usr/bin/node --version                                   # 22.18.0 이상
+
+(
+  d=$(mktemp -d) || exit 1
+  trap 'rm -rf "$d"' EXIT
+  printf 'const n: number = 1; process.exit(n - 1);\n' > "$d/strip-probe.ts" || exit 1
+  if /usr/bin/node "$d/strip-probe.ts"; then
+    echo "타입 스트리핑 OK"
+  else
+    echo "이 node 로는 안 된다" >&2
+    exit 1
+  fi
+)
+```
+
+🔑 **릴레이 진입점으로 확인하지 말 것.** `--help` 핸들러가 **없다**(`bin/heliopause-relay.ts` 는
+`--lang` 만 본다) — 설정이 없으면 env 누락으로 죽고, 있으면 **릴레이를 실제로 기동하려 든다.** 그리고
+`| head` 는 node 의 종료 코드를 가린다. 위 프로브는 **실패를 종료 코드 1 로 돌려주고**, 자기만의
+디렉터리를 `mktemp -d` 로 만들어 `trap` 으로 지운다. **서브셸로 감싸** 호출한 셸의 trap 을 건드리지
+않고, `mktemp` 나 쓰기가 실패하면 **거기서 멈춘다.**
+
+⚠️ 이 프로브는 세 판에 걸쳐 세 번 틀렸고, **매번 그것을 설명하는 문장이 함께 틀렸다**:
+
+| 판 | 명령 | 같이 적혀 있던 문장 |
+|---|---|---|
+| 1 | `heliopause-relay.ts --help \| head -3` | 「확인」 — 실제로는 **릴레이를 기동하려 들고** `head` 가 종료 코드를 가린다 |
+| 2 | `/tmp/strip-probe.ts` 에 쓰고 지움 | 「**부작용이 없고**」 — 네 줄 아래에 적혀 있었다 |
+| 3 | `mktemp -d && trap … EXIT`, 양쪽 `echo` | 「**종료 코드로 답하고**」 — 두 분기가 다 `echo` 로 끝나 **항상 0** 이다 |
+
+3판은 그 외에도 **호출한 셸의 EXIT trap 을 갈아치우고**, `mktemp` 가 실패하면 `$d` 가 비어 **`/strip-probe.ts`
+에 쓴다.** 위 형태는 독립 리뷰가 쓴 것을 그대로 썼다.
+
+🔑 **경로도 맞아야 한다.** 유닛이 `/usr/bin/node` 를 **절대 경로로** 쓴다. tarball 로 `/usr/local` 에
+깔면 심볼릭 링크를 걸어야 하고, 안 걸면 `203/EXEC` 다.
+
+**Bun 은 안 된다.** 유닛 주석이 그 이유를 측정으로 적는다 — Bun 은 `requestCert` 를 집행하지만 peer
+인증서를 읽을 수 없어, 릴레이가 어느 에이전트가 부르는지 알 수 없고 모든 하트비트의 `host` 가 검증되지
+않은 주장이 된다.
+
+## 1. 인증서 — 그다음
 
 **외부 PKI가 필요하지 않다.** heliopause가 자체 발급한다.
 
