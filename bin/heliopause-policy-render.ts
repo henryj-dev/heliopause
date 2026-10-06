@@ -48,7 +48,7 @@ import { oneLine } from "../src/log-scrub.ts";
 import { boundedInteger, ENV_BOUNDS, parsePolicySites } from "../src/env-spec.ts";
 import { zoneMismatch, ZoneMismatchError } from "../src/site-zone.ts";
 import { armedReasons } from "../src/policy-render-guard.ts";
-import { collectPolicySource, type PolicySource } from "../src/policy-source.ts";
+import { collectPolicySource, parsePolicySource, type PolicySource } from "../src/policy-source.ts";
 import { policyHead, type ScreenSite } from "../src/policy-screen.ts";
 import { installCliLanguage } from "../src/operator-i18n.ts";
 
@@ -194,6 +194,19 @@ const arm = setTimeout;
 const disarm = clearTimeout;
 const readClock = Date.now;
 const toJson = JSON.stringify;
+// ## The wire pair, captured for the same reason and with the same limit
+//
+// `evaluated` serialises the outgoing `PolicySource` and its caller parses it back. Both functions
+// are resolved here, before the first `import()`, because a policy module runs in this realm and a
+// call-time lookup would be the module's function — and the value being serialised is the one thing
+// a module fully controls.
+//
+// ⚠️ Capturing the function is not the same as the operation being safe. `JSON.stringify` calls a
+// `toJSON` it finds **on the value**, inherited ones included, so a poisoned `Object.prototype` is
+// not closed by this line — that is why the caller treats a throw here as this site's failure
+// rather than assuming the conversion cannot throw.
+const writeWire = JSON.stringify;
+const parseWire = JSON.parse;
 
 // ## ⚠️ What this does **not** do, stated because leaving it implied is the same silence
 //
@@ -577,7 +590,19 @@ if (!token) {
 // stamp is computed from. One slot for all of them would make every request to a second site a
 // miss, which is merely wasteful; a key that drops the site is what serves one VPC's payload under
 // another's name, which is the failure this whole change exists to stop.
-const cached = new Map<string, { stamp: string; source: PolicySource }>();
+// ## The cache holds the wire bytes, not a parsed value
+//
+// It held the object `collectPolicySource` returned, and the first version of the evaluation seam
+// kept that while adding a parse in front of it. That combination served **two different payloads
+// for one evaluation**: `parsePolicySource` defaults an absent `site.cfg.protectedHosts` by writing
+// it **into the value it was given** (`src/policy-source.ts:247`), so the first response — written
+// from the bytes — omitted the field and the second — served from the parsed object — carried it.
+//
+// Bytes remove the question. There is one representation, it is the one that crossed the boundary,
+// and a later change that evaluates in a worker returns exactly this type.
+//
+// @see src/policy-render-service.test.ts "answers the same payload on a cache miss and a cache hit"
+const cached = new Map<string, { stamp: string; wire: string }>();
 
 /**
  * What can change what `/source` should answer, in one string — as much of it as this can see.
@@ -779,7 +804,7 @@ function hostIdsOf(site: ScreenSite): string[] {
   return hosts.map((h) => toText(h?.id ?? "")).filter(Boolean);
 }
 
-async function currentSource(site: { name: string | null; path: string }): Promise<PolicySource> {
+async function currentSource(site: { name: string | null; path: string }): Promise<string> {
   const { name, path: sitePath } = site;
   // ## 🔴 No complete stamp is a refusal, and the first version of this served instead
   //
@@ -812,7 +837,7 @@ async function currentSource(site: { name: string | null; path: string }): Promi
   }
   const stamp = stamped;
   const hit = cached.get(sitePath);
-  if (hit && hit.stamp === stamp) return hit.source;
+  if (hit && hit.stamp === stamp) return hit.wire;
   // Before the import, so the hook above knows which tree this evaluation may version.
   policyRoots.add(`${pathToFileURL(realpathSync(dirname(resolve(sitePath)))).pathname}/`);
   // The import specifier still needs a value that moves, and `stamp` is not URL-safe.
@@ -853,6 +878,16 @@ async function currentSource(site: { name: string | null; path: string }): Promi
     // The narrowed value, not `mod` plus a `!` at the use. The guard above is twenty lines from the use
     // and the compiler cannot see across the call, so an assertion there rested on an accident:
     // deleting the guard reported `TS2345` at an unrelated line, and adding `!` there too went silent.
+    // ## Bytes out of the evaluation step, a value back in — and the parse is the check
+    //
+    // `evaluated` serialises the whole outgoing `PolicySource` (see there for why), so what crosses
+    // this line is wire text. Parsing it with `parsePolicySource` is not a formality: that function
+    // is the manager's own validator for this payload, and running it here means the renderer refuses
+    // the same shapes its reader would — a function on `site`, a non-array `repo.probes` — at the
+    // site that produced them rather than at the far end of a request.
+    //
+    // Bytes. `evaluated` validates and caches them; this is the boundary a later change moves into a
+    // worker, and nothing about the signature changes when it does.
     return await evaluated({ site: mod.site, name, sitePath, stamp });
   } catch (e) {
     // Only ours passes through. A `ZoneMismatchError` reaching here came from the module -- the
@@ -872,7 +907,7 @@ async function currentSource(site: { name: string | null; path: string }): Promi
  *  tell a failure here — where the check ran — from one before it. */
 async function evaluated(
   input: { site: ScreenSite; name: string | null; sitePath: string; stamp: string },
-): Promise<PolicySource> {
+): Promise<string> {
   const { site: siteValue, name, sitePath, stamp } = input;
   const source = collectPolicySource({
     site: siteValue, sitePath, allowPaths,
@@ -890,9 +925,49 @@ async function evaluated(
   // null one above the scan cap. Two earlier versions of this line carried a `stamp !== null` guard —
   // one of them dead, because it sat where the value had already been replaced by a substitute — and
   // the substitute was what leaked. The refusal upstream is what makes this unconditional again.
-  cached.set(sitePath, { stamp, source });
+  const wire = writeWire(source);
+  // ## Validated with the manager's own reader, and the result is thrown away
+  //
+  // `parsePolicySource` is what the far side runs on this payload, so running it here means the
+  // renderer refuses the shapes its reader would — a function on `site`, a non-array `repo.probes` —
+  // at the site that produced them rather than at the far end of a request.
+  //
+  // 🔴 **The parsed value is discarded on purpose.** It is not the same value: that function defaults
+  // an absent `site.cfg.protectedHosts` by writing into what it was given
+  // (`src/policy-source.ts:247`). Caching or serving it would ship a field the evaluated bytes do
+  // not have — which is exactly the two-different-payloads defect the cache comment describes. The
+  // call is a gate, not a conversion.
+  //
+  // ⚠️ That in-place default is a defect in its own right on the manager's side; it is filed rather
+  // than fixed here, because that function has callers this change does not survey.
+  void parsePolicySource(parseWire(wire));
+  cached.set(sitePath, { stamp, wire });
   log(`evaluated ${name ?? label} at ${source.head.sha ?? "unknown"}${source.head.dirty ? " (dirty)" : ""}`);
-  return source;
+  // ## Serialised here, and the caller receives bytes
+  //
+  // `collectPolicySource` applies `toWire` to `site` and to the resolver results, and to nothing
+  // else: `repo.probes` is carried in as `readCoverageProbes` returned it, past that conversion
+  // (`src/policy-source.ts:437`). So "a `PolicySource` holds only JSON-representable values" is
+  // false, and each attempt to say how far the conversion reaches was wrong one step further along.
+  // Serialising the **whole** outgoing value here removes the question: there is no partial answer
+  // left to give, so no later step has to re-derive which half already crossed.
+  //
+  // It is also where a serialisation failure now lands. Whatever cannot be written here fails **this
+  // site, at evaluation**, instead of reaching the cache and throwing later in `send` on a request
+  // unrelated to the commit that introduced it.
+  //
+  // ⚠️ That is the one **behaviour change** here, and it is deliberate.
+  //
+  // ⚠️ **A probe file cannot be what triggers it, and the first version of this comment said it
+  // could.** `readCoverageProbes` builds probes with `JSON.parse` on `coverage-*.json`, so every
+  // value it yields is a plain object, array, string, number, boolean or null — all of which
+  // stringify. Measured: a parsed probe object round-trips, and the only way to make that call throw
+  // is a poisoned `Object.prototype.toJSON`, which is the **module's** doing and reaches every
+  // `JSON.stringify` in the process, not a property of the probe file. The reachable trigger is the
+  // module, which is why the capture above says so.
+  //
+  // @see src/policy-render-service.test.ts "survives a module that replaces the globals it will be described with"
+  return wire;
 }
 
 /**
@@ -1039,8 +1114,8 @@ let readyMemo: {
 function evaluateWithin(
   site: { name: string | null; path: string },
   budgetMs: number,
-): Promise<PolicySource> {
-  return new Promise<PolicySource>((resolve, reject) => {
+): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
     // ## Deliberately **not** `unref`'d, and the first draft was
     //
     // At startup this is awaited at the module's top level. An `unref`'d timer does not hold the
@@ -1059,7 +1134,7 @@ function evaluateWithin(
       // No `try` around `resolve`. Resolving an object does read `.then` off it, and a module can
       // make that throw — but `currentSource` resolves its own object first, so its promise rejects
       // and this handler is never entered. Written, then deleted when no mutation could make it fire.
-      (source) => { disarm(timer); resolve(source); },
+      (wire) => { disarm(timer); resolve(wire); },
       // `asError`, not a cast. `throw null` in a policy module rejected the import with `null`,
       // which `/source`'s handler then read `.message` off — a `TypeError` in a rejection handler,
       // so an unhandled rejection, so **exit 1 on the first request**. The startup loop had its own
@@ -1365,7 +1440,11 @@ const server = createServer((req, res) => {
     // bounded at the same number as the manager's abort, this side loses the race every time and the
     // sentence still never ships.
     void evaluateWithin(site, SOURCE_SITE_BUDGET_MS).then(
-      (source) => send(200, source),
+      // `raw`, not `send`. The body is already the wire text this evaluation produced; `send` takes a
+      // **value** and writes it with the captured `JSON.stringify`, so passing the string there would
+      // send a JSON string literal rather than the object. `raw` writes what it is given and sets
+      // `content-length` from it — the same path `/healthz` uses for its literal body.
+      (wire) => raw(200, wire),
       (e: Error) => {
         // The manager turns this into a 503 with this sentence in it. An empty page there would read
         // as "no policy", which is a different and much worse claim than "the policy will not load".
@@ -1428,8 +1507,11 @@ const pending = sites.map(async (site) => {
   // Nothing was declared, so there is nothing to contradict.
   if (site.name === null) return;
   try {
-    const source = await evaluateWithin(site, STARTUP_SITE_BUDGET_MS);
-    log(`verified ${site.name} — ${source.site.hosts?.length ?? 0} hosts`);
+    const wire = await evaluateWithin(site, STARTUP_SITE_BUDGET_MS);
+    // Parsed only to count hosts for this line. `evaluateWithin` now carries the wire bytes, and the
+    // one thing startup wants from them is a number to print — so the parse is local to the log
+    // rather than something the evaluation path hands around.
+    log(`verified ${site.name} — ${parsePolicySource(parseWire(wire)).site.hosts?.length ?? 0} hosts`);
   } catch (e) {
     failures.push({ site, error: asError(e) });
   }
