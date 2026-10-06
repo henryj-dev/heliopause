@@ -17,8 +17,22 @@
 //
 // ── Safety invariants ─────────────────────────────────────────────────────────
 //   · Only ever touches its own table. firewalld / existing iptables rules are untouched.
-//   · Creates `input` and `output` hooks only. `forward` is never touched, so routed traffic
-//     and container/VM networking are unaffected.
+//   · Creates `input` and `output` hooks on every host. A `forward` chain is created only for a
+//     host that `cfg.forward.hosts` matches (`forwardRules`), and its chain policy is always
+//     `accept` — so a host with no forward config keeps whatever another table has on that hook,
+//     and one with it does not become a default-deny surface there. What the rules *inside* that
+//     chain drop is `ForwardConfig`'s business, not this line's.
+//
+//     ⚠️ This read "`forward` is never touched" long after the chain existed. That was not a small
+//     slip: a false entry in a list of safety invariants makes the true ones unreadable too, since
+//     a reader cannot tell which kind they are holding. And the old line's second half does not
+//     survive narrowing: what `accept` buys is only that this chain adds no default-deny on that
+//     hook. Its configured rules do deny — `forwardRules` drops invalid packets and traffic
+//     entering `internalSupernet` from outside it. So routed and container/VM traffic is *not*
+//     guaranteed unaffected; read `ForwardConfig` for what a given site denies there.
+//
+//     @see the forward chain > keeps the chain policy accept even when input drops
+//     @see the forward chain > is absent on a host the config does not name
 //   · Baseline rules render before policy rules, and a policy that could overlap one is
 //     rejected with a reason (see `baselineConflict`).
 //   · `ct state established,related accept` is the first rule in both chains. Without it a
