@@ -261,10 +261,39 @@ src/policy-source.ts:409   const wire = toWire({ ...site, resolveService: undefi
    - 평가기가 그 포트를 **전역에 두거나 export 하면 다시 열린다.** 내 평가기는 두지 않았고
      `globalThis.__evaluatorReplyPort` 가 **absent** 로 측정됐다 — 그래서 요건은 **전역에 두지
      말고 export 하지 말 것**이다.
-   - ⚠️ **모듈이 다른 모듈의 스코프 바인딩에 닿는 다른 길이 있는지는 재지 않았다.** 평범한 ES
-     의미로는 export 없이 닿지 못하지만, **같은 realm 이라는 사실이 그 질문을 열어 둔다** — 이
-     저장소는 같은 realm 에서 「전역을 안 건드리고 닿는 길이 여섯 개 더」 있었던 것을 기록해
-     뒀다. **구현 전에 재야 할 것.**
+   ### 🔴 포트에 닿지 못해도 **보내는 메서드**를 갈면 된다 — 측정
+
+   「재지 않았다」로 남겨 뒀던 자리다. 독립 리뷰가 그 방향을 가리켰고(그 라운드는 결론을 내지
+   못했다 — §3 끝의 메모), 재 보니 **뚫린다**:
+
+   | 평가기가 보내는 방법 | 위조가 부모에 도착하는가 |
+   |---|---|
+   | `reply.postMessage(payload)` — 호출 시점에 메서드를 찾는다 | 🔴 **도착한다** |
+   | `MessagePort.prototype.postMessage` 를 **import 전에 캡처**해 `.call(reply, payload)` | **도착하지 않는다** |
+
+   모듈은 **포트 객체에 닿지 못해도** `MessagePort.prototype.postMessage` 를 갈아치울 수 있고,
+   평가기의 `reply.postMessage(...)` 는 **그 함수를 부른다.** 모듈이 그 안에서 다른 값을 같은
+   포트로 보냈다.
+
+   🔑 **이 저장소가 이미 기록한 모양이다.** `bin/heliopause-policy-render.ts:120` 의 주석이
+   똑같이 적는다 — 「**집합은 모듈이 닿을 수 없었지만 *lookup* 은 닿을 수 있었다**」. 거기서는
+   `WeakSet.prototype.has` 였고 여기서는 `MessagePort.prototype.postMessage` 다.
+
+   → **요건이 하나 더 늘었다**: **보내는 함수도 첫 untrusted import 전에 캡처한다.** 「전용
+   채널」·「순서」에 이어 **셋째**다.
+
+   - ⚠️ **모듈이 다른 모듈의 스코프 바인딩에 닿는 길은 여전히 재지 않았다.** 평범한 ES 의미로는
+     export 없이 닿지 못한다. 위 측정은 **그것이 필요 없다**는 것을 보였을 뿐이다 — 공유
+     prototype 으로 충분했다. **다른 공유 표면이 또 있는지는 열린 질문이고, 구현 전에 재야
+     한다**(`receiveMessageOnPort`, `EventEmitter.prototype.once`, `structuredClone` 자체).
+
+   ### 그리고 스키마 검증은 **이미 있다**
+
+   `src/policy-source.ts:186` 의 `parsePolicySource` 가 그 일을 한다 — `repo.probes` 가 배열인지
+   (`:264`), `site` 의 어느 키도 **함수가 아닌지**(`:255-257`, 「a function cannot survive JSON,
+   so one arriving here means the payload was built in-process by a caller that skipped the wire」).
+   ⚠️ 다만 그 함수 검사는 **`site` 의 자기 키들**에 대한 것이고 **`probes` 의 내용물에는 돌지
+   않는다** — 요건 1 이 전체 직렬화를 요구하는 또 하나의 이유다.
 
 3. **모든 경로에서 `terminate()`.** 결과를 받은 뒤에도, 에러 뒤에도, 타임아웃에도.
 4. **워커 메모리 한도(`resourceLimits`)는 프로세스 전체 OOM 을 다 막지 못한다.** 한도는 그 워커의
@@ -273,6 +302,25 @@ src/policy-source.ts:409   const wire = toWire({ ...site, resolveService: undefi
 5. **지연된 결함이 보이게 남는다.** 모듈이 건 타이머가 종료 뒤 발사되지 않는 것은 이득이지만,
    **발사됐어야 할 결함이 조용히 사라지는 것**이기도 하다. 로그·`faults` 집계가 어떻게 바뀌는지
    → **#117**.
+
+### ⚠️ 3라운드 리뷰는 **결론을 내지 못했다** — 그래도 비어 있지 않았다
+
+`gpt-6.1-sol` 이 프로브를 돌린 뒤 출력이 **콘텐츠 필터에 두 번 거부**됐다(`This content was
+flagged for possible cybersecurity risk`). **판정이 없다.**
+
+남은 것으로 둘을 얻었다:
+
+1. 머리말에 **「전체 페이로드 직렬화 요건이 부분 직렬화 구멍을 닫고, §1-a 가 이제 #89 의 서술과
+   맞는다」**고 적혔다 — 2라운드 지적 1·3 이 해결됐다는 것.
+2. **무엇을 확인하려 했는지**를 적었다 — 「모듈이 평가기의 지역 바인딩을 읽지 못해도 **공유
+   메서드**로 전용 포트를 가로챌 수 있는가」. **그 방향이 맞았고, 위 표가 그것이다.**
+
+🔑 AGENTS.md 가 9차에서 같은 일을 기록해 뒀다: **「막힌 리뷰도 자기 프로브 목록은 준다. 결론이
+안 왔다고 그 실행이 비어 있는 것은 아니다.」** 그때는 모델을 바꿔 통과시켰다. 이번에는 이미
+`gpt-6.1-sol` 이고, **그 프로브 방향을 내가 직접 재서 요건을 하나 더 얻었다.**
+
+ℓ **그러므로 이 문서의 §3 은 독립 검토를 끝까지 받지 못했다.** 요건 2 의 세 항목 중 **셋째(보내는
+함수 캡처)는 검토 없이 들어간 것**이다.
 
 ### 격리는 더 좁아진다
 
@@ -332,6 +380,7 @@ src/policy-source.ts:409   const wire = toWire({ ...site, resolveService: undefi
 | `forge.mjs` · `forge-child.mjs` | §3 요건 1 의 위조 재현 |
 | `port-test.mjs` · `port-child.mjs` | §3 요건 2 의 표 첫 두 행 |
 | `steal-test.mjs` · `steal-child.mjs` | §3 요건 2 의 표 셋째 행(순서) |
+| `proto-test.mjs` · `proto-child.mjs` | §3 요건 2 의 prototype 가로채기 표 |
 
 경로: `/private/tmp/claude-501/-Users-henry-github/397cfe2e-3c33-47d6-afc6-72d6b83f6d18/scratchpad/leak89/`
 — **세션 스크래치패드이므로 영구적이지 않다.**
