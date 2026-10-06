@@ -21,14 +21,33 @@
 보호 호스트이므로, 플래그 없는 발행은 `nothing to publish — no hosts given` 이 아니라 **그 호스트를
 이유로 거부**된다.
 
+## 🔴 먼저 — 정책 트리가 깨끗해야 한다
+
+```bash
+cd ~/github/mack-erel/heliopause/policy
+git pull --ff-only
+git status --short          # 비어 있어야 한다
+```
+
+**미커밋이 있으면 보호 호스트 게이트에 닿기 전에 죽는다.** `heliopause-publish.ts:208` 의 dirty 검사가
+타이포 처리(`:385`)와 보호 게이트(`:414`)보다 **먼저** 돌기 때문이다:
+
+```
+working tree has uncommitted changes, so the commit id would not describe what is being published.
+```
+
+⚠️ **그래서 exit 1 을 보고 「게이트가 막았다」로 읽으면 안 된다.** 2026-10-05 실측: 그 저장소에
+수정된 `az01.ts` 가 있는 상태에서 **플래그 없음 · 올바른 플래그 · `--allow-protexted` 세 경우가 전부
+dirty 로 exit 1** 이었다. 세 입력에 같은 답이 나오는 동안은 아무것도 측정되지 않는다. `git pull` 은
+이 전제를 **세우지 않는다** — 남의 미커밋은 pull 로 사라지지 않는다.
+
 ## CLI — `--allow-protected`
 
 ```bash
-cd ~/github/mack-erel/heliopause/policy && git pull --ff-only   # 심링크 실체를 먼저 최신화
 cd ~/github/henryj-dev/heliopause                                # 도구가 사는 곳
 
 node bin/heliopause-publish.ts policy/prod.ts prod-icn-vtr \
-  --propose=https://10.17.0.10:30444 --pki=pki --operator=ops-henry-review \
+  --propose=https://<manager> --pki=pki --operator=ops-henry-review \
   --allow-protected
 ```
 
@@ -44,14 +63,19 @@ Protected hosts are the ones whose failure takes out more than themselves.
 같은 것은 조용히 무시될 수 있었다. 근사형(`--allow-prot…`)은 **exit 2 로 거부**하고 철자를 알려
 준다 — 「답했다고 생각한 거부」를 보는 일을 막기 위한 것이다.
 
-## 승인 — `--show` 를 먼저
+다만 그 그물은 `/^--allow[-_]?prot/i` 이고 **모든 오타를 잡지는 않는다.** 실측(2026-10-05):
+`--allow-protexted` · `--allow_protected` · `--ALLOW-PROTECTED` · `--allow-protected=true` 는 exit 2,
+**`--alow-protected`(l 하나)는 그물을 지나 게이트에 닿아 exit 1** 이다. 뒤쪽이 더 나쁜 결과는 아니다
+— 게이트가 막은 것이니 안전하다. 다만 **오타를 알려 주지 않으므로** 거부 문구를 읽어야 한다.
+
+## 승인 — 규칙을 읽는 것은 `--show --rules` 다
 
 ```bash
 # 🔴 승인 전에. 이것 없이 승인하는 것은 해시 비교이고 규칙에 대한 검사가 아니다
-node bin/heliopause-approve.ts <manager> <plan-sha256> --show \
+node bin/heliopause-approve.ts <manager> <plan-sha256> --show --rules \
   --pki=pki --operator=ops-henry-review
 
-# 승인은 다른 운영자여야 한다
+# 승인 — 제안자와 다른 계정이어야 한다 (아래)
 node bin/heliopause-approve.ts <manager> <plan-sha256> --approve \
   --pki=pki --operator=ops-henry
 ```
@@ -62,13 +86,47 @@ node bin/heliopause-approve.ts <manager> <plan-sha256> --approve \
 protected  🔴 this plan reaches a protected host and the proposer opted in (--allow-protected). …
 ```
 
-**없으면 그 플랜은 opt-in 을 담고 있지 않다.** 그 문장은 호스트 행보다 **위에** 인쇄된다 — 아래에
-있으면 결정이 끝난 뒤에 읽히기 때문이다.
+그 문장은 호스트 행보다 **위에** 인쇄된다 — 아래에 있으면 결정이 끝난 뒤에 읽힌다.
 
-### 운영자 둘은 서로 달라야 한다
+⚠️ **그 줄이 없다고 opt-in 이 없는 것은 아니다.** `--show` 는 매니저가 기록한 요약에서 인쇄하고,
+**새 판 이전의 매니저는 그 필드를 아예 담지 않는다**(`ca45291^` 의 요약에는 호스트만 있다). 그러니
+부재는 **「opt-in 이 없음」또는 「매니저가 옛 판」**이고, 두 경우를 그 줄로는 가를 수 없다. 아래
+「매니저 이미지」 절과 함께 읽을 것.
 
-제안 `ops-henry-review` · 승인 `ops-henry`. ⚠️ **`ops-ci` 는 매니저에 등록돼 있지 않다.** 그리고
-**자기 승인은 CLI 로 불가능하다** — 인증서에 역할 주장이 없어서이고, 브라우저 경로에 OTP 가 있다.
+### 🔴 운영자 둘은 **다른 계정**이어야 한다 — 다른 인증서 이름으로는 부족하다
+
+여태 쓴 짝은 제안 `ops-henry-review` · 승인 `ops-henry` 다. 그런데 매니저는 **같은 IdP 계정에 매핑된
+writer CN 들을 한 사람으로 묶고**(`manager-server.ts:1462`), 묶인 짝의 승인을 **403 으로 거부**한다
+(`approval.ts:259`). 그 기능을 만들게 한 실측 예시가 코드 주석에 있고, **그 예시가 정확히 이 짝이다**:
+
+```
+HELIOPAUSE_WRITER_CNS = ops-henry,ops-henry-review
+HELIOPAUSE_OTP_USERS  = ops-henry=5b1ed54b-…, ops-henry-review=5b1ed54b-…   ← 같은 계정
+```
+
+그러므로 **이 짝이 도는지는 배포의 `HELIOPAUSE_OTP_USERS` 매핑에 달려 있고, 이 저장소의 코드로는
+알 수 없다.** 쓰기 전에 그 두 CN 이 **서로 다른 userId** 를 갖는지 확인할 것. 같으면 403 이고,
+필요한 것은 이름이 아니라 **사람이 둘**이다.
+
+⚠️ **`ops-ci` 는 매니저에 등록돼 있지 않다.** 그리고 **자기 승인은 CLI 로 불가능하다** — 인증서에
+역할 주장이 없어서이고, 브라우저 경로에 OTP 가 있다.
+
+## 🔴 승인은 발행이 아니다 — `--push` 가 남아 있다
+
+여기에는 오래 `--approve` 까지만 적혀 있었다. 그러면 **승인된 채 발행되지 않은 플랜**이 남는다.
+CLI 자신이 다음에 칠 것을 인쇄한다(`heliopause-approve.ts:230`):
+
+```
+To publish: heliopause-approve <manager> <hash> --push
+```
+
+```bash
+node bin/heliopause-approve.ts <manager> <plan-sha256> --push \
+  --pki=pki --operator=ops-henry
+```
+
+⚠️ **OTP 를 다시 받아야 한다** — 승인에 쓴 코드는 쓸 수 없다. IdP 가 마지막 단계 이하의 코드를
+거부한다. 그리고 push 뒤에 **serving 세대와 롤아웃**을 봐야 한다. 거기까지가 발행이다.
 
 ## 콘솔
 
@@ -90,8 +148,16 @@ protected  🔴 this plan reaches a protected host and the proposer opted in (--
 | 콘솔 제안 | 매니저 | **그 이미지가 배포된 뒤** |
 | 정책 워커 | 매니저 | 같음 |
 
-**그 사이에 콘솔로 prod·util 을 발행하면 확인 없이 지나간다.** 배포 전에는 CLI 를 쓰거나, 콘솔을
-쓰더라도 `--show` 로 그 `protected` 줄을 직접 확인할 것.
+**그 사이에 콘솔로 prod·util 을 발행하면 확인 없이 지나간다.** 배포 전에는 CLI 를 쓸 것.
+
+⚠️ **그리고 「`--show` 로 확인하면 된다」로 메울 수 없다.** 여기에는 그렇게 적혀 있었는데, 옛 판
+매니저는 **그 요약 필드를 담지 않으므로** 그 줄이 없는 것이 「opt-in 없음」인지 「매니저가 옛 판」인지
+가르지 못한다(위 「승인」 절). 같은 이유로 해시 보장도 그 판을 전제한다.
+
+**그러므로 이 문서의 두 기준(`protected` 줄 · 해시 재사용 불가)은 매니저 판을 먼저 확정한 뒤에만
+성립한다.** 저장소의 코드로는 알 수 없는 사실이니, 발행 전에 **도는 이미지의 태그를 직접 확인**할
+것 — 그리고 그 sha 가 이 저장소의 것인지도 함께 봐야 한다(`git cat-file -t <sha>`). 2026-09-30 에
+다른 저장소의 sha 를 이 저장소 기준으로 재어 여덟 시간을 잃은 기록이 `AGENTS.md` 에 있다.
 
 ## 자동 정책 워커는 opt-in 할 수 없다
 
@@ -105,15 +171,30 @@ opt-in 이 아니라 **단계가 하나 더 있는 기본값**이기 때문이�
 ## 🔴 이 게이트가 묻지 않는 것
 
 플래그는 **「이 세대가 게이트웨이에 닿는다는 것을 사람이 말했는가」**만 묻는다. **그 규칙이 맞는지는
-묻지 않는다.** 실제로 게이트웨이를 지키는 것은 셋이다:
+묻지 않는다.** 실제로 게이트웨이를 지키는 것은 둘이다:
 
-1. **발행 전 렌더 확인** — `--propose` 없이 돌려 그 호스트의 룰셋을 눈으로 본다.
+1. **발행 전 룰셋 확인** — `--show --rules`. 여기에는 오래 「`--propose` 없이 돌려 본다」라고 적혀
+   있었는데 **두 군데가 틀렸다.** 발행 CLI 는 호스트 수·단계·룰 수·해시를 인쇄하고 **룰셋을 인쇄하지
+   않는다**(`heliopause-publish.ts:422`). 그리고 `--propose` 를 떼면 그것은 **직접 발행**이 되어
+   `--break-glass` 없이 **exit 2** 다(`:503`). 렌더된 룰셋을 읽는 자리는 `--show --rules`
+   (`heliopause-approve.ts:207`)다.
 2. **2인 승인 + OTP.**
-3. **`gateway` 단계를 마지막에 두기** — `ROLLOUT_ORDER` 가 `canary → general → gateway` 다.
 
-플래그는 **네 번째가 아니라 2번을 또렷하게 만드는 장치**다: opt-in 이 플랜 해시에 들어가므로
+플래그는 **세 번째가 아니라 2번을 또렷하게 만드는 장치**다: opt-in 이 플랜 해시에 들어가므로
 플래그 없는 플랜에 준 승인을 플래그 있는 플랜에 **재사용할 수 없고**, `--show` 가 승인자에게 그
-사실을 문장으로 인쇄한다.
+사실을 문장으로 인쇄한다. ⚠️ 단 그 해시 보장도 **새 판 매니저를 전제한다** — 그 이전 판은 번들 파싱에서
+그 필드를 버리고 해시에도 넣지 않았다(`ca45291^:src/bundle.ts`).
+
+### 🔴 prod·util 에는 「`gateway` 를 마지막에」가 **없다**
+
+여기에는 세 번째 보호로 **`ROLLOUT_ORDER` 가 `canary → general → gateway` 이므로 게이트웨이가
+마지막」**이라고 적혀 있었다. 순서는 맞지만 **그 두 사이트에는 적용되지 않는다** — `prod.ts:281` 과
+`util.ts:281` 이 자기 유일 게이트웨이를 **`stage: "canary"`** 로 둔다.
+
+그러면 `rollout.ts:221` 의 선행 단계 검사에 **걸릴 선행 호스트가 없다.** 게이트웨이가 첫 번째이고,
+그것이 잠기면 확인해 줄 다른 호스트가 없다. 그 사이트들에 호스트가 하나뿐이니 다른 배치가 불가능하고,
+**그래서 저 보호는 dev·az01 의 것이지 prod·util 의 것이 아니다.** 이것을 셋 중 하나로 세면 prod·util
+발행이 실제보다 안전하게 읽힌다.
 
 ### 그리고 권한 검사가 아니다
 
