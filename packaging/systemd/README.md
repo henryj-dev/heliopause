@@ -228,7 +228,7 @@ no-op 이 된다 — 실패가 아니라 종착 상태다), `heliopause-agent.pa
 
 ```bash
 install -d -m 755 /opt/heliopause
-cp -r src bin /opt/heliopause/
+cp -r src bin packages /opt/heliopause/        # packages 가 빠지면 기동에서 죽는다 — 아래
 install -m 640 packaging/systemd/relay.env.example /etc/heliopause/relay.env   # 편집할 것
 install -m 644 packaging/systemd/heliopause-relay.service /etc/systemd/system/
 install -m 644 packaging/systemd/heliopause-revocation-writer.{service,socket} /etc/systemd/system/
@@ -249,6 +249,49 @@ systemd-run --wait --collect --unit=heliopause-revocations-init \
 systemctl enable --now heliopause-revocation-writer.socket
 systemctl enable --now heliopause-relay
 ```
+
+### 🔑 `packages` 가 빠지면 기동에서 죽는다
+
+여기에는 오래 `cp -r src bin` 이라고 적혀 있었다. **릴레이는 `packages/i18n` 도 필요하다**:
+
+```
+src/i18n.ts:5   import { LANGS, LANG_NAME, MESSAGES as SHARED_MESSAGES, pickLang, … }
+                  from "../packages/i18n/src/index.ts"
+```
+
+`bin/heliopause-relay.ts` 의 정적 import 그래프를 걸어 재면 **23 파일 · 세 디렉터리**다 —
+**`src` 21 · `bin` 1 · `packages` 1**. 그리고 **`node:` 밖의 의존은 없다**(외부 패키지 0, 그래서
+`node_modules` 도 필요 없다).
+
+**빠뜨리면 무엇이 보이는지 대조군으로 쟀다**(`src`·`bin` 만 둔 트리 대 `packages` 를 더한 트리):
+
+```
+src + bin            → node:internal/modules/esm/resolve  ERR_MODULE_NOT_FOUND
+src + bin + packages → [relay] missing required environment: HELIOPAUSE_ARTIFACT_DIR
+```
+
+ℓ **`scripts/deploy-fleet.sh:146-151` 이 같은 사실을 이미 적어 뒀다** — 「릴레이가 전에 필요
+없던 공유 패키지를 갖게 됐을 때 **`packages/i18n` 이 처음 보내졌다**」(gw-01.util 2026-08-27 실측).
+그 스크립트는 그래서 새 중첩 경로의 **부모 디렉터리를 먼저 만든다.** 이 README 만 `cp -r src bin`
+으로 남아 있었다.
+
+🔑 **env 검사에 도달하지도 못한다.** `bin/heliopause-relay.ts:11` 이 최상단 정적 import 이고
+`:14` 가 바로 그것을 부르므로, 해석 실패는 **설정을 읽기 전**이다 — 그래서 저널에 「설정이
+틀렸다」가 아니라 **모듈 경로 오류**로 나타난다.
+
+배포된 dev 게이트웨이에는 `/opt/heliopause` 에 **agent · bin · packages · policy · src** 가 있다.
+그중 **`agent` 는 같은 호스트의 에이전트 몫**이다(게이트웨이도 정책을 적용하는 호스트다).
+
+⚠️ **`policy` 가 왜 거기 있는지는 모른다.** 릴레이는 정책을 평가하지 않고 — 그것은 렌더러의
+일이다 — `bin/heliopause-relay.ts` 도 `src/relay.ts` 도 `policy/` 를 **참조하지 않는다**(측정).
+dev 게이트웨이에는 `dev.ts`·`dev-observe.ts`·`dev-observe.test.ts` 가 있다. 아는 사람이 적어
+주면 좋겠다. **릴레이에 필요해서 거기 있는 것은 아니다.**
+
+ℓ 그 호스트에는 날짜별 `.bak` 도 여럿 있다. `deploy-fleet.sh` 의 흔적으로 보이며, 손으로
+설치할 때 흉내낼 것이 아니다.
+
+⚠️ **재서 얻은 것은 정적 그래프다.** 동적 `import()` 는 따라가지 않았다 — 그것을 쓰는 것은
+렌더러이지 릴레이가 아니지만, 그 범위를 적어 두는 것이 이 수의 정직한 한계다.
 
 디렉터리는 유닛의 `StateDirectory`가 만든다. **세 역할이 서로 다른 디렉터리를 쓴다:**
 
