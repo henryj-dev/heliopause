@@ -267,7 +267,7 @@ jobs:
         run: cargo metadata --locked --format-version 1 > /dev/null
 
   # **The policy layer does not belong to this repository.** Credential scanning, workflow
-  # auditing and dependency review ask the same question of all five repositories, whatever
+  # auditing and dependency review ask the same question of every repository that calls them, whatever
   # each one builds. Kept as copies they drift, and once they drift nothing says which one
   # is the standard.
   #
@@ -286,20 +286,18 @@ jobs:
   # The pin was therefore permanent by accident, which is the worst version of a pin: it looks
   # reviewed and it is simply stuck. The update it was missing mattered — upstream had discovered
   # that `gitleaks-action`'s default binary is 8.24.3, and **that version parses no top-level
-  # `[[allowlists]]` at all**, dropping the exception list without a word. Both of this repository's
-  # gitleaks eyes now run the same pinned version because of it.
+  # `[[allowlists]]` at all**, dropping the exception list without a word. Upstream has since
+  # removed the action (henryj-dev/.github#10): one pinned, sha256-checked gitleaks CLI scans the
+  # whole history on every event, and no licence secret is involved any more.
   #
   # **Until that upstream repository cuts tags, this line moves by hand.** Check it when you touch
   # this file: `gh api repos/henryj-dev/.github/commits/main --jq .sha`.
   policy:
-    uses: henryj-dev/.github/.github/workflows/policy-checks.yml@2bb32384d4b9b6acf735478cfcd229da1df3452c # 2026-08-29
+    uses: henryj-dev/.github/.github/workflows/policy-checks.yml@982f0bc15519dc094fa0a4cc8de6724d3f1bba4c # 2026-10-06
     permissions:
       contents: read
       # dependency-review says inside the pull request what was blocked and why.
       pull-requests: write
-    secrets:
-      # A licence is required for organisation-owned repositories. It is an org secret.
-      GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
 
   # The one check name the branch ruleset requires.
   #
