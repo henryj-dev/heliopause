@@ -1449,3 +1449,39 @@ describe("a refused generation says so where an operator looks", () => {
     assert.equal(fleetView(older, new Date(AT), 300).hosts[0]!.agentBuild, null);
   });
 });
+
+describe("the agent certificate each heartbeat presented", () => {
+  const presented = {
+    cn: "h-canary", serial: "0A", sha256: "ab".repeat(32),
+    notBefore: "2026-07-01T00:00:00.000Z", notAfter: "2026-11-25T04:16:24.000Z",
+  };
+
+  it("is recorded with the heartbeat and carried on the host's fleet row", () => {
+    const s = state();
+    handleHeartbeat(s, "h-canary", hb(), AT, presented);
+    assert.deepEqual(s.agentCerts["h-canary"], { ...presented, observedAt: AT });
+    const row = fleetView(s, new Date(AT)).hosts.find((h) => h.host === "h-canary")!;
+    assert.deepEqual(row.agentCert, { ...presented, observedAt: AT });
+    assert.equal(fleetView(s, new Date(AT)).hosts.find((h) => h.host === "h-app-01")!.agentCert, null);
+  });
+
+  it("is not recorded for a host the manifest does not list — the same rule as its status", () => {
+    const s = state();
+    handleHeartbeat(s, "h-stranger", hb({ host: "h-stranger" }), AT, { ...presented, cn: "h-stranger" });
+    assert.equal(s.agentCerts["h-stranger"], undefined);
+    assert.equal(s.statuses["h-stranger"], undefined);
+  });
+
+  it("is not recorded from a heartbeat the relay refuses", () => {
+    const s = state();
+    handleHeartbeat(s, "h-canary", hb({ host: "h-app-01" }), AT, presented);
+    assert.deepEqual(s.agentCerts, {});
+  });
+
+  it("keeps the previous reading when a heartbeat arrives without a readable certificate", () => {
+    const s = state();
+    handleHeartbeat(s, "h-canary", hb(), AT, presented);
+    handleHeartbeat(s, "h-canary", hb(), "2026-07-30T00:01:00Z", null);
+    assert.equal(s.agentCerts["h-canary"]!.observedAt, AT);
+  });
+});

@@ -13,6 +13,7 @@ const host = (over: Partial<HostView> = {}): HostView => ({
   host: "h-a",
   agentVersion: "0.3.0-pull",
   agentBuild: null,
+  agentCert: null,
   lastRefusal: null,
   stage: "canary",
   state: "confirmed",

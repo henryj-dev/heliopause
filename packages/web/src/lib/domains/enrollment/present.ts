@@ -112,6 +112,7 @@ export const APP_TOKEN_STATE_KEY = {
 const SCOPE_KEY = {
   "enrollment:token-create": "m.scopeTokenCreate",
   "enrollment:requests-read": "m.scopeRequestsRead",
+  "certificates:read": "m.scopeCertificatesRead",
 } as const;
 
 export function scopeLabel(scope: string, lang: Lang = "en"): string {

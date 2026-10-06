@@ -25,6 +25,7 @@
 import type { FleetView, HostView } from "./relay.ts";
 import type { Contradiction } from "./consistency.ts";
 import type { RulesetEvent } from "./protocol.ts";
+import type { CertFacts } from "./cert-watch.ts";
 
 /** One VPC's relay, as the manager knows it. */
 export interface RelaySource {
@@ -68,7 +69,14 @@ export interface RelaySource {
  * the reason turns a diagnosable outage into an absence.
  */
 export type RelayResult =
-  | { name: string; url: string; ok: true; view: FleetView }
+  | {
+      name: string; url: string; ok: true; view: FleetView;
+      /**
+       * The server certificate this relay presented on the call that produced `view`. `null` when
+       * the TLS layer handed back nothing readable; absent from results built without a connection.
+       */
+      relayCert?: CertFacts | null;
+    }
   | { name: string; url: string; ok: false; error: string };
 
 /** The whole site, assembled from every relay that answered. */
@@ -149,6 +157,12 @@ export interface SiteView {
      */
     agentVersion: string | null;
     agentBuild: string | null;
+    /**
+     * The client certificate the agent presented on its latest heartbeat, as the relay recorded it.
+     * `null` when the relay has not recorded one — including a relay too old to record any, which is
+     * "unknown", not "nothing to renew".
+     */
+    agentCert: HostView["agentCert"];
     lastRefusal: { generation: string; reason: string; at: string } | null;
     /** Ports another table redirects inbound, outside what this ruleset governs (H36). */
     publishedPorts: string[] | null;
@@ -241,6 +255,7 @@ export function siteView(results: RelayResult[]): SiteView {
         intrusions: h.intrusions ?? null,
         agentVersion: h.agentVersion ?? null,
         agentBuild: h.agentBuild ?? null,
+        agentCert: h.agentCert ?? null,
         lastRefusal: h.lastRefusal ?? null,
         publishedPorts: h.publishedPorts ?? null,
         routes: h.routes ?? null,

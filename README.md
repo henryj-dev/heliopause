@@ -596,7 +596,9 @@ The plaintext is printed once and only its SHA-256 is stored, like a node token.
 revoking one keeps every operator check there is — that is where the grant is decided — and *using*
 one has none of them.
 
-**Two scopes exist and no more.** `enrollment:token-create` reaches `POST /enrollment/tokens`;
+**Four scopes exist and no more.** `enrollment:host-deregister` is a separately issued destructive
+grant for one host lifecycle (see `APP_TOKEN_SCOPES` in `src/enrollment-store.ts`); `certificates:read`
+is described below. `enrollment:token-create` reaches `POST /enrollment/tokens`;
 `enrollment:requests-read` reaches `GET /enrollment/requests`, which takes `?status=` and
 `?hostname=` in any combination — a caller that just planted a token can wait for that host's CSR to
 appear instead of reading the whole queue. **That read is narrowed to the token's own hostname
@@ -604,8 +606,24 @@ pattern**: a `*.dev` token sees dev CSRs and is not told that prod or util exist
 outside the pattern returns an empty list rather than a refusal, so the route cannot be used to map
 where the boundary is. Any other route answers 403 naming the token, and an
 unknown, expired or revoked token answers 401 saying only that. **An app token cannot sign, upload,
-reject or revoke anything** — the worst a leaked one can do is mint node tokens inside its hostname
-pattern and read the CSR queue, and a certificate still requires an operator holding a one-time code.
+reject or revoke anything** — short of `enrollment:host-deregister`, the worst a leaked one can do is
+mint node tokens inside its hostname pattern, read the CSR queue and read certificate expiries, and a certificate still requires an operator holding a one-time code.
+
+**`certificates:read` reaches `GET /api/certificates`** — every certificate the deployment depends
+on and how long each has left: each agent's client certificate as its relay saw it on the latest
+heartbeat, each relay's server certificate as the manager saw it on the wire, the manager's own client
+certificate and CA per VPC, its server certificate both as served and as on disk (they differ after a
+rotation the process has not been restarted for), and the operators' public certificates in
+`HELIOPAUSE_KNOWN_OPERATORS_DIR`. Each row carries `state` — `ok`, `renew` (inside the
+`RENEW_BEFORE_DAYS` window), `critical` (7 days), `expired` or `unknown` — and the thresholds travel in
+the report. The expected set is derived from configuration, not from what answered, so an unreachable
+relay is `complete: false` with the gap named in `missing` rather than a shorter list. **This scope is
+fleet-wide: the hostname pattern does not narrow it**, because a monitor that sees part of the fleet
+reports the rest as healthy by omission, and the CA, manager and operator rows have no hostname to
+match. Every string is at most 512 characters; an identifying one that would be longer is replaced by
+its SHA-256 rather than cut, so two rows cannot collide. Operators reach the same report at
+`/api/certificates` with their certificate or session, and the fleet view lists every certificate in
+`renew` or worse under `problems`.
 
 The hostname pattern is an exact hostname or **one leading wildcard label**: `*.dev` covers
 `k3s-01.dev`, and covers neither `dev` nor `a.b.dev`. Node tokens issued this way are recorded with

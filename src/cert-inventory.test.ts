@@ -1,0 +1,228 @@
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import {
+  CERT_KINDS, MAX_WIRE_STRING, certificateInventory, certificateProblems, prose,
+  type CertificateReport, type InventoryInput,
+} from "./cert-inventory.ts";
+import type { CertFacts } from "./cert-watch.ts";
+import type { HostView } from "./relay.ts";
+import type { RelayResult } from "./manager.ts";
+
+const NOW = new Date("2026-10-06T00:00:00Z");
+const inDays = (d: number) => new Date(NOW.getTime() + d * 86_400_000).toISOString();
+
+const facts = (over: Partial<CertFacts> = {}): CertFacts => ({
+  cn: "x", serial: "01", sha256: "ab".repeat(32),
+  notBefore: inDays(-60), notAfter: inDays(100), ...over,
+});
+
+const host = (name: string, agentCert: HostView["agentCert"]) => ({ host: name, agentCert }) as HostView;
+
+const relay = (name: string, hosts: HostView[], relayCert: CertFacts | null = facts({ cn: `gw.${name}` })): RelayResult => ({
+  name, url: `https://${name}.invalid`, ok: true, relayCert,
+  view: { generation: "g", hosts, problems: [] } as unknown as Extract<RelayResult, { ok: true }>["view"],
+});
+
+const base = (over: Partial<InventoryInput> = {}): InventoryInput => ({
+  now: NOW,
+  relays: [relay("dev", [host("web-01.dev", { ...facts({ cn: "web-01.dev" }), observedAt: NOW.toISOString() })])],
+  vpcFiles: [{ vpc: "dev", client: facts({ cn: "hp-manager" }), ca: facts({ cn: "heliopause-ca" }) }],
+  manager: { loaded: facts({ cn: "hp-manager" }), file: facts({ cn: "hp-manager" }) },
+  operators: [],
+  ...over,
+});
+
+/**
+ * stardust cert-drift's acceptance rule, restated here as the contract this module must meet: any
+ * string over 512 characters, or any `kind` outside `^[a-z][a-z-]{0,31}$`, makes it discard the whole
+ * report. Restated rather than imported — it lives in another repository — and pinned by its own
+ * known positives below, so a validator that accepts everything cannot make the other tests pass.
+ */
+function consumerRejects(report: unknown): string | null {
+  const kind = /^[a-z][a-z-]{0,31}$/;
+  const walk = (v: unknown, path: string): string | null => {
+    if (typeof v === "string") return v.length > MAX_WIRE_STRING ? `${path}: ${v.length} characters` : null;
+    if (Array.isArray(v)) {
+      for (const [i, x] of v.entries()) { const bad = walk(x, `${path}[${i}]`); if (bad) return bad; }
+      return null;
+    }
+    if (v && typeof v === "object") {
+      for (const [k, x] of Object.entries(v)) {
+        if (k === "kind" && (typeof x !== "string" || !kind.test(x))) return `${path}.kind: ${JSON.stringify(x)}`;
+        const bad = walk(x, `${path}.${k}`); if (bad) return bad;
+      }
+    }
+    return null;
+  };
+  return walk(report, "$");
+}
+
+describe("the consumer's acceptance rule, as restated here", () => {
+  it("rejects what stardust rejects — the known positives that keep the other tests honest", () => {
+    assert.equal(consumerRejects({ s: "a".repeat(512) }), null);
+    assert.match(consumerRejects({ s: "a".repeat(513) }) ?? "", /513 characters/);
+    assert.match(consumerRejects({ rows: [{ kind: "agent-v2" }] }) ?? "", /agent-v2/);
+    assert.match(consumerRejects({ rows: [{ kind: "relay_server" }] }) ?? "", /relay_server/);
+    assert.equal(consumerRejects({ rows: [{ kind: "relay-server" }] }), null);
+  });
+
+  it("accepts every kind this module can emit", () => {
+    for (const k of CERT_KINDS) assert.equal(consumerRejects({ kind: k }), null, k);
+  });
+});
+
+describe("certificateInventory", () => {
+  it("reports every expected certificate when everything answered", () => {
+    const r = certificateInventory(base());
+    assert.equal(r.complete, true);
+    assert.deepEqual(r.missing, []);
+    assert.equal(r.expected.total, r.observed.total);
+    assert.deepEqual(r.expected.byKind, {
+      agent: 1, "relay-server": 1, "manager-client": 1, "manager-server": 2, ca: 1, operator: 0,
+    });
+    assert.deepEqual(r.observed.byKind, r.expected.byKind);
+    assert.equal(consumerRejects(r), null);
+  });
+
+  it("names a host the relay lists but has no certificate for, and is then incomplete", () => {
+    const r = certificateInventory(base({
+      relays: [relay("dev", [host("web-01.dev", null)])],
+    }));
+    assert.equal(r.complete, false);
+    assert.deepEqual(r.missing.map((m) => [m.kind, m.vpc, m.host]), [["agent", "dev", "web-01.dev"]]);
+    assert.equal(r.expected.byKind.agent, 1);
+    assert.equal(r.observed.byKind.agent, 0);
+  });
+
+  it("does not shrink when a relay is unreachable — the relay and its agents are named as missing", () => {
+    const r = certificateInventory(base({
+      relays: [
+        relay("dev", [host("web-01.dev", { ...facts(), observedAt: NOW.toISOString() })]),
+        { name: "prod", url: "https://prod.invalid", ok: false, error: "ECONNREFUSED" },
+      ],
+    }));
+    assert.equal(r.complete, false);
+    assert.deepEqual(
+      r.missing.map((m) => [m.kind, m.vpc, m.host]),
+      [["relay-server", "prod", null], ["agent", "prod", null]],
+    );
+    assert.match(r.missing[0]!.reason, /ECONNREFUSED/);
+    assert.equal(r.expected.byKind["relay-server"], 2);
+  });
+
+  it("reports the manager's serving and on-disk certificates separately, so a missed restart shows", () => {
+    const r = certificateInventory(base({
+      manager: { loaded: facts({ sha256: "11".repeat(32), notAfter: inDays(5) }), file: facts({ sha256: "22".repeat(32) }) },
+    }));
+    const rows = r.certificates.filter((c) => c.kind === "manager-server");
+    assert.deepEqual(rows.map((c) => [c.source, c.sha256.slice(0, 2), c.state]), [["loaded", "11", "critical"], ["file", "22", "ok"]]);
+    assert.notEqual(rows[0]!.id, rows[1]!.id);
+  });
+
+  it("flags an agent reading the relay took long ago, and still judges it", () => {
+    const old = new Date(NOW.getTime() - 3_600_000).toISOString();
+    const r = certificateInventory(base({
+      relays: [relay("dev", [host("web-01.dev", { ...facts({ notAfter: inDays(3) }), observedAt: old })])],
+    }));
+    const a = r.certificates.find((c) => c.kind === "agent")!;
+    assert.equal(a.stale, true);
+    assert.equal(a.state, "critical");
+    assert.equal(a.observedAt, old);
+    assert.equal(a.observedBy, "relay:dev");
+  });
+
+  it("tells an unconfigured operator directory from an empty one, and counts an unreadable file as expected", () => {
+    assert.equal(certificateInventory(base({ operators: null })).operatorsConfigured, false);
+    assert.equal(certificateInventory(base({ operators: [] })).operatorsConfigured, true);
+    const r = certificateInventory(base({
+      operators: [{ file: "ops.pem", reading: facts({ cn: "ops" }) }, { file: "broken.pem", reading: { error: "not a certificate" } }],
+    }));
+    assert.equal(r.expected.byKind.operator, 2);
+    assert.equal(r.observed.byKind.operator, 1);
+    assert.deepEqual(r.missing.map((m) => [m.kind, m.host]), [["operator", "broken.pem"]]);
+  });
+
+  it("gives two operator files carrying one CN two different ids", () => {
+    const r = certificateInventory(base({
+      operators: [{ file: "a.pem", reading: facts({ cn: "ops" }) }, { file: "b.pem", reading: facts({ cn: "ops" }) }],
+    }));
+    const ids = r.certificates.map((c) => c.id);
+    assert.equal(new Set(ids).size, ids.length, `duplicate ids: ${ids.join(", ")}`);
+    assert.equal(r.observed.byKind.operator, 2);
+  });
+
+  it("keeps an identifying string of exactly 512 characters and replaces one of 513 with its digest", () => {
+    const at512 = "h".repeat(512), at513 = "h".repeat(513);
+    const r = certificateInventory(base({
+      relays: [relay("dev", [
+        host(at512, { ...facts(), observedAt: NOW.toISOString() }),
+        host(at513, { ...facts(), observedAt: NOW.toISOString() }),
+      ])],
+    }));
+    const hosts = r.certificates.filter((c) => c.kind === "agent").map((c) => c.host!);
+    assert.equal(hosts[0], at512);
+    assert.match(hosts[1]!, /^sha256:[0-9a-f]{64}$/);
+    assert.equal(consumerRejects(r), null);
+  });
+
+  it("does not let two long names that differ only past the limit collide", () => {
+    const a = "h".repeat(600) + "a", b = "h".repeat(600) + "b";
+    const r = certificateInventory(base({
+      relays: [relay("dev", [
+        host(a, { ...facts(), observedAt: NOW.toISOString() }),
+        host(b, { ...facts(), observedAt: NOW.toISOString() }),
+      ])],
+    }));
+    const rows = r.certificates.filter((c) => c.kind === "agent");
+    assert.notEqual(rows[0]!.host, rows[1]!.host);
+    assert.notEqual(rows[0]!.id, rows[1]!.id);
+  });
+
+  it("meets the consumer's rule even when every input is hostile", () => {
+    const huge = "x".repeat(5_000);
+    const r = certificateInventory({
+      now: NOW,
+      relays: [
+        relay(huge, [host(huge, { cn: huge, serial: huge, sha256: huge, notBefore: huge, notAfter: huge, observedAt: huge })],
+          { cn: huge, serial: huge, sha256: huge, notBefore: huge, notAfter: huge }),
+        relay(huge + "2", [host(huge, null)]),
+        { name: huge + "3", url: huge, ok: false, error: huge },
+      ],
+      vpcFiles: [{ vpc: huge, client: { error: huge }, ca: facts({ cn: huge }) }],
+      manager: { loaded: facts({ cn: huge }), file: { error: huge } },
+      operators: [{ file: huge, reading: { error: huge } }, { file: huge, reading: facts({ cn: huge }) }],
+    });
+    assert.equal(consumerRejects(r), null);
+    // And still a report: the unreadable expiry is `unknown`, not dropped and not `ok`.
+    assert.equal(r.certificates.find((c) => c.kind === "agent")!.state, "unknown");
+    const ids = r.certificates.map((c) => c.id);
+    assert.equal(new Set(ids).size, ids.length);
+  });
+});
+
+describe("prose", () => {
+  it("leaves 512 characters alone and cuts 513 to exactly 512, marked", () => {
+    assert.equal(prose("a".repeat(512)), "a".repeat(512));
+    const cut = prose("a".repeat(513));
+    assert.equal(cut.length, 512);
+    assert.match(cut, /…\[truncated\]$/);
+  });
+});
+
+describe("certificateProblems", () => {
+  it("lists renew, critical and expired, and nothing that is ok", () => {
+    const r: CertificateReport = certificateInventory(base({
+      relays: [relay("dev", [
+        host("ok.dev", { ...facts({ notAfter: inDays(100) }), observedAt: NOW.toISOString() }),
+        host("renew.dev", { ...facts({ notAfter: inDays(25) }), observedAt: NOW.toISOString() }),
+        host("critical.dev", { ...facts({ notAfter: inDays(5) }), observedAt: NOW.toISOString() }),
+        host("expired.dev", { ...facts({ notAfter: inDays(-2) }), observedAt: NOW.toISOString() }),
+      ])],
+    }));
+    const lines = certificateProblems(r);
+    assert.equal(lines.length, 3, lines.join("\n"));
+    assert.match(lines.find((l) => l.includes("renew.dev"))!, /renew — 25 day\(s\) left/);
+    assert.match(lines.find((l) => l.includes("critical.dev"))!, /critical — 5 day\(s\) left/);
+    assert.match(lines.find((l) => l.includes("expired.dev"))!, /expired — expired 2 day\(s\) ago/);
+  });
+});
