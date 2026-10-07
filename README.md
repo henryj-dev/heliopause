@@ -638,8 +638,9 @@ person's machine, where the manager cannot see it; `HELIOPAUSE_KNOWN_OPERATORS_D
 of each, and that copy is what the report judges. When `heliopause-pki issue <dir> <name> --role=operator`
 renews an operator, replace that operator's `.pem` in the directory in the same change — otherwise the
 report keeps the old expiry and alerts on a certificate that has already been replaced. Only public
-certificates go there; the manager never needs the key. The directory is re-read on every request, so
-adding or removing a file needs no restart.
+certificates go there, one per file named `*.pem` (other names are not read); the manager never needs
+the key. The directory is re-read on every request, so adding or removing a file needs no restart —
+setting `HELIOPAUSE_KNOWN_OPERATORS_DIR` itself does.
 
 The hostname pattern is an exact hostname or **one leading wildcard label**: `*.dev` covers
 `k3s-01.dev`, and covers neither `dev` nor `a.b.dev`. Node tokens issued this way are recorded with
