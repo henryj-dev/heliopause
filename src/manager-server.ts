@@ -71,7 +71,7 @@ import { CONSOLE_ENTRY, consoleAppPath, policyAppPath } from "./app-shell.ts";
 import { allSitePolicies, buildScreen, type Screen } from "./policy-screen.ts";
 import { assertProtectedAllowed, planPublish, protectedHostsIn, PublishError } from "./publish.ts";
 import { editableFiles, parsePolicySource, screenSiteOf, type PolicySource } from "./policy-source.ts";
-import { compareRoutes, readyToApply, type RouteDecl } from "./routes.ts";
+import { checkedRead, routesView, type SiteSourceRead } from "./routes-view.ts";
 import { lookupPolicies } from "./policy-lookup.ts";
 import { pickLang } from "./i18n.ts";
 import type { Lang } from "./i18n.ts";
@@ -2474,38 +2474,26 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       if (!opts.policySource) {
         return send(res, 404, { error: "this deployment does not carry a policy repository" });
       }
-      let source: PolicySource;
-      try {
-        source = await fetchPolicySource(opts.policySource, timeoutMs, defaultSite());
-      } catch (e) {
-        return send(res, 503, { error: `the policy could not be read: ${(e as Error).message}` });
-      }
-      const declaredBy = new Map<string, readonly RouteDecl[] | undefined>();
-      for (const h of (screenSiteOf(source) as unknown as { hosts?: readonly { id: string; routes?: readonly RouteDecl[] }[] }).hosts ?? []) {
-        declaredBy.set(h.id, h.routes);
-      }
-      const results = await pollRelays(opts.relays, timeoutMs);
-      const view: SiteView = siteView(results);
-      return send(res, 200, {
-        generation: source.head.sha,
-        dirty: source.head.dirty,
-        hosts: view.hosts.map((h) => ({
-          vpc: h.vpc,
-          host: h.host,
-          // **Passed straight through, and the first version did not.** It turned "in the model with
-          // no routes key" into "declared, and the declaration is empty", so k3s-01 and the three
-          // mailers came back `missing 0 · undeclared 0 · unstated 0` — the best-looking result this
-          // screen can print — over four hosts nobody had described. Measured against the live fleet
-          // twenty minutes after shipping it, and it also put this route in disagreement with
-          // `policy/dev-routes.test.ts`, which asserts `rows === null` for exactly those hosts.
-          //
-          // Green because nothing was checked is the failure this project has a name for. A host whose
-          // routing has not been written down must say so, and `routes: []` remains available and means
-          // something different: somebody looked and there was nothing to declare.
-          ...compareRoutes(declaredBy.get(h.host), h.routes),
-          appliable: readyToApply(declaredBy.get(h.host)),
+      // One policy source per relay, requested together. This process waits for the slowest, but the
+      // renderer serves them on one event loop — a stamp check (two `git` forks) per site on every
+      // call, and an evaluation per site after a commit — so the renderer's work is the sum.
+      // Each host is compared with its own site's declarations; see `routes-view.ts`.
+      const src = opts.policySource;
+      const [reads, results] = await Promise.all([
+        Promise.all(opts.relays.map(async (r, i): Promise<SiteSourceRead> => {
+          try {
+            return checkedRead(r.name, i, await fetchPolicySource(src, timeoutMs, r.name));
+          } catch (e) {
+            return { site: r.name, ok: false, error: `the policy could not be read: ${(e as Error).message}` };
+          }
         })),
-      });
+        pollRelays(opts.relays, timeoutMs),
+      ]);
+      // Every site failing is still one answer: nothing here can be compared, and 503 says so.
+      if (reads.length > 0 && reads.every((r) => !r.ok)) {
+        return send(res, 503, { error: (reads[0] as { error: string }).error, sites: routesView(reads, siteView([])).sites });
+      }
+      return send(res, 200, routesView(reads, siteView(results)));
     }
 
     // ── Policy lookup ──────────────────────────────────────────────────────────

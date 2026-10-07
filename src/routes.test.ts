@@ -1,6 +1,5 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import { compareRoutes, managementGuard, originOf, readyToApply, type ObservedRoute, type RouteDecl } from "./routes.ts";
 
 /**
@@ -250,16 +249,12 @@ describe("the manager must not turn an absent declaration into an empty one", ()
   // described. It also put the handler in disagreement with `policy/dev-routes.test.ts`, which asserts
   // `rows === null` for those same hosts: two halves of one answer, quietly contradicting each other.
   //
-  // The assertion is on the source rather than through a server because what went wrong was one
-  // expression, and a test that stands up a manager to check it would be slower and no more specific.
-  it("passes the declaration through instead of defaulting it", () => {
-    const src = readFileSync(new URL("./manager-server.ts", import.meta.url), "utf8");
-    const call = /compareRoutes\(([^;]*?), h\.routes\)/.exec(src)?.[1] ?? "";
-    assert.ok(call, "the /routes handler no longer calls compareRoutes — this test is measuring nothing");
-    assert.equal(/\?\?\s*\[\]/.test(call), false, `an absent declaration is being defaulted to []: ${call}`);
-    assert.equal(/\.has\(/.test(call), false, `presence in the model is being read as a declaration: ${call}`);
-  });
-
+  // It was asserted on the handler's source text — the expression passed to `compareRoutes` — and
+  // that broke the day the call moved out of the handler (#132, into `routes-view.ts`), which is the
+  // weakness of a source test: it pins where the code is, not what it does. It is now a behaviour:
+  // `routes-view.test.ts` "keeps a host its site does not describe as rows: null, with no error"
+  // builds a site whose host has no `routes` key and asserts `rows === null`. Defaulting the
+  // declaration to `[]` there turns that test red (measured).
   it("keeps the two absences meaning the same thing to a reader", () => {
     // A host outside the model and a host inside it with nothing declared are both "no route
     // declaration for this host". Only an explicit `routes: []` says "looked, nothing to declare",
