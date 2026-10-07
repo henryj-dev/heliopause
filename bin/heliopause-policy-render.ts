@@ -39,7 +39,8 @@
 // a sidecar cannot be given a different network identity from the process it is isolating.
 
 import { createServer } from "node:http";
-import { Worker, MessageChannel } from "node:worker_threads";
+import { Worker } from "node:worker_threads";
+import { evaluateWithLifecycle } from "../src/policy-eval-lifecycle.ts";
 import { existsSync, opendirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -48,7 +49,7 @@ import { oneLine } from "../src/log-scrub.ts";
 import { boundedInteger, ENV_BOUNDS, parsePolicySites } from "../src/env-spec.ts";
 import { zoneMismatch, ZoneMismatchError } from "../src/site-zone.ts";
 import { armedReasons } from "../src/policy-render-guard.ts";
-import { collectPolicySource, parsePolicySource, type PolicySource } from "../src/policy-source.ts";
+import { assemblePolicySource, parsePolicySource, type PolicySource } from "../src/policy-source.ts";
 import { policyHead, type ScreenSite } from "../src/policy-screen.ts";
 import { installCliLanguage } from "../src/operator-i18n.ts";
 
@@ -804,17 +805,41 @@ async function currentSource(site: { name: string | null; path: string }): Promi
   // `src/policy-eval-worker.ts` holds the three lines §3-b measured — a dedicated port, taken before
   // the module is imported, and a captured `postMessage` — and the reasons they are not
   // interchangeable with the obvious alternatives.
-  const wire = await evaluateInWorker({ sitePath, allowPaths, label: name ?? label, siteName: name, stamp });
-  return accepted({ wire, name, sitePath, stamp });
+  const moduleWire = await evaluateInWorker({ sitePath, label: name ?? label });
+  return accepted({ moduleWire, name, sitePath, stamp });
 }
 
-/** The half of `currentSource` that runs on the bytes the worker produced: validate, zone-check,
- *  cache. Separated because every one of those steps can refuse, and the caller turns a refusal into
- *  that site's 503. */
+/** The half of `currentSource` that runs in the parent on what the worker sent: read the module's
+ *  half, add everything the renderer reads itself, validate, zone-check, cache. Separated because
+ *  every one of those steps can refuse, and the caller turns a refusal into that site's 503. */
 function accepted(
-  input: { wire: string; name: string | null; sitePath: string; stamp: string },
+  input: { moduleWire: string; name: string | null; sitePath: string; stamp: string },
 ): string {
-  const { wire, name, sitePath, stamp } = input;
+  const { moduleWire, name, sitePath, stamp } = input;
+  // ## 🔑 The worker sends the module's half; this side reads the rest
+  //
+  // A module controls everything its worker sends — measured: one replaced `Function.prototype.call`,
+  // intercepted the send, and had a different site's real payload, renamed, served as its own. So the
+  // only fields taken from the worker are the ones the module is entitled to choose anyway: `site` and
+  // the resolver table. `label`, `siteName`, `build`, `repo`, `head` and `files` are read here, by the
+  // renderer, from its own configuration and the checkout — the worker never sends them, so nothing
+  // the module does in its thread can set them.
+  //
+  // The module's half is read as plain data and nothing else is kept: any other key it sent is
+  // dropped, so a forged `files` or `head` has nowhere to land.
+  //
+  // @see src/policy-render-service.test.ts "does not take anything but the module's own half from the worker"
+  const half = parseWire(moduleWire) as { site?: unknown; services?: unknown } | null;
+  if (typeof half !== "object" || half === null || Array.isArray(half)) {
+    throw new RealError(`${sitePath}: the evaluation sent something that is not an object`);
+  }
+  const wire = writeWire(assemblePolicySource({
+    module: { site: half.site as ScreenSite, services: half.services as Record<string, never> },
+    sitePath,
+    allowPaths,
+    label: name ?? label,
+    siteName: name ?? undefined,
+  }));
   // ## Validated with the manager's own reader, and the result is thrown away
   //
   // `parsePolicySource` is what the far side runs on this payload, so running it here means the
@@ -970,172 +995,30 @@ const WORKER_ENTRY = new URL("../src/policy-eval-worker.ts", import.meta.url);
  * failure" below makes reclaiming immediate but does not make spawning rarer. @see #117
  */
 let workersAlive = 0;
-
 /**
  * Evaluate one policy module in a worker and return the bytes it produced.
  *
- * The three lines §3-b measured live in `src/policy-eval-worker.ts`; this side is the lifecycle:
- * which signal counts as a result, what happens when more than one arrives, and when the thread is
- * reclaimed.
+ * The three lines §3-b measured live in `src/policy-eval-worker.ts`; the lifecycle — which signal is
+ * the result, what happens when more than one arrives, when the thread is reclaimed — lives in
+ * `src/policy-eval-lifecycle.ts`, where it takes the thread as an argument so a test can produce event
+ * orders a real worker produces 1 time in 2,000.
+ *
+ * @see src/policy-render-service.test.ts "a module that spins forever fails only its own site"
  */
-function evaluateInWorker(
-  task: { sitePath: string; allowPaths: readonly string[]; label: string; siteName: string | null; stamp: string },
-): Promise<string> {
-  return new Promise<string>((resolve, reject) => {
-    const { port1, port2 } = new MessageChannel();
+function evaluateInWorker(task: { sitePath: string; label: string }): Promise<string> {
+  return evaluateWithLifecycle({
     // The port is **not** in `workerData` — a module reads `workerData` and posts on the port itself,
-    // which §3-b ② measured arriving at the parent. Only strings go in it.
-    const worker = new Worker(WORKER_ENTRY, {
-      workerData: {
-        sitePath: task.sitePath,
-        allowPaths: [...task.allowPaths],
-        label: task.label,
-        siteName: task.siteName,
-      },
-    });
-    workersAlive += 1;
-
-    let settled = false;
-    let reclaimed = false;
-    let terminatedByUs = false;
-
-    // ## Reclaiming, and the three endings that decide when
-    //
-    // "No grace on failure" is two different reasons, and writing it as one sentence loses one of
-    // them:
-    //
-    //   · a valid result → grace, because that is the only ending with something left to see;
-    //   · `error` or an abnormal `exit` → no grace, because the ending already happened and waiting
-    //     longer counts nothing;
-    //   · the budget expiring → no grace, and for the opposite reason: the time was already spent,
-    //     so adding grace spends it twice.
-    //
-    // The third is why this takes a flag rather than a boolean argument: at the call site "it failed"
-    // and "it ran out of time" look alike, and they are not.
-    const reclaim = (graceMs: number) => {
-      if (reclaimed) return;
-      reclaimed = true;
-      const done = () => {
-        workersAlive -= 1;
-        // Ours, so its exit is not a fault. `terminate()` makes the worker exit **1** — measured: a
-        // worker that answered and was terminated reports 1, one left to finish reports 0 — and the
-        // exit handler below counted that 1 as a late fault on every site whose module kept a handle
-        // open past its grace. @see src/policy-render-service.test.ts "does not count its own reclaim
-        // of a worker as a fault" — it reads `faults: 1` without this flag.
-        terminatedByUs = true;
-        void worker.terminate();
-      };
-      if (graceMs <= 0) {
-        done();
-        return;
-      }
-      const timer = setTimeout(done, graceMs);
-      // The process must be able to exit during a grace window. Without this a terminating renderer
-      // waits for every outstanding grace, which turns a shutdown into a second of silence per
-      // in-flight evaluation.
-      timer.unref();
-    };
-
-    // ## The only result path
-    //
-    // `parentPort` is ignored: §3-b ① measured a module importing `node:worker_threads` and answering
-    // on it *first*. Nothing arriving there is a result, so nothing here listens for it.
-    port1.on("message", (reply: unknown) => {
-      if (settled) {
-        // A second message after the first valid one. Logged, never acted on — the decision is "the
-        // first valid result wins", and a module that keeps posting does not get to revise it.
-        log(`${task.label}: ignoring a second message from an evaluation that already answered`);
-        return;
-      }
-      // Decision 6: a dedicated channel, a schema, and bytes. The type of `wire` is the whole check
-      // here; its content is checked by `parsePolicySource` in `accepted`.
-      if (typeof reply === "object" && reply !== null && (reply as { ok?: unknown }).ok === true) {
-        const wire = (reply as { wire?: unknown }).wire;
-        if (typeof wire === "string") {
-          settled = true;
-          resolve(wire);
-          reclaim(WORKER_GRACE_MS);
-          return;
-        }
-      }
-      if (typeof reply === "object" && reply !== null && (reply as { ok?: unknown }).ok === false) {
-        const message = (reply as { message?: unknown }).message;
-        settled = true;
-        // Prefixed, because the text came from the module: a bare line can be written to read like
-        // this process's own. The worker already flattened newlines for the same reason.
-        reject(new RealError(`${task.sitePath}: ${typeof message === "string" ? message : "evaluation failed"}`));
-        reclaim(0);
-        return;
-      }
-      // Neither shape. Not a result, so it does not settle anything — and it is logged because a
-      // module that reaches this line is trying something.
-      log(`${task.label}: discarding a message on the result channel that is not a result`);
-    });
-
-    worker.on("error", (thrown) => {
-      if (settled) {
-        // A late failure inside the grace window: counted and logged, and the answer stands. This is
-        // the behaviour the window exists to carry over from the in-process handlers.
-        noteLateFault(task.label, thrown);
-        return;
-      }
-      settled = true;
-      reject(new RealError(`${task.sitePath}: ${reasonOf(thrown)}`));
-      reclaim(0);
-    });
-
-    worker.on("exit", (code) => {
-      if (settled) {
-        if (code !== 0 && !terminatedByUs) {
-          noteLateFault(task.label, new RealError(`worker exited ${code} after answering`));
-        }
-        return;
-      }
-      // Decision 8: an exit with no result is this site's 503, and nothing is cached. A module calling
-      // `process.exit(0)` leaves neither `message` nor `error` (§3-b ④), so this is the only place it
-      // can be noticed.
-      settled = true;
-      // ## Exit 13 is a hang that ended itself, and it is not the budget
-      //
-      // A module whose top level awaits something that never settles — `await new Promise(() => {})`,
-      // a fetch to nowhere — leaves the worker's event loop with nothing to run, so Node ends the thread
-      // with code 13, "unsettled top-level await", in a few milliseconds. Measured (node 26.4): the
-      // `exit` arrives 25 ms after the handover, while the 3 s budget has not fired. A spin or a hang
-      // that holds a handle open stays alive until the budget terminates it, and exits 1.
-      //
-      // So this is the *decision 8* ending, not the timeout ending, and the message says which. The
-      // in-process renderer reported the same module as a timeout because the shared event loop kept
-      // the process alive until its timer fired; the worker learns the truth sooner. Saying "did not
-      // finish within" here would report a budget that never ran out.
-      const why = code === 13
-        ? "the module's top level awaited something that never settled (exit 13)"
-        : `the evaluation exited (${code}) without producing a result`;
-      reject(new RealError(`${task.sitePath}: ${why}`));
-      reclaim(0);
-    });
-
-    // ## The budget, and what is different now that it can be enforced
-    //
-    // `SOURCE_SITE_BUDGET_MS` already bounds "how long one site gets", and that question does not
-    // change with the thread the work runs on — so no new environment variable is introduced. Two
-    // names for one bound is a shape this repository has had to unpick before.
-    //
-    // 🔑 **What changes is what happens when it expires.** In-process, the timer could only reject
-    // while the module kept running: a top-level `while (true) {}` was the one hole §11 could not
-    // close, because a timer cannot preempt synchronous code. `terminate()` can.
-    // @see src/policy-render-service.test.ts "a module that spins forever fails only its own site"
-    const budget = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      reject(new RealError(`evaluation did not finish within ${SOURCE_SITE_BUDGET_MS}ms`));
-      reclaim(0);
-    }, SOURCE_SITE_BUDGET_MS);
-    budget.unref();
-
-    // Handing the port over as the first message, before the worker imports anything untrusted. The
-    // worker takes it and stops reading `parentPort`; §3-b ② measured what happens if it imports
-    // first — the module calls `parentPort.once("message")` and takes the handover instead.
-    worker.postMessage({ reply: port2 }, [port2]);
+    // which §3-b ② measured arriving at the parent. The path and nothing else goes in it; the label,
+    // name and allowlist were never the module's to see, and the parent fills them in (see `accepted`).
+    spawn: () => new Worker(WORKER_ENTRY, { workerData: { sitePath: task.sitePath } }),
+    budgetMs: SOURCE_SITE_BUDGET_MS,
+    graceMs: WORKER_GRACE_MS,
+    sitePath: task.sitePath,
+    label: task.label,
+    onLateFault: (thrown) => noteLateFault(task.label, thrown),
+    log,
+    onAlive: (delta) => { workersAlive += delta; },
+    reasonOf,
   });
 }
 

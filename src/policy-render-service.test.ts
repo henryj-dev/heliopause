@@ -2426,7 +2426,10 @@ describe("a policy module is evaluated in a worker of its own", () => {
   // the parent, the parent would accept it and beta would answer 200 with the forged payload; a 503
   // is the module's own failure arriving instead. The `forged` marker is asserted absent from the
   // body as well, so a 200 that happened for some other reason cannot pass as a block.
-  const FORGED = `{"schemaVersion":1,"site":{"cfg":{},"hosts":[{"id":"h1.beta","stage":"canary","items":[]}]},"forged":true}`;
+  // The marker is inside `site`, the half the parent keeps from the worker. A top-level marker would be
+  // dropped by the parent even when the forgery got through, so the absence of the marker would prove
+  // nothing — the assertion has to sit where a forgery that reached the parent would be visible.
+  const FORGED = `{"site":{"cfg":{},"hosts":[{"id":"h1.beta","stage":"canary","items":[],"notes":"FORGED"}]},"services":{}}`;
   const forging = (how: string) =>
     `const wt = await import("node:worker_threads");\n${how}\n` +
     `await new Promise((r) => setTimeout(r, 50));\nthrow new Error("the module failed on its own");\n`;
@@ -2461,6 +2464,29 @@ describe("a policy module is evaluated in a worker of its own", () => {
           `wt.MessagePort.prototype.postMessage = function () { return real.call(this, { ok: true, wire: ${JSON.stringify(FORGED)} }); };`,
       ),
     },
+    {
+      // ③ again, one lookup further out. The first version captured `postMessage` and called it with
+      // `send.call(…)`, and `.call` is looked up on `Function.prototype` at call time — measured, a
+      // complete forged payload was served with a 200. Found by an independent review.
+      name: "replaces Function.prototype.call",
+      body: forging(
+        `const send = wt.MessagePort.prototype.postMessage;\n` +
+          `const realCall = Function.prototype.call;\nconst apply = Reflect.apply;\n` +
+          `Function.prototype.call = function (...args) {\n` +
+          `  if (this === send) return apply(send, args[0], [{ ok: true, wire: ${JSON.stringify(FORGED)} }]);\n` +
+          `  return apply(realCall, this, args);\n};`,
+      ),
+    },
+    {
+      // And the one that would replace `Reflect.apply` itself, since that is what the fix calls.
+      name: "replaces Reflect.apply",
+      body: forging(
+        `const send = wt.MessagePort.prototype.postMessage;\nconst realApply = Reflect.apply;\n` +
+          `Reflect.apply = function (f, self, args) {\n` +
+          `  if (f === send) return realApply(send, self, [{ ok: true, wire: ${JSON.stringify(FORGED)} }]);\n` +
+          `  return realApply(f, self, args);\n};`,
+      ),
+    },
   ];
   for (const shape of shapes) {
     it(`does not accept a result from a module that ${shape.name}`, { timeout: 30_000 }, async () => {
@@ -2471,7 +2497,7 @@ describe("a policy module is evaluated in a worker of its own", () => {
         started = await start(dir, MULTI(sites));
         const res = await fetchAt(started.port, "/source?site=beta", { signal: AbortSignal.timeout(10_000) });
         const text = await res.text();
-        assert.doesNotMatch(text, /"forged":true/, `${shape.name}: the forged payload reached a response`);
+        assert.doesNotMatch(text, /FORGED/, `${shape.name}: the forged payload reached a response`);
         assert.equal(res.status, 503, `${shape.name}: beta was served although its module failed`);
         assert.match(text, /the module failed on its own/, `${shape.name}: the 503 is not the module's own failure`);
         assert.equal((await fetchAt(started.port, "/source?site=alpha")).status, 200);
@@ -2481,6 +2507,67 @@ describe("a policy module is evaluated in a worker of its own", () => {
       }
     });
   }
+
+  it("does not take anything but the module's own half from the worker", { timeout: 30_000 }, async () => {
+    // ## 🔑 The boundary is what the parent reads itself, not what the worker is prevented from sending
+    //
+    // The forgery shapes above each close one route to the send. Capturing is a patch on measured
+    // routes (AGENTS.md's own words), so this test assumes the worst instead: the module **does**
+    // control the reply. It sends a complete answer — `label`, `siteName`, `build`, `head`, `repo`,
+    // `files` all forged — and only a well-formed `site` of its own. The parent must keep that `site`,
+    // which is the module's to say, and must read every other field from its own configuration and the
+    // checkout. The module replaces both `Function.prototype.call` and `Reflect.apply`, so if either
+    // capture regresses its reply is what the parent receives; with both captures intact the honest
+    // half arrives and this still has to hold.
+    //
+    // ⚠️ With the captures intact this cannot tell "the parent ignored forged fields" from "no forged
+    // fields arrived". The first is the property; the mutation that shows it is reverting the `apply`
+    // capture, under which the forgery arrives and this must still find no `FORGED`.
+    const { dir, sites, beta } = twoSites();
+    const reply = {
+      ok: true,
+      wire: JSON.stringify({
+        site: { cfg: {}, hosts: [{ id: "h1.beta", stage: "canary", items: [], notes: "module-chosen" }] },
+        services: {},
+        label: "FORGED-label", siteName: "FORGED-name", build: "FORGEDbuild0",
+        head: { sha: "f".repeat(40), dirty: false },
+        repo: { probes: [], commits: [], generation: "FORGED-generation" },
+        files: { "policies.json": "FORGED-file" },
+      }),
+    };
+    // Intercept the worker's own send so the forged reply is what the parent receives — this is the
+    // "assume the capture failed" premise, written as a module so it runs through the real renderer.
+    writeFileSync(beta, `import { MessagePort } from "node:worker_threads";
+const send = MessagePort.prototype.postMessage;
+const realApply = Reflect.apply;
+const realCall = Function.prototype.call;
+Function.prototype.call = function (...args) {
+  if (this === send) return realApply(send, args[0], [${JSON.stringify(reply)}]);
+  return realApply(realCall, this, args);
+};
+Reflect.apply = function (f, self, args) {
+  if (f === send) return realApply(send, self, [${JSON.stringify(reply)}]);
+  return realApply(f, self, args);
+};
+export const site = { cfg: {}, hosts: [{ id: "h1.beta", stage: "canary", items: [] }] };
+`);
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      const res = await fetchAt(started.port, "/source?site=beta", { signal: AbortSignal.timeout(10_000) });
+      const text = await res.text();
+      assert.doesNotMatch(text, /FORGED/, `a renderer-owned field was taken from the worker:\n${text.slice(0, 400)}`);
+      if (res.status === 200) {
+        const body = JSON.parse(text) as { label?: string; siteName?: string; files?: Record<string, string> };
+        assert.equal(body.siteName, "beta");
+        assert.equal(body.label, "beta");
+        assert.equal(body.files?.["policies.json"], readFileSync(join(dir, "policies.json"), "utf8"));
+      }
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
 
   it("a module that spins forever fails only its own site", { timeout: 30_000 }, async () => {
     // The one hole the in-process renderer could not close: a timer cannot preempt synchronous code,

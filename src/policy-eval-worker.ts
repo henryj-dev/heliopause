@@ -31,21 +31,36 @@
 // "fix" the order and break ②.
 import { parentPort, workerData, MessagePort } from "node:worker_threads";
 import { pathToFileURL } from "node:url";
-import { collectPolicySource } from "./policy-source.ts";
+import { collectModuleFacts } from "./policy-source.ts";
 import type { ScreenSite } from "./policy-screen.ts";
 
 // ③ — captured here, at the top of this module's body, which is after this file's static imports and
-// before the dynamic import below. @see policy-eval-worker.test.ts "a module that rewrites
-// MessagePort.prototype.postMessage does not intercept the result"
+// before the dynamic import below.
+//
+// 🔴 **The method alone was not enough, and the first version shipped that way.** It captured
+// `postMessage` and called it as `send.call(reply, …)` — and `.call` is looked up on
+// `Function.prototype` at call time. A module that replaced `Function.prototype.call` intercepted the
+// send and posted a complete forged payload, which the parent served with a 200 and logged as
+// "verified" (measured; an independent review found the route). `apply` is captured with the method,
+// and the call goes through it, so nothing between here and the port is looked up after the import.
+//
+// ⚠️ This is a patch on the measured route, not the boundary. Everything this thread sends is the
+// module's to choose in principle, so the parent does not rely on it: the worker sends only what the
+// module is entitled to say anyway (`site` and the resolver table), and the parent reads every other
+// field from the checkout itself. @see `assemblePolicySource` in `./policy-source.ts`
+//
+// @see src/policy-render-service.test.ts "does not accept a result from a module that rewrites
+// MessagePort.prototype.postMessage" and "… that replaces Function.prototype.call"
 const send = MessagePort.prototype.postMessage;
+const apply = Reflect.apply;
 
-// The serialisation that produces the bytes. §2's requirement 1: the **whole** outgoing
-// `PolicySource` is serialised in here, `repo.probes` included, because a design that tracks "how far
-// did `toWire` reach" was wrong twice in the table above it. Captured for the same reason as ③.
+// The serialisation that produces the bytes. §2's requirement 1: the module's half is serialised in
+// here, so nothing that cannot be written reaches the parent as a value. Captured for the same reason
+// as ③.
 const writeWire = JSON.stringify;
 
-// A module cannot forge this shape usefully — the parent checks the type of every field it reads, and
-// `wire` is only ever a string. It is exported so the test and the parent describe one thing.
+// `wire` is the module's half only — `{ site, services }` as JSON — and the parent checks the type of
+// every field it reads. It is exported so the test and the parent describe one thing.
 export type EvalReply =
   | { ok: true; wire: string }
   | { ok: false; message: string };
@@ -121,13 +136,7 @@ if (!(reply instanceof MessagePort)) {
 }
 
 // Everything above runs before the module. Everything below is in its reach.
-const task = workerData as {
-  sitePath: string;
-  allowPaths: readonly string[];
-  label: string;
-  siteName: string | null;
-  url: string;
-};
+const task = workerData as { sitePath: string };
 
 try {
   // ## No `?v=` and no child-version hook
@@ -147,16 +156,11 @@ try {
   // The zone check is **not** here. It reads `site.hosts[].id`, and in this thread every prototype it
   // touches belongs to the module — a getter or a replaced `Array.prototype` makes it pass. The parent
   // runs it on the parsed wire instead, where the values are data.
+  //
+  // Nor is anything the renderer reads from disk: `label`, `siteName`, `repo`, `head`, `files` and
+  // `build` are filled in by the parent. Only the module's own half crosses.
   // @see bin/heliopause-policy-render.ts, and the decision note in docs/policy-eval-worker-notes.md
-  const source = collectPolicySource({
-    site: mod.site,
-    sitePath: task.sitePath,
-    allowPaths: task.allowPaths,
-    label: task.label,
-    ...(task.siteName === null ? {} : { siteName: task.siteName }),
-  });
-
-  send.call(reply, { ok: true, wire: writeWire(source) } satisfies EvalReply);
+  apply(send, reply, [{ ok: true, wire: writeWire(collectModuleFacts(mod.site)) } satisfies EvalReply]);
 } catch (thrown) {
-  send.call(reply, { ok: false, message: failureText(thrown) } satisfies EvalReply);
+  apply(send, reply, [{ ok: false, message: failureText(thrown) } satisfies EvalReply]);
 }
