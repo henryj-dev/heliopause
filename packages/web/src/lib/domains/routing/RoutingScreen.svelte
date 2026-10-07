@@ -5,7 +5,7 @@
   import { chromeFreshness } from "$lib/shell/freshness.svelte";
   import { chromePrefs } from "$lib/shell/prefs.svelte";
   import { loginHref } from "$lib/shell/who";
-  import { hostIsClean, routingListing, type RouteVerdict, type RoutingHost } from "./routing";
+  import { hostIsClean, routingListing, siteGenerationSplit, type RouteVerdict, type RoutingHost } from "./routing";
   import { ROUTING_POLL_MS, routingQuery } from "./query.svelte";
 
   const routing = routingQuery();
@@ -103,9 +103,17 @@
     </div>
   {:else}
     <div class:stale-hold={stale}>
+    {#each view.sites.filter((s) => s.error !== null) as site, i (i)}
+      <p class="caveat">{t(prefs.lang, "m.routingSiteUnread", { site: site.site, error: site.error ?? "" })}</p>
+    {/each}
+    {#if siteGenerationSplit(view).length > 0}
+      <p class="caveat">{t(prefs.lang, "m.routingGenerationSplit", { list: siteGenerationSplit(view).map((s) => `${s.site} ${String(s.generation).slice(0, 7)}`).join(", ") })}</p>
+    {/if}
     {#each view.hosts as host (host.vpc + host.host)}
       <h3>{host.host} <span>{host.vpc}</span></h3>
-      {#if host.rows === null}
+      {#if host.declarationError !== null}
+        <p class="caveat">{t(prefs.lang, "m.routingDeclarationUnread")}</p>
+      {:else if host.rows === null}
         <p class="caveat">{t(prefs.lang, "m.routingNoModel")}</p>
       {:else}
         <p>

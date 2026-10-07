@@ -30,6 +30,7 @@
 
 import { createServer, type Server } from "node:https";
 import { certificateIsRevoked } from "./certificate-revocation.ts";
+import { certFactsFromPeer, type CertFacts, type PeerCertificateLike } from "./cert-watch.ts";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { lstat, readFile, stat } from "node:fs/promises";
 import {
@@ -117,6 +118,19 @@ export interface RelayState {
    * current is worse than an absent one.
    */
   membership: Record<string, SelectorMembership>;
+  /**
+   * The client certificate each filed host presented on its latest heartbeat, keyed by host.
+   *
+   * Observed on the wire rather than read from the host's disk: the certificate that matters is the
+   * one the agent is actually using, and a renewed file the agent has not reloaded is not it. Memory
+   * only, refilled on the next beat — `observedAt` says how old a reading is.
+   */
+  agentCerts: Record<string, AgentCertObservation>;
+}
+
+/** One agent certificate as the relay saw it. */
+export interface AgentCertObservation extends CertFacts {
+  observedAt: string;
 }
 
 export function emptyState(): RelayState {
@@ -130,6 +144,7 @@ export function emptyState(): RelayState {
     drifted: new Set(),
     contradictions: {},
     membership: {},
+    agentCerts: {},
   };
 }
 
@@ -219,6 +234,11 @@ export interface HostView {
   agentVersion: string | null;
   /** Source digest the agent reported. `null` is "did not say" — see `Heartbeat.agentBuild`. */
   agentBuild: string | null;
+  /**
+   * The client certificate this host presented on its latest heartbeat. `null` when none has been
+   * recorded since this relay started — not "no certificate": every heartbeat is mTLS.
+   */
+  agentCert: AgentCertObservation | null;
   /**
    * Why this host refused the generation it was offered, in its own words.
    *
@@ -344,6 +364,7 @@ export function fleetView(
       intrusions: st?.intrusions ?? null,
       agentVersion: st?.agentVersion ?? null,
       agentBuild: st?.agentBuild ?? null,
+      agentCert: state.agentCerts[host] ?? null,
       // Only while it still matters. A refusal of a generation the host has since moved past is
       // history, and history in a status view reads as a live problem.
       lastRefusal: st?.lastRefusal && st.lastRefusal.generation !== st?.generation
@@ -655,6 +676,8 @@ export function handleHeartbeat(
   certCN: string | null,
   hb: Heartbeat,
   at: string,
+  /** What the agent's TLS client certificate says. See `RelayState.agentCerts`. */
+  presented: CertFacts | null = null,
 ): HeartbeatOutcome {
   if (!certCN) {
     return { status: 401, body: { error: "client certificate carries no subject CN" } };
@@ -709,6 +732,11 @@ export function handleHeartbeat(
   }
 
   state.lastSeen[certCN] = at;
+  // Filed where the status is filed — after the manifest check above — so a host gets a row here only
+  // if it gets one in `statuses`. A beat without a readable certificate leaves the
+  // previous reading in place: that reading still says when it was taken, and its absence is not
+  // evidence of a newer certificate.
+  if (presented) state.agentCerts[certCN] = { ...presented, observedAt: at };
   state.statuses[certCN] = {
     generation: hb.applied.generation,
     // Kept so a host-unit deployment can be verified from the server rather than from the
@@ -984,6 +1012,21 @@ export function peerCN(req: IncomingMessage): string | null {
   return cert?.subject?.CN ?? null;
 }
 
+/**
+ * The authenticated peer's certificate facts, or null if the peer is not authenticated.
+ *
+ * Same gate as `peerCN`: an unauthorised socket's certificate is whatever the client chose to send,
+ * and recording its expiry would be recording a claim.
+ */
+export function peerCertFacts(req: IncomingMessage): CertFacts | null {
+  const socket = req.socket as unknown as {
+    authorized?: boolean;
+    getPeerCertificate?: () => PeerCertificateLike | null;
+  };
+  if (!socket.authorized) return null;
+  return certFactsFromPeer(socket.getPeerCertificate?.());
+}
+
 async function readBody(req: IncomingMessage, limit = MAX_BODY_BYTES): Promise<string> {
   const chunks: Buffer[] = [];
   let size = 0;
@@ -1103,7 +1146,7 @@ export async function startRelay(
       } catch (e) {
         return send(res, 400, { error: `bad request body: ${(e as Error).message}` });
       }
-      const outcome = handleHeartbeat(state, cn, hb, now().toISOString());
+      const outcome = handleHeartbeat(state, cn, hb, now().toISOString(), peerCertFacts(req));
       if (outcome.status !== 200) {
         log(`heartbeat rejected from ${cn}: ${JSON.stringify(outcome.body)}`, `${cn}의 하트비트를 거부함: ${JSON.stringify(outcome.body)}`);
       }

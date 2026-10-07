@@ -170,9 +170,14 @@ export interface HostDeregistrationRecord {
  * `enrollment:host-deregister` is destructive, but only for one lifecycle under the token's
  * hostname pattern; issue it solely to the zone authority that already destroys those VMs. Signing
  * and arbitrary revocation stay with an operator holding a certificate and one-time code.
+ *
+ * `certificates:read` is the one scope the hostname pattern does not narrow. It reads the whole
+ * fleet's certificate expiries — CAs, the manager's own and operators' certificates among them, none
+ * of which has a hostname to match — and a monitor that can see only part of the fleet reports the
+ * rest as healthy by omission.
  */
 export const APP_TOKEN_SCOPES = [
-  "enrollment:token-create", "enrollment:requests-read", "enrollment:host-deregister",
+  "enrollment:token-create", "enrollment:requests-read", "enrollment:host-deregister", "certificates:read",
 ] as const;
 export type AppTokenScope = (typeof APP_TOKEN_SCOPES)[number];
 export interface AppTokenRecord {

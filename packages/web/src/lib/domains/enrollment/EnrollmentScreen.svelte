@@ -54,7 +54,7 @@
     writeHeaders,
   } from "./write";
 
-  const APP_SCOPES = ["enrollment:token-create", "enrollment:requests-read"];
+  const APP_SCOPES = ["enrollment:token-create", "enrollment:requests-read", "certificates:read"];
 
   let { asked = "" }: { asked?: string } = $props();
 

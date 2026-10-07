@@ -210,6 +210,8 @@ const { server } = await startManager({
     authorizationTtlSec: artifactAuthorizationTtlSec,
   },
   ...(process.env.HELIOPAUSE_REVOCATION_FILE ? { revocationFile: process.env.HELIOPAUSE_REVOCATION_FILE } : {}),
+  // Operators' public certificates, for `/api/certificates`. See `ManagerOptions.knownOperatorsDir`.
+  ...(process.env.HELIOPAUSE_KNOWN_OPERATORS_DIR ? { knownOperatorsDir: process.env.HELIOPAUSE_KNOWN_OPERATORS_DIR } : {}),
   // Where the rendered policy comes from. **A URL and not a path**, which is the whole of C1's fix:
   // this process must not have a checkout, because a checkout is one `import()` away from running
   // the policy repository's code beside the signing key. `heliopause-policy-render` has the

@@ -356,8 +356,34 @@ export function collectPolicySource(input: {
   siteName?: string;
 }): PolicySource {
   const { site, sitePath, label, allowPaths, siteName } = input;
-  const dir = dirname(resolve(sitePath));
+  return assemblePolicySource({ module: collectModuleFacts(site), sitePath, label, allowPaths, siteName });
+}
 
+/**
+ * The half of a `PolicySource` that only the policy module can say: its `site` and its resolver table.
+ *
+ * ## Why the payload is split in two
+ *
+ * The renderer evaluates a module in a worker, and the worker's realm belongs to the module — so
+ * anything the worker sends is the module's to choose, whatever the worker's own code meant to send.
+ * Measured: a module replaced `Function.prototype.call`, intercepted the worker's send, and had a
+ * copy of a *different* site's real payload — renamed and re-hosted — served as its own, with
+ * "verified" in the log.
+ *
+ * Splitting narrows that by construction rather than by capture. Everything here is **authored by the
+ * module**, so the module choosing it is not a forgery — it is the module's policy, which is what a
+ * policy commit is allowed to say. Everything in `assemblePolicySource` is **taken by the parent from
+ * somewhere other than the worker's message** — its configuration, its code, the checkout — so no
+ * value in that message can become one of those fields.
+ *
+ * ⚠️ That is a statement about the message, not about the checkout. The module runs with the
+ * renderer's filesystem permissions and can write the files the parent then reads (measured: a module
+ * that wrote into `policies.json` had that text served in `files`). That was true before the worker
+ * too; restricting it is a separate change (Node's permission model), #131.
+ *
+ * @see assemblePolicySource for what the parent reads itself
+ */
+export function collectModuleFacts(site: ScreenSite): { site: ScreenSite; services: Record<string, ServiceSelector> } {
   const services: Record<string, ServiceSelector> = {};
   const resolver = site.resolveService as ((ref: string) => ServiceSelector | null) | undefined;
   if (resolver) {
@@ -377,6 +403,47 @@ export function collectPolicySource(input: {
     }
   }
 
+  // `JSON.parse(JSON.stringify())` rather than a spread: it is the wire, applied here, so a field
+  // that cannot survive the crossing fails in the process that owns the mistake instead of arriving
+  // as a silently missing table three seconds later in the manager's log.
+  //
+  // ⚠️ `toWire`, not `JSON`. When this ran in the renderer's own realm, `globalThis.JSON = {
+  // stringify() { throw 1; } }` was two tokens in a policy commit and this line ran for every site;
+  // capturing at module load was the measured fix. In a worker the capture still matters for the
+  // module's *own* answer, and no longer has to protect any other site's.
+  //
+  // @see src/policy-render-service.test.ts "survives a module that replaces the globals it will be described with"
+  return { site: toWire({ ...site, resolveService: undefined }) as ScreenSite, services };
+}
+
+/**
+ * A `PolicySource` from the module's half plus what the renderer reads itself.
+ *
+ * Every field set here comes from the renderer's configuration (`label`, `siteName`), its own code
+ * (`build`, `schemaVersion`) or the checkout on disk (`repo`, `head`, `files`) — never from the
+ * worker's message. The renderer calls this in the **parent**, so of what a module puts in that
+ * message, only `site` and `services` are kept.
+ *
+ * ⚠️ "Never from the worker's message" is not "never influenced by the module": the module can write
+ * the checkout the parent reads. See `collectModuleFacts`.
+ *
+ * ⚠️ That bounds the forgery; it does not end it. A module can still send a `site` other than the one
+ * its code would have produced — including a copy of another site's hosts and rules. The zone check
+ * stops a copy whose host ids name another zone; it does not stop a copy re-hosted under this zone's
+ * ids, because the host ids *are* what the module is allowed to say. That residue is the same thing a
+ * policy commit can already do by writing those rules directly, and it is recorded rather than
+ * claimed closed. @see docs/policy-eval-worker-notes.md §7
+ */
+export function assemblePolicySource(input: {
+  module: { site: ScreenSite; services: Record<string, ServiceSelector> };
+  sitePath: string;
+  label: string;
+  allowPaths: readonly string[];
+  siteName?: string | undefined;
+}): PolicySource {
+  const { module, sitePath, label, allowPaths, siteName } = input;
+  const dir = dirname(resolve(sitePath));
+
   const files: Record<string, string> = {};
   for (const path of allowPaths) {
     // The allowlist is what may be edited, so it is also exactly what may be read out. A file that
@@ -389,24 +456,6 @@ export function collectPolicySource(input: {
       // Absent, unreadable, or the sync has not run yet.
     }
   }
-
-  // `JSON.parse(JSON.stringify())` rather than a spread: it is the wire, applied here, so a field
-  // that cannot survive the crossing fails in the process that owns the mistake instead of arriving
-  // as a silently missing table three seconds later in the manager's log.
-  //
-  // ⚠️ `toWire`, not `JSON`. `site` came from a module the renderer evaluated with `import()`, which
-  // runs it in the renderer's **own realm** — so `globalThis.JSON = { stringify() { throw 1; } }` is
-  // two tokens in a policy commit, and this line runs for **every** site. Measured: one hostile module
-  // made a different, correct site answer 503 after the renderer had already captured its own `JSON`,
-  // because the crossing is here. Captured at module load, which is before the renderer's first
-  // dynamic import.
-  //
-  // This is a patch on a measured path, not a boundary. Every module the renderer imports resolves its
-  // intrinsics at call time, so the general claim "a policy module cannot reach another site" is not
-  // true and must not be written down. The boundary would be evaluating policy in a separate realm.
-  //
-  // @see src/policy-render-service.test.ts "survives a module that replaces the globals it will be described with"
-  const wire = toWire({ ...site, resolveService: undefined }) as ScreenSite;
 
   const head = policyHead(sitePath);
   // A checkout with a `.git` and no answer from git is a different state from no checkout, and the
@@ -431,8 +480,8 @@ export function collectPolicySource(input: {
     // as "this renderer cannot say", which is a different fact from "it said nothing".
     ...(siteName === undefined ? {} : { siteName }),
     label,
-    site: wire,
-    services,
+    site: module.site,
+    services: module.services,
     repo: {
       probes: readCoverageProbes(sitePath),
       commits: policyCommits(sitePath),
