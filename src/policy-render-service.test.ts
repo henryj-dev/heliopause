@@ -507,6 +507,16 @@ function twoSites(): { dir: string; sites: string; alpha: string; beta: string }
   const dir = join(root, "policy");
   mkdirSync(dir);
   writeFileSync(join(dir, "policies.json"), '{\n  "schemaVersion": 1,\n  "groups": []\n}\n');
+  // ## A probe file, so the paths that read one are reachable
+  //
+  // `readCoverageProbes` only calls `JSON.parse` when `readdirSync` matches a `coverage-*.json`, so
+  // without this file every shape that attacks that parser does nothing and passes. One such shape
+  // was written, observed to answer 200, and removed as unreproducible (#126) — the fixture was
+  // missing this line, not the renderer missing the defect.
+  //
+  // Contents are deliberately empty: the shapes that care replace the parser, so what the file holds
+  // never reaches the answer. It has to exist, not to say anything.
+  writeFileSync(join(dir, "coverage-a.json"), '{"probes":[]}\n');
   const body = (zone: string, extra = "") =>
     `export const site = {
        cfg: { hookPolicy: { input: "drop", output: "accept" } },
@@ -1650,6 +1660,81 @@ export const site = {
         started?.stop();
         rmSync(join(dir, ".."), { recursive: true, force: true });
       }
+    }
+  });
+
+  // ## #126 — a replaced probe parser, and what the expectation should be
+  //
+  // `readCoverageProbes` reads `coverage-*.json` with an **uncaptured** `JSON.parse`
+  // (`src/policy-screen.ts:146`), so a module replacing the global chooses what a probe holds. A
+  // `BigInt` survives collection — the row builder checks three string fields — and then the
+  // whole-source serialisation throws. `beta`, the poisoning site, answers 503.
+  //
+  // 🔴 **`alpha`, which poisoned nothing, also answers 503**, because the module never restores the
+  // global. That is the defect, so the desired value for `alpha` is **200**, and the first test below
+  // says so. It is `todo`: it fails today, on purpose, and a `todo` failure does not fail the suite.
+  //
+  // ⚠️ The first draft put this in the matrix above with `alpha: 503` as the expected value — the
+  // shape AGENTS.md records as "관찰된 동작이 기대값이 되는 순간 — 테스트가 구멍을 봉인한다". That
+  // matrix means "this is correct", so a 503 there would have made the contamination the
+  // specification, and a later fix would have arrived looking like a regression. A review caught it.
+  //
+  // ⚠️ A `todo` alone is silent whichever way it goes, so the second test pins today's answer and is
+  // named for the issue rather than for the behaviour: when #126 is fixed it goes red and asks to be
+  // deleted along with the `todo` marker.
+  //
+  // This shape was written once, observed to answer 200 for `beta`, and removed as unreproducible.
+  // The renderer was right and the fixture was wrong — `twoSites` wrote no `coverage-*.json`, so the
+  // replaced parser was never called. That 200 did not mean "no defect"; it meant "that code did not
+  // run".
+  const POISONS_PROBE_PARSER =
+    'JSON.parse = () => ({ probes: [{ checkId: "c", addr: "a", at: "t", n: 1n }] });\n' +
+    'export const site = { cfg: {}, hosts: [{ id: "h1.beta", stage: "canary", items: [] }] };\n';
+
+  async function probeParserSites(): Promise<{ alpha: number; beta: number; stop: () => void; dir: string }> {
+    const { dir, sites, beta } = twoSites();
+    writeFileSync(beta, POISONS_PROBE_PARSER);
+    const started = await start(dir, MULTI(sites));
+    const at = async (site: string) =>
+      (await fetchAt(started.port, `/source?site=${site}`, { signal: AbortSignal.timeout(10_000) })).status;
+    // `alpha` first, because it is the question — asking it after `beta` would leave "did the order
+    // matter" unanswered. Startup already evaluated both, so neither request is a first evaluation.
+    const alpha = await at("alpha");
+    const statusBeta = await at("beta");
+    return { alpha, beta: statusBeta, stop: started.stop, dir };
+  }
+
+  it(
+    "a healthy site still answers when another site's module replaces JSON.parse",
+    { timeout: 30_000, todo: "#126 — it does not: alpha answers 503, because the global is never restored" },
+    async () => {
+      const got = await probeParserSites();
+      try {
+        assert.equal(got.alpha, 200, "alpha poisoned nothing and should still be served");
+      } finally {
+        got.stop();
+        rmSync(join(got.dir, ".."), { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("#126 is still open: a replaced probe parser takes the healthy site down too", { timeout: 30_000 }, async () => {
+    const got = await probeParserSites();
+    try {
+      // Delete this test when #126 is fixed — the `todo` above becomes the live assertion. Both
+      // statuses are checked so "everything is 503" and "the contamination is gone" cannot be
+      // confused: a green `beta` is a reason to go and read the fixture.
+      //
+      // ⚠️ `beta: 503` does not establish that the replaced parser ran — the site could fail for a
+      // neighbouring reason, and the review said so. What establishes it is the pair of
+      // measurements that bracket the fixture: with no `coverage-*.json` present this shape answered
+      // 200, and with one present it answers `Do not know how to serialize a BigInt`, a value only
+      // the replaced parser supplies. This assertion is the smoke, not the cause.
+      assert.equal(got.beta, 503, "the poisoning site must fail — a green here means reading the fixture");
+      assert.equal(got.alpha, 503, "today the healthy site fails too; when this goes green, #126 is fixed");
+    } finally {
+      got.stop();
+      rmSync(join(got.dir, ".."), { recursive: true, force: true });
     }
   });
 
