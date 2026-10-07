@@ -227,12 +227,21 @@ export function evaluateWithLifecycle(opts: EvalLifecycleOptions): Promise<strin
         // So the only discriminator is the code: a terminated worker exits **1**. An exit after our call
         // with any other non-zero code is the module's own, and counted.
         //
-        // ⚠️ The blind spot that leaves: a module that calls `process.exit(1)` itself, inside the window
-        // where our `terminate()` is in flight, looks exactly like our own termination and is not counted.
-        // Measured with `exit 1` in the same race: every run read exit 1, whichever side won. The window is
-        // the time between the grace timer firing and the thread ending, and a module exiting on its own
-        // outside it is counted. @see src/policy-eval-lifecycle.test.ts "counts the module's own exit even
-        // when our terminate is in flight"
+        // ⚠️ **Two reproduced cases where a module's own `process.exit(1)` is not counted**, both because
+        // its code is the one our termination produces and `terminatedByUs` is set:
+        //
+        //   ① our grace-end `terminate()` is in flight when the module exits 1 itself — measured with
+        //     `exit 1` in the race above: every run read exit 1, whichever side won;
+        //   ② the reply is still queued on the port when the module's `exit 1` arrives and grace is 0 —
+        //     `drain()` settles the reply inside this handler, reclaims with no grace, and so calls
+        //     `terminate()` on a thread that has already stopped. Reproduced by a review that delayed
+        //     reply delivery to force that order; with grace 100 ms the same exit was counted.
+        //
+        // Both predate this flag's code check (round three); the check narrowed the loss to code 1 and
+        // did not create it. Outside those two conditions a module's own `exit 1` after its answer is
+        // counted. These are the reproduced cases, not a proof that there are no others.
+        // @see src/policy-eval-lifecycle.test.ts "counts the module's own exit even when our terminate is
+        // in flight"
         const ours = terminatedByUs && code === 1;
         if (code !== 0 && !ours && !lateErrorCounted) {
           opts.onLateFault(new Error(`worker exited ${code} after answering`));

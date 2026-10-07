@@ -2560,6 +2560,10 @@ describe("a policy module is evaluated in a worker of its own", () => {
       files: { "policies.json": "FORGED-file" },
       unrelated: "FORGED-extra",
     };
+    // A probe in the checkout, so `repo.probes` read by the parent is not empty — see the reference below.
+    writeFileSync(join(dir, "coverage-a.json"), JSON.stringify({
+      probes: [{ checkId: "c-real", addr: "10.0.0.1", at: "2026-10-07T00:00:00Z" }],
+    }));
     // Only the outermost object answers with the forgery; everything nested serialises normally, so
     // the module's own collection still works and the forged object is what reaches the wire.
     writeFileSync(beta, `const forged = ${JSON.stringify(forged)};
@@ -2572,9 +2576,22 @@ export const site = { cfg: {}, hosts: [{ id: "h1.beta", stage: "canary", items: 
     let started: Started | undefined;
     try {
       started = await start(dir, MULTI(sites));
-      // The renderer's own build, from a site that forged nothing — the expected value for beta's.
-      const alphaBuild = ((await (await fetchAt(started.port, "/source?site=alpha")).json()) as { build?: string }).build;
+      // ## The references come from alpha, which forged nothing and shares beta's checkout
+      //
+      // `build`, `head` and the whole of `repo` are facts about the renderer and the checkout, not
+      // about the site, so alpha's answer *is* the expected value for beta's. Comparing whole objects
+      // rather than one field is the point: round four's review took the worker's entire `repo` in a
+      // mutated parent with unmarked `probes`/`commits` and `generation: null`, and the check that
+      // looked only at `generation` stayed green.
+      //
+      // `repo.probes` is made non-empty here (a probe file in the checkout) so that "the parent read
+      // the checkout" and "both sides were empty" cannot be confused.
+      const alphaRef = (await (await fetchAt(started.port, "/source?site=alpha")).json()) as {
+        build?: string; head?: unknown; repo?: { probes?: unknown[] };
+      };
+      const alphaBuild = alphaRef.build;
       assert.match(alphaBuild ?? "", /^[0-9a-f]{12}$/, "the reference build is not a build id");
+      assert.equal(alphaRef.repo?.probes?.length, 1, "the reference repo did not read the probe file, so it would not tell sources apart");
       const res = await fetchAt(started.port, "/source?site=beta", { signal: AbortSignal.timeout(10_000) });
       const text = await res.text();
       assert.equal(res.status, 200, `the forged message was not served at all, so nothing was tested:\n${text.slice(0, 300)}`);
@@ -2582,19 +2599,18 @@ export const site = { cfg: {}, hosts: [{ id: "h1.beta", stage: "canary", items: 
       assert.doesNotMatch(text, /FORGED/, `a renderer-owned field was taken from the worker:\n${text.slice(0, 400)}`);
       const body = JSON.parse(text) as {
         label?: string; siteName?: string; schemaVersion?: number; build?: string;
-        head?: { sha: string | null; dirty: boolean }; repo?: { generation?: string | null };
-        files?: Record<string, string>;
+        head?: unknown; repo?: unknown; files?: Record<string, string>;
       };
-      // Every renderer-owned field compared to its own source, not only scanned for the marker: round
-      // three put a forged `head` through a mutated parent and this test stayed green, because the
-      // forged sha is forty `f`s and contains no `FORGED`. Each field below is checked against what the
-      // renderer reads — `twoSites()` is not a git checkout, so `head` and `generation` are empty.
+      // Each renderer-owned field compared to its source, not only scanned for the marker: round three
+      // put a forged `head` through a mutated parent and this test stayed green, because the forged sha
+      // is forty `f`s and contains no `FORGED`. Configuration fields against the configuration,
+      // checkout fields against alpha's (same checkout), and `files` against the file on disk.
       assert.equal(body.siteName, "beta");
       assert.equal(body.label, "beta");
       assert.equal(body.schemaVersion, 1);
       assert.equal(body.build, alphaBuild, "build was not the renderer's own");
-      assert.deepEqual(body.head, { sha: null, dirty: false }, "head was not read from the checkout");
-      assert.equal(body.repo?.generation ?? null, null, "repo was not read from the checkout");
+      assert.deepEqual(body.head, alphaRef.head, "head was not read from the checkout");
+      assert.deepEqual(body.repo, alphaRef.repo, "repo was not read from the checkout");
       assert.equal(body.files?.["policies.json"], readFileSync(join(dir, "policies.json"), "utf8"));
     } finally {
       started?.stop();

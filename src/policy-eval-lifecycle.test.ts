@@ -14,11 +14,17 @@ import { evaluateWithLifecycle, type EvalThread, type EvalLifecycleOptions } fro
 /**
  * A thread that replies on the handed-over port, then does `after` — all before returning.
  *
- * `terminate()` behaves like a real worker's: once, it ends the thread with `exit 1` on a later turn
- * (measured: a terminated worker exits 1). The first version of this fake resolved `terminate()` and
- * never emitted `exit`, which was harmless while the count dropped on our own decision — and which
- * would have hidden a count that only drops on `exit`. `t` is returned so a test can drive the thread
- * after the answer.
+ * `terminate()` ends a still-running fake with `exit 1` a turn later, which is what a real worker
+ * terminated after it answered does (measured: exit 1). It is **not** a faithful copy of a real worker
+ * in two ways a reader should know: it resolves `terminate()` *before* emitting `exit`, where a real
+ * worker's promise resolves with the exit; and a real worker terminated before it started reported
+ * code **0** (measured by round four's review), which the fake never does. Neither matters to the
+ * tests here — none awaits `terminate()`, and the lifecycle does not count exit 0 as a fault — but a
+ * test that needs either ordering must use a real worker.
+ *
+ * The first version of this fake never emitted `exit` at all, which was harmless while the count
+ * dropped on our own decision and would have hidden a count that only drops on `exit`. `t` is returned
+ * so a test can drive the thread after the answer.
  */
 function fakeThread(
   reply: unknown,
