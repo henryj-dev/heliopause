@@ -188,7 +188,16 @@ describe("certificateInventory", () => {
     assert.match(r.missing[0]!.reason, /^broken\.pem: not a certificate$/);
   });
 
-  it("numbers operator files that share a CN from the base id — #2, #3, not #2#3", () => {
+  it("keeps operator files with one over-long CN unique and within 512 characters", () => {
+    const r = certificateInventory(base({
+      operators: ["a", "b", "c"].map((f) => ({ file: `${f}.pem`, reading: facts({ cn: "o".repeat(600) }) })),
+    }));
+    const ids = r.certificates.filter((c) => c.kind === "operator").map((c) => c.id);
+    assert.equal(new Set(ids).size, 3, ids.join(", "));
+    assert.ok(ids.every((id) => id.length <= 512), ids.map((id) => id.length).join(", "));
+  });
+
+  it("numbers three operator files that share a CN from the base id — #2, #3, not #2#3", () => {
     const r = certificateInventory(base({
       operators: ["a", "b", "c"].map((f) => ({ file: `${f}.pem`, reading: facts({ cn: "ops" }) })),
     }));
