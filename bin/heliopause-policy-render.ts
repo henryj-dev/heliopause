@@ -562,6 +562,21 @@ if (!token) {
 const cached = new Map<string, { stamp: string; wire: string }>();
 
 /**
+ * The evaluation in progress for each site, keyed like `cached` and holding the stamp it started on.
+ *
+ * Concurrent cache misses on one stamp used to start one worker each — measured on `d8615ca`: 64
+ * concurrent requests after a stamp move ran 64 workers, and a failing site, which is never cached,
+ * ran one per request (#117). A miss now joins the evaluation already running for the same stamp.
+ *
+ * Only the **running** evaluation is shared. A failure is not remembered once it settles, so the next
+ * request after it evaluates again, as before; what changes is that everyone waiting on that one
+ * evaluation receives its answer, success or failure, instead of starting their own.
+ *
+ * @see src/policy-render-service.test.ts "concurrent requests share one evaluation"
+ */
+const inFlight = new Map<string, { stamp: string; answer: Promise<string> }>();
+
+/**
  * What can change what `/source` should answer, in one string — as much of it as this can see.
  *
  * Not "everything", which is what this claimed. It reads the entry module, the allowlisted files, the
@@ -805,8 +820,21 @@ async function currentSource(site: { name: string | null; path: string }): Promi
   // `src/policy-eval-worker.ts` holds the three lines §3-b measured — a dedicated port, taken before
   // the module is imported, and a captured `postMessage` — and the reasons they are not
   // interchangeable with the obvious alternatives.
-  const moduleWire = await evaluateInWorker({ sitePath, label: name ?? label });
-  return accepted({ moduleWire, name, sitePath, stamp });
+  const running = inFlight.get(sitePath);
+  // The stamp is part of the match: a request that sees a newer stamp than the running evaluation
+  // started on must not be answered from the older one.
+  if (running && running.stamp === stamp) return running.answer;
+  const answer = (async () => {
+    const moduleWire = await evaluateInWorker({ sitePath, label: name ?? label });
+    return accepted({ moduleWire, name, sitePath, stamp });
+  })();
+  const entry = { stamp, answer };
+  inFlight.set(sitePath, entry);
+  // Removes only its own entry: a newer evaluation may have replaced it. Both handlers, so this chain
+  // is never an unhandled rejection; each caller handles the rejection it receives.
+  const forget = () => { if (inFlight.get(sitePath) === entry) inFlight.delete(sitePath); };
+  answer.then(forget, forget);
+  return answer;
 }
 
 /** The half of `currentSource` that runs in the parent on what the worker sent: read the module's
