@@ -188,6 +188,16 @@ describe("certificateInventory", () => {
     assert.match(r.missing[0]!.reason, /^broken\.pem: not a certificate$/);
   });
 
+  it("numbers operator files that share a CN from the base id — #2, #3, not #2#3", () => {
+    const r = certificateInventory(base({
+      operators: ["a", "b", "c"].map((f) => ({ file: `${f}.pem`, reading: facts({ cn: "ops" }) })),
+    }));
+    assert.deepEqual(
+      r.certificates.filter((c) => c.kind === "operator").map((c) => c.id),
+      ["operator/-/ops/file", "operator/-/ops/file#2", "operator/-/ops/file#3"],
+    );
+  });
+
   it("gives two operator files carrying one CN two different ids", () => {
     const r = certificateInventory(base({
       operators: [{ file: "a.pem", reading: facts({ cn: "ops" }) }, { file: "b.pem", reading: facts({ cn: "ops" }) }],

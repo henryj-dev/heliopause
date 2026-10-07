@@ -203,10 +203,11 @@ export function certificateInventory(input: InventoryInput): CertificateReport {
     const v = ident(vpc), h = ident(host), cn = ident(facts.cn);
     // `source` is part of the id because the manager's own certificate has two rows — the one it is
     // serving and the one on disk — and they are the same thing otherwise.
-    let id = ident([kind, v ?? "-", h ?? cn ?? "-", source].join("/"));
-    // Two rows can still meet: two operator files carrying one CN. Suffixed rather than dropped, so
-    // the count still matches the files.
-    for (let n = 2; ids.has(id); n++) id = ident(`${id}#${n}`);
+    const base = ident([kind, v ?? "-", h ?? cn ?? "-", source].join("/"));
+    // Two rows can still meet: operator files carrying one CN. Suffixed rather than dropped, so the
+    // count still matches the files — and suffixed on the base, so the third is `#3`, not `#2#3`.
+    let id = base;
+    for (let n = 2; ids.has(id); n++) id = ident(`${base}#${n}`);
     ids.add(id);
     const { state, daysLeft } = certState(facts.notAfter, now);
     rows.push({
