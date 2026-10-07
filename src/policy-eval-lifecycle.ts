@@ -73,14 +73,20 @@ export function evaluateWithLifecycle(opts: EvalLifecycleOptions): Promise<strin
     let terminatedByUs = false;
     let lateErrorCounted = false;
 
-    // ## The count goes down once, when the thread is actually gone
+    // ## The count goes down once, on the thread's `exit`, and nowhere else
     //
-    // `onAlive(-1)` used to run only when *we* reclaimed, so a worker that answered and then finished
-    // on its own — `exit 0` a few ms later — was still counted for the rest of its grace window
-    // (measured: `workers: 1` 400 ms after a clean exit, `0` only after the 1 s grace). `/readyz`
-    // reports this count and #117's cap is to be chosen from its observed maximum, so it has to mean
-    // "threads alive now". Whichever comes first, our `terminate()` or the thread's own `exit`, ends it.
-    // @see src/policy-eval-lifecycle.test.ts "stops counting a thread the moment it exits"
+    // `/readyz` reports this count and #117's cap is to be chosen from its observed maximum, so it has
+    // to mean "threads alive now". Two earlier versions did not:
+    //
+    //   · the first decremented only when *we* reclaimed, so a worker that answered and finished on its
+    //     own was counted for the rest of its grace (measured: `workers: 1` 400 ms after a clean exit);
+    //   · the second decremented when we *decided* to reclaim — before calling `terminate()` — so a
+    //     thread still running was already uncounted (a review recorded `−1`, then `terminate`, then
+    //     `exit`).
+    //
+    // `exit` fires for every ending — a terminated worker emits it too — so it is the one place.
+    // @see src/policy-eval-lifecycle.test.ts "stops counting a thread the moment it exits" and "keeps
+    // counting a thread we have decided to terminate until it exits"
     let gone = false;
     let graceTimer: ReturnType<typeof setTimeout> | undefined;
     const leave = () => {
@@ -88,8 +94,7 @@ export function evaluateWithLifecycle(opts: EvalLifecycleOptions): Promise<strin
       gone = true;
       if (graceTimer !== undefined) clearTimeout(graceTimer);
       // The port is ours to close whichever way the thread ended. An open `port1` keeps the event loop
-      // alive — measured: the first version of this closed it only on our own reclaim, and a test whose
-      // thread exited first left the runner hanging.
+      // alive — measured: a version that closed it only on our own reclaim left a test runner hanging.
       port1.close();
       opts.onAlive(-1);
     };
@@ -110,12 +115,11 @@ export function evaluateWithLifecycle(opts: EvalLifecycleOptions): Promise<strin
       const done = () => {
         // A thread that already exited has nothing to terminate.
         if (gone) return;
-        // Ours, so its exit is not a fault. `terminate()` makes a worker exit **1** — measured: a worker
-        // that answered and was terminated reports 1, one left to finish reports 0 — and without this
-        // flag every module that keeps a handle open past its grace would raise `faults` once per
-        // evaluation. Set before `leave()`, whose own work does not depend on it but whose caller's does.
+        // `terminate()` makes a worker exit **1** — measured: a worker that answered and was terminated
+        // reports 1, one left to finish reports 0. The exit handler reads this flag with that code to
+        // tell our ending from the module's own. The count is not touched here: the thread is still
+        // running until its `exit`, which is where `leave()` runs.
         terminatedByUs = true;
-        leave();
         void thread.terminate();
       };
       if (graceMs <= 0) {
@@ -207,7 +211,30 @@ export function evaluateWithLifecycle(opts: EvalLifecycleOptions): Promise<strin
         // exit with no `error` before it — `process.exit(2)` after answering — is still a fault.
         // @see src/policy-render-service.test.ts "counts a fault that arrives inside the grace window
         // without changing the answer", which asserts exactly 1
-        if (code !== 0 && !terminatedByUs && !lateErrorCounted) {
+        //
+        // ## Which non-zero exits are ours
+        //
+        // `terminatedByUs` alone said "we asked", not "this exit is the one we caused", so a module that
+        // exited on its own with `process.exit(2)` while our grace-end `terminate()` was in flight was
+        // dropped — measured, 49 of 300 races. Nothing else separates the two: racing our `terminate()`
+        // against the module's own exit (330 runs, the gap swept across 0–10 ms) gave three outcomes —
+        //
+        //   · ours wins:  exit 1, and `terminate()` resolves to 1;
+        //   · theirs wins after our call:  exit 2, and `terminate()` resolves to **2** — the same value
+        //     as the exit, so the promise does not tell which one ended the thread;
+        //   · theirs wins before our call:  exit 2, and our call never reaches a running thread.
+        //
+        // So the only discriminator is the code: a terminated worker exits **1**. An exit after our call
+        // with any other non-zero code is the module's own, and counted.
+        //
+        // ⚠️ The blind spot that leaves: a module that calls `process.exit(1)` itself, inside the window
+        // where our `terminate()` is in flight, looks exactly like our own termination and is not counted.
+        // Measured with `exit 1` in the same race: every run read exit 1, whichever side won. The window is
+        // the time between the grace timer firing and the thread ending, and a module exiting on its own
+        // outside it is counted. @see src/policy-eval-lifecycle.test.ts "counts the module's own exit even
+        // when our terminate is in flight"
+        const ours = terminatedByUs && code === 1;
+        if (code !== 0 && !ours && !lateErrorCounted) {
           opts.onLateFault(new Error(`worker exited ${code} after answering`));
         }
         return;

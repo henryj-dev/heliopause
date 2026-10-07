@@ -11,13 +11,23 @@ import { EventEmitter } from "node:events";
 import type { MessagePort } from "node:worker_threads";
 import { evaluateWithLifecycle, type EvalThread, type EvalLifecycleOptions } from "./policy-eval-lifecycle.ts";
 
-/** A thread that replies on the handed-over port, then does `after` — all before returning. */
+/**
+ * A thread that replies on the handed-over port, then does `after` — all before returning.
+ *
+ * `terminate()` behaves like a real worker's: once, it ends the thread with `exit 1` on a later turn
+ * (measured: a terminated worker exits 1). The first version of this fake resolved `terminate()` and
+ * never emitted `exit`, which was harmless while the count dropped on our own decision — and which
+ * would have hidden a count that only drops on `exit`. `t` is returned so a test can drive the thread
+ * after the answer.
+ */
 function fakeThread(
   reply: unknown,
-  after: (t: EventEmitter) => void,
-): { thread: EvalThread; terminated: () => number } {
+  after: (t: EventEmitter) => void = () => undefined,
+): { thread: EvalThread; t: EventEmitter; terminated: () => number } {
   const t = new EventEmitter();
   let terminated = 0;
+  let exited = false;
+  t.on("exit", () => { exited = true; });
   const thread: EvalThread = {
     postMessage(value) {
       const port = (value as { reply: MessagePort }).reply;
@@ -30,11 +40,15 @@ function fakeThread(
     },
     terminate() {
       terminated += 1;
+      if (!exited) setImmediate(() => { if (!exited) t.emit("exit", 1); });
       return Promise.resolve(1);
     },
   } as EvalThread;
-  return { thread, terminated: () => terminated };
+  return { thread, t, terminated: () => terminated };
 }
+
+/** Lets the fake's `terminate()` → `exit` turn run. */
+const turn = () => new Promise((r) => setImmediate(r));
 
 function options(thread: EvalThread, over: Partial<EvalLifecycleOptions> = {}) {
   const logs: string[] = [];
@@ -116,6 +130,27 @@ describe("an evaluation settles once, on the right signal", () => {
     // emitted one or the other, which is how double counting got past it. Measured through the real
     // renderer: one late throw was `faults: 1` on `da80b7b` and `faults: 2` before this fix. Grace is
     // long so the thread is still ours when both events arrive.
+    const { thread, t } = fakeThread({ ok: true, wire: "x" });
+    const { opts, late } = options(thread, { graceMs: 60_000 });
+    assert.equal(await evaluateWithLifecycle(opts), "x");
+    t.emit("error", new Error("late"));
+    t.emit("exit", 1);
+    assert.equal(late.length, 1, "one late throw was counted more than once");
+    // The known positive: an abnormal exit with no error before it is still a fault.
+    const second = fakeThread({ ok: true, wire: "x" });
+    const o2 = options(second.thread, { graceMs: 60_000 });
+    assert.equal(await evaluateWithLifecycle(o2.opts), "x");
+    second.t.emit("exit", 2);
+    assert.equal(o2.late.length, 1, "an abnormal exit after the answer was not counted at all");
+  });
+
+  it("counts the module's own exit even when our terminate is in flight", async () => {
+    // Round three's race. Our grace-end `terminate()` is called, and before it lands the module ends
+    // the thread itself with `process.exit(2)`. `terminatedByUs` alone said "we asked", so this was
+    // dropped — measured, 49 of 300 real-worker races. A terminated worker exits **1**; any other
+    // non-zero code after our call is the module's own (measured: racing the two over a 0–10 ms gap
+    // gave exit 1 when ours won and exit 2 when theirs did, and `terminate()` resolved to the same
+    // code either way, so the promise cannot tell them apart).
     const t = new EventEmitter();
     let port: MessagePort | undefined;
     const thread = {
@@ -124,24 +159,20 @@ describe("an evaluation settles once, on the right signal", () => {
         port.postMessage({ ok: true, wire: "x" });
       },
       on(e: string, l: (...a: never[]) => void) { t.on(e, l as (...a: unknown[]) => void); return thread; },
-      terminate: () => Promise.resolve(1),
+      // The module's own exit wins the race our terminate starts.
+      terminate() { t.emit("exit", 2); return Promise.resolve(2); },
     } as unknown as EvalThread;
-    const { opts, late } = options(thread, { graceMs: 60_000 });
+    const { opts, late } = options(thread, { graceMs: 1 });
     assert.equal(await evaluateWithLifecycle(opts), "x");
-    t.emit("error", new Error("late"));
-    t.emit("exit", 1);
-    assert.equal(late.length, 1, "one late throw was counted more than once");
-    // The known positive: an abnormal exit with no error before it is still a fault.
-    const t2 = new EventEmitter();
-    const thread2 = {
-      postMessage(value: unknown) { (value as { reply: MessagePort }).reply.postMessage({ ok: true, wire: "x" }); },
-      on(e: string, l: (...a: never[]) => void) { t2.on(e, l as (...a: unknown[]) => void); return thread2; },
-      terminate: () => Promise.resolve(1),
-    } as unknown as EvalThread;
-    const second = options(thread2, { graceMs: 60_000 });
-    assert.equal(await evaluateWithLifecycle(second.opts), "x");
-    t2.emit("exit", 2);
-    assert.equal(second.late.length, 1, "an abnormal exit after the answer was not counted at all");
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(late.length, 1, "the module's own exit 2 was taken for our termination");
+    // And the known negative: our own termination (exit 1) is still not a fault.
+    const ours = fakeThread({ ok: true, wire: "x" });
+    const o2 = options(ours.thread, { graceMs: 1 });
+    assert.equal(await evaluateWithLifecycle(o2.opts), "x");
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(ours.terminated(), 1);
+    assert.equal(o2.late.length, 0, "our own terminate was counted as the module's fault");
   });
 
   it("stops counting a thread the moment it exits", async () => {
@@ -149,12 +180,7 @@ describe("an evaluation settles once, on the right signal", () => {
     // thread that answered and then finished on its own was still counted until its grace expired —
     // measured: `workers: 1` 400 ms after a clean exit, inside a 1 s grace. Grace is long here so the
     // only thing that can bring the count to zero is the exit itself.
-    const t = new EventEmitter();
-    const thread = {
-      postMessage(value: unknown) { (value as { reply: MessagePort }).reply.postMessage({ ok: true, wire: "x" }); },
-      on(e: string, l: (...a: never[]) => void) { t.on(e, l as (...a: unknown[]) => void); return thread; },
-      terminate: () => Promise.resolve(1),
-    } as unknown as EvalThread;
+    const { thread, t } = fakeThread({ ok: true, wire: "x" });
     const { opts, alive } = options(thread, { graceMs: 60_000 });
     assert.equal(await evaluateWithLifecycle(opts), "x");
     assert.equal(alive(), 1, "the thread should still be counted while it is alive inside its grace");
@@ -162,20 +188,36 @@ describe("an evaluation settles once, on the right signal", () => {
     assert.equal(alive(), 0, "a thread that exited is still counted");
   });
 
+  it("keeps counting a thread we have decided to terminate until it exits", async () => {
+    // The opposite mistake from the test above, and round three found it: the count dropped when we
+    // *decided* to reclaim — before `terminate()` was even called — so a thread still running was
+    // already uncounted. Here `terminate()` does not end the thread; only a later `exit` does.
+    const t = new EventEmitter();
+    let terminateCalls = 0;
+    const thread = {
+      postMessage(value: unknown) { (value as { reply: MessagePort }).reply.postMessage({ ok: false, message: "m" }); },
+      on(e: string, l: (...a: never[]) => void) { t.on(e, l as (...a: unknown[]) => void); return thread; },
+      terminate() { terminateCalls += 1; return new Promise<number>(() => undefined); },
+    } as unknown as EvalThread;
+    const { opts, alive } = options(thread);
+    await assert.rejects(evaluateWithLifecycle(opts), /m/);
+    assert.equal(terminateCalls, 1, "a failed evaluation was not reclaimed");
+    assert.equal(alive(), 1, "a thread still running after terminate() was already uncounted");
+    t.emit("exit", 1);
+    assert.equal(alive(), 0, "the thread's exit did not bring the count down");
+  });
+
   it("balances the thread count on every ending", async () => {
     // `workers` on /readyz is this count, and #117's cap is to be chosen from its observed maximum, so
     // a path that forgets to decrement makes the number a slow leak of its own.
     //
-    // `terminate()` is owed only to a thread that has not already ended. The first version of this
-    // asserted "terminated exactly once" for every ending, which was the shape the code happened to
-    // have — it terminated threads that had already exited. The property is: never more than once,
-    // and exactly once when the thread is still running at the decision (here, `error` alone: a real
-    // worker would follow it with `exit`, the fake does not, so only `terminate()` can end it).
+    // `terminate()` is owed only to a thread that has not already ended: never more than once, and
+    // exactly once when the thread is still running at the decision. The two "then exit" rows are 1
+    // because the `exit` is delivered while the reply is still queued, so `drain()` settles first and
+    // reclaims a thread that, at that moment, has not exited.
     //
-    // The two "then exit" rows are 1, not 0, and that is what the code should do: the `exit` is
-    // delivered while the reply is still queued, so `drain()` settles first and reclaims a thread that,
-    // at that moment, has not exited — with grace 0 the reclaim is immediate. Only the rows where
-    // nothing settles before the `exit` owe no `terminate()`.
+    // The fake's `terminate()` ends the thread with `exit 1` a turn later, as a real worker does, so the
+    // count can only reach zero through an `exit` — which is the property.
     const endings: [string, unknown, (t: EventEmitter) => void, number][] = [
       ["answer then exit", { ok: true, wire: "x" }, (t) => t.emit("exit", 0), 1],
       ["failure then exit", { ok: false, message: "m" }, (t) => t.emit("exit", 0), 1],
@@ -188,6 +230,7 @@ describe("an evaluation settles once, on the right signal", () => {
       const { thread, terminated } = fakeThread(reply, after);
       const { opts, alive } = options(thread);
       await evaluateWithLifecycle(opts).catch(() => undefined);
+      await turn();
       assert.equal(alive(), 0, `${name}: the thread count did not return to zero`);
       assert.equal(terminated(), wantTerminate, `${name}: terminate() was called ${terminated()} times`);
     }

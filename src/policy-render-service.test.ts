@@ -2572,17 +2572,29 @@ export const site = { cfg: {}, hosts: [{ id: "h1.beta", stage: "canary", items: 
     let started: Started | undefined;
     try {
       started = await start(dir, MULTI(sites));
+      // The renderer's own build, from a site that forged nothing — the expected value for beta's.
+      const alphaBuild = ((await (await fetchAt(started.port, "/source?site=alpha")).json()) as { build?: string }).build;
+      assert.match(alphaBuild ?? "", /^[0-9a-f]{12}$/, "the reference build is not a build id");
       const res = await fetchAt(started.port, "/source?site=beta", { signal: AbortSignal.timeout(10_000) });
       const text = await res.text();
       assert.equal(res.status, 200, `the forged message was not served at all, so nothing was tested:\n${text.slice(0, 300)}`);
       assert.match(text, /module-chosen/, "the forgery did not reach the parent, so nothing was tested");
       assert.doesNotMatch(text, /FORGED/, `a renderer-owned field was taken from the worker:\n${text.slice(0, 400)}`);
       const body = JSON.parse(text) as {
-        label?: string; siteName?: string; schemaVersion?: number; files?: Record<string, string>;
+        label?: string; siteName?: string; schemaVersion?: number; build?: string;
+        head?: { sha: string | null; dirty: boolean }; repo?: { generation?: string | null };
+        files?: Record<string, string>;
       };
+      // Every renderer-owned field compared to its own source, not only scanned for the marker: round
+      // three put a forged `head` through a mutated parent and this test stayed green, because the
+      // forged sha is forty `f`s and contains no `FORGED`. Each field below is checked against what the
+      // renderer reads — `twoSites()` is not a git checkout, so `head` and `generation` are empty.
       assert.equal(body.siteName, "beta");
       assert.equal(body.label, "beta");
       assert.equal(body.schemaVersion, 1);
+      assert.equal(body.build, alphaBuild, "build was not the renderer's own");
+      assert.deepEqual(body.head, { sha: null, dirty: false }, "head was not read from the checkout");
+      assert.equal(body.repo?.generation ?? null, null, "repo was not read from the checkout");
       assert.equal(body.files?.["policies.json"], readFileSync(join(dir, "policies.json"), "utf8"));
     } finally {
       started?.stop();
