@@ -633,6 +633,14 @@ its SHA-256 rather than cut, so two rows cannot collide. Operators reach the sam
 `/api/certificates` with their certificate or session, and the fleet view lists every certificate in
 `renew` or worse under `problems`.
 
+**Known operators are copies, so renewing one is two changes.** An operator's certificate lives on a
+person's machine, where the manager cannot see it; `HELIOPAUSE_KNOWN_OPERATORS_DIR` holds a public copy
+of each, and that copy is what the report judges. When `heliopause-pki issue <dir> <name> --role=operator`
+renews an operator, replace that operator's `.pem` in the directory in the same change — otherwise the
+report keeps the old expiry and alerts on a certificate that has already been replaced. Only public
+certificates go there; the manager never needs the key. The directory is re-read on every request, so
+adding or removing a file needs no restart.
+
 The hostname pattern is an exact hostname or **one leading wildcard label**: `*.dev` covers
 `k3s-01.dev`, and covers neither `dev` nor `a.b.dev`. Node tokens issued this way are recorded with
 `createdBy: app:<label>#<id>` and an `appTokenId` in the audit row's detail — **the label alone is
