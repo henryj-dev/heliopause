@@ -260,11 +260,28 @@ describe("the evaluation happens somewhere, and only there", () => {
   // program that never runs the guard.
   //
   // What is left here is the shape a grep can actually see.
-  it("keeps the one import of untrusted code in an entry point", () => {
+  it("keeps the one import of untrusted code in the worker the renderer starts, and nowhere else", () => {
     // Visible in a file somebody opens on purpose, rather than in a library where a future caller
     // could reach it without noticing what they were doing.
+    //
+    // ## The import moved into a worker, and the property is now two halves
+    //
+    // This test read `await import(` in the renderer. Policy modules are now evaluated in a worker
+    // (`src/policy-eval-worker.ts`, #89), so the renderer itself must have **no** dynamic import — one
+    // left there would be a policy module back in the process's own realm, the exact thing the worker
+    // exists to end. And the worker has to be reachable only by being *started*: it exports a type and
+    // nothing callable, so no library caller can evaluate a policy by importing it.
     const renderer = code(read("../bin/heliopause-policy-render.ts"));
-    assert.match(renderer, /await import\(/, "the renderer stopped evaluating the site module");
+    const inRenderer = [...renderer.matchAll(/(^|[^.\w])import\s*\(/g)].map((m) => m.index);
+    assert.deepEqual(inRenderer, [], "the renderer evaluates something in its own realm again");
+    assert.match(
+      renderer, /new Worker\(WORKER_ENTRY/,
+      "the renderer stopped starting the evaluation worker",
+    );
+    const worker = code(read("./policy-eval-worker.ts"));
+    assert.match(worker, /await import\(/, "the worker stopped evaluating the site module");
+    const exported = [...worker.matchAll(/^export\s+(?!type\b)(\w+)/gm)].map((m) => m[1]);
+    assert.deepEqual(exported, [], "the worker exports something callable, so a library could import it to evaluate a policy");
   });
 
   it("does not let the contract module import a policy path of its own", () => {
