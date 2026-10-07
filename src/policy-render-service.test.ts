@@ -2716,11 +2716,18 @@ describe("concurrent requests share one evaluation", () => {
   //
   // ## Held open by the test, so the overlap is not a race
   //
-  // After counting itself, evaluation `n` waits until the test creates `go-<n>`. Every request in a
-  // burst therefore arrives while the first evaluation is still running, however slowly the machine
-  // starts workers. The one timing left is how long the test waits for a burst's requests to reach the
-  // renderer before it releases the gate; a request arriving later than that would find the evaluation
-  // settled, which can make a broken renderer pass (a cache hit) but cannot make a working one fail.
+  // After counting itself, evaluation `n` waits until the test creates `go-<n>`, so the evaluation a
+  // burst starts stays open however slowly the machine starts workers.
+  //
+  // ⚠️ **One timing is left: `ARRIVAL_MS`**, how long the test waits for a burst's requests to reach the
+  // renderer before it releases the gate. A request slower than that arrives after the evaluation
+  // settled, and what it does then depends on the site — and it is wrong in **both** directions:
+  //
+  //   · healthy site → a cache hit, so a renderer that does not share could still pass (false green);
+  //   · failing site → failures are not cached, so it starts evaluation 3, whose gate is closed: it
+  //     times out and the count reads 3 on a renderer that shares correctly (false red).
+  //
+  // Neither has been observed (three runs green, three mutations red by name); 500 ms is a choice.
   function gatedSite(opts: { fails: boolean }): { root: string; dir: string; site: string } {
     const root = mkdtempSync(join(tmpdir(), "hp-policy-coalesce-"));
     mkdirSync(join(root, "src"));
