@@ -176,8 +176,13 @@ async function main() {
   const MB = (b) => (b / 1024 / 1024).toFixed(2);
 
   // §4-b: three controls over the same evaluation, each keeping less than the one before. If
-  // `dropped` still grows, this loop is not the cause; if `ctx-only` stays flat, the context is not
-  // either, and what is retained is the module graph.
+  // `dropped` still grows, this loop holding a reference is not the cause.
+  //
+  // ⚠️ What it does NOT establish is what the retained bytes are. A flat `ctx-only` says an empty
+  // context is collected; it does not rule out the module evaluation path retaining its context too.
+  // This comment said "what is retained is the module graph" — the same inference §4-b retracted,
+  // left behind here when the document was narrowed. Measuring the kind needs heap-snapshot
+  // retainers, which this script does not take.
   if (process.argv.includes("--retention")) {
     const iters = Number(process.argv[process.argv.indexOf("--retention") + 1] ?? 60);
     for (const mode of ["held", "dropped", "ctx-only"]) {
