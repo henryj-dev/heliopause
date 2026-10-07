@@ -39,8 +39,8 @@
 // a sidecar cannot be given a different network identity from the process it is isolating.
 
 import { createServer } from "node:http";
-import { registerHooks } from "node:module";
-import { existsSync, opendirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { Worker, MessageChannel } from "node:worker_threads";
+import { existsSync, opendirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { timingSafeEqual } from "node:crypto";
@@ -226,20 +226,17 @@ const parseWire = JSON.parse;
 // value** as well — `JSON.stringify` calls an inherited `toJSON`, resolving a promise reads an
 // inherited `then`, and capturing the global closes neither.
 
-// ## The same treatment for "the zone check had already passed"
+// ## "The zone check had already passed" is no longer a fact this file carries
 //
-// That fact was carried by `error instanceof ZoneCheckedError`, and `instanceof` walks a prototype
-// chain — so an `Error` wrapped in a revoked `Proxy.revocable` made the classification itself throw
-// (`TypeError: Cannot perform 'getPrototypeOf' on a proxy that has been revoked`) at startup, before
-// the listener existed. Measured. The previous round guarded the `instanceof` inside `asError` and left
-// this one, which is the same fix applied to one of two sites.
+// It used to be, as `ZoneCheckedError` plus a `WeakSet` — membership rather than `instanceof`,
+// because an `Error` in a revoked `Proxy.revocable` made the prototype walk throw at startup before
+// the listener existed (measured). That whole mechanism is gone: the zone check now runs **last**, on
+// the parsed wire, so no failure can arrive past it and nothing is left to mark. Deleting it was not
+// tidying — a classification that cannot be true is a line a reviewer reverts, sees green, and reads
+// as protecting nothing.
 //
-// Membership rather than a guarded `instanceof`, so there is no prototype walk to trap at all, and so
-// both classifications in this file work the same way. Bound here, before the first dynamic import,
-// for the reason the block above gives.
-const OUR_ZONE_CHECKED = new WeakSet<object>();
-const zoneCheckedIsOurs = WeakSet.prototype.has.bind(OUR_ZONE_CHECKED) as (e: object) => boolean;
-const rememberZoneChecked = WeakSet.prototype.add.bind(OUR_ZONE_CHECKED) as (e: object) => unknown;
+// The sibling mechanism above it stays: `foundHere` still has to tell a zone mismatch **this** process
+// raised from one a module threw, because the class is importable and `instanceof` is forgeable.
 
 /** A zone mismatch this process found. Registered so `foundHere` can recognise it later. */
 function ownZoneMismatch(message: string): ZoneMismatchError {
@@ -341,20 +338,6 @@ function asError(thrown: unknown): Error {
     described = `a ${typeof thrown} that cannot be described`;
   }
   return new RealError(`policy module threw a non-error value: ${described}`);
-}
-
-class ZoneCheckedError extends Error {
-  constructor(message: string, options?: ErrorOptions) {
-    super(message, options);
-    this.name = "ZoneCheckedError";
-    rememberZoneChecked(this);
-  }
-}
-
-/** Whether this process wrapped `error` after the zone check passed. */
-function zoneWasChecked(error: unknown): boolean {
-  if (error === null || (typeof error !== "object" && typeof error !== "function")) return false;
-  return zoneCheckedIsOurs(error);
 }
 
 const env = (name: string, fallback?: string): string => {
@@ -461,55 +444,28 @@ for (const site of sites) {
     process.exit(2);
   }
 }
-/**
- * Carry the site module's version onto everything it imports from the policy checkout.
- *
- * ⚠ **`?v=` on the site module alone was not enough, and that was wrong for a month.** ES modules
- * are cached by URL. The moving query re-evaluated `dev.ts`, and `dev.ts` then imported
- * `./policies.json` — the same URL it had always been — and got the copy read at pod start. The
- * stamp moved, the generation id moved, `files` (read from disk) moved, and the rules did not.
- * Found 2026-09-30: three rules added from the console were published, confirmed on every host,
- * and absent from every ruleset. The console edits `policies.json` and nothing else, so every
- * console edit took this path.
- *
- * So a module that was loaded with a `v` passes it to what it imports from the policy tree. The
- * model under `../src` is this image's own code and is not versioned — it does not change between
- * commits, and re-evaluating it would give each commit its own copy of every class the
- * manager-facing code compares against.
- *
- * The tree is compared by **real path**. Node resolves to the real path, so a checkout behind a
- * symlink — macOS's `/var` → `/private/var`, or a sync tool's link — resolves to URLs that a prefix
- * built from the configured path never matches. The first version of this compared against the
- * configured path and did nothing, silently.
- */
+// ## The child-version loader hook is gone, and so is `?v=`
 //
-// ## The boundary is the policy tree, not the importing module's directory
+// Both existed to defeat the module registry. ES modules are keyed by URL and never evicted, so the
+// renderer minted a moving query per evaluation, and #59 extended it to the children — without that,
+// `dev.ts` re-evaluated while `./policies.json` stayed the copy read at pod start, so the stamp and
+// the generation id moved and the rules did not.
 //
-// The second version keyed on the parent's directory, and an independent review found two holes in
-// it the day after: `sub/a.ts` importing `../up.json` got the pod-start copy, and `../class.ts`
-// loaded twice — versioned from the root, bare from `sub/` — so `instanceof` went false on the
-// first evaluation. One rule closes both: every file under a site module's own directory gets the
-// same `v`, whichever policy module asked for it. `node_modules` is left alone even inside that
-// tree; a package is not policy, and re-evaluating it per commit is a class-identity hazard with
-// no stale-data benefit.
+// A worker starts with an **empty registry** and is terminated after one evaluation. There is nothing
+// to evict, so there is nothing to defeat: the worker imports the module by its plain path and every
+// file it pulls in is read fresh. @see src/policy-eval-worker.ts
 //
-// The roots are real paths, refreshed each time a site is evaluated (`currentSource`), because the
-// resolver answers in real paths and a checkout can sit behind a link that is re-pointed.
-const policyRoots = new Set<string>();
-registerHooks({
-  resolve(specifier, context, nextResolve) {
-    const result = nextResolve(specifier, context);
-    if (!context.parentURL) return result;
-    const v = new URL(context.parentURL).searchParams.get("v");
-    if (v === null) return result;
-    const url = new URL(result.url);
-    if (url.protocol !== "file:" || url.searchParams.has("v")) return result;
-    if (url.pathname.includes("/node_modules/")) return result;
-    if (![...policyRoots].some((root) => url.pathname.startsWith(root))) return result;
-    url.searchParams.set("v", v);
-    return { ...result, url: url.href };
-  },
-});
+// 🔑 Removed rather than left in place. The hook only fired for imports whose parent URL carried a
+// `v`, and no import in this process has one any more — so it would be a guard that cannot be
+// reached, which this repository has recorded three times as worse than no guard: a reviewer reverts
+// it, sees green, and reads the line as protecting nothing.
+//
+// ⚠️ What it cost to find is worth keeping: the first version keyed on the importing module's
+// directory and left two holes a review found the next day (`sub/a.ts` importing `../up.json` got the
+// pod-start copy; `../class.ts` loaded twice, so `instanceof` went false), and the version before
+// that compared against the configured path rather than the real one and did nothing, silently, on
+// macOS. @see docs/policy-evaluation-realm-design.md §1-g, which measured the hook as an amplifier of
+// the leak this change removes.
 
 const allowPaths = (process.env.HELIOPAUSE_POLICY_ALLOW_PATHS ?? "policies.json")
   .split(",")
@@ -838,94 +794,27 @@ async function currentSource(site: { name: string | null; path: string }): Promi
   const stamp = stamped;
   const hit = cached.get(sitePath);
   if (hit && hit.stamp === stamp) return hit.wire;
-  // Before the import, so the hook above knows which tree this evaluation may version.
-  policyRoots.add(`${pathToFileURL(realpathSync(dirname(resolve(sitePath)))).pathname}/`);
-  // The import specifier still needs a value that moves, and `stamp` is not URL-safe.
-  const mod = (await import(`${pathToFileURL(sitePath).href}?v=${encodeURIComponent(stamp)}`)) as {
-    site?: ScreenSite;
-  };
-  if (!mod.site) throw new RealError(`${sitePath} does not export \`site\``);
-  // ## Checked on every evaluation, not only at startup
+  // ## The module is evaluated in a worker, and what comes back is text
   //
-  // Startup is where a wrong manifest is caught while somebody is watching, but a module that threw
-  // at startup was never checked, and a commit can move a host id at any time. This is the gate that
-  // holds; the startup one is the one that is loud. Throwing here surfaces as the 503 below, which
-  // is the right shape — the module is present and this process will not vouch for it.
-  const wrongZone = name === null ? null : zoneMismatch({ target: name, hostIds: hostIdsOf(mod.site) });
-  if (wrongZone) throw ownZoneMismatch(wrongZone);
-  // ## Everything past this point has been zone-checked, and the caller needs to know that
+  // Everything the module can reach now lives in a thread that is terminated after one evaluation:
+  // the globals it replaces, the prototypes it poisons, a top-level `while (true) {}`, and the module
+  // graph itself, which is what #89 is about. `docs/policy-evaluation-realm-design.md` §4-a has the
+  // measurement that chose a worker over `vm`.
   //
-  // The startup verification logs "the declared-name check did not run" on any failure that is not a
-  // `ZoneMismatchError`. That was right for the failures above — the import, the missing export, a
-  // timeout — and **wrong for everything below**, which happens only after the check ran and passed.
-  // `collectPolicySource` has three reachable throw paths, all from the module: a `JSON.stringify`
-  // over a site with a cycle, a `BigInt`, or a throwing `toJSON`; the module's own `resolveService`
-  // being called; and `Object.values` over a throwing getter. Reproduced with an ordinary accidental
-  // cycle: a correctly-declared site printed "the declared-name check did not run for it", sending
-  // an operator to edit a Deployment that was right.
-  //
-  // That is the round-three defect inverted — it under-claimed, this over-claimed — and the reason
-  // both happened is that the distinction was being inferred from where the failure came from rather
-  // than carried with it. Wrapping is what carries it. Note the distinction from the zone brand above:
-  // `ZoneCheckedError` is declared here and a module has no reason to construct one, but if it did,
-  // the consequence is a *milder* log line — whereas forging the zone error escalated to `exit 2`,
-  // which is why the zone brand needed a `WeakSet` first. This one has the same treatment now: an
-  // `instanceof` walks a prototype chain, and a module handing back a revoked `Proxy` made the
-  // classification itself throw. Two rounds of this file said "and this one does not" after the
-  // `WeakSet` had already been added to both — the code moved and the sentence explaining why it
-  // needn't stayed.
-  try {
-    // The narrowed value, not `mod` plus a `!` at the use. The guard above is twenty lines from the use
-    // and the compiler cannot see across the call, so an assertion there rested on an accident:
-    // deleting the guard reported `TS2345` at an unrelated line, and adding `!` there too went silent.
-    // ## Bytes out of the evaluation step, a value back in — and the parse is the check
-    //
-    // `evaluated` serialises the whole outgoing `PolicySource` (see there for why), so what crosses
-    // this line is wire text. Parsing it with `parsePolicySource` is not a formality: that function
-    // is the manager's own validator for this payload, and running it here means the renderer refuses
-    // the same shapes its reader would — a function on `site`, a non-array `repo.probes` — at the
-    // site that produced them rather than at the far end of a request.
-    //
-    // Bytes. `evaluated` validates and caches them; this is the boundary a later change moves into a
-    // worker, and nothing about the signature changes when it does.
-    return await evaluated({ site: mod.site, name, sitePath, stamp });
-  } catch (e) {
-    // Only ours passes through. A `ZoneMismatchError` reaching here came from the module -- the
-    // class is shared, so its type says nothing about who built it -- and that is a content fault.
-    if (foundHere(e)) throw e;
-    // `reasonOf`, not `asError(e).message`. `asError` returns an `Error` unchanged — deliberately,
-    // because identity is what the membership checks key on — so a throwing `.message` getter survived
-    // it and threw *here*, before the wrapper existed. The failure then propagated unclassified and the
-    // startup loop reported that the declared-name check had not run, on a site where it had. Same
-    // getter, same line of reasoning as the four interpolation points; this was the fifth and it was
-    // missed because it reads the message to *build* a message rather than to print one.
-    throw new ZoneCheckedError(reasonOf(e), { cause: e });
-  }
+  // `src/policy-eval-worker.ts` holds the three lines §3-b measured — a dedicated port, taken before
+  // the module is imported, and a captured `postMessage` — and the reasons they are not
+  // interchangeable with the obvious alternatives.
+  const wire = await evaluateInWorker({ sitePath, allowPaths, label: name ?? label, siteName: name, stamp });
+  return accepted({ wire, name, sitePath, stamp });
 }
 
-/** The half of `currentSource` that runs once the zone check has passed. Separated so the caller can
- *  tell a failure here — where the check ran — from one before it. */
-async function evaluated(
-  input: { site: ScreenSite; name: string | null; sitePath: string; stamp: string },
-): Promise<string> {
-  const { site: siteValue, name, sitePath, stamp } = input;
-  const source = collectPolicySource({
-    site: siteValue, sitePath, allowPaths,
-    // ## The label follows the site once there is more than one
-    //
-    // `HELIOPAUSE_POLICY_LABEL` is one value for the process, and the console prints it as "which
-    // site this is". With several sites that makes every screen say the same thing — pick
-    // `prod-icn-vtr` and the header still reads the label somebody wrote for dev, which is the
-    // shape of the incident this whole change exists to stop: a page reporting the opposite of
-    // what it drew. A named site knows its own name, so it uses it.
-    label: name ?? label,
-    ...(name === null ? {} : { siteName: name }),
-  });
-  // Always stored, because nothing reaches here without a complete stamp: `currentSource` refuses a
-  // null one above the scan cap. Two earlier versions of this line carried a `stamp !== null` guard —
-  // one of them dead, because it sat where the value had already been replaced by a substitute — and
-  // the substitute was what leaked. The refusal upstream is what makes this unconditional again.
-  const wire = writeWire(source);
+/** The half of `currentSource` that runs on the bytes the worker produced: validate, zone-check,
+ *  cache. Separated because every one of those steps can refuse, and the caller turns a refusal into
+ *  that site's 503. */
+function accepted(
+  input: { wire: string; name: string | null; sitePath: string; stamp: string },
+): string {
+  const { wire, name, sitePath, stamp } = input;
   // ## Validated with the manager's own reader, and the result is thrown away
   //
   // `parsePolicySource` is what the far side runs on this payload, so running it here means the
@@ -949,10 +838,32 @@ async function evaluated(
   // unconsumable" is the state a validator exists to prevent — but it is a third change in behaviour,
   // not a refactor.
   //
+  // ⚠️ The parsed value is no longer *only* discarded — the zone check below reads host ids off it.
+  // The sentence above still holds for what gets cached and served: those are the bytes.
+  //
   // @see src/policy-render-service.test.ts "no guard had named" — shape `serialisableButInvalid`
-  void parsePolicySource(parseWire(wire));
+  const parsed = parsePolicySource(parseWire(wire));
+  // ## The zone check reads the wire, because the worker's realm belongs to the module
+  //
+  // This check used to run in the parent on the module's own `site` object, before collection. Now
+  // that the module is evaluated in a worker, running it *there* would put it in a realm the module
+  // controls: `hostIdsOf` reads `site.hosts[].id`, and a getter — or a replaced `Array.prototype` —
+  // makes it pass, after which the worker reports success and the parent has no reason to doubt it.
+  //
+  // So it runs here, on the parsed wire, where the values are data: serialisation leaves no getters
+  // and no functions behind. @see src/policy-render-service.test.ts "a module that forges its host
+  // ids through a getter is still refused"
+  //
+  // ⚠️ **The cost is that a wrong-zone module is now collected before it is refused**, where it used
+  // to be refused first. A zone mismatch is a misconfiguration rather than a request-path cost, and
+  // the wasted work is what buys a refusal the module cannot talk its way out of. It is a behaviour
+  // change, not a refactor. @see docs/policy-eval-worker-notes.md
+  const wrongZone = name === null
+    ? null
+    : zoneMismatch({ target: name, hostIds: hostIdsOf(parsed.site as ScreenSite) });
+  if (wrongZone) throw ownZoneMismatch(wrongZone);
   cached.set(sitePath, { stamp, wire });
-  log(`evaluated ${name ?? label} at ${source.head.sha ?? "unknown"}${source.head.dirty ? " (dirty)" : ""}`);
+  log(`evaluated ${name ?? label} at ${parsed.head.sha ?? "unknown"}${parsed.head.dirty ? " (dirty)" : ""}`);
   // ## Serialised here, and the caller receives bytes
   //
   // `collectPolicySource` applies `toWire` to `site` and to the resolver results, and to nothing
@@ -1004,6 +915,237 @@ async function evaluated(
   //
   // @see src/policy-render-service.test.ts "survives a module that replaces the globals it will be described with"
   return wire;
+}
+
+/**
+ * How long a worker is kept alive after it has answered.
+ *
+ * ## Why it is not zero
+ *
+ * A module that returns a correct value and then throws from a timer is visible today: the
+ * `uncaughtException`/`unhandledRejection` handlers above count it in `faults`, log it, and keep
+ * serving. Terminating the moment the result arrives would **lose that**, which makes moving to a
+ * worker a change that removes a signal the operator has now. This window carries it over: a late
+ * failure inside it is counted and logged, and the answer already given does not change.
+ *
+ * ## Why this number, and what it does not claim
+ *
+ * 🔴 **It is a choice, not a measurement.** One observation exists — design §3-b ④: against a module
+ * with a 200 ms timer, terminating at 50 ms saw no `error`, and staying up 600 ms saw it. **That is a
+ * single data point**, and the distribution is unknown. "1,000 ms catches most of them" has not been
+ * measured and is not claimed here.
+ *
+ * 🔴 **No value catches all of them** — a module can arm a timer for any delay. So read this as how
+ * much is being spent, not as what is being caught.
+ *
+ * It does not add to response latency: the answer is sent as soon as a valid result arrives. What it
+ * delays is reclaiming the thread, so the cost lands on concurrent worker count and memory — which is
+ * why there is a counter below and why the cap itself is #117's to set.
+ */
+const WORKER_GRACE_MS = 1_000;
+
+/**
+ * The worker's entry file, resolved from this one.
+ *
+ * Not a bare `"../src/policy-eval-worker.ts"` string: `new Worker(path)` resolves a relative path
+ * against the **process's** working directory, not this module's, so the renderer would find it only
+ * when started from the repository root. The runtime image copies `src/` and `bin/` side by side
+ * (`packaging/Dockerfile.manager`), and `import.meta.url` is the one value that holds in both.
+ */
+const WORKER_ENTRY = new URL("../src/policy-eval-worker.ts", import.meta.url);
+
+/**
+ * Workers alive right now, including ones inside their grace window.
+ *
+ * 🔑 **Counted rather than capped, on purpose.** A cap needs a number, and the number depends on the
+ * deployment's memory limit — `resourceLimits` bounds one worker's heap while the container bounds the
+ * whole process, and this repository cannot read that manifest (it is `stardust-deploy`'s, and the
+ * cost of confusing "configured" with "running" is recorded in `AGENTS.md`). So the order is: count
+ * first, read the maximum from operations, then choose. Capping first would put a number I invented
+ * into production without a measurement.
+ *
+ * ⚠️ **Until then there is no cap, and the natural bounds are these**: startup evaluates every site at
+ * once (four today), and the request path spawns one per concurrent cache miss without coalescing —
+ * so a site that fails evaluation, which is never cached, spawns one per request. "No grace on
+ * failure" below makes reclaiming immediate but does not make spawning rarer. @see #117
+ */
+let workersAlive = 0;
+
+/**
+ * Evaluate one policy module in a worker and return the bytes it produced.
+ *
+ * The three lines §3-b measured live in `src/policy-eval-worker.ts`; this side is the lifecycle:
+ * which signal counts as a result, what happens when more than one arrives, and when the thread is
+ * reclaimed.
+ */
+function evaluateInWorker(
+  task: { sitePath: string; allowPaths: readonly string[]; label: string; siteName: string | null; stamp: string },
+): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const { port1, port2 } = new MessageChannel();
+    // The port is **not** in `workerData` — a module reads `workerData` and posts on the port itself,
+    // which §3-b ② measured arriving at the parent. Only strings go in it.
+    const worker = new Worker(WORKER_ENTRY, {
+      workerData: {
+        sitePath: task.sitePath,
+        allowPaths: [...task.allowPaths],
+        label: task.label,
+        siteName: task.siteName,
+      },
+    });
+    workersAlive += 1;
+
+    let settled = false;
+    let reclaimed = false;
+    let terminatedByUs = false;
+
+    // ## Reclaiming, and the three endings that decide when
+    //
+    // "No grace on failure" is two different reasons, and writing it as one sentence loses one of
+    // them:
+    //
+    //   · a valid result → grace, because that is the only ending with something left to see;
+    //   · `error` or an abnormal `exit` → no grace, because the ending already happened and waiting
+    //     longer counts nothing;
+    //   · the budget expiring → no grace, and for the opposite reason: the time was already spent,
+    //     so adding grace spends it twice.
+    //
+    // The third is why this takes a flag rather than a boolean argument: at the call site "it failed"
+    // and "it ran out of time" look alike, and they are not.
+    const reclaim = (graceMs: number) => {
+      if (reclaimed) return;
+      reclaimed = true;
+      const done = () => {
+        workersAlive -= 1;
+        // Ours, so its exit is not a fault. `terminate()` makes the worker exit **1** — measured: a
+        // worker that answered and was terminated reports 1, one left to finish reports 0 — and the
+        // exit handler below counted that 1 as a late fault on every site whose module kept a handle
+        // open past its grace. @see src/policy-render-service.test.ts "does not count its own reclaim
+        // of a worker as a fault" — it reads `faults: 1` without this flag.
+        terminatedByUs = true;
+        void worker.terminate();
+      };
+      if (graceMs <= 0) {
+        done();
+        return;
+      }
+      const timer = setTimeout(done, graceMs);
+      // The process must be able to exit during a grace window. Without this a terminating renderer
+      // waits for every outstanding grace, which turns a shutdown into a second of silence per
+      // in-flight evaluation.
+      timer.unref();
+    };
+
+    // ## The only result path
+    //
+    // `parentPort` is ignored: §3-b ① measured a module importing `node:worker_threads` and answering
+    // on it *first*. Nothing arriving there is a result, so nothing here listens for it.
+    port1.on("message", (reply: unknown) => {
+      if (settled) {
+        // A second message after the first valid one. Logged, never acted on — the decision is "the
+        // first valid result wins", and a module that keeps posting does not get to revise it.
+        log(`${task.label}: ignoring a second message from an evaluation that already answered`);
+        return;
+      }
+      // Decision 6: a dedicated channel, a schema, and bytes. The type of `wire` is the whole check
+      // here; its content is checked by `parsePolicySource` in `accepted`.
+      if (typeof reply === "object" && reply !== null && (reply as { ok?: unknown }).ok === true) {
+        const wire = (reply as { wire?: unknown }).wire;
+        if (typeof wire === "string") {
+          settled = true;
+          resolve(wire);
+          reclaim(WORKER_GRACE_MS);
+          return;
+        }
+      }
+      if (typeof reply === "object" && reply !== null && (reply as { ok?: unknown }).ok === false) {
+        const message = (reply as { message?: unknown }).message;
+        settled = true;
+        // Prefixed, because the text came from the module: a bare line can be written to read like
+        // this process's own. The worker already flattened newlines for the same reason.
+        reject(new RealError(`${task.sitePath}: ${typeof message === "string" ? message : "evaluation failed"}`));
+        reclaim(0);
+        return;
+      }
+      // Neither shape. Not a result, so it does not settle anything — and it is logged because a
+      // module that reaches this line is trying something.
+      log(`${task.label}: discarding a message on the result channel that is not a result`);
+    });
+
+    worker.on("error", (thrown) => {
+      if (settled) {
+        // A late failure inside the grace window: counted and logged, and the answer stands. This is
+        // the behaviour the window exists to carry over from the in-process handlers.
+        noteLateFault(task.label, thrown);
+        return;
+      }
+      settled = true;
+      reject(new RealError(`${task.sitePath}: ${reasonOf(thrown)}`));
+      reclaim(0);
+    });
+
+    worker.on("exit", (code) => {
+      if (settled) {
+        if (code !== 0 && !terminatedByUs) {
+          noteLateFault(task.label, new RealError(`worker exited ${code} after answering`));
+        }
+        return;
+      }
+      // Decision 8: an exit with no result is this site's 503, and nothing is cached. A module calling
+      // `process.exit(0)` leaves neither `message` nor `error` (§3-b ④), so this is the only place it
+      // can be noticed.
+      settled = true;
+      // ## Exit 13 is a hang that ended itself, and it is not the budget
+      //
+      // A module whose top level awaits something that never settles — `await new Promise(() => {})`,
+      // a fetch to nowhere — leaves the worker's event loop with nothing to run, so Node ends the thread
+      // with code 13, "unsettled top-level await", in a few milliseconds. Measured (node 26.4): the
+      // `exit` arrives 25 ms after the handover, while the 3 s budget has not fired. A spin or a hang
+      // that holds a handle open stays alive until the budget terminates it, and exits 1.
+      //
+      // So this is the *decision 8* ending, not the timeout ending, and the message says which. The
+      // in-process renderer reported the same module as a timeout because the shared event loop kept
+      // the process alive until its timer fired; the worker learns the truth sooner. Saying "did not
+      // finish within" here would report a budget that never ran out.
+      const why = code === 13
+        ? "the module's top level awaited something that never settled (exit 13)"
+        : `the evaluation exited (${code}) without producing a result`;
+      reject(new RealError(`${task.sitePath}: ${why}`));
+      reclaim(0);
+    });
+
+    // ## The budget, and what is different now that it can be enforced
+    //
+    // `SOURCE_SITE_BUDGET_MS` already bounds "how long one site gets", and that question does not
+    // change with the thread the work runs on — so no new environment variable is introduced. Two
+    // names for one bound is a shape this repository has had to unpick before.
+    //
+    // 🔑 **What changes is what happens when it expires.** In-process, the timer could only reject
+    // while the module kept running: a top-level `while (true) {}` was the one hole §11 could not
+    // close, because a timer cannot preempt synchronous code. `terminate()` can.
+    // @see src/policy-render-service.test.ts "a module that spins forever fails only its own site"
+    const budget = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new RealError(`evaluation did not finish within ${SOURCE_SITE_BUDGET_MS}ms`));
+      reclaim(0);
+    }, SOURCE_SITE_BUDGET_MS);
+    budget.unref();
+
+    // Handing the port over as the first message, before the worker imports anything untrusted. The
+    // worker takes it and stops reading `parentPort`; §3-b ② measured what happens if it imports
+    // first — the module calls `parentPort.once("message")` and takes the handover instead.
+    worker.postMessage({ reply: port2 }, [port2]);
+  });
+}
+
+/** A fault that arrived after its site had already answered. Counted the same way the in-process
+ *  handlers count one, so the signal the grace window exists to keep looks the same from outside. */
+function noteLateFault(which: string, thrown: unknown): void {
+  faults += 1;
+  console.error(
+    `[policy-render] ${oneLine(`${which}: a fault arrived after the answer (#${faults}) — the answer stands: ${reasonOf(thrown)}`)}`,
+  );
 }
 
 /**
@@ -1417,7 +1559,13 @@ const server = createServer((req, res) => {
       ({ serving, total }) => {
         // One site is enough to be *up*. Refusing while two of three work would let a bad `dev.ts`
         // take prod's and util's consoles down — the trade the startup verification below refused.
-        send(serving > 0 ? 200 : 503, { ok: serving > 0, degraded: serving < total, serving, total, faults });
+        // `workers` is the count `workersAlive` keeps — threads alive now, grace windows included. It
+        // is here because the cap on it is #117's to choose and needs an operational maximum to be
+        // chosen from (see `workersAlive`). It is also the only outside view of a budget that rejected
+        // but did not terminate: the answer is identical either way and only this number differs.
+        send(serving > 0 ? 200 : 503, {
+          ok: serving > 0, degraded: serving < total, serving, total, faults, workers: workersAlive,
+        });
       },
       // `readiness` is documented as not rejecting and that was true of the per-site failures it was
       // written for. It is not true of the collection: a module can poison the `then` that resolving
@@ -1584,15 +1732,31 @@ for (const failure of failures) {
   // Not fatal, because a slow-but-correct module must not take the pod down — that is the outage the
   // fix would manufacture. Containment is unchanged either way: `currentSource` re-checks the zone on
   // every evaluation, so an unverified site 503s rather than serving the wrong policy.
-  if (zoneWasChecked(error)) {
-    // The check ran and passed; what failed is the module's content. Same non-fatal outcome, and the
-    // operator is pointed at the policy commit rather than at a Deployment that is correct.
-    log(`${site.name} is the site it is declared as, but did not evaluate at startup and will ` +
-      `answer 503 until it does: ${why}`);
-    continue;
-  }
-  log(`${site.name} did not evaluate at startup — the declared-name check did not run for it, ` +
-    `and it will answer 503 until it does: ${why}`);
+  // One line, and it says nothing about the declared name.
+  //
+  // 🔴 **This used to be two lines, and the split is no longer available.** The zone check ran before
+  // collection, so a failure after it meant "the name is right, the content broke" — carried by
+  // `ZoneCheckedError` — and the other branch said the check had not run. Now the check runs **last**,
+  // on the parsed wire (see `accepted`), because a check inside the worker is a check in a realm the
+  // module controls. Every content failure therefore happens before it.
+  //
+  // So the honest message is this one. Mentioning the check at all would re-open the defect an earlier
+  // round closed: a module with an ordinary `JSON.stringify` cycle was told its declared name might be
+  // wrong, and an operator went to edit a Deployment that was correct. The reason text already says
+  // what broke — "Converting circular structure to JSON" does not read as a naming fault.
+  //
+  // ⚠️ **What is lost is the reassurance**, not the diagnosis: an operator no longer reads "your name
+  // is right". The alternative was to have the worker report host ids alongside its failure so this
+  // side could still check them, and those ids come from the module's realm — a forged set would
+  // print "the name is right" over a name that is wrong, which is the same operator sent to the same
+  // wrong place with the sign flipped. A genuine naming fault is still `exit 2` above, precisely.
+  //
+  // Not fatal, because a slow-but-correct module must not take the pod down — that is the outage the
+  // fix would manufacture. Containment is unchanged: `currentSource` re-checks the zone on every
+  // evaluation, so an unverified site answers 503 rather than serving the wrong policy.
+  //
+  // @see docs/policy-eval-worker-notes.md for the decision and what it cost
+  log(`${site.name} did not evaluate at startup and will answer 503 until it does: ${why}`);
 }
 
 server.listen(port, hostname, () => {

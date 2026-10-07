@@ -534,6 +534,20 @@ function twoSites(): { dir: string; sites: string; alpha: string; beta: string }
 /** `start()` pins `HELIOPAUSE_POLICY_SITE`; multi-site runs have to clear it. Empty reads as unset. */
 const MULTI = (sites: string) => ({ HELIOPAUSE_POLICY_SITE: "", HELIOPAUSE_POLICY_SITES: sites });
 
+/**
+ * A readiness body without `workers`, for the assertions that pin the readiness contract exactly.
+ *
+ * `workers` is how many evaluation threads are alive at that instant, and a `/readyz` that has to
+ * re-evaluate starts some of its own — so it is a timing measurement, not part of the answer these
+ * assertions describe. The tests that are *about* it read it directly; @see "a module that spins
+ * forever fails only its own site". Dropping it here rather than writing a number into each expected
+ * object keeps those assertions about serving, total and faults, which is what they were written for.
+ */
+const readinessOf = async (res: Response): Promise<Record<string, unknown>> => {
+  const { workers: _, ...rest } = (await res.json()) as Record<string, unknown>;
+  return rest;
+};
+
 const fetchAt = (port: number, path: string, init: RequestInit = {}) =>
   fetch(`http://127.0.0.1:${port}${path}`, {
     ...init,
@@ -818,42 +832,106 @@ describe("a site module has to be the site it is declared as", () => {
     }
   });
 
-  it("says the declared-name check did not run, whichever way the module failed", { timeout: 30_000 }, async () => {
-    // ## The caveat, and the predicate that only covered half of what needed it
+  it("reports why a module failed without pointing at the declared name", { timeout: 30_000 }, async () => {
+    // ## What this test protects, across two rewrites of the message it reads
     //
-    // A site whose module never evaluated was never zone-checked, and the startup block treats a
-    // name/module mismatch as the fault that cannot heal itself. So the line has to say which check
-    // did not run — otherwise its silence is read as a pass.
+    // The property is **not** a wording: it is that a failure which is not a zone fault does not send
+    // an operator to the site name in their Deployment. That has been protected three different ways.
     //
-    // 🔴 That caveat was selected by `why.includes("did not finish within")`, which is wrong on both
-    // sides. The zone check runs **after** the import, so it is skipped by every failure at or before
-    // it — and a module that *throws* is the common half, which kept the plain line and left the hole
-    // open on the other path. And the string is `evaluateWithin`'s own wording, so a policy module
-    // could throw that text and choose which sentence an operator reads. The condition is now
-    // `error instanceof ZoneCheckedError` — a class a module cannot reach — and it is driven by
-    // "does not blame the declared name when the check ran and the content failed" below.
+    // 1. The line said nothing, and silence read as "the check passed".
+    // 2. A caveat was added — "the declared-name check did not run for it" — selected by
+    //    `why.includes("did not finish within")`. Wrong on both sides: it covered only the timeout, and
+    //    the string was `evaluateWithin`'s own wording, so a module could throw that text and choose
+    //    which sentence an operator read.
+    // 3. The caveat was carried by a class a module cannot reach (`ZoneCheckedError`), and a second
+    //    branch said "is the site it is declared as" when the check had passed.
     //
-    // Both halves are driven here: one site hangs past its budget, the other throws at import, and
-    // both must carry the caveat. Neither had a test at all — mutating the branch to `if (false)`
-    // left every test green.
+    // 🔑 **The third is gone because the zone check moved.** It now runs last, on the parsed wire,
+    // since a check inside the worker runs in a realm the module controls. Every content failure
+    // therefore happens before it, so "the check passed" is never available to say — and "the check did
+    // not run", while true of everything, points at the name for failures that have nothing to do with
+    // it. That is defect 1 and defect 3's motivation arriving together.
+    //
+    // So the message says the reason and nothing about the name. The three assertions below are the
+    // property, not the sentence: no naming cue, a reason that is present, and — in the test after this
+    // one — a real mismatch still being loud and fatal.
+    //
+    // Both failure shapes are driven, because the predicate that selected the old caveat was wrong on
+    // exactly the half that was not tested: one site hangs past its budget, the other throws at import.
+    //
+    // ⚠️ The hang holds a handle open (`setInterval`). A bare `await new Promise(() => {})` is no longer
+    // a budget hang: in a worker it leaves the event loop empty and Node ends the thread with exit 13
+    // in milliseconds — measured, and asserted separately in "names a top-level await that never
+    // settles". The first version of this test used the bare form and expected "did not finish
+    // within", which in-process was true and in a worker is a budget that never ran out.
     const { dir, sites, alpha, beta } = twoSites();
-    writeFileSync(alpha, "await new Promise(() => {});\nexport const site = { cfg: {}, hosts: [] };\n");
+    writeFileSync(alpha, "setInterval(() => {}, 1000);\nawait new Promise(() => {});\nexport const site = { cfg: {}, hosts: [] };\n");
     writeFileSync(beta, "throw new Error('beta will not import');\n");
     let started: Started | undefined;
     try {
       started = await start(dir, { ...MULTI(sites), HELIOPAUSE_POLICY_STARTUP_BUDGET_MS: "1000" });
       const said = started.startupLog;
-      const caveat = /the declared-name check did not run for it/g;
-      assert.equal(
-        (said.match(caveat) ?? []).length, 2,
-        `both failures must carry the caveat — the timeout and the throw:\n${said}`,
-      );
-      assert.match(said, /alpha did not evaluate at startup — the declared-name check did not run/);
-      assert.match(said, /beta did not evaluate at startup — the declared-name check did not run/);
-      // And it did come up, which is the other half: neither failure may be fatal.
+      // ① No naming cue, for either failure. The words are the ones the two retired messages used, so
+      // reintroducing either of them fails here.
+      for (const cue of [/declared.name/i, /check did not run/i, /is the site it is declared as/i]) {
+        assert.ok(
+          !cue.test(said),
+          `a failure that is not a zone fault pointed at the declared name (${cue.source}):\n${said}`,
+        );
+      }
+      // ② The reason is present — for both, and each naming its own cause. Without this, ① is satisfied
+      // by a message that says nothing at all, which is defect 1.
+      assert.match(said, /alpha did not evaluate at startup and will answer 503 until it does: .*did not finish within/);
+      assert.match(said, /beta did not evaluate at startup and will answer 503 until it does: .*beta will not import/);
+      // And it did come up: neither failure may be fatal.
       assert.equal((await fetchAt(started.port, "/healthz")).status, 200);
     } finally {
       started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("names a top-level await that never settles, rather than calling it a timeout", { timeout: 30_000 }, async () => {
+    // A module that awaits nothing-at-all leaves the worker's loop empty, and Node ends the thread with
+    // exit 13 before any budget can fire. That is a real ending with a real cause, and reporting it as
+    // "did not finish within" would name a budget that never ran out. The budget here is long on
+    // purpose: if the reason still says "within", the timer fired, which means exit 13 was missed.
+    const { dir, sites, alpha } = twoSites();
+    writeFileSync(alpha, "await new Promise(() => {});\nexport const site = { cfg: {}, hosts: [] };\n");
+    let started: Started | undefined;
+    try {
+      started = await start(dir, { ...MULTI(sites), HELIOPAUSE_POLICY_STARTUP_BUDGET_MS: "20000" });
+      const said = started.startupLog;
+      assert.match(said, /alpha did not evaluate at startup and will answer 503 until it does: .*never settled \(exit 13\)/);
+      assert.doesNotMatch(said, /did not finish within/);
+      assert.equal((await fetchAt(started.port, "/source?site=alpha")).status, 503);
+      assert.equal((await fetchAt(started.port, "/source?site=beta")).status, 200);
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("is still loud and fatal when the declared name really is wrong", { timeout: 30_000 }, async () => {
+    // ③ The other half of the property above. Dropping the naming cue from content failures must not
+    // make a real mismatch quieter: this one is the fault the startup block treats as unable to heal
+    // itself, so it refuses to come up at all.
+    //
+    // 🔑 Without this test, ① is satisfiable by removing the zone check entirely.
+    const { dir, beta } = twoSites();
+    writeFileSync(beta, 'export const site = { cfg: {}, hosts: [{ id: "h1.somewhere-else", stage: "canary", items: [] }] };\n');
+    try {
+      const { code, err } = await startExpectingRefusal(dir, {
+        HELIOPAUSE_POLICY_SITE: "",
+        HELIOPAUSE_POLICY_SITES: `beta=${beta}`,
+        HELIOPAUSE_POLICY_RENDER_TOKEN: BEARER,
+      });
+      assert.equal(code, 2, `a declared-name mismatch must refuse to start\n${err}`);
+      // The exit code alone would pass if the process refused for an unrelated reason, which this
+      // file has recorded as a way a refusal test goes hollow. The message has to name the host that
+      // gave it away.
+      assert.match(err, /somewhere-else/, `it did not name the host that gave it away\n${err}`);
+    } finally {
       rmSync(join(dir, ".."), { recursive: true, force: true });
     }
   });
@@ -882,13 +960,19 @@ site.hosts[0].notes = cycle;
     try {
       started = await start(dir, MULTI(sites));
       const said = started.startupLog;
+      // The property this test has always held, now without the reassurance sentence it used to read
+      // (that sentence needed the zone check to run first, and it runs last now — see "reports why a
+      // module failed without pointing at the declared name"): a content fault does not send the
+      // operator to the site name. ① no naming cue, ② the cause is there.
+      for (const cue of [/declared.name/i, /check did not run/i]) {
+        assert.doesNotMatch(
+          said, cue,
+          `a content fault was reported as a possible naming fault:\n${said}`,
+        );
+      }
       assert.match(
-        said, /alpha is the site it is declared as, but did not evaluate at startup/,
-        `a content fault past the zone check was reported as a possible naming fault:\n${said}`,
-      );
-      assert.doesNotMatch(
-        said, /alpha did not evaluate at startup — the declared-name check did not run/,
-        "it blamed the declared name for a failure that happened after the name was checked",
+        said, /alpha did not evaluate at startup and will answer 503 until it does: .*circular/i,
+        `the cause did not reach the operator:\n${said}`,
       );
       // beta is untouched, so the positive half must still be there — otherwise this passes against a
       // renderer that stopped verifying anything.
@@ -971,8 +1055,9 @@ export const site = {
       started = await start(dir, MULTI(sites));
       const said = started.startupLog;
       assert.doesNotMatch(said, /refusing to start/, `a module forced a refusal:\n${said}`);
+      // Treated as a content fault: the one-line non-fatal message, carrying the module's text.
       assert.match(
-        said, /beta is the site it is declared as, but did not evaluate/,
+        said, /beta did not evaluate at startup and will answer 503 until it does: .*forged by the policy module/,
         `a module-authored zone error was not treated as a content fault:\n${said}`,
       );
       // alpha is untouched, so it must still be served — the pod staying up is the whole point.
@@ -1208,16 +1293,32 @@ throw new Error("an ordinary content fault");
       const healthz = await fetchAt(port, "/healthz", deadline());
       assert.equal(healthz.status, 200, "the liveness probe stopped answering");
       assert.deepEqual(await healthz.json(), { ok: true }, "/healthz went through the serialiser");
+      // ## 🔑 The poisoned site fails; the others no longer do
+      //
+      // Before the worker, the `toJSON` lived in the renderer's own realm, so it took over every
+      // serialisation the process did: measured on `da80b7b` with this exact module, `/source?site=alpha`,
+      // `/source?site=beta` and `/readyz` all answered **503 "the answer could not be serialised"**. That
+      // was cross-site contamination — alpha poisoned nothing — and the assertion here used to require
+      // it, because the only thing that could be guaranteed then was "not an empty 200".
+      //
+      // In a worker the prototype it poisons belongs to beta's thread alone. Measured on this tree:
+      // alpha 200, readiness 200 (degraded, 1 of 2 serving), beta 503. The property the test always
+      // protected — no empty body, no unserialisable answer passed off as success — still holds, and
+      // it is asserted for every path; what changed is that a healthy site is no longer collateral.
       for (const path of ["/source?site=alpha", "/source?site=beta", "/readyz"]) {
         const res = await fetchAt(port, path, deadline());
         const text = await res.text();
         assert.notEqual(text, "", `${path}: an empty body went out with ${res.status}`);
-        assert.notEqual(res.status, 200, `${path}: an unserialisable answer was reported as success`);
-        assert.equal(
-          (JSON.parse(text) as { error?: string }).error, "the answer could not be serialised",
-          `${path}: the body is not the stated fallback`,
-        );
+        // Every body parses: nothing unserialisable went out under any status.
+        JSON.parse(text);
       }
+      const alpha = await fetchAt(port, "/source?site=alpha", deadline());
+      assert.equal(alpha.status, 200, "alpha poisoned nothing and was taken down with beta");
+      assert.equal(((await alpha.json()) as { siteName?: string }).siteName, "alpha");
+      const beta = await fetchAt(port, "/source?site=beta", deadline());
+      assert.equal(beta.status, 503, "the poisoning site was reported as healthy");
+      const ready = (await (await fetchAt(port, "/readyz", deadline())).json()) as { serving?: number; total?: number };
+      assert.deepEqual([ready.serving, ready.total], [1, 2], "readiness did not count beta as down and alpha as up");
       assert.equal((await fetchAt(port, "/healthz", deadline())).status, 200, "healthz after");
     } finally {
       started?.stop();
@@ -1536,9 +1637,15 @@ export const site = {
     //   - a module's own `setTimeout` callback throwing after its import resolved: nothing from this
     //     file is on that stack, so the default action exited — **after** both probes had passed.
     //
-    // The expectation per shape differs on purpose. A resolver fault is one site's; poisoning a
-    // prototype breaks every module's render, so every site answering 503 is the correct answer and
-    // not a regression. What no shape may do is take the process or `/healthz` down.
+    // What no shape may do is take the process or `/healthz` down.
+    //
+    // 🔑 **This paragraph used to say that poisoning a prototype breaks every module's render, "so
+    // every site answering 503 is the correct answer and not a regression".** That was the in-process
+    // renderer describing its own limit as the specification. Measured on `da80b7b` (before the
+    // worker): `poisonedToJSON` answered alpha 503 — a site that poisoned nothing, taken down by its
+    // neighbour's prototype. That is cross-site contamination, the defect AGENTS.md's table records,
+    // and the old 503 was the defect. The worker gives each evaluation its own realm, so the poisoned
+    // prototype ends with beta's thread; alpha now answers 200, and the row says so.
     const resolver = (body: string): string => `export const site = {
   cfg: { hookPolicy: { input: "drop", output: "accept" } },
   hosts: [{ id: "gw-01.beta", stage: "canary", items: [] }],
@@ -1552,7 +1659,8 @@ export const site = {
       {
         name: "poisonedToJSON",
         body: 'Object.defineProperty(Object.prototype, "toJSON", { value() { throw new Error("bad serializer"); }, configurable: true });\nthrow new Error("bad beta");\n',
-        beta: 503, alpha: 503,
+        // alpha was 503 before the worker (measured on `da80b7b`) — cross-site contamination. See above.
+        beta: 503, alpha: 200,
       },
       {
         // ## `alpha: 200` — and that number changed when the evaluation seam landed
@@ -1635,10 +1743,7 @@ export const site = {
         // passed both probes and then died is the worst shape operationally, because it looks healthy.
         await new Promise((r) => setTimeout(r, 900));
         assert.equal((await fetchAt(port, "/healthz", deadline())).status, 200, `${shape.name}: healthz after`);
-        // `/readyz` reports the swallowed fault rather than hiding it — except under a poisoned
-        // `toJSON`, where the readiness body cannot be serialised either and the literal fallback goes
-        // out instead. That is the correct answer there, so the shape asserts the fallback rather than
-        // a count it could not have carried.
+        // `/readyz` reports the swallowed fault rather than hiding it.
         const ready = (await (await fetchAt(port, "/readyz", deadline())).json()) as {
           faults?: number;
           error?: string;
@@ -1650,8 +1755,11 @@ export const site = {
           typeof ready.faults, "number",
           `${shape.name}: readiness did not report a fault count`,
         );
+        // Under a poisoned `toJSON` the readiness body used to be the literal fallback, "the answer could
+        // not be serialised" — the poison reached this process's own serialiser (measured on `da80b7b`).
+        // It now stays in beta's worker, so readiness serialises normally and must count the outage.
         if (shape.name === "poisonedToJSON") {
-          assert.equal(ready.error, "the answer could not be serialised", `${shape.name}: readyz body`);
+          assert.equal(ready.error, undefined, `${shape.name}: the poison reached the renderer's own serialiser`);
         }
         if (shape.name === "lateThrowFromModuleTimer") {
           assert.ok((ready.faults ?? 0) > 0, `${shape.name}: the fault was swallowed silently`);
@@ -1670,18 +1778,21 @@ export const site = {
   // `BigInt` survives collection — the row builder checks three string fields — and then the
   // whole-source serialisation throws. `beta`, the poisoning site, answers 503.
   //
-  // 🔴 **`alpha`, which poisoned nothing, also answers 503**, because the module never restores the
-  // global. That is the defect, so the desired value for `alpha` is **200**, and the first test below
-  // says so. It is `todo`: it fails today, on purpose, and a `todo` failure does not fail the suite.
+  // ## 🔑 #126 is closed by the worker, and this is the test that was waiting for it
   //
-  // ⚠️ The first draft put this in the matrix above with `alpha: 503` as the expected value — the
-  // shape AGENTS.md records as "관찰된 동작이 기대값이 되는 순간 — 테스트가 구멍을 봉인한다". That
-  // matrix means "this is correct", so a 503 there would have made the contamination the
-  // specification, and a later fix would have arrived looking like a regression. A review caught it.
+  // `alpha`, which poisoned nothing, used to answer **503** as well: the module never restored the
+  // global, so the healthy site's evaluation used the replaced parser too. Evaluating in a worker ends
+  // it — the replacement lives in a realm that is terminated after that one site, so it cannot reach
+  // `alpha`'s evaluation at all.
   //
-  // ⚠️ A `todo` alone is silent whichever way it goes, so the second test pins today's answer and is
-  // named for the issue rather than for the behaviour: when #126 is fixed it goes red and asks to be
-  // deleted along with the `todo` marker.
+  // ⚠️ Written as a `todo` asserting the **desired** value (`alpha: 200`), with a second test pinning
+  // the 503 and named "#126 is still open" so a fix would turn it red and ask to be deleted. It did,
+  // and it was. That is the whole mechanism working: the expectation was never changed to match the
+  // defect, so the fix arrived as a fix rather than as a regression.
+  //
+  // ⚠️ The first draft had put this in the matrix above with `alpha: 503` as the expected value — the
+  // shape AGENTS.md records as "관찰된 동작이 기대값이 되는 순간 — 테스트가 구멍을 봉인한다". A review
+  // caught it. Had it stayed, this PR would have broken that row and looked like the regression.
   //
   // This shape was written once, observed to answer 200 for `beta`, and removed as unreproducible.
   // The renderer was right and the fixture was wrong — `twoSites` wrote no `coverage-*.json`, so the
@@ -1706,7 +1817,7 @@ export const site = {
 
   it(
     "a healthy site still answers when another site's module replaces JSON.parse",
-    { timeout: 30_000, todo: "#126 — it does not: alpha answers 503, because the global is never restored" },
+    { timeout: 30_000 },
     async () => {
       const got = await probeParserSites();
       try {
@@ -1717,26 +1828,6 @@ export const site = {
       }
     },
   );
-
-  it("#126 is still open: a replaced probe parser takes the healthy site down too", { timeout: 30_000 }, async () => {
-    const got = await probeParserSites();
-    try {
-      // Delete this test when #126 is fixed — the `todo` above becomes the live assertion. Both
-      // statuses are checked so "everything is 503" and "the contamination is gone" cannot be
-      // confused: a green `beta` is a reason to go and read the fixture.
-      //
-      // ⚠️ `beta: 503` does not establish that the replaced parser ran — the site could fail for a
-      // neighbouring reason, and the review said so. What establishes it is the pair of
-      // measurements that bracket the fixture: with no `coverage-*.json` present this shape answered
-      // 200, and with one present it answers `Do not know how to serialize a BigInt`, a value only
-      // the replaced parser supplies. This assertion is the smoke, not the cause.
-      assert.equal(got.beta, 503, "the poisoning site must fail — a green here means reading the fixture");
-      assert.equal(got.alpha, 503, "today the healthy site fails too; when this goes green, #126 is fixed");
-    } finally {
-      got.stop();
-      rmSync(join(got.dir, ".."), { recursive: true, force: true });
-    }
-  });
 
   it("stops serving a cached answer when a file the module imports breaks", { timeout: 30_000 }, async () => {
     // ## The stamp read the entry module, not what the entry module imports
@@ -1850,12 +1941,12 @@ export const site = {
         assert.equal((await fetchAt(port, "/healthz", deadline())).status, 200, `${name}: healthz`);
         const ready = await fetchAt(port, "/readyz", deadline());
         assert.equal(ready.status, 200, `${name}: readyz`);
-        assert.deepEqual(await ready.json(), { ok: true, degraded: true, serving: 1, total: 2, faults: 0 }, name);
+        assert.deepEqual(await readinessOf(ready), { ok: true, degraded: true, serving: 1, total: 2, faults: 0 }, name);
         // Again, immediately: the memo compares `Date.now()` to when it settled, so the clock is only
         // read on a second request inside the window. One call leaves that capture untested.
         const memoised = await fetchAt(port, "/readyz", deadline());
         assert.equal(memoised.status, 200, `${name}: memoised readyz`);
-        assert.deepEqual(await memoised.json(), { ok: true, degraded: true, serving: 1, total: 2, faults: 0 }, name);
+        assert.deepEqual(await readinessOf(memoised), { ok: true, degraded: true, serving: 1, total: 2, faults: 0 }, name);
         if (name === "replacesString") {
           // The second shared `String` call is inside `sourceStamp`'s `try`/`catch`, so a replaced
           // coercion throws nothing — it makes **every** mtime component `"-"`. The stamp then stops
@@ -1960,13 +2051,14 @@ export const site = {
     try {
       started = await start(dir, MULTI(sites));
       const said = started.startupLog;
+      // The trap now fires in the worker, where `failureText` reads it under a guard. The property is
+      // unchanged: no naming cue, and a line that still says the site failed rather than nothing.
+      for (const cue of [/declared.name/i, /check did not run/i]) {
+        assert.doesNotMatch(said, cue, `an unreadable content fault was blamed on the declared name:\n${said}`);
+      }
       assert.match(
-        said, /beta is the site it is declared as, but did not evaluate/,
-        `a content fault past the zone check was blamed on the declared name:\n${said}`,
-      );
-      assert.doesNotMatch(
-        said, /beta did not evaluate at startup — the declared-name check did not run/,
-        "it told the operator to check a name that had already been checked",
+        said, /beta did not evaluate at startup and will answer 503 until it does: .*could not be read/,
+        `the unreadable failure was not reported at all:\n${said}`,
       );
       assert.equal((await fetchAt(started.port, "/source?site=beta")).status, 503);
     } finally {
@@ -2009,7 +2101,7 @@ export const site = {
       // would let a broken `dev.ts` take prod's and util's consoles down, which is the trade the
       // startup verification already refused to make — and the test below pins the other half.
       assert.equal(res.status, 200, "one broken site made the whole renderer report unready");
-      assert.deepEqual(await res.json(), { ok: true, degraded: true, serving: 1, total: 2, faults: 0 });
+      assert.deepEqual(await readinessOf(res), { ok: true, degraded: true, serving: 1, total: 2, faults: 0 });
       // Documentation, not coverage — and saying which it is matters. `deepEqual` above already
       // rejects any added key, so a leak dies there and this line is never the failure; measured by
       // injecting `names: "alpha,beta"` into the body, which fails on the line above. It is kept
@@ -2070,7 +2162,7 @@ export const site = {
     try {
       started = await start(dir, MULTI(sites));
       assert.deepEqual(
-        await (await fetchAt(started.port, "/readyz")).json(),
+        await readinessOf(await fetchAt(started.port, "/readyz")),
         { ok: true, degraded: false, serving: 2, total: 2, faults: 0 },
       );
       // Break it after the process is up, and move the mtime so the stamp changes — `utimesSync`
@@ -2080,10 +2172,35 @@ export const site = {
       utimesSync(beta, later, later);
       await new Promise((r) => setTimeout(r, 2_100)); // the memo window, plus a margin
       assert.deepEqual(
-        await (await fetchAt(started.port, "/readyz")).json(),
+        await readinessOf(await fetchAt(started.port, "/readyz")),
         { ok: true, degraded: true, serving: 1, total: 2, faults: 0 },
         "the answer was remembered from startup instead of read from the tree",
       );
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("does not count its own reclaim of a worker as a fault", { timeout: 30_000 }, async () => {
+    // A module that answers correctly and keeps a handle open (`setInterval`) outlives its grace, and
+    // the renderer terminates it. `terminate()` makes a worker exit **1**, and the exit handler counts a
+    // non-zero exit after an answer as a late fault — so without telling the two apart, every module
+    // with an open timer would raise `faults` once per evaluation, and the one signal the grace window
+    // exists to carry would mean nothing. Measured: removing the distinction gives `faults: 1` here.
+    //
+    // ⚠️ The neighbouring "answers from the tree as it is now" does not reach this: its beta throws at
+    // the top level, which is an evaluation failure and gets no grace at all.
+    const { dir, sites, alpha } = twoSites();
+    writeFileSync(alpha, `setInterval(() => {}, 1000);\n${readFileSync(alpha, "utf8")}`);
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      assert.equal((await fetchAt(started.port, "/source?site=alpha")).status, 200);
+      await new Promise((r) => setTimeout(r, 3_100)); // the grace window, then the memo window
+      const ready = (await (await fetchAt(started.port, "/readyz")).json()) as { faults?: number; serving?: number };
+      assert.equal(ready.serving, 2, "alpha stopped being served when its worker was reclaimed");
+      assert.equal(ready.faults, 0, "the renderer counted its own termination as the module's fault");
     } finally {
       started?.stop();
       rmSync(join(dir, ".."), { recursive: true, force: true });
@@ -2180,7 +2297,7 @@ export const site = {
         signal: AbortSignal.timeout(10_000),
       });
       assert.equal(res.status, 200, "alpha was serving, so this must be up and degraded");
-      assert.deepEqual(await res.json(), { ok: true, degraded: true, serving: 1, total: 2, faults: 0 });
+      assert.deepEqual(await readinessOf(res), { ok: true, degraded: true, serving: 1, total: 2, faults: 0 });
     } finally {
       started?.stop();
       rmSync(join(dir, ".."), { recursive: true, force: true });
@@ -2200,7 +2317,7 @@ export const site = {
       started = await start(dir, MULTI(sites));
       const res = await fetchAt(started.port, "/readyz");
       assert.equal(res.status, 503, "a renderer serving nothing reported itself ready");
-      assert.deepEqual(await res.json(), { ok: false, degraded: true, serving: 0, total: 2, faults: 0 });
+      assert.deepEqual(await readinessOf(res), { ok: false, degraded: true, serving: 0, total: 2, faults: 0 });
       assert.equal(
         (await fetchAt(started.port, "/healthz")).status, 200,
         "/healthz went strict — that restarts the pod for a policy fault",
@@ -2295,6 +2412,154 @@ export const site = {
       assert.equal(code, 2);
       assert.match(err, /both set/);
     } finally {
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+});
+
+describe("a policy module is evaluated in a worker of its own", () => {
+  // The claims `src/policy-eval-worker.ts` and `evaluateInWorker` make, each driven through the real
+  // renderer. The forgery shapes are §3-b ①②③ of `docs/policy-evaluation-realm-design.md`, which
+  // were measured in a synthetic harness; these run them through the code that ships.
+  //
+  // Every forgery module posts a well-formed fake result **and then fails**. If the forgery reached
+  // the parent, the parent would accept it and beta would answer 200 with the forged payload; a 503
+  // is the module's own failure arriving instead. The `forged` marker is asserted absent from the
+  // body as well, so a 200 that happened for some other reason cannot pass as a block.
+  const FORGED = `{"schemaVersion":1,"site":{"cfg":{},"hosts":[{"id":"h1.beta","stage":"canary","items":[]}]},"forged":true}`;
+  const forging = (how: string) =>
+    `const wt = await import("node:worker_threads");\n${how}\n` +
+    `await new Promise((r) => setTimeout(r, 50));\nthrow new Error("the module failed on its own");\n`;
+
+  const shapes: { name: string; body: string }[] = [
+    {
+      // ① `parentPort` is a channel the module can reach directly.
+      name: "posts on parentPort",
+      body: forging(`wt.parentPort.postMessage({ ok: true, wire: ${JSON.stringify(FORGED)} });`),
+    },
+    {
+      // ② `workerData` is readable; if the port were there, the module would post on it.
+      name: "posts on anything workerData holds",
+      body: forging(
+        `for (const v of Object.values(wt.workerData ?? {})) {\n` +
+          `  if (v && typeof v.postMessage === "function") v.postMessage({ ok: true, wire: ${JSON.stringify(FORGED)} });\n` +
+          `}`,
+      ),
+    },
+    {
+      // ② again: the handover message, if it were still waiting, would hand the module the port.
+      name: "takes the next message on parentPort",
+      body: forging(
+        `wt.parentPort.once("message", (m) => m?.reply?.postMessage?.({ ok: true, wire: ${JSON.stringify(FORGED)} }));`,
+      ),
+    },
+    {
+      // ③ The send method is looked up on the prototype unless it was captured first.
+      name: "rewrites MessagePort.prototype.postMessage",
+      body: forging(
+        `const real = wt.MessagePort.prototype.postMessage;\n` +
+          `wt.MessagePort.prototype.postMessage = function () { return real.call(this, { ok: true, wire: ${JSON.stringify(FORGED)} }); };`,
+      ),
+    },
+  ];
+  for (const shape of shapes) {
+    it(`does not accept a result from a module that ${shape.name}`, { timeout: 30_000 }, async () => {
+      const { dir, sites, beta } = twoSites();
+      writeFileSync(beta, shape.body);
+      let started: Started | undefined;
+      try {
+        started = await start(dir, MULTI(sites));
+        const res = await fetchAt(started.port, "/source?site=beta", { signal: AbortSignal.timeout(10_000) });
+        const text = await res.text();
+        assert.doesNotMatch(text, /"forged":true/, `${shape.name}: the forged payload reached a response`);
+        assert.equal(res.status, 503, `${shape.name}: beta was served although its module failed`);
+        assert.match(text, /the module failed on its own/, `${shape.name}: the 503 is not the module's own failure`);
+        assert.equal((await fetchAt(started.port, "/source?site=alpha")).status, 200);
+      } finally {
+        started?.stop();
+        rmSync(join(dir, ".."), { recursive: true, force: true });
+      }
+    });
+  }
+
+  it("a module that spins forever fails only its own site", { timeout: 30_000 }, async () => {
+    // The one hole the in-process renderer could not close: a timer cannot preempt synchronous code,
+    // so `while (true) {}` at a module's top level held the whole process. A worker is terminated.
+    const { dir, sites, beta } = twoSites();
+    writeFileSync(beta, "while (true) {}\n");
+    let started: Started | undefined;
+    try {
+      started = await start(dir, {
+        ...MULTI(sites),
+        HELIOPAUSE_POLICY_STARTUP_BUDGET_MS: "1000",
+        HELIOPAUSE_POLICY_SOURCE_BUDGET_MS: "1000",
+      });
+      assert.match(started.startupLog, /beta did not evaluate at startup .*did not finish within/);
+      const deadline = (): RequestInit => ({ signal: AbortSignal.timeout(10_000) });
+      assert.equal((await fetchAt(started.port, "/healthz", deadline())).status, 200);
+      assert.equal((await fetchAt(started.port, "/source?site=alpha", deadline())).status, 200);
+      assert.equal((await fetchAt(started.port, "/source?site=beta", deadline())).status, 503);
+      // The answers above are the same whether or not the spinning thread was terminated — the budget
+      // rejects either way. What differs is that an unterminated spin is still burning a core, so the
+      // thread count is the assertion that the hole is closed and not merely answered around.
+      //
+      // ⚠️ Read with the readiness memo **warm**. A `/readyz` that has to re-evaluate starts beta's
+      // spinning worker again, and that thread is alive at the moment the count is taken — measured:
+      // 1 on a cold read, 0 on a warm one, with nothing left over. So the first read pays for the
+      // evaluation and waits out its budget, and the second, inside the memo window, reports what
+      // is still running without starting anything. With the budget not terminating, this reads 3.
+      await fetchAt(started.port, "/readyz", deadline());
+      await new Promise((r) => setTimeout(r, 1_100)); // past beta's 1 s budget, inside the 2 s memo
+      const ready = (await (await fetchAt(started.port, "/readyz", deadline())).json()) as { workers?: number };
+      assert.equal(ready.workers, 0, "a spinning worker was left running after its budget");
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("counts a fault that arrives inside the grace window without changing the answer", { timeout: 30_000 }, async () => {
+    // The grace window exists to keep what the in-process handlers gave: a module that answers and
+    // then throws from a timer is counted in `faults`, and the answer it gave stands.
+    const { dir, sites, alpha } = twoSites();
+    writeFileSync(alpha, `setTimeout(() => { throw new Error("late"); }, 200);\n${readFileSync(alpha, "utf8")}`);
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      assert.equal((await fetchAt(started.port, "/source?site=alpha")).status, 200);
+      await new Promise((r) => setTimeout(r, 2_500)); // past the 200 ms throw and the memo window
+      const ready = (await (await fetchAt(started.port, "/readyz")).json()) as { faults?: number; serving?: number };
+      assert.ok((ready.faults ?? 0) > 0, "a fault inside the grace window was swallowed");
+      assert.equal(ready.serving, 2, "a late fault changed the answer already given");
+      assert.equal((await fetchAt(started.port, "/source?site=alpha")).status, 200);
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("a changed file the module imports is read on the next evaluation", { timeout: 30_000 }, async () => {
+    // There is no `?v=` and no child-version hook any more: each evaluation has a fresh registry. This
+    // is the property the hook existed for (#59) — the stamp moves and the imported data must move too.
+    const { dir, sites, alpha } = twoSites();
+    writeFileSync(join(dir, "helper.json"), '{"mark":"first"}\n');
+    writeFileSync(
+      alpha,
+      `import h from "./helper.json" with { type: "json" };\n` +
+        `export const site = { cfg: {}, hosts: [{ id: "h1.alpha", stage: "canary", items: [], notes: h.mark }] };\n`,
+    );
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      const first = await (await fetchAt(started.port, "/source?site=alpha")).text();
+      assert.match(first, /"notes":"first"/, "the fixture did not reach the answer");
+      writeFileSync(join(dir, "helper.json"), '{"mark":"second"}\n');
+      const later = new Date(Date.now() + 5_000);
+      utimesSync(join(dir, "helper.json"), later, later);
+      const second = await (await fetchAt(started.port, "/source?site=alpha")).text();
+      assert.match(second, /"notes":"second"/, "the imported file was served from an earlier evaluation");
+    } finally {
+      started?.stop();
       rmSync(join(dir, ".."), { recursive: true, force: true });
     }
   });
