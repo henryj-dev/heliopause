@@ -28,6 +28,28 @@ export type SiteSourceRead =
   | { site: string; ok: true; source: PolicySource }
   | { site: string; ok: false; error: string };
 
+/**
+ * Whether the renderer's answer is the site that was asked for — and the read, failed, if not.
+ *
+ * A single-site renderer ignores `?site=` and serves its one site to every request, and the renderer
+ * calls that an ordinary state during a rollout. Without this check every relay would receive the
+ * same declarations and a host id that repeats across VPCs would be compared with another VPC's —
+ * the defect this module exists to prevent. Same rule as `/policy/plan`'s `siteName` check.
+ *
+ * A renderer that names no site is accepted for the **first** relay only: that is what this screen
+ * read before it read per site, and refusing it would blank the one site that used to work. For any
+ * other relay an unnamed answer cannot be told from the first relay's, so it is not used.
+ */
+export function checkedRead(site: string, index: number, source: PolicySource): SiteSourceRead {
+  if (source.siteName !== undefined && source.siteName !== site) {
+    return { site, ok: false, error: `asked the renderer for ${site} and it served ${source.siteName}` };
+  }
+  if (source.siteName === undefined && index > 0) {
+    return { site, ok: false, error: `the renderer did not say which site it served, so it may be another relay's — not used for ${site}` };
+  }
+  return { site, ok: true, source };
+}
+
 export interface RoutesSite {
   site: string;
   generation: string | null;

@@ -71,7 +71,7 @@ import { CONSOLE_ENTRY, consoleAppPath, policyAppPath } from "./app-shell.ts";
 import { allSitePolicies, buildScreen, type Screen } from "./policy-screen.ts";
 import { assertProtectedAllowed, planPublish, protectedHostsIn, PublishError } from "./publish.ts";
 import { editableFiles, parsePolicySource, screenSiteOf, type PolicySource } from "./policy-source.ts";
-import { routesView, type SiteSourceRead } from "./routes-view.ts";
+import { checkedRead, routesView, type SiteSourceRead } from "./routes-view.ts";
 import { lookupPolicies } from "./policy-lookup.ts";
 import { pickLang } from "./i18n.ts";
 import type { Lang } from "./i18n.ts";
@@ -2474,13 +2474,15 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       if (!opts.policySource) {
         return send(res, 404, { error: "this deployment does not carry a policy repository" });
       }
-      // One policy source per relay, in parallel — the latency is the slowest site, not the sum.
+      // One policy source per relay, requested together. This process waits for the slowest, but the
+      // renderer serves them on one event loop — a stamp check (two `git` forks) per site on every
+      // call, and an evaluation per site after a commit — so the renderer's work is the sum.
       // Each host is compared with its own site's declarations; see `routes-view.ts`.
       const src = opts.policySource;
       const [reads, results] = await Promise.all([
-        Promise.all(opts.relays.map(async (r): Promise<SiteSourceRead> => {
+        Promise.all(opts.relays.map(async (r, i): Promise<SiteSourceRead> => {
           try {
-            return { site: r.name, ok: true, source: await fetchPolicySource(src, timeoutMs, r.name) };
+            return checkedRead(r.name, i, await fetchPolicySource(src, timeoutMs, r.name));
           } catch (e) {
             return { site: r.name, ok: false, error: `the policy could not be read: ${(e as Error).message}` };
           }

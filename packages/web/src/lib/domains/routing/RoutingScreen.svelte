@@ -103,7 +103,7 @@
     </div>
   {:else}
     <div class:stale-hold={stale}>
-    {#each view.sites.filter((s) => s.error !== null) as site (site.site)}
+    {#each view.sites.filter((s) => s.error !== null) as site, i (i)}
       <p class="caveat">{t(prefs.lang, "m.routingSiteUnread", { site: site.site, error: site.error ?? "" })}</p>
     {/each}
     {#if siteGenerationSplit(view).length > 0}

@@ -3,6 +3,10 @@
 // The joining is `routes-view.test.ts`. This file is about the handler — that it asks the renderer
 // for every relay's site and not only the first, that one site failing does not take the others
 // with it, and that every site failing is still a 503.
+//
+// What it does **not** show: the relays here are unreachable, so `hosts` is always empty and no host
+// is joined with a site at this level. That `SiteView` tags each host with its relay's name (the key
+// the join uses) is `manager.ts`'s `siteView`, and the join itself is tested where it is pure.
 
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -22,17 +26,21 @@ const read = (f: string) => readFileSync(join(dir, f));
 /** What the fake renderer was asked for, in order. */
 const asked: Array<string | null> = [];
 
-/** The renderer's answer for one site: a distinct commit per site, so the response shows which was read. */
-function body(site: string): string {
+/**
+ * The renderer's answer for one site: a distinct commit per site, so the response shows which was
+ * read, and the site's name — a multi-site renderer names what it served. `served` lets a test make
+ * it answer with another site's name.
+ */
+function body(site: string, served = site): string {
   const collected = collectPolicySource({
     site: { cfg: defineConfig({ baseline: [] }), hosts: [] } as never,
-    sitePath: "/nonexistent/site.ts", label: site, allowPaths: [],
+    sitePath: "/nonexistent/site.ts", label: site, allowPaths: [], siteName: served,
   });
   const sha = (site === "dev" ? "d" : site === "az01" ? "a" : "f").repeat(40);
   return JSON.stringify({ ...collected, head: { sha, dirty: false }, repo: { probes: [], commits: [], generation: sha.slice(0, 7) } });
 }
 
-async function manager(failing: ReadonlySet<string>): Promise<number> {
+async function manager(failing: ReadonlySet<string>, mislabel: ReadonlyMap<string, string> = new Map()): Promise<number> {
   const started = await startManager({
     port: 0,
     hostname: "127.0.0.1",
@@ -54,7 +62,7 @@ async function manager(failing: ReadonlySet<string>): Promise<number> {
         if (site && failing.has(site)) {
           return new Response(JSON.stringify({ error: `no such site ${site}` }), { status: 400, headers: { "content-type": "application/json" } });
         }
-        return new Response(body(site ?? "none"), { status: 200, headers: { "content-type": "application/json" } });
+        return new Response(body(site ?? "none", mislabel.get(site ?? "") ?? site ?? "none"), { status: 200, headers: { "content-type": "application/json" } });
       }) as unknown as typeof fetch,
     },
   } as Parameters<typeof startManager>[0]);
@@ -106,7 +114,7 @@ describe("GET /routes reads one policy source per relay", () => {
     assert.deepEqual([...asked].sort(), ["az01", "dev", "prod"]);
     assert.deepEqual(r.body.sites.map((s: any) => [s.site, s.generation?.[0], s.error]),
       [["dev", "d", null], ["az01", "a", null], ["prod", "f", null]]);
-    assert.equal(r.body.generation, "d".repeat(40), "the top-level generation is no longer the first relay's");
+    assert.equal(r.body.generation, "d".repeat(40), "the top-level generation should be the first readable site's (dev)");
   });
 
   it("answers for the sites it could read when one cannot be", async () => {
@@ -116,6 +124,15 @@ describe("GET /routes reads one policy source per relay", () => {
     const az = r.body.sites.find((s: any) => s.site === "az01");
     assert.match(az.error, /the policy could not be read: no such site az01/);
     assert.deepEqual(r.body.sites.filter((s: any) => s.error === null).map((s: any) => s.site), ["dev", "prod"]);
+  });
+
+  it("does not use an answer that names another site than the one asked for", async () => {
+    // A renderer that served dev to a request for az01 would make az01's hosts compare against dev's
+    // declarations — the cross-VPC mix this route exists to prevent.
+    const port = await manager(new Set(), new Map([["az01", "dev"]]));
+    const r = await get(port, "/routes");
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    assert.match(r.body.sites.find((s: any) => s.site === "az01").error, /asked the renderer for az01 and it served dev/);
   });
 
   it("is a 503 when no site can be read, and still names each one", async () => {

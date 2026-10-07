@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { routesView, type SiteSourceRead } from "./routes-view.ts";
+import { checkedRead, routesView, type SiteSourceRead } from "./routes-view.ts";
 import { collectPolicySource, parsePolicySource, type PolicySource } from "./policy-source.ts";
 import { defineConfig } from "./config.ts";
 import type { SiteView } from "./manager.ts";
@@ -101,5 +101,26 @@ describe("routesView", () => {
     );
     assert.equal(v.generation, "b".repeat(40));
     assert.deepEqual(v.sites.map((s) => [s.site, s.generation]), [["dev", null], ["prod", "b".repeat(40)], ["util", "c".repeat(40)]]);
+  });
+});
+
+describe("checkedRead", () => {
+  const named = (name: string | undefined) => ({ ...source({}), ...(name === undefined ? {} : { siteName: name }) }) as PolicySource;
+
+  it("refuses an answer for a different site than the one asked for", () => {
+    const r = checkedRead("az01", 1, named("dev"));
+    assert.equal(r.ok, false);
+    assert.match(!r.ok ? r.error : "", /asked the renderer for az01 and it served dev/);
+  });
+
+  it("accepts an unnamed answer for the first relay only — a single-site renderer serves one site to everyone", () => {
+    assert.equal(checkedRead("dev", 0, named(undefined)).ok, true);
+    const second = checkedRead("az01", 1, named(undefined));
+    assert.equal(second.ok, false);
+    assert.match(!second.ok ? second.error : "", /did not say which site it served/);
+  });
+
+  it("accepts the site it asked for", () => {
+    assert.equal(checkedRead("prod", 2, named("prod")).ok, true);
   });
 });
