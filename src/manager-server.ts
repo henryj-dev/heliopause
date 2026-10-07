@@ -46,8 +46,8 @@
 // directory, and `heliopause-status` reads a relay directly. Verified by killing it and using all
 // three.
 
-import { createServer, request, type Server } from "node:https";
-import { createSecureContext, type SecureContext } from "node:tls";
+import { Agent, createServer, request, type Server } from "node:https";
+import { createSecureContext, type SecureContext, type TLSSocket } from "node:tls";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { readFile, readdir, realpath } from "node:fs/promises";
 import { join, resolve } from "node:path";
@@ -145,6 +145,8 @@ import { certificateIsRevoked } from "./certificate-revocation.ts";
 import { MAX_REVOCATION_ROWS, serializeRevocationSnapshot } from "./revocation-snapshot.ts";
 import { daysUntilExpiry } from "./cert-api.ts";
 import type { CertBundle } from "./cert-api.ts";
+import { certFactsFromPeer, certFactsFromPem, pemCertificateCount, type CertFacts } from "./cert-watch.ts";
+import { certificateInventory, certificateProblems, prose, type CertificateReport, type FileReading } from "./cert-inventory.ts";
 import type { CertificateRevocation } from "./enrollment-store.ts";
 
 /**
@@ -248,6 +250,7 @@ export function republishRefusal(input: {
 
 export const API_ROUTES: ReadonlySet<string> = new Set([
   "/site",
+  "/certificates",
   "/authz",
   "/plans",
   "/plan",
@@ -440,6 +443,15 @@ export interface ManagerOptions {
   enrollment?: { storeFile: string; trustedCaFiles?: ReadonlyMap<string, string> };
   /** Enrollment store or standalone JSON denylist, reloaded on every authenticated request. */
   revocationFile?: string;
+  /**
+   * A directory of operators' **public** certificates (`*.pem`), reported by `/api/certificates`.
+   *
+   * The manager never holds an operator's key, so it cannot see an operator certificate any other
+   * way — and the operator's is the one that expires on a laptop where nothing watches it. Each file
+   * is a certificate the deployment expects to stay valid; replacing the file is part of renewing it.
+   * Unset reports no operators and says so (`expected.byKind.operator` is 0).
+   */
+  knownOperatorsDir?: string;
   /** Dedicated online Ed25519 key. It signs approved artifacts and is never shared with a relay. */
   artifactSigning?: {
     privateKey: KeyObject;
@@ -679,8 +691,9 @@ export async function pollRelays(
         // take effect on the next poll, not on the next manager restart — and this runs at human
         // pace, so three file reads cost nothing worth optimising.
         const tls = await loadRelayCreds(r);
-        const view = await getFleetView(r.url, tls, timeoutMs);
-        return { name: r.name, url: r.url, ok: true, view };
+        let relayCert: CertFacts | null = null;
+        const view = await getFleetView(r.url, tls, timeoutMs, (c) => { relayCert = c; });
+        return { name: r.name, url: r.url, ok: true, view, relayCert };
       } catch (e) {
         return { name: r.name, url: r.url, ok: false, error: (e as Error).message };
       }
@@ -922,9 +935,26 @@ function getFleetView(
   relayUrl: string,
   tls: { cert: Buffer; key: Buffer; ca: Buffer },
   timeoutMs: number,
+  onPeer?: (cert: CertFacts | null) => void,
 ): Promise<FleetView> {
-  return relayCall<FleetView>(relayUrl, "/status", "GET", null, tls, timeoutMs);
+  return relayCall<FleetView>(relayUrl, "/status", "GET", null, tls, timeoutMs, onPeer);
 }
+
+/**
+ * The agent for relay calls: connections kept alive as the global agent keeps them, TLS sessions not
+ * resumed.
+ *
+ * A resumed TLS 1.3 session hands the client an empty `getPeerCertificate()`, and the relay's
+ * certificate is read from exactly that (`onPeer` below). With the global agent, every poll after the
+ * relay's 5 s keep-alive had closed the socket resumed — and the console polls every 10 s — so the
+ * relay's expiry was readable on the first poll only. Measured in review of #127: the second
+ * `/api/certificates` six seconds after the first reported the relay certificate as unreadable.
+ * A new connection then does a full handshake, which costs nothing at this rate. Only the session cache
+ * matters here — keep-alive is kept so a burst of calls still reuses one connection, as before.
+ *
+ * @see cert-endpoint.test.ts "still reads the relay's certificate after the connection has closed"
+ */
+const relayAgent = new Agent({ keepAlive: true, maxCachedSessions: 0 });
 
 /**
  * One request to one relay, with that VPC's credentials.
@@ -940,6 +970,12 @@ function relayCall<T>(
   body: string | Buffer | null,
   tls: { cert: Buffer; key: Buffer; ca: Buffer },
   timeoutMs: number,
+  /**
+   * Handed the certificate the relay presented, once the handshake that produced this response is
+   * done. Read here because this is the only place the socket is in hand — the relay's certificate
+   * is observed on the wire, not inferred from a file on a gateway the manager cannot read.
+   */
+  onPeer?: (cert: CertFacts | null) => void,
 ): Promise<T> {
   const url = new URL(path, relayUrl);
   return new Promise((settleOk, settleErr) => {
@@ -969,6 +1005,7 @@ function relayCall<T>(
         port: url.port,
         path: url.pathname,
         method,
+        agent: relayAgent,
         cert: tls.cert,
         key: tls.key,
         ca: tls.ca,
@@ -983,6 +1020,7 @@ function relayCall<T>(
           : {}),
       },
       (res) => {
+        onPeer?.(certFactsFromPeer((res.socket as TLSSocket).getPeerCertificate?.()));
         // ## Decoded once, on the whole body — not per chunk
         //
         // This was `let payload = ""; res.on("data", (c) => (payload += c))`, which calls
@@ -1490,6 +1528,68 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     readFile(opts.tls.keyFile),
     readFile(opts.tls.caFile),
   ]);
+  // What this process is serving, fixed for its lifetime. `/api/certificates` compares it with the
+  // file read fresh, which is how a renewed Secret the process was never restarted for shows up.
+  const loadedServerCert = certFactsFromPem(cert);
+
+  const certReading = (pem: Buffer, where: string): FileReading => {
+    try {
+      return certFactsFromPem(pem);
+    } catch (e) {
+      return { error: prose(`${where}: ${(e as Error).message}`) };
+    }
+  };
+  const readCertFile = async (path: string): Promise<FileReading> => {
+    try {
+      return certReading(await readFile(path), path);
+    } catch (e) {
+      return { error: prose(`${path}: ${(e as Error).message}`) };
+    }
+  };
+
+  /**
+   * The certificates this deployment's own PKI issues, from one round of relay polls. Not the public
+   * (SNI) certificate — see `cert-inventory.ts`.
+   *
+   * The client certificates are read the way `pollRelays` reads them (`loadRelayCreds`), so what is
+   * reported is what the next relay call will present — not a guess at which file that is.
+   */
+  async function gatherCertificates(results: RelayResult[]): Promise<CertificateReport> {
+    const vpcFiles = await Promise.all(opts.relays.map(async (r) => {
+      try {
+        const creds = await loadRelayCreds(r);
+        return {
+          vpc: r.name,
+          client: certReading(creds.cert, r.pkiDir),
+          ca: certReading(creds.ca, join(r.pkiDir, "ca.pem")),
+          caBlocks: pemCertificateCount(creds.ca),
+        };
+      } catch (e) {
+        const caFile = join(r.pkiDir, "ca.pem");
+        let caBlocks: number | undefined;
+        try { caBlocks = pemCertificateCount(await readFile(caFile)); } catch { /* reported by readCertFile below */ }
+        return { vpc: r.name, client: { error: prose((e as Error).message) }, ca: await readCertFile(caFile), caBlocks };
+      }
+    }));
+    let operators: Array<{ file: string; reading: FileReading }> | null = null;
+    if (opts.knownOperatorsDir) {
+      const dir = opts.knownOperatorsDir;
+      try {
+        const files = (await readdir(dir)).filter((f) => f.endsWith(".pem")).sort();
+        operators = await Promise.all(files.map(async (file) => ({ file, reading: await readCertFile(join(dir, file)) })));
+      } catch (e) {
+        // Configured and unreadable is not "no operators": it is one expectation that could not be met.
+        operators = [{ file: dir, reading: { error: prose(`${dir}: ${(e as Error).message}`) } }];
+      }
+    }
+    return certificateInventory({
+      now: now(),
+      relays: results,
+      vpcFiles,
+      manager: { loaded: loadedServerCert, file: await readCertFile(opts.tls.certFile) },
+      operators,
+    });
+  }
 
   // `rejectUnauthorized: false`, and the relay next door uses `true`. The difference is deliberate
   // and it is safe only because of where the identity check lives.
@@ -2852,10 +2952,17 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     if (req.method === "GET" && url.pathname === "/site") {
       const results = await pollRelays(opts.relays, timeoutMs);
       const view: SiteView = siteView(results);
+      // Certificates nearing expiry are fleet problems: an expired relay or agent certificate stops
+      // the hosts behind it receiving anything, the same consequence as an unreachable relay.
+      view.problems.push(...certificateProblems(await gatherCertificates(results)));
       // Logged only when something is wrong. A line per poll would bury the one that matters under a
       // repeating message that says nothing happened.
       for (const r of results) if (!r.ok) log(`${r.name} unreachable: ${r.error}`, `${r.name}에 연결할 수 없음: ${r.error}`);
       return send(res, 200, view);
+    }
+
+    if (req.method === "GET" && url.pathname === "/certificates") {
+      return send(res, 200, await gatherCertificates(await pollRelays(opts.relays, timeoutMs)));
     }
 
     // Who may change the fleet, and by which door.
@@ -4008,6 +4115,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       const scope: AppTokenScope | null =
         req.method === "POST" && url.pathname === "/enrollment/tokens" ? "enrollment:token-create"
           : req.method === "GET" && url.pathname === "/enrollment/requests" ? "enrollment:requests-read"
+          : req.method === "GET" && url.pathname === "/certificates" ? "certificates:read"
             : deregistrationRoute && (req.method === "GET" || req.method === "PUT") ? "enrollment:host-deregister"
             : null;
 
@@ -4042,6 +4150,12 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
           `앱 토큰 ${gate.label} (${gate.id})의 ${url.pathname} 거부: 스코프(${gate.scopes.join(",")}) 밖`,
         );
         return send(res, 403, { error: `app token ${gate.label} is not authorised for ${url.pathname}` });
+      }
+
+      if (scope === "certificates:read") {
+        // Fleet-wide, not narrowed by the token's hostname pattern — see `APP_TOKEN_SCOPES`.
+        const report = await gatherCertificates(await pollRelays(opts.relays, timeoutMs));
+        return send(res, 200, report, { "x-heliopause-app-token-expires-at": gate.expiresAt });
       }
 
       if (scope === "enrollment:requests-read") {

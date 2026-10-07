@@ -526,6 +526,7 @@ export const MESSAGES = {
   "m.appScopesLabel": { en: "scopes", ko: "스코프" },
   "m.scopeTokenCreate": { en: "issue node tokens", ko: "노드 토큰 발급" },
   "m.scopeRequestsRead": { en: "read CSR queue", ko: "CSR 목록 읽기" },
+  "m.scopeCertificatesRead": { en: "read certificate expiries (whole fleet)", ko: "인증서 만료 읽기(함대 전체)" },
   "m.appTokenIssuedOnce": { en: "app token issued", ko: "앱 토큰을 발급했다" },
   "m.appTokenRevoked": { en: "app token revoked", ko: "앱 토큰을 폐기했다" },
   "m.appTokenExpiring": { en: "expiring", ko: "만료 임박" },

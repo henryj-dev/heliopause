@@ -40,7 +40,8 @@ Use an https manager URL instead of <store.json> for remote operation, with
 --pki=DIR [--operator=NAME] [--otp=CODE]. Remote cert-upload needs --cert and --ca-name; the
 manager reads the trusted CA from HELIOPAUSE_ENROLLMENT_TRUSTED_CAS.
 
-App token scopes: enrollment:token-create, enrollment:requests-read. A hostname pattern is an exact
+App token scopes: enrollment:token-create, enrollment:requests-read, certificates:read (fleet-wide;
+not narrowed by the hostname pattern). A hostname pattern is an exact
 hostname or one leading wildcard label, quoted so the shell does not expand it: --hostname-pattern='*.dev'`;
 
 const requiredFlag = (name: string): string => { const value = flags.get(name); if (!value || value === "true") throw new Error(`--${name}=VALUE is required`); return value; };
