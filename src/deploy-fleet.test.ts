@@ -135,10 +135,29 @@ describe("deploy-fleet.sh --all reaches the whole fleet", () => {
     }
   });
 
+  it("names hosts by the id the fleet view prints, and every relay host has a relay", () => {
+    // The relay's `/status` and the console name hosts `gw-01.dev-icn-vtr`; a script that says
+    // `gw-01.dev` cannot be matched to a row without translating, and that drift stood for two months.
+    for (const host of fleetHosts()) {
+      assert.match(host, /^[a-z0-9-]+\.[a-z0-9]+-[a-z0-9]+-[a-z0-9]+$/, `${host} is not a fleet host id`);
+    }
+    const gateways = fleetHosts().filter((h) => h.startsWith("gw-01."));
+    assert.deepEqual([...order("RELAY_ORDER")].sort(), [...gateways].sort(), "a gateway is missing from RELAY_ORDER");
+  });
+
+  it("refuses before touching a host that has no rsync", () => {
+    // The install is `rsync --delete`. Checked first, so a host without it is left exactly as it was
+    // rather than with backups taken and the tarball unpacked.
+    const script = read("../scripts/deploy-fleet.sh");
+    const check = script.indexOf("command -v rsync");
+    assert.ok(check > 0, "the rsync preflight is gone");
+    assert.ok(check < script.indexOf("sudo cp -a"), "the rsync check must come before the first backup");
+  });
+
   it("puts the canary first among agents", () => {
     // The rollout stages already name k3s-01 as the canary; the deploy order agreeing with them is
     // what makes a bad build stop at the same host a bad generation would.
-    assert.equal(order("AGENT_ORDER")[0], "k3s-01.dev");
+    assert.equal(order("AGENT_ORDER")[0], "k3s-01.dev-icn-vtr");
   });
 });
 
