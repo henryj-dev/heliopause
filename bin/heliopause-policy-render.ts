@@ -1019,10 +1019,11 @@ const WORKER_ENTRY = new URL("../src/policy-eval-worker.ts", import.meta.url);
  * first, read the maximum from operations, then choose. Capping first would put a number I invented
  * into production without a measurement.
  *
- * ⚠️ **Until then there is no cap, and the natural bounds are these**: startup evaluates every site at
- * once (four today), and the request path spawns one per concurrent cache miss without coalescing —
- * so a site that fails evaluation, which is never cached, spawns one per request. "No grace on
- * failure" below makes reclaiming immediate but does not make spawning rarer. @see #117
+ * ⚠️ **Until then there is no cap.** Startup evaluates every site at once (four today). On the request
+ * path, concurrent cache misses on one stamp share one evaluation (`inFlight`), so a burst no longer
+ * spawns one worker per request — but a site that keeps failing still evaluates again on each request
+ * after the shared one settles, and a moved stamp starts a new evaluation while the old one may still
+ * be inside its grace. @see #117
  */
 let workersAlive = 0;
 /**

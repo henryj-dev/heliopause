@@ -2703,3 +2703,156 @@ export const site = { cfg: {}, hosts: [{ id: "h1.beta", stage: "canary", items: 
     }
   });
 });
+
+describe("concurrent requests share one evaluation", () => {
+  // ## Counted by the module, not timed
+  //
+  // `AGENTS.md` records a duplicate-work check that was measured with the wall clock and survived its
+  // mutation. So each evaluation **writes one line** — the module appends to `evals.log` as its first
+  // statement — and the assertions are about that count.
+  //
+  // The file sits beside `policy/`, not in it: the stamp walks the module's directory, and a file it
+  // watched would move the stamp on every evaluation.
+  //
+  // ## Held open by the test, so the overlap is not a race
+  //
+  // After counting itself, evaluation `n` waits until the test creates `go-<n>`. Every request in a
+  // burst therefore arrives while the first evaluation is still running, however slowly the machine
+  // starts workers. The one timing left is how long the test waits for a burst's requests to reach the
+  // renderer before it releases the gate; a request arriving later than that would find the evaluation
+  // settled, which can make a broken renderer pass (a cache hit) but cannot make a working one fail.
+  function gatedSite(opts: { fails: boolean }): { root: string; dir: string; site: string } {
+    const root = mkdtempSync(join(tmpdir(), "hp-policy-coalesce-"));
+    mkdirSync(join(root, "src"));
+    const dir = join(root, "policy");
+    mkdirSync(dir);
+    writeFileSync(join(dir, "policies.json"), '{\n  "schemaVersion": 1,\n  "groups": []\n}\n');
+    const site = join(dir, "alpha.ts");
+    writeFileSync(
+      site,
+      `import { appendFileSync, existsSync, readFileSync } from "node:fs";
+       const log = new URL("../evals.log", import.meta.url);
+       appendFileSync(log, "x\\n");
+       const n = readFileSync(log, "utf8").split("\\n").filter(Boolean).length;
+       const gate = new URL("../go-" + n, import.meta.url);
+       while (!existsSync(gate)) await new Promise((r) => setTimeout(r, 10));
+       ${opts.fails ? 'throw new Error("the shared failure");' : ""}
+       export const site = {
+         cfg: { hookPolicy: { input: "drop", output: "accept" } },
+         hosts: [{ id: "gw-01.alpha", stage: "canary", items: [] }],
+         objects: [{ id: "ao-alpha", kind: "address", name: "alpha",
+                     members: [{ kind: "cidr", value: "10.0.0.0/8" }] }],
+       };\n`,
+    );
+    // The startup evaluation is the first, and it must not wait.
+    writeFileSync(join(root, "go-1"), "");
+    return { root, dir, site };
+  }
+
+  const evaluations = (root: string): number => {
+    try {
+      return readFileSync(join(root, "evals.log"), "utf8").split("\n").filter(Boolean).length;
+    } catch {
+      return 0;
+    }
+  };
+  const release = (root: string, n: number) => writeFileSync(join(root, `go-${n}`), "");
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  /**
+   * Waits until at least `want` evaluations have counted themselves, then requires exactly `want`.
+   * Fails by count rather than by the test's timeout, and the message says which way it missed — the
+   * first version said "did not start" when more had started than expected.
+   */
+  async function untilEvaluations(root: string, want: number, why: string): Promise<void> {
+    for (let i = 0; i < 500 && evaluations(root) < want; i++) await sleep(10);
+    const seen = evaluations(root);
+    assert.equal(seen, want, `${why}: expected ${want} evaluations, counted ${seen}`);
+  }
+  /** Moves the module's mtime, which is the stamp moving — a publish landing. */
+  const touch = (site: string, seconds: number) => {
+    const later = new Date(Date.now() + seconds * 1_000);
+    utimesSync(site, later, later);
+  };
+  const C = 8;
+  const deadline = (): RequestInit => ({ signal: AbortSignal.timeout(10_000) });
+  /** Time given to a burst's requests to reach the renderer before the gate opens. */
+  const ARRIVAL_MS = 500;
+
+  it("starts one evaluation for a burst of cache misses on one stamp", { timeout: 30_000 }, async () => {
+    const { root, dir, site } = gatedSite({ fails: false });
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(`alpha=${site}`));
+      assert.equal(evaluations(root), 1, "the startup evaluation did not count itself");
+      touch(site, 5);
+      const burst = Array.from({ length: C }, () => fetchAt(started!.port, "/source?site=alpha", deadline()));
+      await untilEvaluations(root, 2, "the burst did not start an evaluation");
+      await sleep(ARRIVAL_MS);
+      release(root, 2);
+      const answers = await Promise.all(burst.map(async (r) => {
+        const res = await r;
+        return { status: res.status, body: await res.text() };
+      }));
+      assert.deepEqual(answers.map((a) => a.status), Array(C).fill(200));
+      assert.equal(new Set(answers.map((a) => a.body)).size, 1, "the burst was answered from more than one evaluation");
+      assert.equal(evaluations(root), 2, `${C} concurrent misses started ${evaluations(root) - 1} evaluations`);
+    } finally {
+      started?.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("starts one evaluation for a burst against a failing site, and every request gets its failure", { timeout: 30_000 }, async () => {
+    // A failure is never cached, so this is the shape that used to start one worker per request.
+    const { root, dir, site } = gatedSite({ fails: true });
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(`alpha=${site}`));
+      assert.equal(evaluations(root), 1, "the startup evaluation did not count itself");
+      const burst = Array.from({ length: C }, () => fetchAt(started!.port, "/source?site=alpha", deadline()));
+      await untilEvaluations(root, 2, "the burst did not start an evaluation");
+      await sleep(ARRIVAL_MS);
+      release(root, 2);
+      // `deadline()` on each: a waiter left behind by a shared failure is a hang, and a hang is not red.
+      const answers = await Promise.all(burst.map(async (r) => {
+        const res = await r;
+        return { status: res.status, body: await res.text() };
+      }));
+      assert.deepEqual(answers.map((a) => a.status), Array(C).fill(503));
+      assert.match(answers[0]!.body, /the shared failure/, "the 503 did not carry the module's reason");
+      assert.equal(new Set(answers.map((a) => a.body)).size, 1, "the waiters did not all receive the same failure");
+      assert.equal(evaluations(root), 2, `${C} concurrent requests started ${evaluations(root) - 1} evaluations`);
+
+      // The failure is shared while it runs and not remembered after: the next request evaluates again.
+      release(root, 3);
+      const again = await fetchAt(started.port, "/source?site=alpha", deadline());
+      assert.equal(again.status, 503);
+      assert.equal(evaluations(root), 3, "a settled failure was served again instead of re-evaluated");
+    } finally {
+      started?.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not answer a newer stamp from an evaluation of an older one", { timeout: 30_000 }, async () => {
+    const { root, dir, site } = gatedSite({ fails: false });
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(`alpha=${site}`));
+      touch(site, 5);
+      const older = fetchAt(started.port, "/source?site=alpha", deadline());
+      await untilEvaluations(root, 2, "the first request did not start an evaluation");
+      // The stamp moves while that evaluation is still held open.
+      touch(site, 10);
+      const newer = fetchAt(started.port, "/source?site=alpha", deadline());
+      await untilEvaluations(root, 3, "a request on a newer stamp joined the evaluation of the older one");
+      release(root, 2);
+      release(root, 3);
+      assert.equal((await older).status, 200);
+      assert.equal((await newer).status, 200);
+    } finally {
+      started?.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
