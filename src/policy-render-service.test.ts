@@ -2182,6 +2182,28 @@ export const site = {
     }
   });
 
+  it("reports a worker gone as soon as it exits, not when its grace ends", { timeout: 30_000 }, async () => {
+    // `workers` is the number #117's cap is to be chosen from, so it has to be threads alive now. A
+    // module with no open handle finishes a few ms after answering; the grace window is 1 s. Read at
+    // 400 ms — after the exit, inside the grace — this was 1 before the fix (measured) and must be 0.
+    //
+    // ⚠️ Single site and no `/readyz` until the read that matters: a `/readyz` that has to evaluate
+    // starts a worker of its own and would be counted. The startup evaluation is the only one.
+    const { dir } = twoSites();
+    const only = join(dir, "alpha.ts");
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(`alpha=${only}`));
+      await new Promise((r) => setTimeout(r, 400));
+      const ready = (await (await fetchAt(started.port, "/readyz")).json()) as { workers?: number };
+      // This /readyz evaluated nothing: the startup answer is cached under an unchanged stamp.
+      assert.equal(ready.workers, 0, "a worker that had exited was still counted during its grace window");
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
   it("does not count its own reclaim of a worker as a fault", { timeout: 30_000 }, async () => {
     // A module that answers correctly and keeps a handle open (`setInterval`) outlives its grace, and
     // the renderer terminates it. `terminate()` makes a worker exit **1**, and the exit handler counts a
@@ -2509,46 +2531,42 @@ describe("a policy module is evaluated in a worker of its own", () => {
   }
 
   it("does not take anything but the module's own half from the worker", { timeout: 30_000 }, async () => {
-    // ## 🔑 The boundary is what the parent reads itself, not what the worker is prevented from sending
+    // ## 🔑 What the parent selects from the worker's message, with a forgery that actually arrives
     //
-    // The forgery shapes above each close one route to the send. Capturing is a patch on measured
-    // routes (AGENTS.md's own words), so this test assumes the worst instead: the module **does**
-    // control the reply. It sends a complete answer — `label`, `siteName`, `build`, `head`, `repo`,
-    // `files` all forged — and only a well-formed `site` of its own. The parent must keep that `site`,
-    // which is the module's to say, and must read every other field from its own configuration and the
-    // checkout. The module replaces both `Function.prototype.call` and `Reflect.apply`, so if either
-    // capture regresses its reply is what the parent receives; with both captures intact the honest
-    // half arrives and this still has to hold.
+    // Capturing is a patch on measured routes (AGENTS.md's own words), so this test does not rely on
+    // the captures failing: it uses a route that goes **through** them. `JSON.stringify` — captured —
+    // still calls a `toJSON` it finds on the value, inherited ones included, so a module that defines
+    // `Object.prototype.toJSON` chooses the whole serialised message without touching the send at all.
+    // Found and measured by an independent review.
     //
-    // ⚠️ With the captures intact this cannot tell "the parent ignored forged fields" from "no forged
-    // fields arrived". The first is the property; the mutation that shows it is reverting the `apply`
-    // capture, under which the forgery arrives and this must still find no `FORGED`.
+    // The forged message carries a `site` the module chose (marked `module-chosen`) and a complete set
+    // of renderer-owned fields marked `FORGED`. What must hold:
+    //
+    //   · it **arrives** — the `module-chosen` site is served, so the test is not passing because
+    //     nothing reached the parent (the first version of this test could not tell those apart);
+    //   · nothing marked `FORGED` is served — `label`, `siteName`, `build`, `head`, `repo`, `files` are
+    //     read by the parent from its configuration and the checkout.
+    //
+    // ⚠️ The module choosing `site` is not something this test says is prevented. It is the module's to
+    // say anyway — a policy commit can write those rules directly — and it is recorded as the residue
+    // in `docs/policy-eval-worker-notes.md` §7.
     const { dir, sites, beta } = twoSites();
-    const reply = {
-      ok: true,
-      wire: JSON.stringify({
-        site: { cfg: {}, hosts: [{ id: "h1.beta", stage: "canary", items: [], notes: "module-chosen" }] },
-        services: {},
-        label: "FORGED-label", siteName: "FORGED-name", build: "FORGEDbuild0",
-        head: { sha: "f".repeat(40), dirty: false },
-        repo: { probes: [], commits: [], generation: "FORGED-generation" },
-        files: { "policies.json": "FORGED-file" },
-      }),
+    const forged = {
+      site: { cfg: {}, hosts: [{ id: "h1.beta", stage: "canary", items: [], notes: "module-chosen" }] },
+      services: {},
+      label: "FORGED-label", siteName: "FORGED-name", build: "FORGEDbuild0", schemaVersion: 999,
+      head: { sha: "f".repeat(40), dirty: false },
+      repo: { probes: [], commits: [], generation: "FORGED-generation" },
+      files: { "policies.json": "FORGED-file" },
+      unrelated: "FORGED-extra",
     };
-    // Intercept the worker's own send so the forged reply is what the parent receives — this is the
-    // "assume the capture failed" premise, written as a module so it runs through the real renderer.
-    writeFileSync(beta, `import { MessagePort } from "node:worker_threads";
-const send = MessagePort.prototype.postMessage;
-const realApply = Reflect.apply;
-const realCall = Function.prototype.call;
-Function.prototype.call = function (...args) {
-  if (this === send) return realApply(send, args[0], [${JSON.stringify(reply)}]);
-  return realApply(realCall, this, args);
-};
-Reflect.apply = function (f, self, args) {
-  if (f === send) return realApply(send, self, [${JSON.stringify(reply)}]);
-  return realApply(f, self, args);
-};
+    // Only the outermost object answers with the forgery; everything nested serialises normally, so
+    // the module's own collection still works and the forged object is what reaches the wire.
+    writeFileSync(beta, `const forged = ${JSON.stringify(forged)};
+Object.defineProperty(Object.prototype, "toJSON", {
+  configurable: true,
+  value(key) { return key === "" && "site" in this && "services" in this ? forged : this; },
+});
 export const site = { cfg: {}, hosts: [{ id: "h1.beta", stage: "canary", items: [] }] };
 `);
     let started: Started | undefined;
@@ -2556,13 +2574,16 @@ export const site = { cfg: {}, hosts: [{ id: "h1.beta", stage: "canary", items: 
       started = await start(dir, MULTI(sites));
       const res = await fetchAt(started.port, "/source?site=beta", { signal: AbortSignal.timeout(10_000) });
       const text = await res.text();
+      assert.equal(res.status, 200, `the forged message was not served at all, so nothing was tested:\n${text.slice(0, 300)}`);
+      assert.match(text, /module-chosen/, "the forgery did not reach the parent, so nothing was tested");
       assert.doesNotMatch(text, /FORGED/, `a renderer-owned field was taken from the worker:\n${text.slice(0, 400)}`);
-      if (res.status === 200) {
-        const body = JSON.parse(text) as { label?: string; siteName?: string; files?: Record<string, string> };
-        assert.equal(body.siteName, "beta");
-        assert.equal(body.label, "beta");
-        assert.equal(body.files?.["policies.json"], readFileSync(join(dir, "policies.json"), "utf8"));
-      }
+      const body = JSON.parse(text) as {
+        label?: string; siteName?: string; schemaVersion?: number; files?: Record<string, string>;
+      };
+      assert.equal(body.siteName, "beta");
+      assert.equal(body.label, "beta");
+      assert.equal(body.schemaVersion, 1);
+      assert.equal(body.files?.["policies.json"], readFileSync(join(dir, "policies.json"), "utf8"));
     } finally {
       started?.stop();
       rmSync(join(dir, ".."), { recursive: true, force: true });
@@ -2616,7 +2637,10 @@ export const site = { cfg: {}, hosts: [{ id: "h1.beta", stage: "canary", items: 
       assert.equal((await fetchAt(started.port, "/source?site=alpha")).status, 200);
       await new Promise((r) => setTimeout(r, 2_500)); // past the 200 ms throw and the memo window
       const ready = (await (await fetchAt(started.port, "/readyz")).json()) as { faults?: number; serving?: number };
-      assert.ok((ready.faults ?? 0) > 0, "a fault inside the grace window was swallowed");
+      // Exactly 1, and the number comes from `da80b7b`, not from this code: the same module run against
+      // the in-process renderer reads `faults: 1`. The first version of this asserted `> 0` and a worker
+      // that counted the throw twice (as `error` and then as the `exit 1` that follows it) passed.
+      assert.equal(ready.faults, 1, "one late throw was not counted exactly once");
       assert.equal(ready.serving, 2, "a late fault changed the answer already given");
       assert.equal((await fetchAt(started.port, "/source?site=alpha")).status, 200);
     } finally {

@@ -42,15 +42,21 @@ import type { ScreenSite } from "./policy-screen.ts";
 // `Function.prototype` at call time. A module that replaced `Function.prototype.call` intercepted the
 // send and posted a complete forged payload, which the parent served with a 200 and logged as
 // "verified" (measured; an independent review found the route). `apply` is captured with the method,
-// and the call goes through it, so nothing between here and the port is looked up after the import.
+// and the final call goes through it, so the **send itself** looks nothing up after the import.
 //
-// ⚠️ This is a patch on the measured route, not the boundary. Everything this thread sends is the
-// module's to choose in principle, so the parent does not rely on it: the worker sends only what the
-// module is entitled to say anyway (`site` and the resolver table), and the parent reads every other
-// field from the checkout itself. @see `assemblePolicySource` in `./policy-source.ts`
+// ⚠️ That is the send, not the message. Plenty that runs before it still resolves at call time: the
+// reads of `site`, the resolver call, `Object.values`/`Array.isArray`/iteration in `collectModuleFacts`,
+// and the `toJSON` that the captured `JSON.stringify` still calls on the value — inherited ones
+// included. An independent review delivered a complete forged message through every capture intact by
+// defining `Object.prototype.toJSON`. So the content of this message is the module's to choose, and
+// the parent does not rely on it: of what arrives it keeps `site` and `services`, which are the
+// module's to say anyway, and takes every other field from somewhere other than this message.
+// @see `assemblePolicySource` in `./policy-source.ts`, and src/policy-render-service.test.ts
+// "does not take anything but the module's own half from the worker"
 //
-// @see src/policy-render-service.test.ts "does not accept a result from a module that rewrites
-// MessagePort.prototype.postMessage" and "… that replaces Function.prototype.call"
+// The capture's own tests: "does not accept a result from a module that rewrites
+// MessagePort.prototype.postMessage", "… that replaces Function.prototype.call", "… that replaces
+// Reflect.apply".
 const send = MessagePort.prototype.postMessage;
 const apply = Reflect.apply;
 
@@ -59,8 +65,9 @@ const apply = Reflect.apply;
 // as ③.
 const writeWire = JSON.stringify;
 
-// `wire` is the module's half only — `{ site, services }` as JSON — and the parent checks the type of
-// every field it reads. It is exported so the test and the parent describe one thing.
+// `wire` is what this file *means* to send — `{ site, services }` as JSON. A module can make it carry
+// more (see above); the parent reads only those two keys from it. Exported so the test and the parent
+// describe one thing.
 export type EvalReply =
   | { ok: true; wire: string }
   | { ok: false; message: string };
@@ -158,7 +165,8 @@ try {
   // runs it on the parsed wire instead, where the values are data.
   //
   // Nor is anything the renderer reads from disk: `label`, `siteName`, `repo`, `head`, `files` and
-  // `build` are filled in by the parent. Only the module's own half crosses.
+  // `build` are filled in by the parent. This sends the module's half; the parent keeps only that
+  // half from whatever actually arrives.
   // @see bin/heliopause-policy-render.ts, and the decision note in docs/policy-eval-worker-notes.md
   apply(send, reply, [{ ok: true, wire: writeWire(collectModuleFacts(mod.site)) } satisfies EvalReply]);
 } catch (thrown) {

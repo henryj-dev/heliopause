@@ -370,11 +370,16 @@ export function collectPolicySource(input: {
  * copy of a *different* site's real payload — renamed and re-hosted — served as its own, with
  * "verified" in the log.
  *
- * Splitting closes most of that by construction rather than by capture. Everything here is
- * **authored by the module**, so the module choosing it is not a forgery — it is the module's policy,
- * which is exactly what a policy commit is allowed to say. Everything in `assemblePolicySource` is
- * **read by the renderer** from the checkout and its own configuration, so the worker never sends it
- * and cannot choose it.
+ * Splitting narrows that by construction rather than by capture. Everything here is **authored by the
+ * module**, so the module choosing it is not a forgery — it is the module's policy, which is what a
+ * policy commit is allowed to say. Everything in `assemblePolicySource` is **taken by the parent from
+ * somewhere other than the worker's message** — its configuration, its code, the checkout — so no
+ * value in that message can become one of those fields.
+ *
+ * ⚠️ That is a statement about the message, not about the checkout. The module runs with the
+ * renderer's filesystem permissions and can write the files the parent then reads (measured: a module
+ * that wrote into `policies.json` had that text served in `files`). That was true before the worker
+ * too; restricting it is a separate change (Node's permission model), #131.
  *
  * @see assemblePolicySource for what the parent reads itself
  */
@@ -415,9 +420,12 @@ export function collectModuleFacts(site: ScreenSite): { site: ScreenSite; servic
  * A `PolicySource` from the module's half plus what the renderer reads itself.
  *
  * Every field set here comes from the renderer's configuration (`label`, `siteName`), its own code
- * (`build`, `schemaVersion`) or the checkout on disk (`repo`, `head`, `files`) — never from a module.
- * The renderer calls this in the **parent**, after the worker has returned the module's half, so a
- * module that controls the worker's send can choose `site` and `services` and nothing else.
+ * (`build`, `schemaVersion`) or the checkout on disk (`repo`, `head`, `files`) — never from the
+ * worker's message. The renderer calls this in the **parent**, so of what a module puts in that
+ * message, only `site` and `services` are kept.
+ *
+ * ⚠️ "Never from the worker's message" is not "never influenced by the module": the module can write
+ * the checkout the parent reads. See `collectModuleFacts`.
  *
  * ⚠️ That bounds the forgery; it does not end it. A module can still send a `site` other than the one
  * its code would have produced — including a copy of another site's hosts and rules. The zone check

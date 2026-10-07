@@ -816,17 +816,19 @@ function accepted(
   input: { moduleWire: string; name: string | null; sitePath: string; stamp: string },
 ): string {
   const { moduleWire, name, sitePath, stamp } = input;
-  // ## 🔑 The worker sends the module's half; this side reads the rest
+  // ## 🔑 Two keys are taken from the worker's message; this side reads the rest
   //
-  // A module controls everything its worker sends — measured: one replaced `Function.prototype.call`,
-  // intercepted the send, and had a different site's real payload, renamed, served as its own. So the
-  // only fields taken from the worker are the ones the module is entitled to choose anyway: `site` and
-  // the resolver table. `label`, `siteName`, `build`, `repo`, `head` and `files` are read here, by the
-  // renderer, from its own configuration and the checkout — the worker never sends them, so nothing
-  // the module does in its thread can set them.
+  // A module controls what its worker sends — measured twice: once by replacing
+  // `Function.prototype.call` to intercept the send, once by an inherited `Object.prototype.toJSON` that
+  // the worker's captured `JSON.stringify` still calls. So the only fields taken from the message are
+  // the ones the module is entitled to choose anyway: `site` and the resolver table. `label`,
+  // `siteName`, `build`, `repo`, `head` and `files` are taken here from the renderer's configuration and
+  // the checkout, and any other key in the message is dropped, so a value placed in the message cannot
+  // become one of them.
   //
-  // The module's half is read as plain data and nothing else is kept: any other key it sent is
-  // dropped, so a forged `files` or `head` has nowhere to land.
+  // ⚠️ That is about the message. The module runs with this process's filesystem permissions and can
+  // write the checkout files read below — measured: a module that wrote into `policies.json` had its
+  // text served in `files`. That predates the worker, and closing it is a separate change, #131.
   //
   // @see src/policy-render-service.test.ts "does not take anything but the module's own half from the worker"
   const half = parseWire(moduleWire) as { site?: unknown; services?: unknown } | null;

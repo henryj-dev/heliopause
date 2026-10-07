@@ -48,15 +48,19 @@ export interface EvalLifecycleOptions {
  * Evaluate once and settle exactly once: with the worker's `wire` on a valid answer, or with an
  * `Error` naming the reason otherwise.
  *
- * The ordering rules this file holds, each with the test that pins it in
- * `src/policy-eval-lifecycle.test.ts`:
+ * The rules this file holds, each with the test that pins it:
  *
- *   · only the dedicated port carries a result ("ignores the thread's own messages");
- *   · the first valid reply wins ("keeps the first answer and logs the second");
- *   · a reply already queued is read before an `exit` or `error` may settle anything ("reads a reply
- *     still queued when the thread's exit arrives first", and the same for `error`);
- *   · the three endings and their grace ("grants grace only after a valid answer");
- *   · our own `terminate()` is not a fault ("does not count its own reclaim as a fault").
+ *   · only the dedicated port carries a result — `src/policy-render-service.test.ts` "does not accept
+ *     a result from a module that posts on parentPort";
+ *   · the first valid reply wins — "keeps the first answer and logs the second";
+ *   · a reply already queued is read before an `exit` or `error` may settle anything — "reads a reply
+ *     still queued when the thread's exit arrives first", and the `error` variant;
+ *   · one late fault is one count — "counts an error and the exit that follows it once";
+ *   · the thread count drops when the thread is gone — "stops counting a thread the moment it exits";
+ *   · our own `terminate()` is not a fault — `src/policy-render-service.test.ts` "does not count its
+ *     own reclaim of a worker as a fault".
+ *
+ * Unprefixed names are in `src/policy-eval-lifecycle.test.ts`.
  */
 export function evaluateWithLifecycle(opts: EvalLifecycleOptions): Promise<string> {
   return new Promise<string>((resolve, reject) => {
@@ -67,6 +71,28 @@ export function evaluateWithLifecycle(opts: EvalLifecycleOptions): Promise<strin
     let settled = false;
     let reclaimed = false;
     let terminatedByUs = false;
+    let lateErrorCounted = false;
+
+    // ## The count goes down once, when the thread is actually gone
+    //
+    // `onAlive(-1)` used to run only when *we* reclaimed, so a worker that answered and then finished
+    // on its own — `exit 0` a few ms later — was still counted for the rest of its grace window
+    // (measured: `workers: 1` 400 ms after a clean exit, `0` only after the 1 s grace). `/readyz`
+    // reports this count and #117's cap is to be chosen from its observed maximum, so it has to mean
+    // "threads alive now". Whichever comes first, our `terminate()` or the thread's own `exit`, ends it.
+    // @see src/policy-eval-lifecycle.test.ts "stops counting a thread the moment it exits"
+    let gone = false;
+    let graceTimer: ReturnType<typeof setTimeout> | undefined;
+    const leave = () => {
+      if (gone) return;
+      gone = true;
+      if (graceTimer !== undefined) clearTimeout(graceTimer);
+      // The port is ours to close whichever way the thread ended. An open `port1` keeps the event loop
+      // alive — measured: the first version of this closed it only on our own reclaim, and a test whose
+      // thread exited first left the runner hanging.
+      port1.close();
+      opts.onAlive(-1);
+    };
 
     // ## Reclaiming, and the three endings that decide when
     //
@@ -82,22 +108,23 @@ export function evaluateWithLifecycle(opts: EvalLifecycleOptions): Promise<strin
       if (reclaimed) return;
       reclaimed = true;
       const done = () => {
-        opts.onAlive(-1);
+        // A thread that already exited has nothing to terminate.
+        if (gone) return;
         // Ours, so its exit is not a fault. `terminate()` makes a worker exit **1** — measured: a worker
         // that answered and was terminated reports 1, one left to finish reports 0 — and without this
         // flag every module that keeps a handle open past its grace would raise `faults` once per
-        // evaluation.
+        // evaluation. Set before `leave()`, whose own work does not depend on it but whose caller's does.
         terminatedByUs = true;
-        port1.close();
+        leave();
         void thread.terminate();
       };
       if (graceMs <= 0) {
         done();
         return;
       }
-      const timer = setTimeout(done, graceMs);
+      graceTimer = setTimeout(done, graceMs);
       // The process must be able to exit during a grace window.
-      timer.unref();
+      graceTimer.unref();
     };
 
     // ## The only result path
@@ -159,6 +186,7 @@ export function evaluateWithLifecycle(opts: EvalLifecycleOptions): Promise<strin
       if (settled) {
         // A late failure inside the grace window: counted and logged, and the answer stands.
         opts.onLateFault(thrown);
+        lateErrorCounted = true;
         return;
       }
       settled = true;
@@ -168,8 +196,18 @@ export function evaluateWithLifecycle(opts: EvalLifecycleOptions): Promise<strin
 
     thread.on("exit", (code) => {
       drain();
+      leave();
       if (settled) {
-        if (code !== 0 && !terminatedByUs) {
+        // ## One late fault, one count
+        //
+        // A worker's uncaught exception arrives as `error` **and then** `exit 1`. Counting both made one
+        // throw two faults — measured: a module throwing once from a timer after its answer read
+        // `faults: 1` on `da80b7b` (in-process) and `faults: 2` here, with two log lines. The exit that
+        // follows an `error` already counted is the same event, so it is not counted again. An abnormal
+        // exit with no `error` before it — `process.exit(2)` after answering — is still a fault.
+        // @see src/policy-render-service.test.ts "counts a fault that arrives inside the grace window
+        // without changing the answer", which asserts exactly 1
+        if (code !== 0 && !terminatedByUs && !lateErrorCounted) {
           opts.onLateFault(new Error(`worker exited ${code} after answering`));
         }
         return;
