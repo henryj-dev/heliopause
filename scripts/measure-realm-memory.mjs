@@ -98,8 +98,13 @@ async function main() {
   //
   // 🔴 The first version of this script versioned only the entry URL and called the row `current`. It
   // was the hook-OFF condition, and §4-a compared `vm` against it while claiming to compare against
-  // the renderer. A review measured that. `registerHooks` cannot be removed once installed, so the
-  // flag below decides whether it does anything, and the two rows run in one process.
+  // the renderer. A review measured that. The flag below decides whether the hook does anything, so
+  // the two rows run in one process.
+  //
+  // ⚠️ The flag is not because the hook is unremovable — this comment claimed that and it is false.
+  // `registerHooks` returns `{ resolve, load, deregister }`, and `deregister()` works (measured). The
+  // flag is simply the smaller change: one registration, two conditions, nothing to re-install
+  // between rows.
   // Counted, not assumed: "the hook is installed" and "the hook versioned something" are different
   // claims, and the row is worthless without the second. The first corrected run of this script put
   // hook-on and hook-off within 0.008 MB of each other, which is what a hook that never fires looks
