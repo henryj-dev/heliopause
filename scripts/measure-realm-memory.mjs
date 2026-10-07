@@ -25,15 +25,22 @@
 // implementation — so nothing here runs in CI.
 import vm from "node:vm";
 import { Worker, isMainThread, parentPort, workerData } from "node:worker_threads";
-import { writeFileSync, mkdirSync, readFileSync, mkdtempSync } from "node:fs";
+import { writeFileSync, mkdirSync, readFileSync, mkdtempSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
+import { registerHooks } from "node:module";
 
 // The fixture is generated, so it goes to a temp directory rather than beside this script. The first
 // version wrote `scripts/fixture/` into the checkout, where it showed up as untracked and would have
 // been committed along with the measurement.
-const DIR = new URL(`file://${mkdtempSync(join(tmpdir(), "realm-fixture-"))}/`);
+//
+// 🔴 `realpathSync`, and the reason is measured: ESM resolution realpaths module URLs, so a child
+// specifier resolves to `/private/var/folders/…` on macOS while `mkdtempSync` hands back
+// `/var/folders/…`. Without this the hook's root check never matched, the hook versioned **nothing**,
+// and the hook-on row came out 0.008 MB from hook-off — a difference small enough to read as "the
+// hook costs nothing" instead of "the hook never ran". A counter on the hook caught it.
+const DIR = new URL(`file://${realpathSync(mkdtempSync(join(tmpdir(), "realm-fixture-")))}/`);
 const SITE = new URL("./site.mjs", DIR).pathname;
 
 if (!isMainThread) {
@@ -83,22 +90,65 @@ async function main() {
     return process.memoryUsage();
   };
 
+  // ## The child-version hook, because without it `current` is not today's renderer
+  //
+  // `bin/heliopause-policy-render.ts:499` versions every child specifier the entry module pulls in,
+  // so each evaluation re-instantiates the children too. §1-b measures that as the difference between
+  // "지금 (자식까지 버전 — #59·#63)" and "자식 버전 훅 OFF (#59 이전 동작)".
+  //
+  // 🔴 The first version of this script versioned only the entry URL and called the row `current`. It
+  // was the hook-OFF condition, and §4-a compared `vm` against it while claiming to compare against
+  // the renderer. A review measured that. `registerHooks` cannot be removed once installed, so the
+  // flag below decides whether it does anything, and the two rows run in one process.
+  // Counted, not assumed: "the hook is installed" and "the hook versioned something" are different
+  // claims, and the row is worthless without the second. The first corrected run of this script put
+  // hook-on and hook-off within 0.008 MB of each other, which is what a hook that never fires looks
+  // like — so the count is printed beside the row.
+  let versioned = 0;
+  let hookOn = false;
+  registerHooks({
+    resolve(specifier, context, nextResolve) {
+      const result = nextResolve(specifier, context);
+      if (!hookOn || !context.parentURL) return result;
+      const v = new URL(context.parentURL).searchParams.get("v");
+      if (v === null) return result;
+      const url = new URL(result.url);
+      if (url.protocol !== "file:" || url.searchParams.has("v")) return result;
+      if (url.pathname.includes("/node_modules/")) return result;
+      if (!url.pathname.startsWith(DIR.pathname)) return result;
+      url.searchParams.set("v", v);
+      versioned += 1;
+      return { ...result, url: url.href };
+    },
+  });
+
+  // Each runner returns the value a caller would hold on to. The table reads a count off it and drops
+  // it; `--retention` keeps it. Returning the count itself — which this script did at first — makes
+  // the "holds the namespace" control hold a number instead, so both controls hold nothing and the
+  // split §4-b claims to measure does not happen. A review measured that too.
   const runners = {
-    async current(stamp) {
-      const mod = await import(`${pathToFileURL(SITE).href}?v=${stamp}`);
-      return mod.site.entries.length;
+    async "current-hook-on"(stamp) {
+      hookOn = true;
+      try {
+        return await import(`${pathToFileURL(SITE).href}?v=${stamp}`);
+      } finally {
+        hookOn = false;
+      }
+    },
+    async "current-hook-off"(stamp) {
+      return await import(`${pathToFileURL(SITE).href}?v=${stamp}`);
     },
     worker(stamp) {
       return new Promise((ok, fail) => {
         const w = new Worker(new URL(import.meta.url), { workerData: { site: SITE, stamp } });
-        w.once("message", (m) => w.terminate().then(() => ok(m.entries), fail));
+        w.once("message", (m) => w.terminate().then(() => ok(m), fail));
         w.once("error", fail);
       });
     },
     async "vm-script"(stamp) {
       const ctx = vm.createContext({});
       new vm.Script(`${scriptSrc}\nglobalThis.__stamp = ${JSON.stringify(stamp)};`).runInContext(ctx, { timeout: 30_000 });
-      return ctx.site.entries.length;
+      return ctx;
     },
     async "vm-module"(stamp) {
       const ctx = vm.createContext({});
@@ -114,9 +164,14 @@ async function main() {
         return j;
       });
       await m.evaluate({ timeout: 30_000 });
-      return m.namespace.site.entries.length;
+      return m.namespace;
     },
   };
+
+  // How many entries the held value exposes — proof the evaluation ran, printed beside each row. It
+  // reads through whichever shape that condition returns rather than assuming one.
+  const countOf = (held) =>
+    held?.site?.entries?.length ?? held?.entries ?? "?";
 
   const MB = (b) => (b / 1024 / 1024).toFixed(2);
 
@@ -168,10 +223,12 @@ async function main() {
       continue;
     }
     console.log(
-      `${name.padEnd(10)} ${String(ok).padStart(3)} evals  heapUsed ${per("heapUsed").padStart(7)} MB/eval` +
+      `${name.padEnd(17)} ${String(ok).padStart(3)} evals  heapUsed ${per("heapUsed").padStart(7)} MB/eval` +
       `   rss ${per("rss").padStart(7)} MB/eval   total heap ${MB(end.heapUsed - base.heapUsed).padStart(7)} MB` +
       (failure ? `   stopped: ${failure}` : "") +
-      `   (held ${held})`,
+      `   (entries ${countOf(held)}` +
+      (name === "current-hook-on" ? `, child specifiers versioned ${versioned}` : "") +
+      `)`,
     );
   }
 }

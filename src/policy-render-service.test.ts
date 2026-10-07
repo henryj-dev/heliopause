@@ -1723,8 +1723,14 @@ export const site = {
     try {
       // Delete this test when #126 is fixed — the `todo` above becomes the live assertion. Both
       // statuses are checked so "everything is 503" and "the contamination is gone" cannot be
-      // confused: if `beta` ever stops failing, the fixture stopped reaching the parser again.
-      assert.equal(got.beta, 503, "the poisoning site itself must fail — otherwise the parser was never called");
+      // confused: a green `beta` is a reason to go and read the fixture.
+      //
+      // ⚠️ `beta: 503` does not establish that the replaced parser ran — the site could fail for a
+      // neighbouring reason, and the review said so. What establishes it is the pair of
+      // measurements that bracket the fixture: with no `coverage-*.json` present this shape answered
+      // 200, and with one present it answers `Do not know how to serialize a BigInt`, a value only
+      // the replaced parser supplies. This assertion is the smoke, not the cause.
+      assert.equal(got.beta, 503, "the poisoning site must fail — a green here means reading the fixture");
       assert.equal(got.alpha, 503, "today the healthy site fails too; when this goes green, #126 is fixed");
     } finally {
       got.stop();
