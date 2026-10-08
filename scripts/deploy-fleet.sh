@@ -90,7 +90,7 @@ usage() {
 # A partial identity that reads like a whole one is the failure this column exists to stop.
 status() {
   for name in $(host_names); do
-    printf '%-16s ' "$name"
+    printf '%-24s ' "$name"
     ssh -o ConnectTimeout=6 -o BatchMode=yes "${SSH_USER}@$(host_addr "$name")" '
       sep=""
       for u in heliopause-relay heliopause-agent; do
@@ -154,7 +154,13 @@ unit="$HELIOPAUSE_DEPLOY_UNIT"
 # get its backups taken and the tarball unpacked before `set -e` stopped it at the install — a half
 # step that changes nothing but leaves the operator to work out that nothing changed. Measured
 # 2026-10-07: none of the three az01 hosts has rsync.
-command -v rsync >/dev/null 2>&1 || { echo "  FAILED: rsync is not installed on this host — nothing was changed" >&2; exit 1; }
+# Asked of the sudo environment, because that is where the install runs: secure_path is not the user's
+# PATH. The tarball scp put in /tmp is removed on the way out; /opt is untouched.
+sudo sh -c 'command -v rsync' >/dev/null 2>&1 || {
+  rm -f /tmp/hp-code.tgz
+  echo "  FAILED: rsync is not installed on this host — /opt/heliopause was not changed" >&2
+  exit 1
+}
 # A path may be shipped here for the first time — `packages/i18n` was, when the relay grew a shared
 # package it had never needed before. Backing it up would `cp` a source that is not there yet and
 # `set -e` would abort the whole deploy; a path with no prior version simply has no backup to make.

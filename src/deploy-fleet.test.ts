@@ -151,6 +151,8 @@ describe("deploy-fleet.sh --all reaches the whole fleet", () => {
     const script = read("../scripts/deploy-fleet.sh");
     const check = script.indexOf("command -v rsync");
     assert.ok(check > 0, "the rsync preflight is gone");
+    // On the host, not on the operator's machine: inside the remote heredoc, and before its first change.
+    assert.ok(check > script.indexOf("<<'EOS'"), "the rsync check must run on the host, inside the remote script");
     assert.ok(check < script.indexOf("sudo cp -a"), "the rsync check must come before the first backup");
   });
 
