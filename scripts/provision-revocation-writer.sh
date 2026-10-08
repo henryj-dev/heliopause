@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install the privilege-separated revocation writer on a relay host.
 #
-#   ./scripts/provision-revocation-writer.sh gw-01.util
+#   ./scripts/provision-revocation-writer.sh gw-01.util-icn-vtr
 #
 # ## Why the relay stopped being able to write its own denylist
 #
@@ -26,16 +26,18 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SSH_USER="${HELIOPAUSE_SSH_USER:-linuxuser}"
 
+# The relay hosts, by fleet id — the same names and addresses as `deploy-fleet.sh`.
 HOSTS="
-gw-01.dev=10.17.0.1
-gw-01.prod=10.16.0.1
-gw-01.util=10.253.0.1
+gw-01.dev-icn-vtr=10.17.0.1
+gw-01.prod-icn-vtr=10.16.0.1
+gw-01.util-icn-vtr=10.253.0.1
+gw-01.az01-icn-own=10.112.0.1
 "
 host_addr() { echo "$HOSTS" | sed '/^$/d' | awk -F= -v n="$1" '$1==n {print $2}'; }
 
 name="${1:-}"
 addr="$(host_addr "${name:-}")"
-[ -n "$addr" ] || { echo "usage: $0 <relay-host>   (gw-01.dev|gw-01.prod|gw-01.util)" >&2; exit 64; }
+[ -n "$addr" ] || { echo "usage: $0 <relay-host>   ($(echo "$HOSTS" | sed '/^$/d' | cut -d= -f1 | paste -sd'|' -))" >&2; exit 64; }
 
 echo "── $name: staging units"
 tar czf /tmp/hp-revwriter.tgz -C "$REPO" \
