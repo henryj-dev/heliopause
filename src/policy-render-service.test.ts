@@ -2775,11 +2775,10 @@ export const site = {
       });
       assert.equal(res.status, 200);
       const got = await res.json() as { changes: { host: string; added: unknown[]; removed: unknown[] }[] };
-      assert.deepEqual(got.changes, [{
-        host: "h1.alpha",
-        added: [{ proto: "tcp", ports: "443", sources: ["10.0.0.0/8"] }],
-        removed: [{ proto: "tcp", ports: "443", sources: ["10.1.0.0/16"] }],
-      }]);
+      const rule = (sources: string[]) => ({
+        verdict: "accept", proto: "tcp", ports: "443", sources, destinations: ["10.2.0.7/32"], family: "ip",
+      });
+      assert.deepEqual(got.changes, [{ host: "h1.alpha", added: [rule(["10.0.0.0/8"])], removed: [rule(["10.1.0.0/16"])] }]);
       assert.match(readFileSync(join(dir, "policies.json"), "utf8"), /10\.1\.0\.0\/16/, "the checkout was changed");
       assert.match(started.output(), /preview: copied 2 files, \d+ KiB in \d+ ms/);
       assert.deepEqual(previewCopies(), [], "the preview copy was left on disk");

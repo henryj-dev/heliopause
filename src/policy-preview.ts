@@ -8,7 +8,7 @@
 // @see src/policy-preview.test.ts
 
 import {
-  copyFileSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync,
+  copyFileSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
@@ -17,6 +17,26 @@ import { MAX_PREVIEW_BYTES } from "./preview-limits.ts";
 export { MAX_PREVIEW_BYTES };
 
 export class PreviewRefused extends Error {}
+
+const PREFIX = "hp-preview-";
+
+/**
+ * Remove preview copies a previous process left behind — it was killed before `remove()` ran.
+ *
+ * Only directories named with this module's prefix directly inside `tmpdir()`, and never a symlink;
+ * nothing outside the temporary directory is touched. Returns how many were removed.
+ */
+export function removeLeftoverCopies(dir: string = tmpdir()): number {
+  let removed = 0;
+  for (const name of readdirSync(dir)) {
+    if (!name.startsWith(PREFIX)) continue;
+    const path = join(dir, name);
+    if (!lstatSync(path).isDirectory()) continue;
+    rmSync(path, { recursive: true, force: true });
+    removed += 1;
+  }
+  return removed;
+}
 
 export interface PreviewCopy {
   /** The site module's path inside the copy. */
@@ -67,7 +87,14 @@ export function makePreviewCopy(input: {
   checkEdit(input.path, input.content, input.allowPaths);
   const started = performance.now();
   const from = dirname(resolve(input.sitePath));
-  const root = mkdtempSync(join(tmpdir(), "hp-preview-"));
+  // `TMPDIR` decides where the copy goes, so it is checked rather than assumed: a temporary
+  // directory inside the checkout would put the copy beside the files it was copied from.
+  const temp = realpathSync(tmpdir());
+  const checkoutReal = realpathSync(from);
+  if (temp === checkoutReal || temp.startsWith(checkoutReal + sep)) {
+    throw new PreviewRefused("the temporary directory is inside the policy checkout");
+  }
+  const root = mkdtempSync(join(temp, PREFIX));
   let removed = false;
   const remove = (): void => {
     if (removed) return;
@@ -82,7 +109,8 @@ export function makePreviewCopy(input: {
     for (const name of readdirSync(from)) {
       if (name.startsWith(".")) continue;
       const src = join(from, name);
-      const st = statSync(src);
+      // `lstat`: a symlink is left out rather than followed, so nothing outside the checkout is copied.
+      const st = lstatSync(src);
       if (!st.isFile()) continue;
       copyFileSync(src, join(to, name));
       files += 1;

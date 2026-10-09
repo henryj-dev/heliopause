@@ -1,10 +1,12 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { checkEdit, makePreviewCopy, PreviewRefused } from "./policy-preview.ts";
+import { checkEdit, makePreviewCopy, PreviewRefused, removeLeftoverCopies } from "./policy-preview.ts";
 
 /** This repository's root — the `src` and `bin` the copy must import. */
 const CODE_ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -66,6 +68,65 @@ describe("render-diff preview copy", () => {
     }
     assert.equal(existsSync(dir), false, "the copy was left behind");
     copy.remove();
+  });
+
+  it("does not follow a symlink in the checkout into the copy", () => {
+    const { root, site } = checkout();
+    const outside = mkdtempSync(join(tmpdir(), "hp-preview-src-outside-"));
+    writeFileSync(join(outside, "secret.json"), '{"secret":true}\n');
+    symlinkSync(join(outside, "secret.json"), join(root, "policy", "linked.json"));
+    symlinkSync(join(outside, "missing.json"), join(root, "policy", "dangling.json"));
+    let copy: ReturnType<typeof makePreviewCopy> | undefined;
+    try {
+      copy = makePreviewCopy({
+        sitePath: site, path: "policies.json", content: "{}", allowPaths: ["policies.json"], codeRoot: CODE_ROOT,
+      });
+      const dir = resolve(copy.sitePath, "..");
+      assert.equal(existsSync(join(dir, "linked.json")), false, "a file from outside the checkout was copied");
+      assert.equal(copy.files, 2);
+    } finally {
+      copy?.remove();
+      rmSync(root, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("removes leftover copies by prefix and nothing else", () => {
+    const dir = mkdtempSync(join(tmpdir(), "hp-preview-src-cleanup-"));
+    const outside = mkdtempSync(join(tmpdir(), "hp-preview-src-target-"));
+    try {
+      mkdirSync(join(dir, "hp-preview-left"));
+      writeFileSync(join(dir, "hp-preview-left", "x"), "");
+      mkdirSync(join(dir, "unrelated"));
+      writeFileSync(join(dir, "hp-preview-file"), "a file with the prefix is not a copy");
+      // A symlink named like a copy must not lead the cleanup outside `dir`.
+      writeFileSync(join(outside, "keep"), "");
+      symlinkSync(outside, join(dir, "hp-preview-link"));
+      assert.equal(removeLeftoverCopies(dir), 1);
+      assert.deepEqual(readdirSync(dir).sort(), ["hp-preview-file", "hp-preview-link", "unrelated"]);
+      assert.equal(existsSync(join(outside, "keep")), true, "the cleanup followed a symlink out of the directory");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses when the temporary directory is inside the checkout", () => {
+    const { root, site } = checkout();
+    const inside = join(root, "policy", "tmp");
+    mkdirSync(inside);
+    const saved = process.env.TMPDIR;
+    process.env.TMPDIR = inside;
+    try {
+      assert.throws(() => makePreviewCopy({
+        sitePath: site, path: "policies.json", content: "{}", allowPaths: ["policies.json"], codeRoot: CODE_ROOT,
+      }), /inside the policy checkout/);
+      assert.deepEqual(readdirSync(inside), [], "a copy was made inside the checkout");
+    } finally {
+      if (saved === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = saved;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("refuses anything but JSON data in an editable file", () => {

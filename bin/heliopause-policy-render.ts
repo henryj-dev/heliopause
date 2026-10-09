@@ -55,8 +55,8 @@ import { armedReasons } from "../src/policy-render-guard.ts";
 import { assemblePolicySource, parsePolicySource, type PolicySource } from "../src/policy-source.ts";
 import { policyHead, type ScreenSite } from "../src/policy-screen.ts";
 import { installCliLanguage } from "../src/operator-i18n.ts";
-import { makePreviewCopy, MAX_PREVIEW_BYTES, PreviewRefused } from "../src/policy-preview.ts";
-import { diffOpenings, siteOpenings } from "../src/preview-diff.ts";
+import { makePreviewCopy, MAX_PREVIEW_BYTES, PreviewRefused, removeLeftoverCopies } from "../src/policy-preview.ts";
+import { diffRules, siteRules } from "../src/preview-diff.ts";
 import { readBoundedNodeBody, BodyTooLargeError } from "../src/bounded-body.ts";
 
 installCliLanguage();
@@ -1590,8 +1590,8 @@ const server = createServer((req, res) => {
   //
   // The body is one editable JSON file, edited. The site's directory is copied to a temporary
   // directory with that file replaced, evaluated in a worker, and deleted; nothing is cached. The
-  // answer is, per host, the input openings that the edit adds and removes. It refuses nothing about
-  // the edit itself — saving is unaffected by what this says.
+  // answer is, per host, the input rules the edit adds and removes (`src/preview-diff.ts`). It
+  // refuses nothing about the edit itself — saving is unaffected by what this says.
   //
   // One at a time: a second request while one runs gets 429.
   //
@@ -1646,9 +1646,9 @@ async function runPreview(req: IncomingMessage, site: { name: string | null; pat
   } finally {
     copy.remove();
   }
-  const before = siteOpenings(withResolver(current));
-  const after = siteOpenings(withResolver(edited));
-  return writeWire({ site: site.name, changes: diffOpenings(before, after) });
+  const before = siteRules(withResolver(current));
+  const after = siteRules(withResolver(edited));
+  return writeWire({ site: site.name, changes: diffRules(before, after) });
 }
 
 /** The worker's half carries the resolver as a table; planning wants it as a function again. */
@@ -1786,11 +1786,19 @@ server.listen(port, hostname, () => {
   log(`listening on ${hostname}:${at} — serving ${serving}, editable ${allowPaths.join(", ") || "(nothing)"}`);
   // `/readyz` joined this set in the commit that gated it, and this line did not follow. It is what
   // an operator reads in `kubectl logs` to learn what needs a token.
-  log("bearer required on GET /source, GET /sites and GET /readyz");
+  log("bearer required on GET /source, GET /sites, GET /readyz and POST /preview");
   // Printed because a knob nobody can observe is a knob nobody can trust. `SOURCE_SITE_BUDGET_MS` has
   // to sit under the manager's own `HELIOPAUSE_RELAY_TIMEOUT_MS` and this process cannot read that
   // variable — it lives in another Deployment — so the operator is the one holding the relationship.
   // Without this line the only way to see which value took effect was to induce the timeout it exists
   // to prevent.
   log(`budgets: ${SOURCE_SITE_BUDGET_MS}ms per site on request, ${STARTUP_SITE_BUDGET_MS}ms at startup`);
+  // A previous process killed mid-preview leaves its copy behind; nothing else would remove it.
+  // @see src/policy-preview.test.ts "removes leftover copies by prefix and nothing else"
+  try {
+    const removed = removeLeftoverCopies();
+    if (removed > 0) log(`preview: removed ${removed} copies a previous process left behind`);
+  } catch (e) {
+    log(`preview: could not check for leftover copies: ${reasonOf(e)}`);
+  }
 });
