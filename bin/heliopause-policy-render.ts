@@ -22,14 +22,11 @@
 // said so: a module that poisoned `Object.prototype` made a *different*, correct site answer 503, and
 // the tests asserted that 503 because it was what the code did.
 //
-// They now assert the opposite — "stays up when a module breaks in a way no guard had named": under a
-// poisoned `toJSON` or `then`, the healthy site answers `/source` 200 and `/readyz` counts it as
-// serving. That is the claim, and it is about a prototype poisoned *in the worker*.
+// They now assert the opposite. @see src/policy-render-service.test.ts "stays up when a module breaks
+// in a way no guard had named" — shapes `poisonedToJSON` and `poisonedThen`.
 //
 // ⚠️ **Not a sandbox.** The worker shares this process's filesystem permissions (#131), and what it
-// sends is the module's to choose — the parent keeps only `site` and `services` from it. The captures
-// and guards below predate the worker; they are kept, and the paths they were measured on no longer
-// start in this realm.
+// sends is the module's to choose — the parent keeps only `site` and `services` from it.
 //
 // ## What keeps that true
 //
@@ -116,11 +113,17 @@ const log = (m: string): void => console.log(`[policy-render] ${oneLine(m)}`);
  *      own error class"
  */
 const OUR_ZONE_MISMATCHES = new WeakSet<ZoneMismatchError>();
+
+// ⚠️ **From here to "The zone check had already passed", every paragraph is the record measured before
+// #134, when policy modules were evaluated in this realm.** The present tense below describes that
+// renderer. The current boundary is one worker per evaluation (`src/policy-eval-worker.ts`); see
+// src/policy-render-service.test.ts "stays up when a module breaks in a way no guard had named".
+
 // ## Bound before any policy module is imported
 //
 // `foundHere` called `OUR_ZONE_MISMATCHES.has(...)`, which looks the method up on
-// `WeakSet.prototype` **at call time** — and, before the worker (#134), a policy module ran in this
-// realm, so `WeakSet.prototype.has = () => true` in one made every error look like ours. Measured: it turned an
+// `WeakSet.prototype` **at call time** — and a policy module runs in this realm, so
+// `WeakSet.prototype.has = () => true` in one makes every error look like ours. Measured: it turned an
 // ordinary content fault into `exit 2` with a refusal nobody configured. The set is unreachable to a
 // module, but the *lookup* was not; capturing it here, before the first `import()`, is what makes the
 // unreachability of the set the only thing that matters.
@@ -129,12 +132,10 @@ const rememberOurZoneMismatch = WeakSet.prototype.add.bind(OUR_ZONE_MISMATCHES) 
 
 // ## The value was guarded; the constructor used to describe it was not
 //
-// Until the worker (#134), a policy module was evaluated by `import()` in **this process's own realm**
-// — the same `globalThis` — so `globalThis.Error = function () { throw 1; };` was two tokens that
-// replaced the constructor every later `new Error(...)` resolved. The guards below all read the thrown
-// value carefully and then built an `Error` to carry it, which called the module's function instead.
-// The module now runs in its worker's realm, so its `globalThis` is not this one; the capture below
-// predates that and is kept.
+// A policy module is evaluated by `import()` in **this process's own realm** — the same `globalThis` —
+// so `globalThis.Error = function () { throw 1; };` is two tokens that replace the constructor every
+// later `new Error(...)` resolves. The guards below all read the thrown value carefully and then build
+// an `Error` to carry it, which called the module's function instead.
 //
 // Where that lands is the whole severity. `asError` runs inside `evaluateWithin`'s rejection handler,
 // the single point every module failure funnels through, and a throw inside a rejection handler is an
@@ -206,9 +207,9 @@ const toJson = JSON.stringify;
 // ## The wire pair, captured for the same reason and with the same limit
 //
 // `evaluated` serialises the outgoing `PolicySource` and its caller parses it back. Both functions
-// are resolved here, before the first `import()`, because when this was written a policy module ran
-// in this realm and a call-time lookup would have been the module's function. Since the worker
-// (#134) the module's realm is its thread's; the value parsed here is bytes the worker sent.
+// are resolved here, before the first `import()`, because a policy module runs in this realm and a
+// call-time lookup would be the module's function — and the value being serialised is the one thing
+// a module fully controls.
 //
 // ⚠️ Capturing the function is not the same as the operation being safe. `JSON.stringify` calls a
 // `toJSON` it finds **on the value**, inherited ones included, so a poisoned `Object.prototype` is
@@ -228,14 +229,11 @@ const parseWire = JSON.parse;
 // records three separate times that asserting on source text in this repo missed the thing it was
 // written for, and the test file's own preamble says the same. So this is a gap held open on purpose,
 // not an oversight — and it is a second reason the captures are a patch on measured paths rather than
-// a boundary. Evaluating policy in its own realm removes the whole class, including this — and since
-// the worker (#134) that is where it is evaluated, so a module's replaced intrinsic no longer reaches
-// the call sites in this file.
+// a boundary. Evaluating policy in its own realm removes the whole class, including this.
 //
-// The rule written here for the in-process renderer still holds wherever a policy module and the code
-// that reads its output share a realm — which is now the worker (`src/policy-eval-worker.ts`): an
-// intrinsic resolved at call time must be the captured one, and ask what the operation looks up **on
-// the value** as well — `JSON.stringify` calls an inherited `toJSON`, resolving a promise reads an
+// Until then, the rule for anyone editing this file: an intrinsic resolved at call time on a path
+// more than one site reaches must use the captured name. Ask what the operation looks up **on the
+// value** as well — `JSON.stringify` calls an inherited `toJSON`, resolving a promise reads an
 // inherited `then`, and capturing the global closes neither.
 
 // ## "The zone check had already passed" is no longer a fact this file carries
@@ -968,20 +966,18 @@ function accepted(
   //
   // 🔑 So the thing to carry is the **shape**, not the list: `JSON.stringify` asks the value — and
   // everything the value inherits from — for a `toJSON`, and every prototype in that chain is
-  // something a module in the same realm can write. Any new entry here is another instance of that,
-  // not a new kind of problem. **The list stays open on purpose.**
+  // something a module in this realm can write. Any new entry here is another instance of that, not
+  // a new kind of problem. **The list stays open on purpose.**
   //
-  // Since the worker (#134) that realm is the worker's, not this process's: the three triggers above
-  // were measured in-process, and the serialisation that meets them now runs in the worker.
-  //
-  // ⚠️ **Only the first has a test here.** `poisonedToJSON` is a shape in the matrix below; the
-  // replaced-parser case is measured (a global swap does reach `readCoverageProbes`, and the probe
-  // comes back holding a `BigInt`) but **no test drives it through this renderer** — the fixture
-  // that should have left `/source?site=beta` at 503 answered 200, and why is unresolved. Filed as
-  // **#126** with the hypotheses rather than left as a claim with nothing holding it.
+  // ⚠️ The three were measured **before the worker (#134)**, with modules evaluated in this process.
+  // Re-measured 2026-10-09 on the worker tree, with a `coverage-*.json` present so the probe path
+  // runs: (2) and (3) installed by beta, which then exports a valid site, leave **both** sites at
+  // `/source` 200 with `probes: []`. On `3724e79` (before #134) the same (3) answered 503 on both;
+  // the same (2) answered 200 there too, so this probe does not distinguish the trees for (2).
+  // That is a measurement of those two shapes, not a claim about this serialisation in general.
   //
   // @see src/policy-render-service.test.ts "no guard had named" — shape `poisonedToJSON`
-  //
+  // @see src/policy-render-service.test.ts "a healthy site still answers when another site's module replaces JSON.parse"
   // @see src/policy-render-service.test.ts "survives a module that replaces the globals it will be described with"
   return wire;
 }
@@ -1203,11 +1199,14 @@ let readyMemo: {
  * liveness probe kills the pod and the next one does the same. Measured against `origin/main` of
  * this repository; not separately checked in the running image.
  *
- * There was no fix for this in the same realm, which is why the sentence was a warning rather than a
- * TODO: interrupting the module meant evaluating it somewhere with its own event loop. The worker
- * (#134) is that: when the budget expires the lifecycle calls `terminate()` on the thread, so a
- * synchronous spin now fails only its own site. @see src/policy-render-service.test.ts "a module that
- * spins forever fails only its own site". The paragraph above is kept as the record of why.
+ * There is no fix for this in the same realm, which is why the sentence is a warning rather than a
+ * TODO: interrupting the module means evaluating it somewhere with its own event loop — a
+ * `worker_thread` or a `vm` context. That is also the boundary the intrinsic captures above are
+ * explicitly *not*. The budget still does what it says for a module that hangs **asynchronously**,
+ * which is the common case and the one the test covers.
+ *
+ * ⚠️ The above is pre-#134. @see src/policy-render-service.test.ts "a module that spins forever fails
+ * only its own site"
  *
  * @see src/policy-render-service.test.ts "answers even when a site module never settles"
  *
@@ -1264,13 +1263,13 @@ function evaluateWithin(
  * Whether each site can be evaluated right now, bounded and memoised.
  *
  * This said "never rejects", which was true of the per-site failures it was written for — each one is
- * caught below — and false of the collection. Resolving the answer reads a `then`, and while modules
- * ran in this realm a module could poison it, so `/readyz` handles a rejection as well as an answer;
- * without that it was exit 1 on the readiness probe, i.e. on a schedule.
+ * caught below — and false of the collection. Resolving the answer reads a `then` a policy module can
+ * poison, so `/readyz` handles a rejection as well as an answer; without that it was exit 1 on the
+ * readiness probe, i.e. on a schedule.
  *
- * Since the worker (#134) the poisoning stays in the module's thread and this rejection has no
- * measured cause — under `poisonedThen` the route answers 200 (#125, asserted in "stays up when a
- * module breaks in a way no guard had named"). The handler is kept.
+ * ⚠️ That `then` paragraph and the two in-body comments below on it are pre-#134. @see
+ * src/policy-render-service.test.ts "stays up when a module breaks in a way no guard had named" —
+ * shape `poisonedThen` asserts `/readyz` (#125).
  *
  * ## The window runs from when the answer *settled*, not from when it started
  *
@@ -1289,27 +1288,26 @@ function readiness(): Promise<{ serving: number; total: number }> {
   if (readyMemo && (readyMemo.settledAt === null || readClock() - readyMemo.settledAt < READY_MEMO_MS)) {
     return readyMemo.answer;
   }
-  // Not `Promise.all`: it resolves an array, and an array inherits a `then` a policy module could
-  // poison while it ran in this realm — see the startup loop. The per-site promises resolve booleans, which are primitives and
+  // Not `Promise.all`: it resolves an array, and an array inherits a `then` a policy module can
+  // poison — see the startup loop. The per-site promises resolve booleans, which are primitives and
   // run no thenable check at all, so only the collection had to change. Started before any is
   // awaited, as before.
   const started = sites.map((site) => evaluateWithin(site, READY_SITE_BUDGET_MS).then(() => true, () => false));
   const answer = (async () => {
     let serving = 0;
     for (const one of started) if (await one) serving += 1;
-    // A plain object, deliberately. Resolving it reads `.then`, which a module could poison while it
-    // ran in this realm, and a `__proto__: null` literal here would have dodged that — but `/readyz`
-    // already answers the resulting rejection, so both together meant reverting either one left every
-    // test green. One guard, the general one, is worth more than two that hide each other from a
-    // mutation check. Since the worker the poisoning does not reach this object (#125).
+    // A plain object, deliberately. Resolving it reads `.then`, which a module can poison, and a
+    // `__proto__: null` literal here would dodge that — but `/readyz` already answers the resulting
+    // rejection, so both together meant reverting either one left every test green. One guard, the
+    // general one, is worth more than two that hide each other from a mutation check.
     return { serving, total: started.length };
   })();
   const memo: { settledAt: number | null; answer: typeof answer } = { settledAt: null, answer };
   readyMemo = memo;
   // Both handlers, not just one. Every per-site promise is caught above, so `answer` rejects only if
-  // the collection itself fails — which it could while modules ran in this realm: resolving the answer
-  // reads a `then` a module may have poisoned. With one handler that rejection was unhandled, and a
-  // `void`ed unhandled rejection is exit 1. Stamping on either outcome is also correct: a settled failure is as stale as a settled
+  // the collection itself fails — which it can: resolving the answer reads a `then` a module may have
+  // poisoned. With one handler that rejection was unhandled, and a `void`ed unhandled rejection is
+  // exit 1. Stamping on either outcome is also correct: a settled failure is as stale as a settled
   // success and must not pin the memo open.
   //
   // The closure stamps **its own object**, not `readyMemo`, so a superseded memo can only mark itself
@@ -1338,6 +1336,9 @@ function bearerOk(header: string | undefined): boolean {
 }
 
 // ## Serialising is not safe either, and capturing `JSON.stringify` did not make it safe
+//
+// ⚠️ This paragraph and the next are the record measured before #134 (same-realm evaluation); see the
+// note above `zoneMismatchIsOurs`.
 //
 // `JSON.stringify` calls a **`toJSON` method it finds on the value**, inherited included. So
 // `Object.defineProperty(Object.prototype, "toJSON", { value() { throw … } })` in a policy module
@@ -1441,7 +1442,8 @@ const server = createServer((req, res) => {
   // second and would have had kubelet kill the container on demand. The fix this comment is pointing
   // at is below; the rule it leaves behind is that nothing reachable without the bearer may call
   // `currentSource` on the request path.
-  // Not `send`: the liveness probe must not depend on a serialiser a policy module can hook.
+  // Not `send`: the liveness probe must not depend on a serialiser a policy module could hook (before
+  // #134 — see "Serialising is not safe either").
   if (req.method === "GET" && url.pathname === "/healthz") return raw(200, HEALTHZ_BODY);
 
   // ## Can this process serve any policy at all?
@@ -1501,10 +1503,9 @@ const server = createServer((req, res) => {
         });
       },
       // `readiness` is documented as not rejecting and that was true of the per-site failures it was
-      // written for. It was not true of the collection while modules ran in this realm: a module could
-      // poison the `then` that resolving the answer reads. Without this handler that rejection was
-      // unhandled and the process exited 1 — on `/readyz`, so on a schedule. The worker has since
-      // removed that cause (#125); the handler stays.
+      // written for. It is not true of the collection: a module can poison the `then` that resolving
+      // the answer reads. Without this handler that rejection is unhandled and the process exits 1 —
+      // on `/readyz`, which is the readiness probe, so on a schedule. (Pre-#134; see `readiness()`.)
       (e: unknown) => {
         log(`readiness could not be computed: ${reasonOf(e)}`);
         send(503, { ok: false, degraded: true, error: "readiness could not be computed", faults });

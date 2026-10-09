@@ -610,9 +610,8 @@ macOS 는 13 회 통과했다.
 ## 🔴 정책 모듈은 같은 realm 에서 돌았다 — 전역은 정책 저장소가 쓸 수 있는 코드였다
 
 ⚠️ **이 절과 아래 두 절(「전역 교체는…」·「그중 `then` 오염은…」)은 #134 이전의 기록이다.** 지금은 평가마다
-워커 하나에서 돌고(`src/policy-eval-worker.ts`), 모듈이 바꾼 전역·프로토타입은 그 스레드와 함께 끝난다.
-아래 현재 시제 문장은 그 시점의 서술로 읽을 것 — 무엇이 어떻게 닫혔는지는 「그중 `then` 오염은…」 절의
-표와 그 아래 괄호 문단에 있다.
+워커 하나에서 돈다(`src/policy-eval-worker.ts`). 아래 현재 시제 문장은 그 시점의 서술로 읽을 것 — 지금
+무엇이 단언되는지는 「그중 `then` 오염은…」 절의 표와 그 아래 괄호 문단에 있다.
 
 렌더러는 정책 모듈을 `import()` 로 평가한다. 그건 **이 프로세스 자신의 realm** 이다. 그래서
 `globalThis.Error = function () { throw 1; };` 는 정책 커밋에 들어가는 두 토큰이고, 그 뒤의 모든
@@ -772,8 +771,8 @@ intrinsic 캡처 여덟 개도 필요 없어진다. 「캡처는 측정된 경�
 
 🔑 **그 `/readyz` 칸은 고치기 전에 닫혀 있었다.** 2026-10-09 #125 를 착수하며 먼저 재 보니, 같은 모듈에
 대해 #134 이전(`3724e79`)은 `/readyz` 503 「readiness could not be computed」, 이후는 200(1/2 서빙)이었다.
-오염이 beta 의 워커 안에서 끝나 부모의 `readiness()` 객체에 닿지 않는다. **아무 테스트도 그것을 단언하지
-않았으므로 아무도 몰랐다** — 「경로를 적지 않은 닫혔다」의 반대 방향, **「확인하지 않은 열려 있다」**다.
+**아무 테스트도 그것을 단언하지 않았으므로 아무도 몰랐다** — 「경로를 적지 않은 닫혔다」의 반대 방향,
+**「확인하지 않은 열려 있다」**다.
 지금은 `poisonedThen` 행이 `/readyz` 를 단언한다(#134 이전 트리에서 `poisonedThen: readiness could not be
 computed` 로 빨갛다).
 
@@ -805,10 +804,9 @@ expected 200`).
 「**하나는 한 경로에서** 먼저 닫혔고 둘이 남았다」다 — 그 예고가 맞았던 방식이 **예고한 수단과
 달랐고**, 범위도 예고보다 좁았다.
 
-(그 「realm 이전」은 #134 의 워커로 왔다. 동기 spin 은 예산 끝의 `terminate()` 로 닫혔고(「a module that
-spins forever fails only its own site」), `/readyz` 의 `then` 오염은 위 표대로 닫혔다. 늦은 throw 는 grace
-창 안에서는 `faults` 로 센다(「counts a fault that arrives inside the grace window without changing the
-answer」). 창 밖의 것은 스레드와 함께 사라지고 **세지 않는다** — 설계 메모 `docs/policy-eval-worker-notes.md`.)
+(그 「realm 이전」은 #134 의 워커로 왔다. 지금 단언하는 테스트: 동기 spin 「a module that spins forever
+fails only its own site」, `/readyz` 의 `then` 오염 「stays up when a module breaks in a way no guard had named」의
+`poisonedThen`, 늦은 throw 「counts a fault that arrives inside the grace window without changing the answer」.)
 
 ### 🔴 관찰된 동작이 기대값이 되는 순간 — 테스트가 구멍을 봉인한다
 

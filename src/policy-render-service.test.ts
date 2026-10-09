@@ -1238,10 +1238,12 @@ export const site = {
   });
 
   it("keeps its provenance check working when a module patches WeakSet", { timeout: 30_000 }, async () => {
+    // ⚠️ The comment below is the record measured before #134 (same-realm evaluation).
+    //
     // ## The set was unreachable; the lookup was not
     //
     // `foundHere` called `OUR_ZONE_MISMATCHES.has(...)`, which resolves `has` on `WeakSet.prototype`
-    // at call time. A configuration module ran in this realm until the worker (#134), so
+    // at call time. A configuration module runs in this realm, so
     // `WeakSet.prototype.has = () => true` in one made every error look like one this process built —
     // turning an ordinary content fault into `exit 2` with a refusal nobody configured. Measured.
     //
@@ -1675,12 +1677,11 @@ export const site = {
         // read. `beta` still fails — it threw — and `alpha` now answers `/source` normally, which is
         // the property that was wanted all along.
         //
-        // ⚠️ **`/source`, not every route — at the time.** `readiness()` resolves a plain object, so
-        // under the in-process renderer `/readyz` went 503 under this same module: closed on this
-        // path and open on that one. An earlier version of this comment and of AGENTS.md said it was
-        // closed, full stop; independent review reproduced the `/readyz` half (#125). The worker
-        // (#134) has since closed that half too — the poisoning no longer reaches this realm — and
-        // the `poisonedThen` assertion on `/readyz` below pins it.
+        // ⚠️ **`/source`, not every route.** `readiness()` still resolves a plain object, so
+        // `/readyz` goes 503 under this same module — the poisoning is closed on this path and open
+        // on that one. An earlier version of this comment and of AGENTS.md said it was closed, full
+        // stop; independent review reproduced the `/readyz` half. (That was before #134; the
+        // `/readyz` half is now asserted below — #125.)
         //
         // **Measured, not reasoned.** Reverting just that one line to resolve an object
         // (`resolve({ wire } as unknown as string)`) turns this back:
@@ -1688,11 +1689,10 @@ export const site = {
         //     ✖ stays up when a module breaks in a way no guard had named
         //       AssertionError: poisonedThen: alpha — actual 503, expected 200
         //
-        // ⚠️ At the byte boundary (#124, before the worker) `poisonedToJSON` above kept `alpha: 503`,
-        // and the difference was the point: `toJSON` is called **by the serialisation itself**, so
-        // moving to bytes could not close it. A byte boundary closes the operations that read a value;
-        // it does not close the one that writes it. The worker (#134) closed it a different way — the
-        // poisoned prototype is beta's thread's — which is why that row now says `alpha: 200`.
+        // ⚠️ `poisonedToJSON` above keeps `alpha: 503`, and the difference is the point: `toJSON` is
+        // called **by the serialisation itself**, so moving to bytes cannot close it. A byte boundary
+        // closes the operations that read a value; it does not close the one that writes it. (That
+        // was at #124; the row now says `alpha: 200` — see its own comment.)
         name: "poisonedThen",
         body: 'Object.defineProperty(Object.prototype, "then", { get() { throw new Error("broken then"); }, configurable: true });\nthrow new Error("bad beta");\n',
         beta: 503, alpha: 200,
@@ -1769,13 +1769,12 @@ export const site = {
         if (shape.name === "lateThrowFromModuleTimer") {
           assert.ok((ready.faults ?? 0) > 0, `${shape.name}: the fault was swallowed silently`);
         }
-        // ## `/readyz` under a poisoned `then` — closed by the worker, and pinned here (#125)
+        // ## `/readyz` under a poisoned `then` (#125)
         //
-        // Before the worker, `readiness()` resolved a plain object in the renderer's own realm, so the
-        // poisoned getter ran there: `/readyz` answered 503 "readiness could not be computed" while
-        // `/source?site=alpha` answered 200 (measured on `3724e79`, the commit before #134). Now the
-        // poisoning ends with beta's thread, and readiness counts alpha as serving. Nothing asserted
-        // this until #125 was re-measured and found already closed.
+        // Measured on `3724e79` (the commit before #134): `/readyz` answered 503 "readiness could not be
+        // computed" here while `/source?site=alpha` answered 200. On the worker tree it answers 200 with
+        // `serving: 1`. Nothing asserted it until #125 was re-measured. Reverting `evaluateInWorker` to an
+        // in-process `import()` fails this at `poisonedThen: readiness could not be computed`.
         if (shape.name === "poisonedThen") {
           assert.equal(ready.error, undefined, `${shape.name}: readiness could not be computed`);
           assert.equal((ready as { serving?: number }).serving, 1, `${shape.name}: readiness did not count alpha`);
@@ -1887,10 +1886,13 @@ export const site = {
   });
 
   it("survives a module that replaces the globals it will be described with", { timeout: 60_000 }, async () => {
+    // ⚠️ **The comments in this test are the record measured before #134** (same-realm evaluation). The
+    // assertions still run and pass on the worker tree.
+    //
     // ## The value was read carefully and then handed to a constructor the module owned
     //
-    // Before the worker (#134), `import()` evaluated a policy module in this process's own realm, so a
-    // module could assign to `globalThis.Error`. Every guard in the renderer reads the thrown value defensively and then builds
+    // `import()` evaluates a policy module in this process's own realm, so a module can assign to
+    // `globalThis.Error`. Every guard in the renderer reads the thrown value defensively and then builds
     // an `Error` to carry it — which called the module's function. `asError` does that inside
     // `evaluateWithin`'s rejection handler, the one point every module failure funnels through, and a
     // throw in a rejection handler is an unhandled rejection: **exit 1 in the startup loop, before
