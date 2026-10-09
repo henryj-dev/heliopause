@@ -244,7 +244,6 @@ export function parsePolicySource(raw: unknown): PolicySource {
   if (rawProtected !== undefined && !Array.isArray(rawProtected)) {
     bad("site.cfg.protectedHosts must be an array when present");
   }
-  if (rawProtected === undefined) (s.cfg as Record<string, unknown>).protectedHosts = [];
   if (!Array.isArray(s.hosts)) bad("site.hosts must be an array");
   for (const name of ["zones", "devices", "objects", "coverage", "workload"] as const) {
     if (s[name] !== undefined && !Array.isArray(s[name])) bad(`site.${name} must be an array when present`);
@@ -279,7 +278,11 @@ export function parsePolicySource(raw: unknown): PolicySource {
     ...(v.build === undefined ? {} : { build: v.build as string }),
     ...(v.siteName === undefined ? {} : { siteName: v.siteName as string }),
     label: v.label,
-    site: site as unknown as ScreenSite,
+    // The default goes into a copy, not into `raw` (#123). @see src/policy-source.test.ts "does not
+    // write the default into the object it was given"
+    site: (rawProtected === undefined
+      ? { ...s, cfg: { ...(s.cfg as Record<string, unknown>), protectedHosts: [] } }
+      : site) as unknown as ScreenSite,
     services: services as Readonly<Record<string, ServiceSelector>>,
     repo: {
       probes: repo.probes as Probe[],
