@@ -6,13 +6,13 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { checkEdit, makePreviewCopy, PreviewRefused, removeLeftoverCopies } from "./policy-preview.ts";
+import { checkEdit, makePreviewCopy, PreviewRefused } from "./policy-preview.ts";
 
 /** This repository's root — the `src` and `bin` the copy must import. */
 const CODE_ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
 
 function checkout(): { root: string; site: string } {
-  const root = mkdtempSync(join(tmpdir(), "hp-preview-src-"));
+  const root = mkdtempSync(join(tmpdir(), "hp-pvtest-src-"));
   const dir = join(root, "policy");
   mkdirSync(dir);
   writeFileSync(join(dir, "policies.json"), '{"groups":{"a":[{"id":"before"}]}}\n');
@@ -72,7 +72,7 @@ describe("render-diff preview copy", () => {
 
   it("does not follow a symlink in the checkout into the copy", () => {
     const { root, site } = checkout();
-    const outside = mkdtempSync(join(tmpdir(), "hp-preview-src-outside-"));
+    const outside = mkdtempSync(join(tmpdir(), "hp-pvtest-outside-"));
     writeFileSync(join(outside, "secret.json"), '{"secret":true}\n');
     symlinkSync(join(outside, "secret.json"), join(root, "policy", "linked.json"));
     symlinkSync(join(outside, "missing.json"), join(root, "policy", "dangling.json"));
@@ -87,26 +87,6 @@ describe("render-diff preview copy", () => {
     } finally {
       copy?.remove();
       rmSync(root, { recursive: true, force: true });
-      rmSync(outside, { recursive: true, force: true });
-    }
-  });
-
-  it("removes leftover copies by prefix and nothing else", () => {
-    const dir = mkdtempSync(join(tmpdir(), "hp-preview-src-cleanup-"));
-    const outside = mkdtempSync(join(tmpdir(), "hp-preview-src-target-"));
-    try {
-      mkdirSync(join(dir, "hp-preview-left"));
-      writeFileSync(join(dir, "hp-preview-left", "x"), "");
-      mkdirSync(join(dir, "unrelated"));
-      writeFileSync(join(dir, "hp-preview-file"), "a file with the prefix is not a copy");
-      // A symlink named like a copy must not lead the cleanup outside `dir`.
-      writeFileSync(join(outside, "keep"), "");
-      symlinkSync(outside, join(dir, "hp-preview-link"));
-      assert.equal(removeLeftoverCopies(dir), 1);
-      assert.deepEqual(readdirSync(dir).sort(), ["hp-preview-file", "hp-preview-link", "unrelated"]);
-      assert.equal(existsSync(join(outside, "keep")), true, "the cleanup followed a symlink out of the directory");
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
       rmSync(outside, { recursive: true, force: true });
     }
   });
@@ -157,4 +137,4 @@ describe("render-diff preview copy", () => {
 
 /** Preview copies currently in the temporary directory (the checkout fixtures use another prefix). */
 const readdirTmp = (): string[] =>
-  readdirSync(tmpdir()).filter((n) => n.startsWith("hp-preview-") && !n.startsWith("hp-preview-src-"));
+  readdirSync(tmpdir()).filter((n) => n.startsWith("hp-preview-"));

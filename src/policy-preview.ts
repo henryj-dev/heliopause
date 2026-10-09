@@ -6,6 +6,9 @@
 // copy, which the preview reports as a failure rather than guessing. `../src` and `../bin` are
 // symlinks to the renderer's own, so the copy imports the code this process runs.
 // @see src/policy-preview.test.ts
+//
+// If the process dies mid-preview, its copy may remain. When the pod restarts, `/tmp` usually goes
+// with it — this repository does not verify that deployment.
 
 import {
   copyFileSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync,
@@ -19,24 +22,6 @@ export { MAX_PREVIEW_BYTES };
 export class PreviewRefused extends Error {}
 
 const PREFIX = "hp-preview-";
-
-/**
- * Remove preview copies a previous process left behind — it was killed before `remove()` ran.
- *
- * Only directories named with this module's prefix directly inside `tmpdir()`, and never a symlink;
- * nothing outside the temporary directory is touched. Returns how many were removed.
- */
-export function removeLeftoverCopies(dir: string = tmpdir()): number {
-  let removed = 0;
-  for (const name of readdirSync(dir)) {
-    if (!name.startsWith(PREFIX)) continue;
-    const path = join(dir, name);
-    if (!lstatSync(path).isDirectory()) continue;
-    rmSync(path, { recursive: true, force: true });
-    removed += 1;
-  }
-  return removed;
-}
 
 export interface PreviewCopy {
   /** The site module's path inside the copy. */

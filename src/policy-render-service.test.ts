@@ -2762,7 +2762,7 @@ export const site = {
    * fixed environment, so without it the child used `/tmp` while this read `os.tmpdir()`, and a copy
    * the renderer left behind was invisible here. Measured: removing `copy.remove()` stayed green.
    */
-  const previewCopies = (): string[] => readdirSync(tmpdir()).filter((n) => /^hp-preview-[^s]/.test(n));
+  const previewCopies = (): string[] => readdirSync(tmpdir()).filter((n) => n.startsWith("hp-preview-"));
   const PREVIEW_ENV = { TMPDIR: tmpdir() };
 
   it("previews an edit without touching the checkout", { timeout: 60_000 }, async () => {

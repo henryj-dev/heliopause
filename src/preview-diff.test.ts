@@ -96,6 +96,14 @@ describe("render-diff preview", () => {
       assert.ok(changed([at("10.2.0.7/32")], [at("2001:db8::7/128")]));
     });
 
+    it("changing the input chain's default policy", () => {
+      const withPolicy = (input: "drop" | "accept"): ScreenSite => {
+        const s = site([]) as unknown as { cfg: { hookPolicy: { input: string } } };
+        return { ...s, cfg: { ...s.cfg, hookPolicy: { input, output: "accept" } } } as unknown as ScreenSite;
+      };
+      assert.ok(diffRules(siteRules(withPolicy("drop")), siteRules(withPolicy("accept"))).length > 0);
+    });
+
     it("adding an allow for every protocol, with no ports", () => {
       const base = allow("all", "", ["10.1.0.0/16"]);
       const any: InputItem = { ...base, policy: { ...base.policy, proto: "any", ports: "" } };

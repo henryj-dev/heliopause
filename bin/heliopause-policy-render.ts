@@ -55,7 +55,7 @@ import { armedReasons } from "../src/policy-render-guard.ts";
 import { assemblePolicySource, parsePolicySource, type PolicySource } from "../src/policy-source.ts";
 import { policyHead, type ScreenSite } from "../src/policy-screen.ts";
 import { installCliLanguage } from "../src/operator-i18n.ts";
-import { makePreviewCopy, MAX_PREVIEW_BYTES, PreviewRefused, removeLeftoverCopies } from "../src/policy-preview.ts";
+import { makePreviewCopy, MAX_PREVIEW_BYTES, PreviewRefused } from "../src/policy-preview.ts";
 import { diffRules, siteRules } from "../src/preview-diff.ts";
 import { readBoundedNodeBody, BodyTooLargeError } from "../src/bounded-body.ts";
 
@@ -1793,12 +1793,4 @@ server.listen(port, hostname, () => {
   // Without this line the only way to see which value took effect was to induce the timeout it exists
   // to prevent.
   log(`budgets: ${SOURCE_SITE_BUDGET_MS}ms per site on request, ${STARTUP_SITE_BUDGET_MS}ms at startup`);
-  // A previous process killed mid-preview leaves its copy behind; nothing else would remove it.
-  // @see src/policy-preview.test.ts "removes leftover copies by prefix and nothing else"
-  try {
-    const removed = removeLeftoverCopies();
-    if (removed > 0) log(`preview: removed ${removed} copies a previous process left behind`);
-  } catch (e) {
-    log(`preview: could not check for leftover copies: ${reasonOf(e)}`);
-  }
 });

@@ -7,9 +7,12 @@
 // host matches on is `srcCidrs`, which a site module computes per host — a catalogue entry can say
 // one range while the host renders another.
 //
-// It compares rules, not reachability. Removing a deny shows as a removed deny rule; it does not
-// compute which addresses that leaves open, because that is first-match evaluation over the whole
-// chain. @see src/preview-diff.test.ts
+// It compares the input chain's rules and its default verdict, not reachability. Removing a deny
+// shows as a removed deny rule; it does not compute which addresses that leaves open, because that
+// is first-match evaluation over the whole chain. @see src/preview-diff.test.ts
+//
+// Not visible here: an edit that only reorders rules (which changes first-match behaviour), and any
+// change to the output or forward chain.
 
 import { defineConfig, type Config } from "./config.ts";
 import { planHostRuleset, type Match, type PlannedRule } from "./nft.ts";
@@ -32,11 +35,15 @@ export interface InputRule {
 
 export interface HostRules {
   host: string;
+  /** The input chain's default verdict for whatever no rule matched. */
+  inputPolicy: string;
   rules: InputRule[];
 }
 
 export interface HostDiff {
   host: string;
+  /** Present only when the edit changes the input chain's default verdict. */
+  inputPolicy?: { before: string; after: string };
   added: InputRule[];
   removed: InputRule[];
 }
@@ -97,6 +104,7 @@ export function siteRules(site: ScreenSite): HostRules[] {
   }[];
   return hosts.map((h) => ({
     host: h.id,
+    inputPolicy: cfg.hookPolicy.input,
     rules: inputRulesOf(planHostRuleset(cfg, h.id, h.items ?? [], h.egress ?? []).input),
   }));
 }
@@ -117,17 +125,27 @@ export function diffRules(current: readonly HostRules[], edited: readonly HostRu
     }
     return m;
   };
-  const before = new Map(current.map((h) => [h.host, count(h.rules)]));
-  const after = new Map(edited.map((h) => [h.host, count(h.rules)]));
+  const before = new Map(current.map((h) => [h.host, h]));
+  const after = new Map(edited.map((h) => [h.host, h]));
   const out: HostDiff[] = [];
   for (const host of [...new Set([...before.keys(), ...after.keys()])].sort()) {
-    const b = before.get(host) ?? new Map();
-    const a = after.get(host) ?? new Map();
+    const hb = before.get(host);
+    const ha = after.get(host);
+    const b = count(hb?.rules ?? []);
+    const a = count(ha?.rules ?? []);
     const surplus = (x: typeof b, y: typeof b): InputRule[] =>
       [...x].flatMap(([k, { rule, n }]) => Array(Math.max(0, n - (y.get(k)?.n ?? 0))).fill(rule) as InputRule[]);
     const added = surplus(a, b);
     const removed = surplus(b, a);
-    if (added.length || removed.length) out.push({ host, added, removed });
+    const policyChanged = hb && ha && hb.inputPolicy !== ha.inputPolicy;
+    if (added.length || removed.length || policyChanged) {
+      out.push({
+        host,
+        ...(policyChanged ? { inputPolicy: { before: hb.inputPolicy, after: ha.inputPolicy } } : {}),
+        added,
+        removed,
+      });
+    }
   }
   return out;
 }
