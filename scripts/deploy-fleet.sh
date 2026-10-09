@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Roll the relay and agent code onto the fleet, one host at a time, with a backup and a check.
 #
-#   ./scripts/deploy-fleet.sh relay  gw-01.util
-#   ./scripts/deploy-fleet.sh agent  k3s-01.dev
+#   ./scripts/deploy-fleet.sh relay  gw-01.util-icn-vtr
+#   ./scripts/deploy-fleet.sh agent  k3s-01.dev-icn-vtr
 #   ./scripts/deploy-fleet.sh status
 #
 # ## Why this exists as a script rather than a runbook
@@ -28,8 +28,8 @@
 # is unprotected.
 #
 #   1. manager   (image, flux — already done when you are reading this)
-#   2. relays    util → prod → dev        least entangled first; dev's gateway serves five hosts
-#   3. agents    k3s-01.dev first          the canary the rollout stages already name
+#   2. relays    util → prod → dev → az01  least entangled first; dev's gateway serves five hosts
+#   3. agents    k3s-01.dev-icn-vtr first  the canary the rollout stages already name
 #   4. publish a generation and watch it confirm
 #
 # Rollback is the backup this script leaves beside the live directory:
@@ -48,15 +48,21 @@ SSH_USER="${HELIOPAUSE_SSH_USER:-linuxuser}"
 # A plain list rather than an associative array — macOS ships bash 3.2, which has none, and a script
 # an operator cannot run on the machine they are sitting at is a runbook with extra steps. Measured:
 # the first version of this file failed with `gw: unbound variable` before doing anything.
+# Names are the fleet's host ids — what the relay's `/status` and the console print — so a line of
+# this script's output can be matched to a row on the fleet view without translating. They were the
+# pre-rename short names (`gw-01.dev`) until 2026-10-08, two months after the hosts were renamed.
 HOSTS="
-gw-01.dev=10.17.0.1
-gw-01.prod=10.16.0.1
-gw-01.util=10.253.0.1
-k3s-01.dev=10.17.0.10
-mailer-01.dev=10.17.101.12
-mailer-02.dev=10.17.77.135
-mailer-03.dev=10.17.82.134
-web-01.dev=10.17.47.52
+gw-01.dev-icn-vtr=10.17.0.1
+gw-01.prod-icn-vtr=10.16.0.1
+gw-01.util-icn-vtr=10.253.0.1
+k3s-01.dev-icn-vtr=10.17.0.10
+mailer-01.dev-icn-vtr=10.17.101.12
+mailer-02.dev-icn-vtr=10.17.77.135
+mailer-03.dev-icn-vtr=10.17.82.134
+web-01.dev-icn-vtr=10.17.47.52
+gw-01.az01-icn-own=10.112.0.1
+k3s-01.az01-icn-own=10.112.0.10
+storage-01.az01-icn-own=10.112.0.11
 "
 
 host_names() { echo "$HOSTS" | sed '/^$/d' | cut -d= -f1 | tr '\n' ' '; }
@@ -84,7 +90,7 @@ usage() {
 # A partial identity that reads like a whole one is the failure this column exists to stop.
 status() {
   for name in $(host_names); do
-    printf '%-16s ' "$name"
+    printf '%-24s ' "$name"
     ssh -o ConnectTimeout=6 -o BatchMode=yes "${SSH_USER}@$(host_addr "$name")" '
       sep=""
       for u in heliopause-relay heliopause-agent; do
@@ -144,6 +150,17 @@ set -euo pipefail
 paths="$HELIOPAUSE_DEPLOY_PATHS"
 stamp="$HELIOPAUSE_DEPLOY_STAMP"
 unit="$HELIOPAUSE_DEPLOY_UNIT"
+# Before anything is touched. The install below is `rsync --delete`, and a host without rsync used to
+# get its backups taken and the tarball unpacked before `set -e` stopped it at the install — a half
+# step that changes nothing but leaves the operator to work out that nothing changed. Measured
+# 2026-10-07: none of the three az01 hosts has rsync.
+# Asked of the sudo environment, because that is where the install runs: secure_path is not the user's
+# PATH. The tarball scp put in /tmp is removed on the way out; /opt is untouched.
+sudo sh -c 'command -v rsync' >/dev/null 2>&1 || {
+  rm -f /tmp/hp-code.tgz
+  echo "  FAILED: rsync is not installed on this host — /opt/heliopause was not changed" >&2
+  exit 1
+}
 # A path may be shipped here for the first time — `packages/i18n` was, when the relay grew a shared
 # package it had never needed before. Backing it up would `cp` a source that is not there yet and
 # `set -e` would abort the whole deploy; a path with no prior version simply has no backup to make.
@@ -194,8 +211,8 @@ EOS
 # Do not use `--all` for a protocol change. The header explains why a schema bump wants a human
 # looking at the fleet between hosts; this mode is for the ordinary case, where the code changed and
 # the protocol did not.
-RELAY_ORDER="gw-01.util gw-01.prod gw-01.dev"
-AGENT_ORDER="k3s-01.dev gw-01.dev gw-01.prod gw-01.util mailer-01.dev mailer-02.dev mailer-03.dev web-01.dev"
+RELAY_ORDER="gw-01.util-icn-vtr gw-01.prod-icn-vtr gw-01.dev-icn-vtr gw-01.az01-icn-own"
+AGENT_ORDER="k3s-01.dev-icn-vtr gw-01.dev-icn-vtr gw-01.prod-icn-vtr gw-01.util-icn-vtr mailer-01.dev-icn-vtr mailer-02.dev-icn-vtr mailer-03.dev-icn-vtr web-01.dev-icn-vtr k3s-01.az01-icn-own gw-01.az01-icn-own storage-01.az01-icn-own"
 
 deploy_all() {
   for name in $RELAY_ORDER; do deploy relay "$name"; done
