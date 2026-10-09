@@ -25,13 +25,16 @@
     writeHeaders,
     type PrStatus,
   } from "./write";
+  import { previewUrl, readPreviewReply, ruleLine, type PreviewHost } from "./preview";
 
   const prefs = chromePrefs();
   const who = whoQuery();
   const write = writeAsk();
 
-  let { edit, showRules, showFiles }: {
+  let { edit, site = "", showRules, showFiles }: {
     edit: PolicyEdit;
+    /** The VPC on screen; empty is the single-site case. The preview asks about this one. */
+    site?: string;
     showRules: boolean;
     showFiles: boolean;
   } = $props();
@@ -160,6 +163,36 @@
       return;
     }
     void save(edit.path, fallback);
+  }
+
+  // ## What an unsaved edit would change — a preview, not a gate
+  //
+  // Sends the rule table as it stands to the renderer, which evaluates it in a throwaway copy. Saving
+  // does not wait for it and does not read it. Only the JSON rule file can be previewed; the renderer
+  // refuses code.
+  let preview = $state<PreviewHost[] | null>(null);
+  let previewError = $state("");
+
+  async function runPreview(): Promise<void> {
+    const content = doc ? writePolicyDoc(doc) : fallback;
+    busy = "preview";
+    previewError = "";
+    try {
+      const res = await fetch(previewUrl(site), {
+        method: "POST",
+        credentials: "same-origin",
+        headers: writeHeaders(csrf()),
+        body: JSON.stringify({ path: edit.path, content }),
+      });
+      const reply = readPreviewReply(await res.json());
+      if (!reply.ok) throw new Error(reply.reason);
+      preview = reply.changes;
+    } catch (e) {
+      preview = null;
+      previewError = e instanceof Error ? e.message : String(e);
+    } finally {
+      busy = "";
+    }
   }
 
   function saveFile(path: string): void {
@@ -326,6 +359,35 @@
         <span class="dim">{t(prefs.lang, "m.noMergeNoPublish")}</span>
       {/if}
     </p>
+    {#if showRules}
+      <p class="act">
+        <button type="button" disabled={busy !== ""} onclick={() => void runPreview()}>{t(prefs.lang, "preview.run")}</button>
+        <span class="dim">{t(prefs.lang, "preview.notGate")}</span>
+      </p>
+      {#if previewError}
+        <p class="banner bad">{previewError}</p>
+      {:else if preview !== null}
+        <div>
+          {#if preview.length === 0}
+            <p class="dim">{t(prefs.lang, "preview.none")}</p>
+          {/if}
+          {#each preview as h (h.host)}
+            <p class="mono">{h.host}</p>
+            {#if h.inputPolicy}
+              <p class="mono">{t(prefs.lang, "preview.defaultPolicy", {
+                before: h.inputPolicy.before ?? t(prefs.lang, "preview.absent"),
+                after: h.inputPolicy.after ?? t(prefs.lang, "preview.absent"),
+              })}</p>
+            {/if}
+            <ul class="mono">
+              {#each h.added as r, i (`a${i}`)}<li>+ {t(prefs.lang, "preview.added")} · {ruleLine(r)}</li>{/each}
+              {#each h.removed as r, i (`r${i}`)}<li>− {t(prefs.lang, "preview.removed")} · {ruleLine(r)}</li>{/each}
+            </ul>
+          {/each}
+          <p class="dim">{t(prefs.lang, "preview.limits")}</p>
+        </div>
+      {/if}
+    {/if}
     {#if lastCommit}
       <p class="banner ok">
         {t(prefs.lang, "m.committedBanner", { branch, commit: lastCommit.slice(0, 7) })}
