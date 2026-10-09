@@ -41,12 +41,12 @@
 // share a network namespace, which is why this is a separate Deployment rather than a sidecar —
 // a sidecar cannot be given a different network identity from the process it is isolating.
 
-import { createServer } from "node:http";
+import { createServer, type IncomingMessage } from "node:http";
 import { Worker } from "node:worker_threads";
 import { evaluateWithLifecycle } from "../src/policy-eval-lifecycle.ts";
 import { existsSync, opendirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { timingSafeEqual } from "node:crypto";
 import { oneLine } from "../src/log-scrub.ts";
 import { boundedInteger, ENV_BOUNDS, parsePolicySites } from "../src/env-spec.ts";
@@ -55,6 +55,9 @@ import { armedReasons } from "../src/policy-render-guard.ts";
 import { assemblePolicySource, parsePolicySource, type PolicySource } from "../src/policy-source.ts";
 import { policyHead, type ScreenSite } from "../src/policy-screen.ts";
 import { installCliLanguage } from "../src/operator-i18n.ts";
+import { makePreviewCopy, MAX_PREVIEW_BYTES, PreviewRefused } from "../src/policy-preview.ts";
+import { diffRules, siteRules } from "../src/preview-diff.ts";
+import { readBoundedNodeBody, BodyTooLargeError } from "../src/bounded-body.ts";
 
 installCliLanguage();
 
@@ -1583,8 +1586,76 @@ const server = createServer((req, res) => {
     return;
   }
 
-  return send(404, { error: "this service answers GET /source, GET /sites, GET /healthz and GET /readyz" });
+  // ## A preview of an edit, evaluated once and thrown away
+  //
+  // The body is one editable JSON file, edited. The site's directory is copied to a temporary
+  // directory with that file replaced, evaluated in a worker, and deleted; nothing is cached. The
+  // answer is, per host, the input rules the edit adds and removes (`src/preview-diff.ts`). It
+  // refuses nothing about the edit itself — saving is unaffected by what this says.
+  //
+  // One at a time: a second request while one runs gets 429.
+  //
+  // @see src/policy-render-service.test.ts "previews an edit without touching the checkout"
+  if (req.method === "POST" && url.pathname === "/preview") {
+    if (!bearerOk(req.headers.authorization)) return send(401, { error: "bad or missing bearer" });
+    const asked = url.searchParams.get("site");
+    const site = asked === null ? (sites.length === 1 ? sites[0] : undefined) : sites.find((s) => s.name === asked);
+    if (!site) return send(404, { error: "name a site this renderer serves with ?site=" });
+    if (previewRunning) return send(429, { error: "a preview is already running" });
+    previewRunning = true;
+    void runPreview(req, site).then(
+      (body) => raw(200, body),
+      (e: unknown) => {
+        if (e instanceof PreviewRefused || e instanceof BodyTooLargeError) {
+          return send(400, { error: oneLine(reasonOf(e)) });
+        }
+        const why = reasonOf(e);
+        log(`preview failed: ${why}`);
+        send(503, { error: `the edit could not be evaluated: ${oneLine(why)}` });
+      },
+    ).finally(() => { previewRunning = false; });
+    return;
+  }
+
+  return send(404, { error: "this service answers GET /source, GET /sites, GET /healthz, GET /readyz and POST /preview" });
 });
+
+let previewRunning = false;
+
+/** The directory holding this process's `src` and `bin`, which a preview copy links to. */
+const CODE_ROOT = fileURLToPath(new URL("..", import.meta.url));
+
+async function runPreview(req: IncomingMessage, site: { name: string | null; path: string }): Promise<string> {
+  const raw = await readBoundedNodeBody(req, MAX_PREVIEW_BYTES + 64 * 1024, "the preview request");
+  let body: unknown;
+  try {
+    body = parseWire(raw.toString("utf8"));
+  } catch {
+    throw new PreviewRefused("expected a JSON body");
+  }
+  const { path, content } = (body ?? {}) as { path?: unknown; content?: unknown };
+  if (typeof path !== "string" || typeof content !== "string") {
+    throw new PreviewRefused("expected { path, content } as strings");
+  }
+  const current = parseWire(await evaluateWithin(site, SOURCE_SITE_BUDGET_MS)) as { site: ScreenSite; services: Record<string, unknown> };
+  const copy = makePreviewCopy({ sitePath: site.path, path, content, allowPaths, codeRoot: CODE_ROOT });
+  log(`preview: copied ${copy.files} files, ${Math.round(copy.bytes / 1024)} KiB in ${Math.round(copy.ms)} ms`);
+  let edited: { site: ScreenSite; services: Record<string, unknown> };
+  try {
+    edited = parseWire(await evaluateInWorker({ sitePath: copy.sitePath, label: `${site.name ?? label} (preview)` })) as typeof edited;
+  } finally {
+    copy.remove();
+  }
+  const before = siteRules(withResolver(current));
+  const after = siteRules(withResolver(edited));
+  return writeWire({ site: site.name, changes: diffRules(before, after) });
+}
+
+/** The worker's half carries the resolver as a table; planning wants it as a function again. */
+function withResolver(half: { site: ScreenSite; services?: Record<string, unknown> }): ScreenSite {
+  const table = new Map(Object.entries(half.services ?? {}));
+  return { ...half.site, resolveService: (ref: string) => (table.get(ref) ?? null) as never };
+}
 
 // ## Is each module the site it is declared as? Checked before anything is served.
 //
@@ -1715,7 +1786,7 @@ server.listen(port, hostname, () => {
   log(`listening on ${hostname}:${at} — serving ${serving}, editable ${allowPaths.join(", ") || "(nothing)"}`);
   // `/readyz` joined this set in the commit that gated it, and this line did not follow. It is what
   // an operator reads in `kubectl logs` to learn what needs a token.
-  log("bearer required on GET /source, GET /sites and GET /readyz");
+  log("bearer required on GET /source, GET /sites, GET /readyz and POST /preview");
   // Printed because a knob nobody can observe is a knob nobody can trust. `SOURCE_SITE_BUDGET_MS` has
   // to sit under the manager's own `HELIOPAUSE_RELAY_TIMEOUT_MS` and this process cannot read that
   // variable — it lives in another Deployment — so the operator is the one holding the relationship.

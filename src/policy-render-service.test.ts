@@ -27,7 +27,8 @@ import { spawn, type ChildProcessByStdio } from "node:child_process";
 import { connect } from "node:net";
 import type { Readable } from "node:stream";
 import {
-  chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync,
+  chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -2718,6 +2719,109 @@ export const site = { cfg: {}, hosts: [{ id: "h1.beta", stage: "canary", items: 
       utimesSync(join(dir, "helper.json"), later, later);
       const second = await (await fetchAt(started.port, "/source?site=alpha")).text();
       assert.match(second, /"notes":"second"/, "the imported file was served from an earlier evaluation");
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+});
+
+describe("render-diff preview", () => {
+  function previewSite(): { dir: string; site: string } {
+    const root = mkdtempSync(join(tmpdir(), "hp-policy-preview-"));
+    mkdirSync(join(root, "src"));
+    const dir = join(root, "policy");
+    mkdirSync(dir);
+    writeFileSync(join(dir, "policies.json"), JSON.stringify({ sources: ["10.1.0.0/16"] }));
+    const site = join(dir, "alpha.ts");
+    writeFileSync(site, `import P from "./policies.json" with { type: "json" };
+export const site = {
+  cfg: {
+    tableName: "heliopause", internalSupernet: "10.0.0.0/8",
+    hookPolicy: { input: "drop", output: "accept" },
+    baseline: [{ desc: "ssh", proto: "tcp", ports: "22", srcCidrs: ["10.9.0.0/16"] }],
+  },
+  hosts: [{ id: "h1.alpha", stage: "canary", items: [{
+    policy: { id: "web", name: "web", src: { kind: "cidr", value: "10.0.0.0/8" }, dst: { kind: "host", value: "h1.alpha" },
+              proto: "tcp", ports: "443", action: "allow", denyMode: "drop", priority: 100, enabled: true, notes: "" },
+    srcCidrs: P.sources, dstCidrs: ["10.2.0.7/32"],
+  }] }],
+};\n`);
+    return { dir, site };
+  }
+  const preview = (port: number, body: unknown) =>
+    fetchAt(port, "/preview?site=alpha", {
+      method: "POST",
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(20_000),
+    });
+  /**
+   * Preview copies in the temporary directory. Other tests' fixtures use other prefixes.
+   *
+   * The renderer is started with this process's `TMPDIR` (`PREVIEW_ENV`) — `start()` passes only a
+   * fixed environment, so without it the child used `/tmp` while this read `os.tmpdir()`, and a copy
+   * the renderer left behind was invisible here. Measured: removing `copy.remove()` stayed green.
+   */
+  const previewCopies = (): string[] => readdirSync(tmpdir()).filter((n) => n.startsWith("hp-preview-"));
+  const PREVIEW_ENV = { TMPDIR: tmpdir() };
+
+  it("previews an edit without touching the checkout", { timeout: 60_000 }, async () => {
+    const { dir, site } = previewSite();
+    let started: Started | undefined;
+    try {
+      started = await start(dir, { ...MULTI(`alpha=${site}`), ...PREVIEW_ENV });
+      const res = await preview(started.port, {
+        path: "policies.json", content: JSON.stringify({ sources: ["10.0.0.0/8"] }),
+      });
+      assert.equal(res.status, 200);
+      const got = await res.json() as { changes: { host: string; added: unknown[]; removed: unknown[] }[] };
+      const rule = (sources: string[]) => ({
+        verdict: "accept", proto: "tcp", ports: "443", sources, destinations: ["10.2.0.7/32"], family: "ip",
+      });
+      assert.deepEqual(got.changes, [{ host: "h1.alpha", added: [rule(["10.0.0.0/8"])], removed: [rule(["10.1.0.0/16"])] }]);
+      assert.match(readFileSync(join(dir, "policies.json"), "utf8"), /10\.1\.0\.0\/16/, "the checkout was changed");
+      assert.match(started.output(), /preview: copied 2 files, \d+ KiB in \d+ ms/);
+      assert.deepEqual(previewCopies(), [], "the preview copy was left on disk");
+      // `/source` still serves the checkout, not the preview.
+      const source = await (await fetchAt(started.port, "/source?site=alpha")).text();
+      assert.match(source, /10\.1\.0\.0\/16/);
+      assert.doesNotMatch(source, /"10\.0\.0\.0\/8"\]/);
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a code file, a non-editable file and a body that is not JSON", { timeout: 60_000 }, async () => {
+    const { dir, site } = previewSite();
+    let started: Started | undefined;
+    try {
+      started = await start(dir, { ...MULTI(`alpha=${site}`), HELIOPAUSE_POLICY_ALLOW_PATHS: "policies.json,alpha.ts", ...PREVIEW_ENV });
+      assert.equal((await preview(started.port, { path: "alpha.ts", content: "export {}" })).status, 400);
+      assert.equal((await preview(started.port, { path: "other.json", content: "{}" })).status, 400);
+      assert.equal((await preview(started.port, { path: "policies.json", content: "nope" })).status, 400);
+      const unauthenticated = await fetch(`http://127.0.0.1:${started.port}/preview?site=alpha`, {
+        method: "POST", body: "{}", signal: AbortSignal.timeout(10_000),
+      });
+      assert.equal(unauthenticated.status, 401);
+      assert.deepEqual(previewCopies(), [], "a refused preview left a copy on disk");
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("runs one preview at a time and refuses the rest with 429", { timeout: 60_000 }, async () => {
+    const { dir, site } = previewSite();
+    let started: Started | undefined;
+    try {
+      started = await start(dir, { ...MULTI(`alpha=${site}`), ...PREVIEW_ENV });
+      const body = { path: "policies.json", content: JSON.stringify({ sources: ["10.0.0.0/8"] }) };
+      const statuses = (await Promise.all(Array.from({ length: 4 }, () => preview(started!.port, body))))
+        .map((r) => r.status).sort();
+      assert.equal(statuses.filter((s) => s === 200).length, 1, `statuses: ${statuses.join(",")}`);
+      assert.equal(statuses.filter((s) => s === 429).length, 3, `statuses: ${statuses.join(",")}`);
+      assert.equal((await preview(started.port, body)).status, 200, "the lock was not released");
     } finally {
       started?.stop();
       rmSync(join(dir, ".."), { recursive: true, force: true });

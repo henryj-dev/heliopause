@@ -54,6 +54,7 @@ import { join, resolve } from "node:path";
 import { createHash, createPublicKey, type KeyObject } from "node:crypto";
 import { peerCN, type FleetView } from "./relay.ts";
 import { readBoundedNodeBody, readBoundedText } from "./bounded-body.ts";
+import { MAX_PREVIEW_BYTES } from "./preview-limits.ts";
 import { buildId } from "./build-id.ts";
 
 import { authorizeUrl, endSessionUrl, exchange, nonce as randomNonce, pkce, Provider } from "./oidc.ts";
@@ -261,6 +262,7 @@ export const API_ROUTES: ReadonlySet<string> = new Set([
   "/policy/lookup",
   "/policy/where-used",
   "/policy/screen",
+  "/policy/preview",
   "/policy/edit",
   "/policy/propose",
   "/policy/pr",
@@ -2696,6 +2698,55 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         "cache-control": "no-store",
       });
       return void res.end();
+    }
+
+    // ## What an edit would change on each host, before it is saved
+    //
+    // Relayed to the renderer, which evaluates the edited file in a throwaway copy. Read-only: it
+    // commits nothing and gates nothing, and the save below behaves the same whatever this says.
+    // Writers only, because the edit it previews is one only a writer can save.
+    // @see src/manager-policy-preview.test.ts
+    if (req.method === "POST" && url.pathname === "/policy/preview") {
+      if (!opts.policySource) return send(res, 404, { error: "this deployment does not carry a policy repository" });
+      if (!opts.policyWrite) return send(res, 404, { error: "this console has no write credential" });
+      if (!mayWrite) return refuseWrite(res, who, url.pathname, principal.via);
+      const asked = url.searchParams.get("site");
+      if (asked !== null && !opts.relays.some((r) => r.name === asked)) {
+        return send(res, 400, { error: `unknown site ${JSON.stringify(asked)}` });
+      }
+      const site = asked ?? defaultSite();
+      let body: string;
+      try {
+        // The renderer's own ceiling for the edited file, plus room for the JSON around it.
+        body = await readBody(req, MAX_PREVIEW_BYTES + 64 * 1024);
+      } catch (e) {
+        return send(res, 400, { error: (e as Error).message });
+      }
+      const src = opts.policySource;
+      const at = new URL("preview", `${src.url.replace(/\/$/, "")}/`);
+      if (site !== undefined) at.searchParams.set("site", site);
+      try {
+        const answer = await (src.fetch ?? fetch)(at.toString(), {
+          method: "POST",
+          body,
+          signal: AbortSignal.timeout(timeoutMs),
+          headers: {
+            "content-type": "application/json",
+            ...(src.token ? { authorization: `Bearer ${src.token}` } : {}),
+          },
+        });
+        const text = await readBoundedText(answer, MAX_POLICY_SOURCE_BYTES, "the renderer");
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          return send(res, 502, { error: `the renderer returned ${answer.status} and not JSON` });
+        }
+        return send(res, answer.ok ? 200 : answer.status, parsed);
+      } catch (e) {
+        log(`policy preview failed: ${(e as Error).message}`, `정책 미리보기 실패: ${(e as Error).message}`);
+        return send(res, 502, { error: `the renderer could not be reached: ${(e as Error).message}` });
+      }
     }
 
     if (req.method === "POST" && (url.pathname === "/policy/edit" || url.pathname === "/policy/propose")) {
