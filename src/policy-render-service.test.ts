@@ -1238,7 +1238,7 @@ export const site = {
   });
 
   it("keeps its provenance check working when a module patches WeakSet", { timeout: 30_000 }, async () => {
-    // ⚠️ The comment below is the record measured before #134 (same-realm evaluation).
+    // ⚠️ This section is a pre-#134 record (same-realm evaluation).
     //
     // ## The set was unreachable; the lookup was not
     //
@@ -1788,6 +1788,10 @@ export const site = {
 
   // ## #126 — a replaced probe parser, and what the expectation should be
   //
+  // ⚠️ This section is a pre-#134 record. Measured 2026-10-09 with `POISONS_PROBE_PARSER` below
+  // verbatim: `3724e79` (before #134) answered beta 503 and alpha 503; the worker tree answers beta 200
+  // and alpha 200. Only `alpha` is asserted.
+  //
   // `readCoverageProbes` reads `coverage-*.json` with an **uncaptured** `JSON.parse`
   // (`src/policy-screen.ts:146`), so a module replacing the global chooses what a probe holds. A
   // `BigInt` survives collection — the row builder checks three string fields — and then the
@@ -1886,8 +1890,7 @@ export const site = {
   });
 
   it("survives a module that replaces the globals it will be described with", { timeout: 60_000 }, async () => {
-    // ⚠️ **The comments in this test are the record measured before #134** (same-realm evaluation). The
-    // assertions still run and pass on the worker tree.
+    // ⚠️ This section is a pre-#134 record (same-realm evaluation). The assertions pass on the worker tree.
     //
     // ## The value was read carefully and then handed to a constructor the module owned
     //

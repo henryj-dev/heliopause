@@ -79,6 +79,8 @@ const log = (m: string): void => console.log(`[policy-render] ${oneLine(m)}`);
 /**
  * A zone mismatch **this process** found, as opposed to one handed to it.
  *
+ * ⚠️ This section is a pre-#134 record (same-realm evaluation).
+ *
  * ## Class identity is not provenance, and `instanceof` was treated as if it were
  *
  * A policy module can `import { ZoneMismatchError } from "../src/site-zone.ts"` -- the exact spelling
@@ -114,12 +116,9 @@ const log = (m: string): void => console.log(`[policy-render] ${oneLine(m)}`);
  */
 const OUR_ZONE_MISMATCHES = new WeakSet<ZoneMismatchError>();
 
-// ⚠️ **From here to "The zone check had already passed", every paragraph is the record measured before
-// #134, when policy modules were evaluated in this realm.** The present tense below describes that
-// renderer. The current boundary is one worker per evaluation (`src/policy-eval-worker.ts`); see
-// src/policy-render-service.test.ts "stays up when a module breaks in a way no guard had named".
-
 // ## Bound before any policy module is imported
+//
+// ⚠️ This section is a pre-#134 record (same-realm evaluation).
 //
 // `foundHere` called `OUR_ZONE_MISMATCHES.has(...)`, which looks the method up on
 // `WeakSet.prototype` **at call time** — and a policy module runs in this realm, so
@@ -131,6 +130,8 @@ const zoneMismatchIsOurs = WeakSet.prototype.has.bind(OUR_ZONE_MISMATCHES) as (e
 const rememberOurZoneMismatch = WeakSet.prototype.add.bind(OUR_ZONE_MISMATCHES) as (e: object) => unknown;
 
 // ## The value was guarded; the constructor used to describe it was not
+//
+// ⚠️ This section is a pre-#134 record (same-realm evaluation).
 //
 // A policy module is evaluated by `import()` in **this process's own realm** — the same `globalThis` —
 // so `globalThis.Error = function () { throw 1; };` is two tokens that replace the constructor every
@@ -154,6 +155,8 @@ const rememberOurZoneMismatch = WeakSet.prototype.add.bind(OUR_ZONE_MISMATCHES) 
 const RealError = Error;
 
 // ## A module's callback outlives the handler that was watching its import
+//
+// ⚠️ This section is a pre-#134 record (same-realm evaluation).
 //
 // `setTimeout(() => { throw new Error("late") }, 500)` at a policy module's top level resolves its
 // import cleanly, passes startup verification, answers `/healthz` 200 — and then throws with nothing
@@ -181,6 +184,8 @@ for (const signal of ["uncaughtException", "unhandledRejection"] as const) {
   });
 }
 
+// ⚠️ This section is a pre-#134 record (same-realm evaluation).
+//
 // The same capture, for the same reason, on the coercion two shared paths use. `globalThis.String =
 // function () { throw 1; };` in one module made **another site** answer 503: `sourceStamp` and
 // `hostIds` run for every site, so a module that replaces `String` un-serves the modules it does not
@@ -192,6 +197,8 @@ for (const signal of ["uncaughtException", "unhandledRejection"] as const) {
 // `boundedInteger`'s runs before the first import, where nothing has been replaced yet.
 const toText = String;
 
+// ⚠️ This section is a pre-#134 record (same-realm evaluation).
+//
 // And the rest of what a shared path resolves at call time. `evaluateWithin` arms a timer for **every**
 // site, so `globalThis.setTimeout = function () { throw 1; };` in one module throws inside the
 // `new Promise` executor of another site's evaluation — measured, alpha answered 503 because beta was
@@ -206,6 +213,8 @@ const readClock = Date.now;
 const toJson = JSON.stringify;
 // ## The wire pair, captured for the same reason and with the same limit
 //
+// ⚠️ This section is a pre-#134 record (same-realm evaluation).
+//
 // `evaluated` serialises the outgoing `PolicySource` and its caller parses it back. Both functions
 // are resolved here, before the first `import()`, because a policy module runs in this realm and a
 // call-time lookup would be the module's function — and the value being serialised is the one thing
@@ -219,6 +228,8 @@ const writeWire = JSON.stringify;
 const parseWire = JSON.parse;
 
 // ## ⚠️ What this does **not** do, stated because leaving it implied is the same silence
+//
+// ⚠️ This section is a pre-#134 record (same-realm evaluation).
 //
 // The substitutions above are the call sites that were *measured* to reach another site or the
 // process. Nothing stops the next edit from adding a bare `JSON.stringify(`, `String(` or
@@ -1205,8 +1216,8 @@ let readyMemo: {
  * explicitly *not*. The budget still does what it says for a module that hangs **asynchronously**,
  * which is the common case and the one the test covers.
  *
- * ⚠️ The above is pre-#134. @see src/policy-render-service.test.ts "a module that spins forever fails
- * only its own site"
+ * ⚠️ This section is a pre-#134 record (same-realm evaluation). @see src/policy-render-service.test.ts
+ * "a module that spins forever fails only its own site"
  *
  * @see src/policy-render-service.test.ts "answers even when a site module never settles"
  *
@@ -1267,9 +1278,9 @@ function evaluateWithin(
  * poison, so `/readyz` handles a rejection as well as an answer; without that it was exit 1 on the
  * readiness probe, i.e. on a schedule.
  *
- * ⚠️ That `then` paragraph and the two in-body comments below on it are pre-#134. @see
- * src/policy-render-service.test.ts "stays up when a module breaks in a way no guard had named" —
- * shape `poisonedThen` asserts `/readyz` (#125).
+ * ⚠️ What this function's comments say about a poisoned `then` is a pre-#134 record (same-realm
+ * evaluation). @see src/policy-render-service.test.ts "stays up when a module breaks in a way no guard
+ * had named" — shape `poisonedThen` asserts `/readyz` (#125).
  *
  * ## The window runs from when the answer *settled*, not from when it started
  *
@@ -1337,8 +1348,7 @@ function bearerOk(header: string | undefined): boolean {
 
 // ## Serialising is not safe either, and capturing `JSON.stringify` did not make it safe
 //
-// ⚠️ This paragraph and the next are the record measured before #134 (same-realm evaluation); see the
-// note above `zoneMismatchIsOurs`.
+// ⚠️ This section is a pre-#134 record (same-realm evaluation).
 //
 // `JSON.stringify` calls a **`toJSON` method it finds on the value**, inherited included. So
 // `Object.defineProperty(Object.prototype, "toJSON", { value() { throw … } })` in a policy module
@@ -1355,6 +1365,8 @@ function bearerOk(header: string | undefined): boolean {
 // @see src/policy-render-service.test.ts "answers /healthz when the module poisoned serialisation"
 const HEALTHZ_BODY = '{"ok":true}';
 // ## The fallback carries `faults` too, because a field that vanishes is read as a zero
+//
+// ⚠️ This section is a pre-#134 record (same-realm evaluation).
 //
 // This was a constant without it. So under a poisoned `toJSON` — the one condition that reaches this
 // body — `/readyz` answered with no `faults` key at all, and an operator checking that field sees
