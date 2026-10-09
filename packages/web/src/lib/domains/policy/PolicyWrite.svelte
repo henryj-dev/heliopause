@@ -25,13 +25,18 @@
     writeHeaders,
     type PrStatus,
   } from "./write";
+  import { previewUrl, previewView, readPreviewReply, ruleLine, type PreviewResult } from "./preview";
 
   const prefs = chromePrefs();
   const who = whoQuery();
   const write = writeAsk();
 
-  let { edit, showRules, showFiles }: {
+  let { edit, site = "", siteLoading = false, showRules, showFiles }: {
     edit: PolicyEdit;
+    /** The VPC whose answer is on screen; empty is the single-site case. The preview asks about this one. */
+    site?: string;
+    /** Another site is being loaded, so what is on screen may be about to change. Preview waits. */
+    siteLoading?: boolean;
     showRules: boolean;
     showFiles: boolean;
   } = $props();
@@ -160,6 +165,41 @@
       return;
     }
     void save(edit.path, fallback);
+  }
+
+  // ## What an unsaved edit would change — a preview, not a gate
+  //
+  // Sends the rule table as it stands to the renderer, which evaluates it in a throwaway copy. Saving
+  // does not wait for it and does not read it. Only the JSON rule file can be previewed; the renderer
+  // refuses code.
+  //
+  // Its own busy flag: a slow preview must not disable save, propose or merge.
+  let previewResult = $state<PreviewResult | null>(null);
+  let previewError = $state("");
+  let previewBusy = $state(false);
+  const draftContent = $derived(doc ? writePolicyDoc(doc) : fallback);
+  const shownPreview = $derived(previewView(previewResult, { site, content: draftContent }));
+
+  async function runPreview(): Promise<void> {
+    const sent = { site, content: draftContent };
+    previewBusy = true;
+    previewError = "";
+    previewResult = null;
+    try {
+      const res = await fetch(previewUrl(sent.site), {
+        method: "POST",
+        credentials: "same-origin",
+        headers: writeHeaders(csrf()),
+        body: JSON.stringify({ path: edit.path, content: sent.content }),
+      });
+      const reply = readPreviewReply(await res.json());
+      if (!reply.ok) throw new Error(reply.reason);
+      previewResult = { ...sent, changes: reply.changes };
+    } catch (e) {
+      previewError = e instanceof Error ? e.message : String(e);
+    } finally {
+      previewBusy = false;
+    }
   }
 
   function saveFile(path: string): void {
@@ -326,6 +366,39 @@
         <span class="dim">{t(prefs.lang, "m.noMergeNoPublish")}</span>
       {/if}
     </p>
+    {#if showRules}
+      <p class="act">
+        <button type="button" disabled={previewBusy || siteLoading} onclick={() => void runPreview()}>
+          {t(prefs.lang, "preview.run")}
+        </button>
+        <span class="dim">{t(prefs.lang, "preview.notGate")}</span>
+      </p>
+      {#if previewError}
+        <p class="banner bad">{previewError}</p>
+      {:else if shownPreview.kind === "stale"}
+        <p class="banner warn">{t(prefs.lang, "preview.stale")}</p>
+      {:else if shownPreview.kind === "shown"}
+        <div>
+          {#if shownPreview.changes.length === 0}
+            <p class="dim">{t(prefs.lang, "preview.none")}</p>
+          {/if}
+          {#each shownPreview.changes as h (h.host)}
+            <p class="mono">{h.host}</p>
+            {#if h.inputPolicy}
+              <p class="mono">{t(prefs.lang, "preview.defaultPolicy", {
+                before: h.inputPolicy.before ?? t(prefs.lang, "preview.absent"),
+                after: h.inputPolicy.after ?? t(prefs.lang, "preview.absent"),
+              })}</p>
+            {/if}
+            <ul class="mono">
+              {#each h.added as r, i (`a${i}`)}<li>+ {t(prefs.lang, "preview.added")} · {ruleLine(r)}</li>{/each}
+              {#each h.removed as r, i (`r${i}`)}<li>− {t(prefs.lang, "preview.removed")} · {ruleLine(r)}</li>{/each}
+            </ul>
+          {/each}
+          <p class="dim">{t(prefs.lang, "preview.limits")}</p>
+        </div>
+      {/if}
+    {/if}
     {#if lastCommit}
       <p class="banner ok">
         {t(prefs.lang, "m.committedBanner", { branch, commit: lastCommit.slice(0, 7) })}

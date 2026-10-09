@@ -777,6 +777,27 @@ export const MESSAGES = {
   "write.noPrNumber": { en: "the manager did not number the pull request", ko: "매니저가 PR 번호를 말하지 않았다" },
   "write.noPrUrl": { en: "the manager did not give the pull request URL", ko: "매니저가 PR 주소를 주지 않았다" },
   "rule.save": { en: "save to branch", ko: "브랜치에 저장" },
+  "preview.run": { en: "preview what this changes", ko: "무엇이 바뀌는지 미리 보기" },
+  "preview.notGate": {
+    en: "a preview only — saving is not affected by what it shows",
+    ko: "미리 보기일 뿐이다 — 저장은 이 결과와 무관하다",
+  },
+  "preview.none": { en: "no host's input rules change.", ko: "어느 호스트의 입력 규칙도 바뀌지 않는다." },
+  "preview.stale": {
+    en: "the table or the VPC changed after this preview was asked for — run it again.",
+    ko: "미리 보기를 요청한 뒤 표나 VPC 가 바뀌었다 — 다시 실행할 것.",
+  },
+  "preview.added": { en: "added", ko: "더해짐" },
+  "preview.removed": { en: "removed", ko: "빠짐" },
+  "preview.defaultPolicy": {
+    en: "default for unmatched inbound: {before} → {after}",
+    ko: "걸리지 않는 인바운드의 기본 처리: {before} → {after}",
+  },
+  "preview.absent": { en: "(no host)", ko: "(호스트 없음)" },
+  "preview.limits": {
+    en: "Not shown: which addresses end up reachable, reorder-only edits, output and forward chains.",
+    ko: "보이지 않는 것: 결국 어느 주소가 열리는지, 순서만 바꾸는 편집, 출력·포워드 체인.",
+  },
   "rule.saveFirst": { en: "save first — a pull request needs a branch.", ko: "먼저 저장하라 — PR 에는 브랜치가 필요하다." },
   "rule.saveBeforePropose": { en: "unsaved changes — save before proposing.", ko: "저장 안 된 변경이 있다 — 제안 전에 저장하라." },
   "rule.saveBeforeProposeIn": {

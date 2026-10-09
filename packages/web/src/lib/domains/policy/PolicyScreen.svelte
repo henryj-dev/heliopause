@@ -156,7 +156,7 @@
   {/snippet}
 
   {#if view.edit}
-    <PolicyWrite edit={view.edit} showRules={showing("rules")} showFiles={showing("files")} />
+    <PolicyWrite edit={view.edit} site={policy.loaded} siteLoading={policy.pending} showRules={showing("rules")} showFiles={showing("files")} />
   {/if}
 
   {#if showing("baseline") && view.baseline.length > 0}

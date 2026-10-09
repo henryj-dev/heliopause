@@ -1599,7 +1599,10 @@ const server = createServer((req, res) => {
   if (req.method === "POST" && url.pathname === "/preview") {
     if (!bearerOk(req.headers.authorization)) return send(401, { error: "bad or missing bearer" });
     const asked = url.searchParams.get("site");
-    const site = asked === null ? (sites.length === 1 ? sites[0] : undefined) : sites.find((s) => s.name === asked);
+    // One unnamed site answers any `?site=`, for the reason `/source` gives above.
+    const site = sites.length === 1 && (asked === null || sites[0]!.name === null)
+      ? sites[0]
+      : sites.find((s) => s.name === asked);
     if (!site) return send(404, { error: "name a site this renderer serves with ?site=" });
     if (previewRunning) return send(429, { error: "a preview is already running" });
     previewRunning = true;
