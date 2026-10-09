@@ -104,6 +104,21 @@ describe("render-diff preview", () => {
       assert.ok(diffRules(siteRules(withPolicy("drop")), siteRules(withPolicy("accept"))).length > 0);
     });
 
+    it("adding a host shows its default policy", () => {
+      const withHost = (input: "drop" | "accept"): ScreenSite => {
+        const s = site([]) as unknown as { cfg: { hookPolicy: { input: string } } };
+        return { ...s, cfg: { ...s.cfg, hookPolicy: { input, output: "accept" } } } as unknown as ScreenSite;
+      };
+      const asAccept = diffRules([], siteRules(withHost("accept")));
+      const asDrop = diffRules([], siteRules(withHost("drop")));
+      assert.notDeepEqual(asAccept, asDrop, "an added accepting host and an added dropping host look the same");
+    });
+
+    it("adding a host with no rules and an accepting default", () => {
+      const bare = { cfg: {}, hosts: [{ id: "h1.alpha", stage: "canary", items: [] }] } as unknown as ScreenSite;
+      assert.ok(diffRules([], siteRules(bare)).length > 0, "the added host does not appear at all");
+    });
+
     it("adding an allow for every protocol, with no ports", () => {
       const base = allow("all", "", ["10.1.0.0/16"]);
       const any: InputItem = { ...base, policy: { ...base.policy, proto: "any", ports: "" } };

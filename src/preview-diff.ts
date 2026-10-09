@@ -42,8 +42,11 @@ export interface HostRules {
 
 export interface HostDiff {
   host: string;
-  /** Present only when the edit changes the input chain's default verdict. */
-  inputPolicy?: { before: string; after: string };
+  /**
+   * Present when the edit changes the input chain's default verdict, and always when the host is
+   * added or removed — `null` is the side the host is not on.
+   */
+  inputPolicy?: { before: string | null; after: string | null };
   added: InputRule[];
   removed: InputRule[];
 }
@@ -137,11 +140,12 @@ export function diffRules(current: readonly HostRules[], edited: readonly HostRu
       [...x].flatMap(([k, { rule, n }]) => Array(Math.max(0, n - (y.get(k)?.n ?? 0))).fill(rule) as InputRule[]);
     const added = surplus(a, b);
     const removed = surplus(b, a);
-    const policyChanged = hb && ha && hb.inputPolicy !== ha.inputPolicy;
-    if (added.length || removed.length || policyChanged) {
+    const policyBefore = hb?.inputPolicy ?? null;
+    const policyAfter = ha?.inputPolicy ?? null;
+    if (added.length || removed.length || policyBefore !== policyAfter) {
       out.push({
         host,
-        ...(policyChanged ? { inputPolicy: { before: hb.inputPolicy, after: ha.inputPolicy } } : {}),
+        ...(policyBefore !== policyAfter ? { inputPolicy: { before: policyBefore, after: policyAfter } } : {}),
         added,
         removed,
       });
