@@ -1238,6 +1238,8 @@ export const site = {
   });
 
   it("keeps its provenance check working when a module patches WeakSet", { timeout: 30_000 }, async () => {
+    // ⚠️ This section is a pre-#134 record (same-realm evaluation).
+    //
     // ## The set was unreachable; the lookup was not
     //
     // `foundHere` called `OUR_ZONE_MISMATCHES.has(...)`, which resolves `has` on `WeakSet.prototype`
@@ -1678,7 +1680,8 @@ export const site = {
         // ⚠️ **`/source`, not every route.** `readiness()` still resolves a plain object, so
         // `/readyz` goes 503 under this same module — the poisoning is closed on this path and open
         // on that one. An earlier version of this comment and of AGENTS.md said it was closed, full
-        // stop; independent review reproduced the `/readyz` half.
+        // stop; independent review reproduced the `/readyz` half. (That was before #134; the
+        // `/readyz` half is now asserted below — #125.)
         //
         // **Measured, not reasoned.** Reverting just that one line to resolve an object
         // (`resolve({ wire } as unknown as string)`) turns this back:
@@ -1688,7 +1691,8 @@ export const site = {
         //
         // ⚠️ `poisonedToJSON` above keeps `alpha: 503`, and the difference is the point: `toJSON` is
         // called **by the serialisation itself**, so moving to bytes cannot close it. A byte boundary
-        // closes the operations that read a value; it does not close the one that writes it.
+        // closes the operations that read a value; it does not close the one that writes it. (That
+        // was at #124; the row now says `alpha: 200` — see its own comment.)
         name: "poisonedThen",
         body: 'Object.defineProperty(Object.prototype, "then", { get() { throw new Error("broken then"); }, configurable: true });\nthrow new Error("bad beta");\n',
         beta: 503, alpha: 200,
@@ -1760,9 +1764,20 @@ export const site = {
         // It now stays in beta's worker, so readiness serialises normally and must count the outage.
         if (shape.name === "poisonedToJSON") {
           assert.equal(ready.error, undefined, `${shape.name}: the poison reached the renderer's own serialiser`);
+          assert.equal((ready as { serving?: number }).serving, 1, `${shape.name}: readiness did not count alpha`);
         }
         if (shape.name === "lateThrowFromModuleTimer") {
           assert.ok((ready.faults ?? 0) > 0, `${shape.name}: the fault was swallowed silently`);
+        }
+        // ## `/readyz` under a poisoned `then` (#125)
+        //
+        // Measured on `3724e79` (the commit before #134): `/readyz` answered 503 "readiness could not be
+        // computed" here while `/source?site=alpha` answered 200. On the worker tree it answers 200 with
+        // `serving: 1`. Nothing asserted it until #125 was re-measured. Reverting `evaluateInWorker` to an
+        // in-process `import()` fails this at `poisonedThen: readiness could not be computed`.
+        if (shape.name === "poisonedThen") {
+          assert.equal(ready.error, undefined, `${shape.name}: readiness could not be computed`);
+          assert.equal((ready as { serving?: number }).serving, 1, `${shape.name}: readiness did not count alpha`);
         }
       } finally {
         started?.stop();
@@ -1772,6 +1787,10 @@ export const site = {
   });
 
   // ## #126 — a replaced probe parser, and what the expectation should be
+  //
+  // ⚠️ This section is a pre-#134 record. Measured 2026-10-09 with `POISONS_PROBE_PARSER` below
+  // verbatim: `3724e79` (before #134) answered beta 503 and alpha 503; the worker tree answers beta 200
+  // and alpha 200. Only `alpha` is asserted.
   //
   // `readCoverageProbes` reads `coverage-*.json` with an **uncaptured** `JSON.parse`
   // (`src/policy-screen.ts:146`), so a module replacing the global chooses what a probe holds. A
@@ -1871,6 +1890,8 @@ export const site = {
   });
 
   it("survives a module that replaces the globals it will be described with", { timeout: 60_000 }, async () => {
+    // ⚠️ This section is a pre-#134 record (same-realm evaluation). The assertions pass on the worker tree.
+    //
     // ## The value was read carefully and then handed to a constructor the module owned
     //
     // `import()` evaluates a policy module in this process's own realm, so a module can assign to
