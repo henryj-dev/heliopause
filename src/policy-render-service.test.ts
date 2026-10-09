@@ -1241,7 +1241,7 @@ export const site = {
     // ## The set was unreachable; the lookup was not
     //
     // `foundHere` called `OUR_ZONE_MISMATCHES.has(...)`, which resolves `has` on `WeakSet.prototype`
-    // at call time. A configuration module runs in this realm, so
+    // at call time. A configuration module ran in this realm until the worker (#134), so
     // `WeakSet.prototype.has = () => true` in one made every error look like one this process built —
     // turning an ordinary content fault into `exit 2` with a refusal nobody configured. Measured.
     //
@@ -1688,9 +1688,11 @@ export const site = {
         //     ✖ stays up when a module breaks in a way no guard had named
         //       AssertionError: poisonedThen: alpha — actual 503, expected 200
         //
-        // ⚠️ `poisonedToJSON` above keeps `alpha: 503`, and the difference is the point: `toJSON` is
-        // called **by the serialisation itself**, so moving to bytes cannot close it. A byte boundary
-        // closes the operations that read a value; it does not close the one that writes it.
+        // ⚠️ At the byte boundary (#124, before the worker) `poisonedToJSON` above kept `alpha: 503`,
+        // and the difference was the point: `toJSON` is called **by the serialisation itself**, so
+        // moving to bytes could not close it. A byte boundary closes the operations that read a value;
+        // it does not close the one that writes it. The worker (#134) closed it a different way — the
+        // poisoned prototype is beta's thread's — which is why that row now says `alpha: 200`.
         name: "poisonedThen",
         body: 'Object.defineProperty(Object.prototype, "then", { get() { throw new Error("broken then"); }, configurable: true });\nthrow new Error("bad beta");\n',
         beta: 503, alpha: 200,
@@ -1762,6 +1764,7 @@ export const site = {
         // It now stays in beta's worker, so readiness serialises normally and must count the outage.
         if (shape.name === "poisonedToJSON") {
           assert.equal(ready.error, undefined, `${shape.name}: the poison reached the renderer's own serialiser`);
+          assert.equal((ready as { serving?: number }).serving, 1, `${shape.name}: readiness did not count alpha`);
         }
         if (shape.name === "lateThrowFromModuleTimer") {
           assert.ok((ready.faults ?? 0) > 0, `${shape.name}: the fault was swallowed silently`);
@@ -1886,8 +1889,8 @@ export const site = {
   it("survives a module that replaces the globals it will be described with", { timeout: 60_000 }, async () => {
     // ## The value was read carefully and then handed to a constructor the module owned
     //
-    // `import()` evaluates a policy module in this process's own realm, so a module can assign to
-    // `globalThis.Error`. Every guard in the renderer reads the thrown value defensively and then builds
+    // Before the worker (#134), `import()` evaluated a policy module in this process's own realm, so a
+    // module could assign to `globalThis.Error`. Every guard in the renderer reads the thrown value defensively and then builds
     // an `Error` to carry it — which called the module's function. `asError` does that inside
     // `evaluateWithin`'s rejection handler, the one point every module failure funnels through, and a
     // throw in a rejection handler is an unhandled rejection: **exit 1 in the startup loop, before

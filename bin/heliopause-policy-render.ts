@@ -119,8 +119,8 @@ const OUR_ZONE_MISMATCHES = new WeakSet<ZoneMismatchError>();
 // ## Bound before any policy module is imported
 //
 // `foundHere` called `OUR_ZONE_MISMATCHES.has(...)`, which looks the method up on
-// `WeakSet.prototype` **at call time** — and a policy module runs in this realm, so
-// `WeakSet.prototype.has = () => true` in one makes every error look like ours. Measured: it turned an
+// `WeakSet.prototype` **at call time** — and, before the worker (#134), a policy module ran in this
+// realm, so `WeakSet.prototype.has = () => true` in one made every error look like ours. Measured: it turned an
 // ordinary content fault into `exit 2` with a refusal nobody configured. The set is unreachable to a
 // module, but the *lookup* was not; capturing it here, before the first `import()`, is what makes the
 // unreachability of the set the only thing that matters.
@@ -129,10 +129,12 @@ const rememberOurZoneMismatch = WeakSet.prototype.add.bind(OUR_ZONE_MISMATCHES) 
 
 // ## The value was guarded; the constructor used to describe it was not
 //
-// A policy module is evaluated by `import()` in **this process's own realm** — the same `globalThis` —
-// so `globalThis.Error = function () { throw 1; };` is two tokens that replace the constructor every
-// later `new Error(...)` resolves. The guards below all read the thrown value carefully and then build
-// an `Error` to carry it, which called the module's function instead.
+// Until the worker (#134), a policy module was evaluated by `import()` in **this process's own realm**
+// — the same `globalThis` — so `globalThis.Error = function () { throw 1; };` was two tokens that
+// replaced the constructor every later `new Error(...)` resolved. The guards below all read the thrown
+// value carefully and then built an `Error` to carry it, which called the module's function instead.
+// The module now runs in its worker's realm, so its `globalThis` is not this one; the capture below
+// predates that and is kept.
 //
 // Where that lands is the whole severity. `asError` runs inside `evaluateWithin`'s rejection handler,
 // the single point every module failure funnels through, and a throw inside a rejection handler is an
@@ -204,9 +206,9 @@ const toJson = JSON.stringify;
 // ## The wire pair, captured for the same reason and with the same limit
 //
 // `evaluated` serialises the outgoing `PolicySource` and its caller parses it back. Both functions
-// are resolved here, before the first `import()`, because a policy module runs in this realm and a
-// call-time lookup would be the module's function — and the value being serialised is the one thing
-// a module fully controls.
+// are resolved here, before the first `import()`, because when this was written a policy module ran
+// in this realm and a call-time lookup would have been the module's function. Since the worker
+// (#134) the module's realm is its thread's; the value parsed here is bytes the worker sent.
 //
 // ⚠️ Capturing the function is not the same as the operation being safe. `JSON.stringify` calls a
 // `toJSON` it finds **on the value**, inherited ones included, so a poisoned `Object.prototype` is
@@ -226,11 +228,14 @@ const parseWire = JSON.parse;
 // records three separate times that asserting on source text in this repo missed the thing it was
 // written for, and the test file's own preamble says the same. So this is a gap held open on purpose,
 // not an oversight — and it is a second reason the captures are a patch on measured paths rather than
-// a boundary. Evaluating policy in its own realm removes the whole class, including this.
+// a boundary. Evaluating policy in its own realm removes the whole class, including this — and since
+// the worker (#134) that is where it is evaluated, so a module's replaced intrinsic no longer reaches
+// the call sites in this file.
 //
-// Until then, the rule for anyone editing this file: an intrinsic resolved at call time on a path
-// more than one site reaches must use the captured name. Ask what the operation looks up **on the
-// value** as well — `JSON.stringify` calls an inherited `toJSON`, resolving a promise reads an
+// The rule written here for the in-process renderer still holds wherever a policy module and the code
+// that reads its output share a realm — which is now the worker (`src/policy-eval-worker.ts`): an
+// intrinsic resolved at call time must be the captured one, and ask what the operation looks up **on
+// the value** as well — `JSON.stringify` calls an inherited `toJSON`, resolving a promise reads an
 // inherited `then`, and capturing the global closes neither.
 
 // ## "The zone check had already passed" is no longer a fact this file carries
@@ -963,8 +968,11 @@ function accepted(
   //
   // 🔑 So the thing to carry is the **shape**, not the list: `JSON.stringify` asks the value — and
   // everything the value inherits from — for a `toJSON`, and every prototype in that chain is
-  // something a module in this realm can write. Any new entry here is another instance of that, not
-  // a new kind of problem. **The list stays open on purpose.**
+  // something a module in the same realm can write. Any new entry here is another instance of that,
+  // not a new kind of problem. **The list stays open on purpose.**
+  //
+  // Since the worker (#134) that realm is the worker's, not this process's: the three triggers above
+  // were measured in-process, and the serialisation that meets them now runs in the worker.
   //
   // ⚠️ **Only the first has a test here.** `poisonedToJSON` is a shape in the matrix below; the
   // replaced-parser case is measured (a global swap does reach `readCoverageProbes`, and the probe
@@ -1195,11 +1203,11 @@ let readyMemo: {
  * liveness probe kills the pod and the next one does the same. Measured against `origin/main` of
  * this repository; not separately checked in the running image.
  *
- * There is no fix for this in the same realm, which is why the sentence is a warning rather than a
- * TODO: interrupting the module means evaluating it somewhere with its own event loop — a
- * `worker_thread` or a `vm` context. That is also the boundary the intrinsic captures above are
- * explicitly *not*. The budget still does what it says for a module that hangs **asynchronously**,
- * which is the common case and the one the test covers.
+ * There was no fix for this in the same realm, which is why the sentence was a warning rather than a
+ * TODO: interrupting the module meant evaluating it somewhere with its own event loop. The worker
+ * (#134) is that: when the budget expires the lifecycle calls `terminate()` on the thread, so a
+ * synchronous spin now fails only its own site. @see src/policy-render-service.test.ts "a module that
+ * spins forever fails only its own site". The paragraph above is kept as the record of why.
  *
  * @see src/policy-render-service.test.ts "answers even when a site module never settles"
  *
@@ -1281,26 +1289,27 @@ function readiness(): Promise<{ serving: number; total: number }> {
   if (readyMemo && (readyMemo.settledAt === null || readClock() - readyMemo.settledAt < READY_MEMO_MS)) {
     return readyMemo.answer;
   }
-  // Not `Promise.all`: it resolves an array, and an array inherits a `then` a policy module can
-  // poison — see the startup loop. The per-site promises resolve booleans, which are primitives and
+  // Not `Promise.all`: it resolves an array, and an array inherits a `then` a policy module could
+  // poison while it ran in this realm — see the startup loop. The per-site promises resolve booleans, which are primitives and
   // run no thenable check at all, so only the collection had to change. Started before any is
   // awaited, as before.
   const started = sites.map((site) => evaluateWithin(site, READY_SITE_BUDGET_MS).then(() => true, () => false));
   const answer = (async () => {
     let serving = 0;
     for (const one of started) if (await one) serving += 1;
-    // A plain object, deliberately. Resolving it reads `.then`, which a module can poison, and a
-    // `__proto__: null` literal here would dodge that — but `/readyz` already answers the resulting
-    // rejection, so both together meant reverting either one left every test green. One guard, the
-    // general one, is worth more than two that hide each other from a mutation check.
+    // A plain object, deliberately. Resolving it reads `.then`, which a module could poison while it
+    // ran in this realm, and a `__proto__: null` literal here would have dodged that — but `/readyz`
+    // already answers the resulting rejection, so both together meant reverting either one left every
+    // test green. One guard, the general one, is worth more than two that hide each other from a
+    // mutation check. Since the worker the poisoning does not reach this object (#125).
     return { serving, total: started.length };
   })();
   const memo: { settledAt: number | null; answer: typeof answer } = { settledAt: null, answer };
   readyMemo = memo;
   // Both handlers, not just one. Every per-site promise is caught above, so `answer` rejects only if
-  // the collection itself fails — which it can: resolving the answer reads a `then` a module may have
-  // poisoned. With one handler that rejection was unhandled, and a `void`ed unhandled rejection is
-  // exit 1. Stamping on either outcome is also correct: a settled failure is as stale as a settled
+  // the collection itself fails — which it could while modules ran in this realm: resolving the answer
+  // reads a `then` a module may have poisoned. With one handler that rejection was unhandled, and a
+  // `void`ed unhandled rejection is exit 1. Stamping on either outcome is also correct: a settled failure is as stale as a settled
   // success and must not pin the memo open.
   //
   // The closure stamps **its own object**, not `readyMemo`, so a superseded memo can only mark itself
