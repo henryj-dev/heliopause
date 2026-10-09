@@ -228,6 +228,16 @@ describe("the renderer's answer is untrusted input", () => {
     assert.deepEqual(parsePolicySource(payload).site.cfg.protectedHosts, []);
   });
 
+  it("does not write the default into the object it was given (#123)", () => {
+    const payload = wire();
+    const cfg = (payload.site as Record<string, unknown>).cfg as Record<string, unknown>;
+    delete cfg.protectedHosts;
+    const before = JSON.stringify(payload);
+    assert.deepEqual(parsePolicySource(payload).site.cfg.protectedHosts, []);
+    assert.equal(JSON.stringify(payload), before, "the validator changed its argument");
+    assert.equal("protectedHosts" in cfg, false);
+  });
+
   it("keeps a declared protectedHosts as given", () => {
     // The known positive for the default above: it fails on a reader that throws the real value
     // away, and the gate would otherwise protect nothing while every test stayed green.

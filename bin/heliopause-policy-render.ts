@@ -571,9 +571,9 @@ if (!token) {
 //
 // It held the object `collectPolicySource` returned, and the first version of the evaluation seam
 // kept that while adding a parse in front of it. That combination served **two different payloads
-// for one evaluation**: `parsePolicySource` defaults an absent `site.cfg.protectedHosts` by writing
-// it **into the value it was given** (`src/policy-source.ts:247`), so the first response — written
-// from the bytes — omitted the field and the second — served from the parsed object — carried it.
+// for one evaluation**: `parsePolicySource` defaulted an absent `site.cfg.protectedHosts` by writing
+// it **into the value it was given** (fixed in #123), so the first response — written from the
+// bytes — omitted the field and the second — served from the parsed object — carried it.
 //
 // Bytes remove the question. There is one representation, it is the one that crossed the boundary,
 // and a later change that evaluates in a worker returns exactly this type.
@@ -897,13 +897,9 @@ function accepted(
   // at the site that produced them rather than at the far end of a request.
   //
   // 🔴 **The parsed value is discarded on purpose.** It is not the same value: that function defaults
-  // an absent `site.cfg.protectedHosts` by writing into what it was given
-  // (`src/policy-source.ts:247`). Caching or serving it would ship a field the evaluated bytes do
-  // not have — which is exactly the two-different-payloads defect the cache comment describes. The
-  // call is a gate, not a conversion.
-  //
-  // ⚠️ That in-place default is a defect in its own right on the manager's side; it is filed rather
-  // than fixed here (#123), because that function has callers this change does not survey.
+  // an absent `site.cfg.protectedHosts` in what it returns. Caching or serving it would ship a field
+  // the evaluated bytes do not have — which is exactly the two-different-payloads defect the cache
+  // comment describes. The call is a gate, not a conversion.
   //
   // 🔴 **Calling it here is a behaviour change, and naming it took a review.** A payload that
   // serialises but fails validation — `cfg.protectedHosts: "bad"` is a string, so it writes fine and
