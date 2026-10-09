@@ -2827,6 +2827,26 @@ export const site = {
       rmSync(join(dir, ".."), { recursive: true, force: true });
     }
   });
+
+  it("answers a ?site= on a single unnamed site, as /source does", { timeout: 60_000 }, async () => {
+    // The manager names its relay in `?site=`. A renderer deployed with `HELIOPAUSE_POLICY_SITE` named
+    // nothing, and `/source` answers it (the rollout-order test above); a 404 here showed the screen
+    // and refused its preview.
+    const { dir, site } = previewSite();
+    let started: Started | undefined;
+    try {
+      started = await start(dir, { HELIOPAUSE_POLICY_SITE: site, ...PREVIEW_ENV });
+      const res = await preview(started.port, {
+        path: "policies.json", content: JSON.stringify({ sources: ["10.0.0.0/8"] }),
+      });
+      assert.equal(res.status, 200, await res.clone().text());
+      const got = await res.json() as { changes: unknown[] };
+      assert.equal(got.changes.length, 1);
+    } finally {
+      started?.stop();
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
 });
 
 describe("concurrent requests share one evaluation", () => {

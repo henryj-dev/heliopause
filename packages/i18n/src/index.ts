@@ -783,6 +783,10 @@ export const MESSAGES = {
     ko: "미리 보기일 뿐이다 — 저장은 이 결과와 무관하다",
   },
   "preview.none": { en: "no host's input rules change.", ko: "어느 호스트의 입력 규칙도 바뀌지 않는다." },
+  "preview.stale": {
+    en: "the table or the VPC changed after this preview was asked for — run it again.",
+    ko: "미리 보기를 요청한 뒤 표나 VPC 가 바뀌었다 — 다시 실행할 것.",
+  },
   "preview.added": { en: "added", ko: "더해짐" },
   "preview.removed": { en: "removed", ko: "빠짐" },
   "preview.defaultPolicy": {

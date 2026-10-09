@@ -25,16 +25,18 @@
     writeHeaders,
     type PrStatus,
   } from "./write";
-  import { previewUrl, readPreviewReply, ruleLine, type PreviewHost } from "./preview";
+  import { previewUrl, previewView, readPreviewReply, ruleLine, type PreviewResult } from "./preview";
 
   const prefs = chromePrefs();
   const who = whoQuery();
   const write = writeAsk();
 
-  let { edit, site = "", showRules, showFiles }: {
+  let { edit, site = "", siteLoading = false, showRules, showFiles }: {
     edit: PolicyEdit;
-    /** The VPC on screen; empty is the single-site case. The preview asks about this one. */
+    /** The VPC whose answer is on screen; empty is the single-site case. The preview asks about this one. */
     site?: string;
+    /** Another site is being loaded, so what is on screen may be about to change. Preview waits. */
+    siteLoading?: boolean;
     showRules: boolean;
     showFiles: boolean;
   } = $props();
@@ -170,28 +172,33 @@
   // Sends the rule table as it stands to the renderer, which evaluates it in a throwaway copy. Saving
   // does not wait for it and does not read it. Only the JSON rule file can be previewed; the renderer
   // refuses code.
-  let preview = $state<PreviewHost[] | null>(null);
+  //
+  // Its own busy flag: a slow preview must not disable save, propose or merge.
+  let previewResult = $state<PreviewResult | null>(null);
   let previewError = $state("");
+  let previewBusy = $state(false);
+  const draftContent = $derived(doc ? writePolicyDoc(doc) : fallback);
+  const shownPreview = $derived(previewView(previewResult, { site, content: draftContent }));
 
   async function runPreview(): Promise<void> {
-    const content = doc ? writePolicyDoc(doc) : fallback;
-    busy = "preview";
+    const sent = { site, content: draftContent };
+    previewBusy = true;
     previewError = "";
+    previewResult = null;
     try {
-      const res = await fetch(previewUrl(site), {
+      const res = await fetch(previewUrl(sent.site), {
         method: "POST",
         credentials: "same-origin",
         headers: writeHeaders(csrf()),
-        body: JSON.stringify({ path: edit.path, content }),
+        body: JSON.stringify({ path: edit.path, content: sent.content }),
       });
       const reply = readPreviewReply(await res.json());
       if (!reply.ok) throw new Error(reply.reason);
-      preview = reply.changes;
+      previewResult = { ...sent, changes: reply.changes };
     } catch (e) {
-      preview = null;
       previewError = e instanceof Error ? e.message : String(e);
     } finally {
-      busy = "";
+      previewBusy = false;
     }
   }
 
@@ -361,17 +368,21 @@
     </p>
     {#if showRules}
       <p class="act">
-        <button type="button" disabled={busy !== ""} onclick={() => void runPreview()}>{t(prefs.lang, "preview.run")}</button>
+        <button type="button" disabled={previewBusy || siteLoading} onclick={() => void runPreview()}>
+          {t(prefs.lang, "preview.run")}
+        </button>
         <span class="dim">{t(prefs.lang, "preview.notGate")}</span>
       </p>
       {#if previewError}
         <p class="banner bad">{previewError}</p>
-      {:else if preview !== null}
+      {:else if shownPreview.kind === "stale"}
+        <p class="banner warn">{t(prefs.lang, "preview.stale")}</p>
+      {:else if shownPreview.kind === "shown"}
         <div>
-          {#if preview.length === 0}
+          {#if shownPreview.changes.length === 0}
             <p class="dim">{t(prefs.lang, "preview.none")}</p>
           {/if}
-          {#each preview as h (h.host)}
+          {#each shownPreview.changes as h (h.host)}
             <p class="mono">{h.host}</p>
             {#if h.inputPolicy}
               <p class="mono">{t(prefs.lang, "preview.defaultPolicy", {
