@@ -1675,10 +1675,12 @@ export const site = {
         // read. `beta` still fails — it threw — and `alpha` now answers `/source` normally, which is
         // the property that was wanted all along.
         //
-        // ⚠️ **`/source`, not every route.** `readiness()` still resolves a plain object, so
-        // `/readyz` goes 503 under this same module — the poisoning is closed on this path and open
-        // on that one. An earlier version of this comment and of AGENTS.md said it was closed, full
-        // stop; independent review reproduced the `/readyz` half.
+        // ⚠️ **`/source`, not every route — at the time.** `readiness()` resolves a plain object, so
+        // under the in-process renderer `/readyz` went 503 under this same module: closed on this
+        // path and open on that one. An earlier version of this comment and of AGENTS.md said it was
+        // closed, full stop; independent review reproduced the `/readyz` half (#125). The worker
+        // (#134) has since closed that half too — the poisoning no longer reaches this realm — and
+        // the `poisonedThen` assertion on `/readyz` below pins it.
         //
         // **Measured, not reasoned.** Reverting just that one line to resolve an object
         // (`resolve({ wire } as unknown as string)`) turns this back:
@@ -1763,6 +1765,17 @@ export const site = {
         }
         if (shape.name === "lateThrowFromModuleTimer") {
           assert.ok((ready.faults ?? 0) > 0, `${shape.name}: the fault was swallowed silently`);
+        }
+        // ## `/readyz` under a poisoned `then` — closed by the worker, and pinned here (#125)
+        //
+        // Before the worker, `readiness()` resolved a plain object in the renderer's own realm, so the
+        // poisoned getter ran there: `/readyz` answered 503 "readiness could not be computed" while
+        // `/source?site=alpha` answered 200 (measured on `3724e79`, the commit before #134). Now the
+        // poisoning ends with beta's thread, and readiness counts alpha as serving. Nothing asserted
+        // this until #125 was re-measured and found already closed.
+        if (shape.name === "poisonedThen") {
+          assert.equal(ready.error, undefined, `${shape.name}: readiness could not be computed`);
+          assert.equal((ready as { serving?: number }).serving, 1, `${shape.name}: readiness did not count alpha`);
         }
       } finally {
         started?.stop();

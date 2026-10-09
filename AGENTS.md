@@ -757,13 +757,20 @@ intrinsic 캡처 여덟 개도 필요 없어진다. 「캡처는 측정된 경�
 `.then` 을 읽으므로, **객체**를 resolve 하면 오염된 getter 가 모든 사이트의 평가에서 돌았다.
 문자열에는 읽을 `.then` 이 없다.
 
-| 경로 | `then` 오염 | 왜 |
-|---|---|---|
-| `/source`(정책 소스 평가와 응답) | **닫혔다** | 문자열을 resolve 한다 |
-| **`/readyz`** | **열려 있다** | `readiness()` 가 **평범한 객체**를 resolve 한다 — #125 |
+| 경로 | `then` 오염 (#124 시점) | 왜 | 지금 |
+|---|---|---|---|
+| `/source`(정책 소스 평가와 응답) | **닫혔다** | 문자열을 resolve 한다 | 닫힘 |
+| **`/readyz`** | **열려 있었다** | `readiness()` 가 **평범한 객체**를 resolve 한다 — #125 | **닫힘 — 워커(#134)** |
 
 🔴 **이 문단은 처음 「닫혔다」라고만 적었고, 그것은 한 경로에 대해서만 참이었다.** 독립 리뷰가
 `/readyz` 쪽을 재현했다. **경로를 적지 않은 「닫혔다」는 다음 사람에게 전부를 약속한다.**
+
+🔑 **그 `/readyz` 칸은 고치기 전에 닫혀 있었다.** 2026-10-09 #125 를 착수하며 먼저 재 보니, 같은 모듈에
+대해 #134 이전(`3724e79`)은 `/readyz` 503 「readiness could not be computed」, 이후는 200(1/2 서빙)이었다.
+오염이 beta 의 워커 안에서 끝나 부모의 `readiness()` 객체에 닿지 않는다. **아무 테스트도 그것을 단언하지
+않았으므로 아무도 몰랐다** — 「경로를 적지 않은 닫혔다」의 반대 방향, **「확인하지 않은 열려 있다」**다.
+지금은 `poisonedThen` 행이 `/readyz` 를 단언한다(#134 이전 트리에서 `poisonedThen: readiness could not be
+computed` 로 빨갛다).
 
 **의도한 것이 아니다** — 직렬화 경계를 세웠을 뿐이고, **그 표가 결함으로 적어 둔 기대값이 빨개져서**
 알았다. 그리고 한 줄만 객체를 resolve 하게 되돌려 **측정으로 고정했다**(실패한 테스트:
@@ -792,6 +799,11 @@ expected 200`).
 → 남은 둘(**동기 spin** · **늦은 throw**)은 **여전히 realm 이전을 기다린다.** 「셋을 한 번에」는 이제
 「**하나는 한 경로에서** 먼저 닫혔고 둘이 남았다」다 — 그 예고가 맞았던 방식이 **예고한 수단과
 달랐고**, 범위도 예고보다 좁았다.
+
+(그 「realm 이전」은 #134 의 워커로 왔다. 동기 spin 은 예산 끝의 `terminate()` 로 닫혔고(「a module that
+spins forever fails only its own site」), `/readyz` 의 `then` 오염은 위 표대로 닫혔다. 늦은 throw 는 grace
+창 안에서는 `faults` 로 센다(「counts a fault that arrives inside the grace window without changing the
+answer」). 창 밖의 것은 스레드와 함께 사라지고 **세지 않는다** — 설계 메모 `docs/policy-eval-worker-notes.md`.)
 
 ### 🔴 관찰된 동작이 기대값이 되는 순간 — 테스트가 구멍을 봉인한다
 

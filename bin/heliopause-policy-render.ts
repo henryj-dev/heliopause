@@ -14,16 +14,22 @@
 // there is no way to render a program without running it — but it runs where the blast radius is a
 // rendered answer rather than a console, a credential and a fleet.
 //
-// ⚠️ **It is not confined to the policy it came from, and this file used to say it was.** A module is
-// evaluated by `import()` in this process's own realm, so it shares every intrinsic and every
-// prototype with the other sites served here. The tests below prove it: a module that poisons
-// `Object.prototype` makes a *different*, correct site answer 503, and that is asserted as the
-// expected result because it is what the code does. Per-site isolation would mean a separate realm —
-// a `worker_thread` or a `vm` context — and that is not what this is.
+// ## Each evaluation runs in a worker of its own (#134)
 //
-// What the captures and guards below buy is that one module's mistake is a 503 rather than an exit:
-// the process stays up and the sites that still evaluate keep serving. That is a smaller claim than
-// the one this paragraph made, and it is the one the tests actually hold.
+// A module is evaluated in a `worker_threads` worker started for that one evaluation, and what comes
+// back is text (`src/policy-eval-worker.ts`). Until #134 it was `import()`ed in this process's own
+// realm, sharing every intrinsic and prototype with the other sites served here, and this paragraph
+// said so: a module that poisoned `Object.prototype` made a *different*, correct site answer 503, and
+// the tests asserted that 503 because it was what the code did.
+//
+// They now assert the opposite — "stays up when a module breaks in a way no guard had named": under a
+// poisoned `toJSON` or `then`, the healthy site answers `/source` 200 and `/readyz` counts it as
+// serving. That is the claim, and it is about a prototype poisoned *in the worker*.
+//
+// ⚠️ **Not a sandbox.** The worker shares this process's filesystem permissions (#131), and what it
+// sends is the module's to choose — the parent keeps only `site` and `services` from it. The captures
+// and guards below predate the worker; they are kept, and the paths they were measured on no longer
+// start in this realm.
 //
 // ## What keeps that true
 //
@@ -1250,9 +1256,13 @@ function evaluateWithin(
  * Whether each site can be evaluated right now, bounded and memoised.
  *
  * This said "never rejects", which was true of the per-site failures it was written for — each one is
- * caught below — and false of the collection. Resolving the answer reads a `then` a policy module can
- * poison, so `/readyz` handles a rejection as well as an answer; without that it was exit 1 on the
- * readiness probe, i.e. on a schedule.
+ * caught below — and false of the collection. Resolving the answer reads a `then`, and while modules
+ * ran in this realm a module could poison it, so `/readyz` handles a rejection as well as an answer;
+ * without that it was exit 1 on the readiness probe, i.e. on a schedule.
+ *
+ * Since the worker (#134) the poisoning stays in the module's thread and this rejection has no
+ * measured cause — under `poisonedThen` the route answers 200 (#125, asserted in "stays up when a
+ * module breaks in a way no guard had named"). The handler is kept.
  *
  * ## The window runs from when the answer *settled*, not from when it started
  *
@@ -1482,9 +1492,10 @@ const server = createServer((req, res) => {
         });
       },
       // `readiness` is documented as not rejecting and that was true of the per-site failures it was
-      // written for. It is not true of the collection: a module can poison the `then` that resolving
-      // the answer reads. Without this handler that rejection is unhandled and the process exits 1 —
-      // on `/readyz`, which is the readiness probe, so on a schedule.
+      // written for. It was not true of the collection while modules ran in this realm: a module could
+      // poison the `then` that resolving the answer reads. Without this handler that rejection was
+      // unhandled and the process exited 1 — on `/readyz`, so on a schedule. The worker has since
+      // removed that cause (#125); the handler stays.
       (e: unknown) => {
         log(`readiness could not be computed: ${reasonOf(e)}`);
         send(503, { ok: false, degraded: true, error: "readiness could not be computed", faults });
