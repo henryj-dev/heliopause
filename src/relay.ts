@@ -127,18 +127,38 @@ export interface RelayState {
    */
   agentCerts: Record<string, AgentCertObservation>;
   /**
-   * Per host, consecutive heartbeats that reported `confirmed` with no observed table (#139).
+   * Per host, the unbroken run of heartbeats that reported `confirmed` with no observed table (#139):
+   * when the run began, when its latest beat arrived, and how many beats it holds.
    *
-   * Counted rather than read from `detail`: the agent sends a null observation for a table that is
-   * absent and for one it could not read yet, and telling them apart would mean matching its words.
-   * A healthy reboot re-applies within one or two beats, which resets this. Memory only — a relay
-   * restart starts every host at zero, so it can delay the line but not invent one.
+   * Measured in time between beats rather than read from `detail`: the agent sends a null observation
+   * for a table that is absent and for one it has not read yet, and telling them apart would mean
+   * matching its words. Not a count of beats either — the interval is configurable down to one second
+   * and a restarted agent's first observation can take 25 s, so three beats can pass with the table
+   * intact (review of this change). Any other heartbeat ends the run; a healthy reboot re-applies and
+   * reports `pending`. Memory only — a relay restart begins every run again, so it can delay the line
+   * but not invent one.
    */
-  tableUnseen: Record<string, number>;
+  tableUnseen: Record<string, { since: string; last: string; beats: number }>;
 }
 
-/** Heartbeats in a row with no table before a confirmed host is reported. @see tableUnseen */
-export const TABLE_UNSEEN_BEATS = 3;
+/**
+ * How long a run of table-less `confirmed` beats must span before the host is reported: longer than
+ * the agent's slowest first observation (`NFT_TIMEOUT_SEC` 20 s + route read 5 s), with room.
+ * @see RelayState.tableUnseen
+ */
+export const TABLE_UNSEEN_MIN_SEC = 60;
+
+/**
+ * Whether a host's run of table-less beats is long enough to be a fact rather than a moment.
+ *
+ * Measured between the first and latest beat, so one beat spans zero seconds and never qualifies.
+ * A separate "at least two beats" check was written and removed: with this threshold above zero it
+ * could not change an answer, and reverting it left every test green.
+ */
+function tableAbsentEstablished(run: RelayState["tableUnseen"][string] | undefined): boolean {
+  if (!run) return false;
+  return (Date.parse(run.last) - Date.parse(run.since)) / 1000 >= TABLE_UNSEEN_MIN_SEC;
+}
 
 /** One agent certificate as the relay saw it. */
 export interface AgentCertObservation extends CertFacts {
@@ -358,13 +378,16 @@ export function fleetView(
     const gate = m ? computeGate(m, host, state.statuses) : { open: false, reason: "no manifest", stage: null };
     const drifted = state.drifted.has(host);
     const current = st?.generation === m?.generation;
-    const unseen = state.tableUnseen[host] ?? 0;
+    const unseenRun = state.tableUnseen[host];
+    const tableAbsent = tableAbsentEstablished(unseenRun);
     // A refusal of a generation the host has since moved past is history, and history in a status
     // view reads as a live problem. But a refusal of the generation it is **on** is history only while
-    // that generation is in force — confirmed, with its table. A rebooted host fetches its own
-    // generation again, and on 2026-09-28 that apply was refused while this filter hid it (#139).
+    // that generation is in force — confirmed, and not established as table-less. A rebooted host
+    // fetches its own generation again, and on 2026-09-28 that apply was refused while this filter hid
+    // it (#139). The same threshold as the line below, not one null beat: a healthy host can keep an
+    // old same-generation refusal in its state, and a restart begins with null beats.
     const refusalAnswered = st?.lastRefusal?.generation === st?.generation &&
-      st?.state === "confirmed" && unseen === 0;
+      st?.state === "confirmed" && !tableAbsent;
     const liveRefusal = st?.lastRefusal && !refusalAnswered ? st.lastRefusal : null;
 
     hosts.push({
@@ -421,12 +444,13 @@ export function fleetView(
     // ## Confirmed, and no table (#139)
     //
     // The state file says `confirmed`; the kernel holds no heliopause table. A reboot does that until
-    // the agent re-applies, which needs the relay and the artifact. Counted in beats so the healthy
-    // reboot — one or two beats, then `pending` — says nothing. @see RelayState.tableUnseen
-    if (unseen >= TABLE_UNSEEN_BEATS) {
+    // the agent re-applies, which needs the relay and the artifact. Measured across beats so the
+    // healthy reboot — a beat or two, then `pending` — says nothing. @see RelayState.tableUnseen
+    if (tableAbsent && unseenRun) {
+      const sec = Math.round((Date.parse(unseenRun.last) - Date.parse(unseenRun.since)) / 1000);
       problems.push(
-        `${host}: confirmed generation ${st?.generation} but has shown no ruleset for ${unseen} heartbeats — ` +
-          `${st?.detail ?? "no detail"}`,
+        `${host}: confirmed generation ${st?.generation} but has shown no ruleset for ${sec}s ` +
+          `(${unseenRun.beats} heartbeats) — ${st?.detail ?? "no detail"}`,
       );
     }
     if (drifted) problems.push(`${host}: ruleset no longer matches the dump it confirmed`);
@@ -854,7 +878,8 @@ export function handleHeartbeat(
   else delete state.contradictions[certCN];
 
   if (hb.applied.state === "confirmed" && hb.applied.observedHash === null) {
-    state.tableUnseen[certCN] = (state.tableUnseen[certCN] ?? 0) + 1;
+    const run = state.tableUnseen[certCN];
+    state.tableUnseen[certCN] = run ? { ...run, last: at, beats: run.beats + 1 } : { since: at, last: at, beats: 1 };
   } else {
     delete state.tableUnseen[certCN];
   }

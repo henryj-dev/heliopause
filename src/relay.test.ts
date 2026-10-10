@@ -1511,50 +1511,88 @@ describe("a confirmed host that shows no table", () => {
     });
   const withTable = hb({ applied: { generation: "gen1", state: "confirmed", artifactHash: "a", observedHash: "h" } });
   const reapplying = hb({ applied: { generation: "gen1", state: "pending", artifactHash: "a", observedHash: "h" } });
-  const unseen = (s: RelayState) =>
-    fleetView(s, new Date(AT), 300).problems.filter((p) => p.includes("no ruleset"));
+  // A restarted agent with its table intact: the observation cache is empty until the first read.
+  const observing = (over: HeartbeatOverride = {}) =>
+    absent({ ...over, applied: { detail: "host observation refresh pending", ...(over.applied ?? {}) } });
+  /** `AT` plus `sec` seconds. Beats carry their own time; the window is measured between them. */
+  const at = (sec: number) => new Date(Date.parse(AT) + sec * 1000).toISOString();
+  /** Beats at the given second offsets; the fleet view is read at the last one. */
+  const beats = (s: RelayState, offsets: number[], beat: (sec: number) => Heartbeat) => {
+    for (const sec of offsets) handleHeartbeat(s, "h-canary", beat(sec), at(sec));
+    return fleetView(s, new Date(at(offsets[offsets.length - 1]!)), 300);
+  };
+  const unseen = (v: ReturnType<typeof fleetView>) => v.problems.filter((p) => p.includes("no ruleset"));
+  const range = (from: number, to: number, step: number) =>
+    Array.from({ length: Math.floor((to - from) / step) + 1 }, (_, i) => from + i * step);
 
-  it("is reported after three heartbeats in a row, with the host's own words", () => {
+  it("is reported once no table has been seen for a minute, with the host's own words", () => {
     const s = state();
-    for (let i = 0; i < 3; i++) handleHeartbeat(s, "h-canary", absent(), AT);
-    const lines = unseen(s);
+    const lines = unseen(beats(s, [0, 15, 30, 45, 60], () => absent()));
     assert.equal(lines.length, 1, `expected one line, got ${JSON.stringify(lines)}`);
     assert.match(lines[0]!, /h-canary/);
     assert.match(lines[0]!, /gen1/);
     assert.match(lines[0]!, /table inet heliopause is absent/);
   });
 
+  it("says nothing before a minute has passed, however many beats arrive", () => {
+    // Review scenario 1: an agent restarted with `HELIOPAUSE_INTERVAL_SEC=1`. Its table is intact, but
+    // the first observation (nft up to 20 s, routes up to 5 s) has not finished, so every beat is
+    // `confirmed` + null. Counting beats reported it after three seconds.
+    const s = state();
+    assert.deepEqual(unseen(beats(s, range(0, 25, 1), () => observing())), [],
+      "a restarted agent was reported while its first observation was still running");
+    handleHeartbeat(s, "h-canary", withTable, at(26));
+    assert.deepEqual(unseen(fleetView(s, new Date(at(26)), 300)), []);
+  });
+
+  it("says nothing for a single beat, however long ago it was", () => {
+    // One observation proves nothing about duration; the window is measured between beats.
+    const s = state();
+    handleHeartbeat(s, "h-canary", absent(), at(0));
+    assert.deepEqual(unseen(fleetView(s, new Date(at(120)), 300)), []);
+  });
+
   it("says nothing for the beats a normal reboot spends before it re-applies", () => {
-    // The healthy reboot: one or two beats with no table, then the agent re-applies (`pending`) and
+    // The healthy reboot: a beat or two with no table, then the agent re-applies (`pending`) and
     // confirms with its table. The same class of transient as #146's first-apply false alarm.
     const s = state();
-    for (const beat of [absent(), absent(), reapplying, withTable]) {
-      handleHeartbeat(s, "h-canary", beat, AT);
-      assert.deepEqual(unseen(s), [], "a normal reboot was reported as a host with no ruleset");
+    const sequence: [number, Heartbeat][] = [[0, absent()], [15, absent()], [30, reapplying], [45, withTable]];
+    for (const [sec, beat] of sequence) {
+      handleHeartbeat(s, "h-canary", beat, at(sec));
+      assert.deepEqual(unseen(fleetView(s, new Date(at(sec)), 300)), [],
+        "a normal reboot was reported as a host with no ruleset");
     }
-    // And the count restarted: two more absent beats are still within the window.
-    handleHeartbeat(s, "h-canary", absent(), AT);
-    handleHeartbeat(s, "h-canary", absent(), AT);
-    assert.deepEqual(unseen(s), [], "beats from before the re-apply were still being counted");
+    // The window restarted at the re-apply: beats at 60 and 75 are 15 s apart, not 75.
+    assert.deepEqual(unseen(beats(s, [60, 75], () => absent())), [],
+      "time from before the re-apply was still being counted");
   });
 
   it("says nothing for a first apply that is not confirmed yet", () => {
     const s = state();
     const first = hb({ applied: { generation: "gen1", state: "pending", artifactHash: "a", observedHash: null } });
-    for (let i = 0; i < 3; i++) handleHeartbeat(s, "h-canary", first, AT);
-    assert.deepEqual(unseen(s), []);
+    assert.deepEqual(unseen(beats(s, [0, 30, 60, 90], () => first)), []);
   });
 
-  it("shows a refusal of the generation it is on, when it has no table", () => {
+  it("shows a refusal of the generation it is on, once it has had no table for a minute", () => {
     // 2026-09-28: the rebooted host fetched its own generation again and the apply was refused. The
     // refusal was of the generation it reported, so the filter that hides answered refusals hid it.
     const s = state();
-    handleHeartbeat(s, "h-canary", absent({
-      lastRefusal: { generation: "gen1", reason: "signed artifact authorization has expired", at: AT },
-    }), AT);
-    const v = fleetView(s, new Date(AT), 300);
+    const refused = { lastRefusal: { generation: "gen1", reason: "signed artifact authorization has expired", at: AT } };
+    const v = beats(s, [0, 30, 60], () => absent(refused));
     contains(v.problems.join("|"), "refused generation gen1");
     assert.equal(v.hosts[0]!.lastRefusal?.generation, "gen1");
+  });
+
+  it("keeps an old same-generation refusal hidden through a restart's first observation", () => {
+    // Review scenario 2: a transient nft read failure made a healthy host try to re-apply, the
+    // envelope was refused, and the refusal stayed in its state — the agent returns early once it
+    // sees its table again, which never clears it. The next agent restart begins with null beats.
+    const s = state();
+    const stale = { lastRefusal: { generation: "gen1", reason: "an earlier transient attempt", at: AT } };
+    for (const v of [beats(s, [0], () => observing(stale)), beats(s, [1], () => observing(stale))]) {
+      assert.equal(v.hosts[0]!.lastRefusal, null);
+      assert.deepEqual(v.problems.filter((p) => p.includes("refused generation")), []);
+    }
   });
 
   it("shows a refusal of the generation it is on, when it is not confirmed", () => {
