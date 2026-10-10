@@ -38,6 +38,7 @@ const host = (over: Partial<HostView> = {}): HostView => ({
   ciliumExposure: null,
   table: null,
   authorizationExpiresAt: null,
+  servedAuthorizationExpiresAt: null,
   ...over,
 });
 
@@ -75,13 +76,17 @@ describe("siteView", () => {
     assert.equal(o.hosts[0]!.table, null);
   });
 
-  it("carries when each host's enforced authorization expires, and null from a relay too old to say", () => {
+  it("carries both authorization expiries per host, and null from a relay too old to say", () => {
     // #138: shown, not alarmed on. Null is "not known", never "not expired".
-    const s = siteView([ok("dev", view({ hosts: [host({ authorizationExpiresAt: "2026-10-11T04:28:36Z" })] }))]);
+    const s = siteView([ok("dev", view({ hosts: [host({
+      authorizationExpiresAt: "2026-10-11T04:28:36Z", servedAuthorizationExpiresAt: "2026-10-12T01:00:00Z",
+    })] }))]);
     assert.equal(s.hosts[0]!.authorizationExpiresAt, "2026-10-11T04:28:36Z");
-    const { authorizationExpiresAt: _dropped, ...older } = host();
+    assert.equal(s.hosts[0]!.servedAuthorizationExpiresAt, "2026-10-12T01:00:00Z");
+    const { authorizationExpiresAt: _a, servedAuthorizationExpiresAt: _b, ...older } = host();
     const o = siteView([ok("dev", view({ hosts: [older as HostView] }))]);
     assert.equal(o.hosts[0]!.authorizationExpiresAt, null);
+    assert.equal(o.hosts[0]!.servedAuthorizationExpiresAt, null);
   });
 
   it("describes the rest of the site when one relay is unreachable", () => {

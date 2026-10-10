@@ -26,6 +26,7 @@ const host = (over: Partial<SiteHost> = {}): SiteHost => ({
   publishedPorts: [],
   routes: [],
   authorizationExpiresAt: null,
+  servedAuthorizationExpiresAt: null,
   ...over,
 });
 

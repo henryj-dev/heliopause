@@ -33,7 +33,6 @@ import { certificateIsRevoked } from "./certificate-revocation.ts";
 import { certFactsFromPeer, type CertFacts, type PeerCertificateLike } from "./cert-watch.ts";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { lstat, readFile, stat } from "node:fs/promises";
-import { createHash } from "node:crypto";
 import {
   schemaSupported,
   SCHEMA_VERSION,
@@ -212,10 +211,18 @@ export interface HostView {
   table: "present" | "absent" | "unread" | null;
   /**
    * When the authorization this host enforces lapses, as the agent reported it (#138). `null` when
-   * the agent is too old to say or has none recorded — not known, never "not expired". Shown, not
-   * alarmed on: a confirmed host keeps its rules past it.
+   * the agent is too old to say or has none recorded — not known, never "not expired".
    */
   authorizationExpiresAt: string | null;
+  /**
+   * When the authorization in the envelope this relay serves the host lapses (#138). `null` when it
+   * serves none or cannot read one. The two can differ — the host may enforce an older one.
+   *
+   * Both are information. Whether a host would accept what it is served depends on state only the host
+   * holds (the authorization's signing key, its durable watermark), so the relay does not predict it;
+   * an actual refusal arrives as `lastRefusal` and is reported as a problem.
+   */
+  servedAuthorizationExpiresAt: string | null;
 
   /**
    * Other tables filtering on this host that its policy does not account for.
@@ -313,31 +320,26 @@ export interface FleetView {
 }
 
 /**
+ * `expiresAt` from the envelope this relay serves a host, or `null` when there is none or it is not a
+ * readable time. Shown, never acted on: the agent verifies the signature and decides acceptance.
+ */
+function servedExpiry(envelope: HostArtifactEnvelope | undefined): string | null {
+  if (!envelope || typeof envelope.payload !== "string") return null;
+  try {
+    const payload = JSON.parse(Buffer.from(envelope.payload, "base64url").toString("utf8")) as { expiresAt?: unknown };
+    return typeof payload.expiresAt === "string" && !Number.isNaN(Date.parse(payload.expiresAt)) ? payload.expiresAt : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Describe the fleet as of `now`. Pure — takes the clock rather than reading it.
  *
  * A host in the manifest that has never reported is included with `state: null` rather than omitted.
  * Omitting it would make a host that never enrolled indistinguishable from one that does not exist,
  * and the first is a problem while the second is not.
  */
-/**
- * `expiresAt` from the envelope this relay serves a host, or `null` when there is none or it cannot be
- * read. Read only to report on it; the agent verifies the signature, and an unreadable value says
- * nothing rather than guessing.
- */
-function servedAuthorization(envelope: HostArtifactEnvelope | undefined): { expiresAt: string; payloadHash: string } | null {
-  if (!envelope || typeof envelope.payload !== "string") return null;
-  try {
-    const bytes = Buffer.from(envelope.payload, "base64url");
-    const payload = JSON.parse(bytes.toString("utf8")) as { expiresAt?: unknown };
-    // Not checked for being a time: an unparseable one compares false below, which says nothing.
-    if (typeof payload.expiresAt !== "string") return null;
-    // The agent's `payloadHash`: sha256 of the decoded payload bytes (`verify_artifact_envelope`).
-    return { expiresAt: payload.expiresAt, payloadHash: "sha256:" + createHash("sha256").update(bytes).digest("hex") };
-  } catch {
-    return null;
-  }
-}
-
 export function fleetView(
   state: RelayState,
   now: Date,
@@ -403,6 +405,7 @@ export function fleetView(
       detail: st?.detail ?? null,
       table: st?.table ?? null,
       authorizationExpiresAt: st?.artifactTrust?.currentExpiresAt ?? null,
+      servedAuthorizationExpiresAt: servedExpiry(state.artifacts[host]),
       unexpectedFilters: unexpectedFilters(st, entry),
       contradictions: state.contradictions[host] ?? [],
       intrusions: st?.intrusions ?? null,
@@ -657,31 +660,6 @@ export function fleetView(
         `${host}: enforcing generation ${st?.generation} but cannot name the authorization for it — ` +
           `an expired authorization can never be re-applied on this host, and a break-glass one ` +
           `would not be reported`,
-      );
-    }
-
-    // ## What this relay serves the host has lapsed, and the host still needs it (#138)
-    //
-    // An agent refuses an expired authorization unless it is already confirmed on that generation
-    // under that same authorization (`accept_artifact_authorization`). So once the authorization served
-    // here lapses, a host that does not hold it cannot apply it — until something new is published.
-    // That is the case worth a line. A lapse alone is not: every confirmed host passes its expiry a day
-    // after the last publish and keeps its rules (boot restore and the same-generation escape).
-    // Read from the envelope served, not from the host's report — the host's is for what it enforces.
-    //   · `pending` on the served generation: accepted before the lapse; `confirm` does not re-check.
-    //   · `confirmed` on it: covered when its authorization is the served one, or it cannot name one
-    //     (an older agent) — then the generation is all there is to go on.
-    // @see "authorization expiry" in relay.test.ts
-    const served = servedAuthorization(state.artifacts[host]);
-    const enforced = st?.artifactTrust?.currentPayloadHash ?? null;
-    const holds = st?.generation === m?.generation && (
-      st?.state === "pending" ||
-      (st?.state === "confirmed" && (enforced === null || enforced === served?.payloadHash))
-    );
-    if (served !== null && Date.parse(served.expiresAt) <= now.getTime() && !holds) {
-      problems.push(
-        `${host}: the authorization served for generation ${m?.generation} expired at ${served.expiresAt}, ` +
-          `and the host does not hold it — it cannot apply it until a new generation is published`,
       );
     }
 

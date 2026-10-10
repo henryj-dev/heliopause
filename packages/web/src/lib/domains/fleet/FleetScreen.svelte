@@ -227,16 +227,22 @@
                   <Chip kind="none">{t(prefs.lang, "m.unreported")}</Chip>
                 {/if}
                 {#if host.generation}
-                  {@const auth = authorizationExpiry(host.authorizationExpiresAt, Date.now())}
-                  <div class="dim">
-                    {#if auth.kind === "left"}
-                      {t(prefs.lang, "m.authExpiresIn", { at: auth.at, h: auth.hours, m: auth.minutes })}
-                    {:else if auth.kind === "lapsed"}
-                      {t(prefs.lang, "m.authLapsed", { at: auth.at })}
-                    {:else}
-                      {t(prefs.lang, "m.authExpiryUnknown")}
-                    {/if}
-                  </div>
+                  {#each [
+                    { key: "m.authApplied", at: host.authorizationExpiresAt },
+                    { key: "m.authServed", at: host.servedAuthorizationExpiresAt },
+                  ] as const as line (line.key)}
+                    {@const auth = authorizationExpiry(line.at, Date.now())}
+                    {@const label = t(prefs.lang, line.key)}
+                    <div class="dim">
+                      {#if auth.kind === "left"}
+                        {t(prefs.lang, "m.authExpiresIn", { label, at: auth.at, h: auth.hours, m: auth.minutes })}
+                      {:else if auth.kind === "lapsed"}
+                        {t(prefs.lang, "m.authLapsed", { label, at: auth.at })}
+                      {:else}
+                        {t(prefs.lang, "m.authExpiryUnknown", { label })}
+                      {/if}
+                    </div>
+                  {/each}
                 {/if}
               </td>
               <td>
