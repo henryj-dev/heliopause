@@ -203,6 +203,12 @@ export interface HostView {
    */
   maintenance: string | null;
   detail: string | null;
+  /**
+   * What the agent's last read of the kernel found: `present`, `absent` or `unread` (#139). `null` from
+   * an agent too old to say. Carried to the row so "every host has its table" can be read per host,
+   * not only as the absence of a problem line.
+   */
+  table: "present" | "absent" | "unread" | null;
 
   /**
    * Other tables filtering on this host that its policy does not account for.
@@ -369,6 +375,7 @@ export function fleetView(
       blockedBy: !current && !gate.open ? (gate.reason ?? null) : null,
       maintenance: entry.maintenance ?? null,
       detail: st?.detail ?? null,
+      table: st?.table ?? null,
       unexpectedFilters: unexpectedFilters(st, entry),
       contradictions: state.contradictions[host] ?? [],
       intrusions: st?.intrusions ?? null,

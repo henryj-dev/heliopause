@@ -1577,6 +1577,16 @@ describe("a confirmed host that says its table is absent", () => {
     handleHeartbeat(s, "h-canary", beat("present", { ...stale, applied: { state: "rolled-back" } }), AT);
     assert.equal(refusals(s).length, 1);
   });
+
+  it("puts what the agent said on the host's row, and null for an agent too old to say", () => {
+    // The rollout verdict for #147 is "every host reports `present`"; the row is where it is read.
+    const s = state();
+    handleHeartbeat(s, "h-canary", beat("present"), AT);
+    assert.equal(fleetView(s, new Date(AT), 300).hosts[0]!.table, "present");
+    const older = state();
+    handleHeartbeat(older, "h-canary", beat(undefined), AT);
+    assert.equal(fleetView(older, new Date(AT), 300).hosts[0]!.table, null);
+  });
 });
 
 describe("the agent certificate each heartbeat presented", () => {

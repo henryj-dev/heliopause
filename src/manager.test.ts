@@ -36,6 +36,7 @@ const host = (over: Partial<HostView> = {}): HostView => ({
   publishedPorts: null,
   routes: null,
   ciliumExposure: null,
+  table: null,
   ...over,
 });
 
@@ -64,6 +65,15 @@ const down = (name: string, error = "connect ETIMEDOUT"): RelayResult => ({
 });
 
 describe("siteView", () => {
+  it("carries what each agent said about its table, and null from a relay too old to say", () => {
+    // #139's rollout verdict is "every host reports `present`", and it is read here.
+    const s = siteView([ok("dev", view({ hosts: [host({ table: "present" })] }))]);
+    assert.equal(s.hosts[0]!.table, "present");
+    const { table: _dropped, ...older } = host();
+    const o = siteView([ok("dev", view({ hosts: [older as HostView] }))]);
+    assert.equal(o.hosts[0]!.table, null);
+  });
+
   it("describes the rest of the site when one relay is unreachable", () => {
     // The property the whole file exists for. Relays are separate so a gateway outage is contained;
     // an aggregator that failed the request would report the opposite of what the design provides.
