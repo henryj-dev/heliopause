@@ -345,6 +345,16 @@ export function fleetView(
     const gate = m ? computeGate(m, host, state.statuses) : { open: false, reason: "no manifest", stage: null };
     const drifted = state.drifted.has(host);
     const current = st?.generation === m?.generation;
+    const tableAbsent = st?.state === "confirmed" && st?.table === "absent";
+    // A refusal of a generation the host has since moved past is history, and history in a status
+    // view reads as a live problem. A refusal of the generation it is **on** is history only while that
+    // generation is in force — confirmed, and the agent not saying its table is absent. A rebooted host
+    // fetches its own generation again, and on 2026-09-28 that apply was refused while this filter hid
+    // it (#139). `unread` does not reveal it: a restart begins unread, and a healthy host can keep an
+    // old same-generation refusal in its state.
+    const refusalAnswered = st?.lastRefusal?.generation === st?.generation &&
+      st?.state === "confirmed" && !tableAbsent;
+    const liveRefusal = st?.lastRefusal && !refusalAnswered ? st.lastRefusal : null;
 
     hosts.push({
       host,
@@ -365,10 +375,8 @@ export function fleetView(
       agentVersion: st?.agentVersion ?? null,
       agentBuild: st?.agentBuild ?? null,
       agentCert: state.agentCerts[host] ?? null,
-      // Only while it still matters. A refusal of a generation the host has since moved past is
-      // history, and history in a status view reads as a live problem.
-      lastRefusal: st?.lastRefusal && st.lastRefusal.generation !== st?.generation
-        ? st.lastRefusal : null,
+      // Only while it still matters — see `liveRefusal` above.
+      lastRefusal: liveRefusal,
       publishedPorts: st?.publishedPorts ?? null,
       routes: st?.routes ?? null,
       ciliumExposure: st?.ciliumExposure ?? null,
@@ -396,9 +404,18 @@ export function fleetView(
     //
     // Phrased with the generation it refused, because "this host refuses" and "this host refuses
     // *what you just published*" are different problems and only the second one is urgent.
-    const refusal = st?.lastRefusal;
-    if (refusal && refusal.generation !== st?.generation) {
-      problems.push(`${host}: refused generation ${refusal.generation} — ${refusal.reason}`);
+    if (liveRefusal) {
+      problems.push(`${host}: refused generation ${liveRefusal.generation} — ${liveRefusal.reason}`);
+    }
+    // ## Confirmed, and the agent says its table is absent (#139)
+    //
+    // The state file says `confirmed`; the kernel holds no heliopause table. A reboot does that until
+    // the boot restore or a re-apply puts it back. Read from the agent's own `applied.table`, not
+    // inferred from a null `observedHash` — which also means "not read yet".
+    if (tableAbsent) {
+      problems.push(
+        `${host}: confirmed generation ${st?.generation} but its table is absent — ${st?.detail ?? "no detail"}`,
+      );
     }
     if (drifted) problems.push(`${host}: ruleset no longer matches the dump it confirmed`);
     // Next to drift on purpose: drift is the consequence (the dump changed), this is the cause (who
@@ -756,6 +773,7 @@ export function handleHeartbeat(
     // Carried, not acted on. Gating reads `state` only; this is the host's explanation, and without
     // it a rolled-back host shows up in the fleet view with no reason attached.
     detail: hb.applied.detail ?? null,
+    table: hb.applied.table ?? null,
     // The workload half is recorded whenever the host reports it, and gating decides on its own
     // whether this host was assigned one — the relay stores what it was told rather than judging it.
     workloadState: hb.workload?.state ?? null,

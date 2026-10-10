@@ -5361,6 +5361,299 @@ class TestTheHeartbeatCarriesArtifactTrust(unittest.TestCase):
                 self.assertIsNone(hp._artifact_keys_cache, "a failed read was cached")
 
 
+class TestBootRestore(unittest.TestCase):
+    """Issue #139, decision A: after a reboot, re-install the last confirmed ruleset before the relay.
+
+    A rebooted host's table is gone, and until now it came back only after the relay answered and the
+    artifact arrived. The confirmed signed envelope is kept on disk; at boot it is verified again and
+    installed through a separate path that arms no rollback timer — there is no relay to confirm it,
+    and rolling back to nothing is the state being repaired. An expired authorization is accepted
+    only under the escape hatch's condition: confirmed, same generation, same authorization.
+
+    Signature verification is stubbed here (the real one needs OpenSSL 3 and is covered by
+    `TestEd25519Verification`); the stub raises for an envelope marked tampered, so the tests still
+    show that restore goes through it and refuses on its failure.
+    """
+
+    RECORD = {
+        "authorizedAt": "2026-09-28T14:54:06.273Z",
+        "expiresAt": "2026-09-29T14:54:06.273Z",
+        "payloadHash": "sha256:" + "a" * 64,
+        "keyId": "sha256:" + "b" * 64,
+        "authorizationMode": "solo-otp",
+        "target": hp.TARGET,
+        "host": hp.HOST_ID,
+        "planHash": "sha256:" + "c" * 64,
+        "bundleHash": "sha256:" + "d" * 64,
+        "generation": "g1",
+    }
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._state_file = hp.STATE_FILE
+        hp.STATE_FILE = os.path.join(self.tmp, "state.json")
+        self._real = {n: getattr(hp, n) for n in (
+            "_nft_apply_json", "verify_artifact_envelope", "nft_json", "log",
+        )}
+        self._globals = {n: getattr(hp, n) for n in ("_timer", "_nft_rollback_owed")}
+        hp._timer = None
+        hp._nft_rollback_owed = None
+        self.applied = []
+        self.logged = []
+        hp.log = lambda line: self.logged.append(str(line))
+        hp._nft_apply_json = lambda doc: (self.applied.append(doc), (0, ""))[1]
+        self.table = "absent"
+        hp.nft_json = self._nft_json
+        self.expired = False
+        hp.verify_artifact_envelope = self._verify
+
+    def tearDown(self):
+        for name, value in self._real.items():
+            setattr(hp, name, value)
+        for name, value in self._globals.items():
+            setattr(hp, name, value)
+        hp.STATE_FILE = self._state_file
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _nft_json(self, args):
+        if self.table == "unreadable":
+            return None, "nft exited 1"
+        if self.table == "present":
+            return [{"table": dict(TABLE)}], ""
+        return [], ""
+
+    def _verify(self, envelope, now=None):
+        if envelope.get("tampered"):
+            raise ValueError("artifact authorization signature is invalid")
+        generation = envelope["generation"]
+        artifact = {"generation": generation, "ruleset": VALID, "rulesetHash": VALID_HASH,
+                    "confirmTimeoutSec": hp.NFT_CONFIRM_MIN_SEC}
+        return artifact, {**self.RECORD, "generation": generation}, {}, self.expired
+
+    def _confirmed_host(self, generation="g1", **over):
+        hp.save_state({**hp._EMPTY_STATE, "generation": generation, "state": "confirmed",
+                       "referenceHash": "sha256:" + "e" * 64,
+                       "currentAuthorization": {**self.RECORD, "generation": generation},
+                       "authorizationWatermark": {**self.RECORD, "generation": generation},
+                       **over})
+
+    def _keep(self, generation="g1", **envelope):
+        text = json.dumps({"generation": generation, **envelope})
+        self.assertTrue(hp._remember_accepted_envelope(generation, text))
+        self.assertTrue(hp._promote_confirmed_envelope(generation))
+
+    def test_installs_the_confirmed_ruleset_when_the_table_is_gone(self):
+        self._confirmed_host()
+        self._keep()
+        before = hp.load_state()
+        installed, why = hp.restore_confirmed_ruleset()
+        self.assertTrue(installed, why)
+        self.assertEqual(len(self.applied), 1, "the ruleset was not written to the kernel")
+        self.assertIsNone(hp._timer, "a rollback timer was armed — with no relay it would roll back to nothing")
+        self.assertEqual(hp.load_state(), before, "restoring changed the durable state")
+
+    def test_installs_an_expired_authorization_for_the_confirmed_same_generation(self):
+        # Decision 2: the escape hatch's condition, and only that.
+        self.expired = True
+        self._confirmed_host()
+        self._keep()
+        installed, why = hp.restore_confirmed_ruleset()
+        self.assertTrue(installed, why)
+        self.assertEqual(len(self.applied), 1)
+
+    def test_does_not_install_an_expired_authorization_for_another_generation(self):
+        # The escape hatch's generation clause on its own: the authorization matches the one the state
+        # names, and the confirmed generation is a different one. Only the generation check refuses.
+        self.expired = True
+        self._confirmed_host(generation="g0", currentAuthorization={**self.RECORD, "generation": "g1"})
+        self._keep(generation="g1")
+        installed, why = hp.restore_confirmed_ruleset()
+        self.assertFalse(installed)
+        self.assertEqual(self.applied, [])
+        self.assertIn("confirmed generation is g0", why)
+
+    def test_does_not_install_another_generation_even_unexpired(self):
+        # Refused by the authorization comparison here, which carries the generation too.
+        self._confirmed_host(generation="g0")
+        self._keep(generation="g1")
+        installed, _ = hp.restore_confirmed_ruleset()
+        self.assertFalse(installed)
+        self.assertEqual(self.applied, [])
+
+    def test_does_not_install_an_authorization_the_host_is_not_enforcing(self):
+        self._confirmed_host(currentAuthorization={**self.RECORD, "payloadHash": "sha256:" + "f" * 64})
+        self._keep()
+        installed, why = hp.restore_confirmed_ruleset()
+        self.assertFalse(installed)
+        self.assertEqual(self.applied, [])
+        self.assertIn("authorization", why)
+
+    def test_does_not_install_an_envelope_that_fails_verification(self):
+        self._confirmed_host()
+        self._keep(tampered=True)
+        installed, why = hp.restore_confirmed_ruleset()
+        self.assertFalse(installed)
+        self.assertEqual(self.applied, [])
+        self.assertIn("signature is invalid", why)
+
+    def test_does_nothing_without_a_kept_envelope(self):
+        self._confirmed_host()
+        installed, why = hp.restore_confirmed_ruleset()
+        self.assertFalse(installed)
+        self.assertEqual(self.applied, [])
+        self.assertIn("no confirmed envelope", why)
+
+    def test_leaves_an_unconfirmed_host_to_the_commitment_recovery(self):
+        self._confirmed_host(state="pending")
+        self._keep()
+        installed, _ = hp.restore_confirmed_ruleset()
+        self.assertFalse(installed)
+        self.assertEqual(self.applied, [])
+
+    def test_does_nothing_when_the_table_is_still_there(self):
+        # An agent restart without a reboot.
+        self.table = "present"
+        self._confirmed_host()
+        self._keep()
+        installed, _ = hp.restore_confirmed_ruleset()
+        self.assertFalse(installed)
+        self.assertEqual(self.applied, [])
+
+    def test_does_nothing_when_the_kernel_cannot_be_read(self):
+        # "Could not read" is not "absent"; writing a table over an unknown state is not restoring.
+        self.table = "unreadable"
+        self._confirmed_host()
+        self._keep()
+        installed, _ = hp.restore_confirmed_ruleset()
+        self.assertFalse(installed)
+        self.assertEqual(self.applied, [])
+
+    def test_the_kept_envelope_is_private(self):
+        self._confirmed_host()
+        self._keep()
+        mode = os.stat(hp._envelope_path("confirmed")).st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+
+    def test_an_accepted_envelope_for_another_generation_is_not_promoted(self):
+        # Accepted for g2, then the confirm that arrives is for g1: the kept envelope must stay g1's.
+        self._confirmed_host()
+        self._keep(generation="g1")
+        self.assertTrue(hp._remember_accepted_envelope("g2", json.dumps({"generation": "g2"})))
+        self.assertFalse(hp._promote_confirmed_envelope("g1"))
+        installed, why = hp.restore_confirmed_ruleset()
+        self.assertTrue(installed, why)
+
+    def test_confirm_promotes_the_accepted_envelope(self):
+        """Through the real `confirm()`, not the helper."""
+        hp.save_state({**hp._EMPTY_STATE, "generation": "g1", "state": "pending",
+                       "pendingBackup": {"elements": []}, "rollbackAt": time.time() + 300,
+                       "referenceHash": "sha256:" + "e" * 64,
+                       "pendingAuthorization": dict(self.RECORD)})
+        self.assertTrue(hp._remember_accepted_envelope("g1", json.dumps({"generation": "g1"})))
+        hp._backup = []
+        hp._timer = threading.Timer(300, lambda: None)
+        hp._timer.start()
+        try:
+            self.assertTrue(hp.confirm(hp.load_state()), "the generation did not confirm")
+        finally:
+            if hp._timer is not None:
+                hp._timer.cancel()
+        self.assertTrue(os.path.exists(hp._envelope_path("confirmed")),
+                        "confirm() did not keep the envelope it confirmed")
+        installed, why = (None, None)
+        self.table = "absent"
+        installed, why = hp.restore_confirmed_ruleset()
+        self.assertTrue(installed, why)
+
+    def test_main_calls_the_restore_after_the_commitment_recoveries(self):
+        """A tripwire, named as one: main() is read, not run. The invariants are the tests above.
+
+        Order matters for one reason: the commitment recoveries own every non-confirmed state, and the
+        restore acts only on `confirmed`. A restore that moved before them would still refuse those
+        states, so this guards the call's presence more than its position.
+        """
+        tree = ast.parse(Path(hp.__file__).read_text())
+        main = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "main")
+        calls = [n.func.id for n in ast.walk(main) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
+        self.assertIn("restore_confirmed_ruleset", calls, "main() no longer restores at boot")
+        self.assertLess(calls.index("reconcile_recovered_commitments"), calls.index("restore_confirmed_ruleset"))
+
+    def test_handle_reply_keeps_the_envelope_it_accepted(self):
+        """Through the real `handle_reply`: accepted → kept as pending, before the kernel is touched."""
+        hp.save_state(dict(hp._EMPTY_STATE))
+        seen = {}
+
+        def fake_apply(artifact, validated=None):
+            seen["pending"] = os.path.exists(hp._envelope_path("pending"))
+            return True, "pending", ""
+
+        real = (hp.apply_artifact, hp.fetch_artifact, hp.accept_artifact_authorization,
+                hp.apply_workload, hp._host_observation_report)
+        def fetch():
+            # What the real `fetch_artifact` does besides returning the envelope.
+            hp._last_fetched_envelope_text = json.dumps({"generation": "g1"})
+            return {"generation": "g1"}
+
+        hp.apply_artifact = fake_apply
+        hp.fetch_artifact = fetch
+        hp.accept_artifact_authorization = lambda record, watch, expired: ({}, "")
+        hp.apply_workload = lambda artifact: (True, None, "")
+        try:
+            hp.handle_reply(hp.load_state(), {"schemaVersion": hp.SCHEMA_VERSION,
+                                              "generation": "g1", "gate": {"open": True}})
+        finally:
+            (hp.apply_artifact, hp.fetch_artifact, hp.accept_artifact_authorization,
+             hp.apply_workload, hp._host_observation_report) = real
+        self.assertTrue(seen.get("pending"), "the accepted envelope was not kept before the apply")
+
+
+class TestTheHeartbeatSaysWhetherTheTableIsThere(unittest.TestCase):
+    """Issue #139, decision 3 moved to the agent: "absent" and "not read" are different answers.
+
+    The relay used to see one `observedHash: null` for a table that is gone and for one the agent has
+    not read yet, and two review rounds found three false alarms in trying to tell them apart by time.
+    The agent knows which: `_read_host_observation` has a branch for each.
+    """
+
+    def setUp(self):
+        self._real = {n: getattr(hp, n) for n in ("nft_json", "observed_routes")}
+        hp.observed_routes = lambda: []
+
+    def tearDown(self):
+        for name, value in self._real.items():
+            setattr(hp, name, value)
+
+    def test_present_absent_and_unread_are_three_answers(self):
+        for items, expect in (
+            ([{"table": dict(TABLE)}], "present"),
+            ([], "absent"),
+            (None, "unread"),
+        ):
+            with self.subTest(expect=expect):
+                hp.nft_json = lambda args, items=items: (items, "" if items is not None else "nft exited 1")
+                self.assertEqual(hp._read_host_observation()["table"], expect)
+
+    def test_a_report_not_read_yet_says_unread(self):
+        saved = (hp._host_observe_value, hp._host_observe_at, hp._host_observe_refreshing)
+        hp._host_observe_value, hp._host_observe_at, hp._host_observe_refreshing = None, 0.0, True
+        try:
+            self.assertEqual(hp._host_observation_report()["table"], "unread")
+        finally:
+            hp._host_observe_value, hp._host_observe_at, hp._host_observe_refreshing = saved
+
+    def test_the_heartbeat_carries_it(self):
+        saved = hp._host_observation_report
+        hp._host_observation_report = lambda: {
+            "observed": None, "detail": "table inet heliopause is absent", "table": "absent",
+            "foreignFilters": [], "publishedPorts": [], "routes": [],
+        }
+        try:
+            beat = hp.build_heartbeat({**hp._EMPTY_STATE, "state": "confirmed", "generation": "g1"})
+        finally:
+            hp._host_observation_report = saved
+        self.assertEqual(beat["applied"]["table"], "absent")
+
+
 class TestRelayRequestDeadline(unittest.TestCase):
     """`HTTP_TIMEOUT_SEC` bounds the whole exchange, not each socket operation.
 

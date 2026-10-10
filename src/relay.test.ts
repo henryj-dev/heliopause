@@ -1494,6 +1494,91 @@ describe("a refused generation says so where an operator looks", () => {
   });
 });
 
+// ── A confirmed host with no table (#139) ─────────────────────────────────────
+//
+// After a reboot the table is gone until the agent puts it back. The agent now says which of three
+// it saw — `present`, `absent`, or `unread` (not read yet, or `nft` failed) — and the relay reads that
+// rather than guessing from a null `observedHash`. Guessing by beat count, then by time, produced
+// three false alarms in two review rounds; the scenarios below are those three.
+describe("a confirmed host that says its table is absent", () => {
+  const beat = (table: "present" | "absent" | "unread" | undefined, over: HeartbeatOverride = {}) =>
+    hb({
+      ...over,
+      applied: {
+        generation: "gen1", state: "confirmed", artifactHash: "a",
+        observedHash: table === "present" ? "h" : null,
+        detail: table === "absent" ? "table inet heliopause is absent" : table === "unread" ? "host observation refresh pending" : undefined,
+        ...(table === undefined ? {} : { table }),
+        ...(over.applied ?? {}),
+      },
+    });
+  const absentLines = (s: RelayState) =>
+    fleetView(s, new Date(AT), 300).problems.filter((p) => p.includes("table is absent"));
+  const refusals = (s: RelayState) =>
+    fleetView(s, new Date(AT), 300).problems.filter((p) => p.includes("refused generation"));
+  const stale = { lastRefusal: { generation: "gen1", reason: "an earlier attempt", at: AT } };
+
+  it("is reported as soon as the agent says so, with its words", () => {
+    const s = state();
+    handleHeartbeat(s, "h-canary", beat("absent"), AT);
+    const lines = absentLines(s);
+    assert.equal(lines.length, 1, JSON.stringify(lines));
+    assert.match(lines[0]!, /h-canary/);
+    assert.match(lines[0]!, /gen1/);
+  });
+
+  it("says nothing while a restarted agent has not read its table yet, however many beats", () => {
+    // Review scenario 1 (held branch): a one-second interval and a 25-second first observation.
+    const s = state();
+    for (let i = 0; i < 25; i++) handleHeartbeat(s, "h-canary", beat("unread"), AT);
+    assert.deepEqual(absentLines(s), []);
+  });
+
+  it("says nothing for an agent too old to say", () => {
+    const s = state();
+    for (let i = 0; i < 5; i++) handleHeartbeat(s, "h-canary", beat(undefined, { applied: { observedHash: null } }), AT);
+    assert.deepEqual(absentLines(s), []);
+  });
+
+  it("says nothing for a first apply that is not confirmed yet", () => {
+    const s = state();
+    handleHeartbeat(s, "h-canary", beat("absent", { applied: { state: "pending" } }), AT);
+    assert.deepEqual(absentLines(s), []);
+  });
+
+  it("clears once the table is back", () => {
+    // Review scenario 3 (held branch) was a run of beats bridging a silence. Nothing is carried
+    // between beats now; each one is read as it is.
+    const s = state();
+    handleHeartbeat(s, "h-canary", beat("absent"), AT);
+    handleHeartbeat(s, "h-canary", beat("present"), AT);
+    assert.deepEqual(absentLines(s), []);
+  });
+
+  it("shows a refusal of the generation it is on, when the table is absent", () => {
+    // 2026-09-28: the rebooted host fetched its own generation again and the apply was refused.
+    const s = state();
+    handleHeartbeat(s, "h-canary", beat("absent", stale), AT);
+    assert.equal(refusals(s).length, 1);
+    assert.equal(fleetView(s, new Date(AT), 300).hosts[0]!.lastRefusal?.generation, "gen1");
+  });
+
+  it("keeps an old same-generation refusal hidden while the table is unread", () => {
+    // Review scenario 2 (held branch): a transient failure left a refusal in the agent's state, and a
+    // restart begins with unread beats.
+    const s = state();
+    handleHeartbeat(s, "h-canary", beat("unread", stale), AT);
+    assert.deepEqual(refusals(s), []);
+    assert.equal(fleetView(s, new Date(AT), 300).hosts[0]!.lastRefusal, null);
+  });
+
+  it("shows a refusal of the generation it is on, when it is not confirmed", () => {
+    const s = state();
+    handleHeartbeat(s, "h-canary", beat("present", { ...stale, applied: { state: "rolled-back" } }), AT);
+    assert.equal(refusals(s).length, 1);
+  });
+});
+
 describe("the agent certificate each heartbeat presented", () => {
   const presented = {
     cn: "h-canary", serial: "0A", sha256: "ab".repeat(32),

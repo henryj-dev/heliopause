@@ -2635,6 +2635,9 @@ def confirm(state):
         _route_restore = []
     state.update(fresh)
     log(f"generation {fresh['generation']} confirmed — rollback disarmed")
+    # Kept for a reboot (#139). After the durable confirm, so a crash between the two leaves the
+    # previous confirmed envelope — which then no longer matches and is not installed.
+    _promote_confirmed_envelope(fresh["generation"])
     return True
 
 
@@ -3956,6 +3959,151 @@ def save_state(st):
         return _save_state_unlocked(st)
 
 
+# ## The confirmed envelope, kept for a reboot (#139, decision A)
+#
+# The signed envelope as the relay served it, not the unwrapped artifact: the boot path verifies the
+# signature again, so what is on disk is trusted for what it proves, not for where it sits. Two files,
+# the same two-phase shape as `pendingAuthorization` → `currentAuthorization`: an accepted envelope is
+# kept as `pending` before the kernel is touched, and `confirm()` promotes it only when it is the
+# generation being confirmed. A stale `pending` from a generation that never confirmed is simply
+# overwritten by the next acceptance.
+def _envelope_path(kind):
+    return os.path.join(os.path.dirname(STATE_FILE) or ".", f"{kind}-envelope.json")
+
+
+def _write_private_json(path, value):
+    """Atomically and durably replace `path` with `value`, mode 0600. Same steps as the state file."""
+    directory = os.path.dirname(path) or "."
+    fd = None
+    tmp = None
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=directory)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            fd = None
+            json.dump(value, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        tmp = None
+        dir_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+        return True
+    except (OSError, TypeError, ValueError) as e:
+        log(f"cannot write {path}: {e}")
+        return False
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def _read_kept_envelope(kind):
+    """`(generation, envelope)` from a kept file, or `(None, reason)`.
+
+    The generation beside it is the label it was kept under, used only to decide promotion; restore
+    compares the **signed** generation the verifier returns.
+    """
+    try:
+        with open(_envelope_path(kind), encoding="utf-8") as f:
+            kept = json.load(f)
+        envelope = json.loads(kept["envelopeJson"]) if isinstance(kept, dict) else None
+    except FileNotFoundError:
+        return None, f"no {kind} envelope is kept"
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        return None, f"{kind} envelope is unreadable: {e}"
+    if not isinstance(kept.get("generation"), str) or not isinstance(envelope, dict):
+        return None, f"{kind} envelope is malformed"
+    return kept["generation"], envelope
+
+
+def _remember_accepted_envelope(generation, envelope_text):
+    """Keep the text of an envelope whose authorization was just accepted, before any side effect."""
+    if not isinstance(envelope_text, str):
+        log("not keeping an envelope for boot restore: its text was not captured at fetch")
+        return False
+    return _write_private_json(
+        _envelope_path("pending"), {"generation": generation, "envelopeJson": envelope_text},
+    )
+
+
+def _promote_confirmed_envelope(generation):
+    """Make the kept `pending` envelope the confirmed one, if it is this generation's."""
+    kept, envelope = _read_kept_envelope("pending")
+    if kept != generation:
+        log(f"not keeping an envelope for boot restore: the accepted one is not generation {generation}")
+        return False
+    try:
+        os.replace(_envelope_path("pending"), _envelope_path("confirmed"))
+    except OSError as e:
+        log(f"cannot keep the confirmed envelope for boot restore: {e}")
+        return False
+    return True
+
+
+def restore_confirmed_ruleset():
+    """At boot, before the relay: re-install the confirmed ruleset if the kernel lost it.
+
+    Returns `(installed, reason)`. Installs only if every condition holds — the state is `confirmed`;
+    the table is read and absent; the kept envelope verifies; it is the generation the state is on; its
+    authorization is the one `currentAuthorization` names. An expired authorization passes only then,
+    which is the escape hatch's condition in `accept_artifact_authorization` — so "expired, another
+    generation" is never installed.
+
+    No rollback timer and no state write. This is not a commitment awaiting confirmation; it puts back
+    what was already confirmed, and with no relay a timer would roll back to the empty table this is
+    repairing. The watermark is not advanced, so replay protection is unchanged. Routes are not
+    restored (said in the log when declared). A refusal leaves the table absent, which the heartbeat
+    reports as `table: absent`.
+
+    @see TestBootRestore
+    """
+    st = load_state()
+    if st.get("state") != "confirmed":
+        return False, f"state is {st.get('state')}, not confirmed"
+    items, detail = nft_json(["-s", "list", "ruleset"])
+    if items is None:
+        return False, f"cannot read the kernel ruleset: {detail}"
+    if any(isinstance(i, dict) and "metainfo" not in i and _is_ours(i) for i in items):
+        return False, "the table is present"
+    generation, envelope = _read_kept_envelope("confirmed")
+    if generation is None:
+        return False, envelope
+    try:
+        artifact, record, _watch, _expired = verify_artifact_envelope(envelope)
+    except Exception as e:  # noqa: BLE001 — any verification failure is a refusal
+        return False, f"kept envelope does not verify: {e}"
+    # The signed generation, not the file's label beside it.
+    if artifact.get("generation") != st.get("generation"):
+        return False, (f"kept envelope is generation {artifact.get('generation')}, "
+                       f"the confirmed generation is {st.get('generation')}")
+    current = st.get("currentAuthorization")
+    if not isinstance(current, dict) or _authorization_identity(current) != _authorization_identity(record):
+        return False, "kept envelope's authorization is not the one this host is enforcing"
+    doc, _timeout, reason = _preflight_host_artifact(artifact)
+    if doc is None:
+        return False, reason
+    with _apply_lock:
+        if _timer is not None or _nft_rollback_owed is not None:
+            return False, "an apply or rollback is in progress"
+        rc, err = _nft_apply_json(doc)
+    if rc != 0:
+        return False, f"nft rejected the kept ruleset: {err}"
+    if artifact.get("routes"):
+        log("boot restore installed the ruleset but not its declared routes")
+    return True, f"generation {artifact.get('generation')} restored"
+
+
 def update_state(mutator):
     """Run a load→mutate→durable-save transaction under the shared state lock.
 
@@ -4601,9 +4749,18 @@ def post_heartbeat(payload):
     return relay_request("POST", "/heartbeat", payload)
 
 
+# The envelope as text, written down at fetch, so the boot-restore copy (#139) is kept without
+# `handle_reply` opening the envelope again after verification — which
+# `TestTheApplyPathReadsTheVerifiedArtifact` forbids, and serialising it would do.
+_last_fetched_envelope_text = None
+
+
 def fetch_artifact():
     """Fetch this host's artifact. The relay derives the host from our certificate, not from us."""
-    return relay_request("GET", "/artifact")
+    global _last_fetched_envelope_text
+    envelope = relay_request("GET", "/artifact")
+    _last_fetched_envelope_text = json.dumps(envelope)
+    return envelope
 
 
 # ── loop ──────────────────────────────────────────────────────────────────────
@@ -4625,6 +4782,9 @@ def _read_host_observation():
         return {
             "observed": None,
             "detail": detail,
+            # `observed` is null in this branch and in the absent one below; this is what tells them
+            # apart without anyone matching `detail`'s words (#139).
+            "table": "unread",
             "foreignFilters": None,
             "publishedPorts": None,
             "routes": observed_routes(),
@@ -4636,6 +4796,7 @@ def _read_host_observation():
     return {
         "observed": _observed_digest(ours) if ours else None,
         "detail": "" if ours else f"table {TABLE_FAMILY} {TABLE_NAME} is absent",
+        "table": "present" if ours else "absent",
         "foreignFilters": _foreign_filters_from_items(items),
         "publishedPorts": _published_ports_from_items(items),
         # Read here rather than beside the nftables dump because it is a different subsystem: a
@@ -4716,6 +4877,7 @@ def _host_observation_report():
     return {
         "observed": None,
         "detail": start_failure or failure or "host observation refresh pending",
+        "table": "unread",
         "foreignFilters": None,
         "publishedPorts": None,
         # Present and null on the pending path too. `build_heartbeat` reads this with `.get`, so a
@@ -4792,6 +4954,9 @@ def build_heartbeat(st):
             "artifactHash": st["artifactHash"],
             "observedHash": observed,
             "detail": st["detail"] or detail or None,
+            # "present" · "absent" · "unread" — from the observation, never inferred from a null
+            # `observedHash` (#139). Absent from agents that predate it.
+            "table": host_observation.get("table"),
         },
         # Buffered since the last successful heartbeat. Cleared by take_events() above, so a failed
         # send loses them — acceptable because the events are also in this host's journal, and
@@ -5019,6 +5184,7 @@ def _workload_report(st):
 
 def handle_reply(st, reply):
     """Act on a reply: confirm a pending apply, or start a new one."""
+    global _last_fetched_envelope_text
     if reply.get("schemaVersion") != SCHEMA_VERSION:
         log(
             f"relay speaks schema {reply.get('schemaVersion')}, we speak {SCHEMA_VERSION} — "
@@ -5175,6 +5341,8 @@ def handle_reply(st, reply):
         log(f"generation {wanted} is waiting on stage {gate.get('stage')}: {gate.get('reason')}")
         return
 
+    # Cleared so a text left by an earlier fetch can never be kept as this one's.
+    _last_fetched_envelope_text = None
     try:
         envelope = fetch_artifact()
     except Exception as e:  # noqa: BLE001
@@ -5218,6 +5386,10 @@ def handle_reply(st, reply):
         # that does not reach it is a refusal nobody can act on.
         _record_refusal(wanted, accept_error)
         return
+    # Kept before any side effect, so `confirm()` can promote it for a boot restore (#139). The text
+    # captured at fetch, not the object — see `_last_fetched_envelope_text`. A failure to keep it costs
+    # the restore, not this apply.
+    _remember_accepted_envelope(wanted, _last_fetched_envelope_text)
 
     # Validate the host half without touching the kernel, then apply the workload half first. A
     # workload apply can legitimately spend minutes in API admission/read-back; arming the host's
@@ -5415,6 +5587,11 @@ def main():
     # separate deadlines. A no-op on every host that is not the applier.
     recover_workload_commitment()
     reconcile_recovered_commitments()
+    # A reboot took the table; put back what was confirmed without waiting for the relay (#139).
+    # After the commitment recoveries, which own every non-confirmed state, and before the monitor
+    # starts, so the restore is not observed as a change this agent did not make. Writes no state.
+    installed, why = restore_confirmed_ruleset()
+    log(f"boot restore: {'installed' if installed else 'not installed'} — {why}")
 
     # Watches the ruleset for changes this agent did not make. Daemon, so a wedged monitor can
     # never keep the process alive; the heartbeat loop is what must not stop.
