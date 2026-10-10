@@ -14,7 +14,10 @@
 // This pins the invariant so the next such import is caught here instead of on a gateway: every
 // `packages/<x>` a non-test `src` file imports must be in the relay's ship list.
 import assert from "node:assert/strict";
-import { readdirSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 
@@ -194,5 +197,63 @@ describe("deploy-fleet.sh proves the restart happened", () => {
     assert.match(script, /f=\/opt\/heliopause\/agent\/heliopause-pull\.py/);
     assert.match(script, /f=\/opt\/heliopause\/src\/relay\.ts/);
     assert.doesNotMatch(script, /agent-schema=/);
+  });
+});
+
+// ## The operator's umask travels with the files
+//
+// `tar` packs the checkout's modes and the host-side `rsync -a` keeps them. On 2026-10-10 the operator's
+// shell had `umask 077`, the pull before the rollout rewrote eight tracked files as 0600, and the first
+// relay deploy died with `EACCES … open '/opt/heliopause/src/relay.ts'` — the relay's service account
+// could not read its own source. `heliopause-pull.py` was among the eight, and the agent ships through
+// the same install loop.
+//
+// The script now runs `chmod` on what it installed, and on each new parent directory. Not
+// `rsync --chmod`: macOS's `openrsync` accepts that option, exits 0 and changes nothing (measured the
+// same day), so a test of it on a Mac would pass while proving nothing, and the hosts' rsync was not
+// measured.
+//
+// This runs the script's own install line — the whole loop, read from the remote heredoc — with `sudo`
+// dropped, `/opt/heliopause` pointed at a temporary directory and `umask 077`, so the result is tested
+// by effect. A review showed the first version matched a fragment that a commented-out line or a loop
+// narrowed to `bin` still contained.
+describe("deploy-fleet.sh installs files the service account can read", () => {
+  /** The remote install loop, the whole line, as the host runs it. */
+  function installLine(): string {
+    const script = read("../scripts/deploy-fleet.sh");
+    const heredoc = /<<'EOS'\n([\s\S]*?)\nEOS\n/.exec(script);
+    assert.ok(heredoc, "could not find the remote heredoc in deploy-fleet.sh");
+    const line = heredoc[1]!.split("\n").find((l) => l.startsWith("for p in $paths; do sudo mkdir -p"));
+    assert.ok(line, "the remote install loop over $paths is gone");
+    return line;
+  }
+
+  it("leaves every installed file, executable and new parent readable under umask 077", () => {
+    const root = mkdtempSync(join(tmpdir(), "hp-deploy-modes-"));
+    try {
+      const staged = join(root, "staged");
+      const opt = join(root, "opt");
+      mkdirSync(join(staged, "bin"), { recursive: true });
+      mkdirSync(join(staged, "packages", "i18n", "src"), { recursive: true });
+      // `opt` is not made here: a first install creates the base itself, under umask 077 (review round 2).
+      writeFileSync(join(staged, "bin", "relay.ts"), "x");
+      writeFileSync(join(staged, "bin", "run"), "#!/bin/sh\n");
+      writeFileSync(join(staged, "packages", "i18n", "src", "index.ts"), "x");
+      chmodSync(join(staged, "bin", "relay.ts"), 0o600);
+      chmodSync(join(staged, "bin", "run"), 0o700);
+      chmodSync(join(staged, "packages", "i18n", "src", "index.ts"), 0o600);
+      const line = installLine().replaceAll("sudo ", "").replaceAll("/opt/heliopause", opt);
+      execFileSync("bash", ["-c", `set -euo pipefail; umask 077; T=${JSON.stringify(staged)}; paths="bin packages/i18n"; ${line}`]);
+      const mode = (...p: string[]) => (statSync(join(opt, ...p)).mode & 0o777).toString(8);
+      assert.equal(mode("bin", "relay.ts"), "644", "a 0600 source is still unreadable to the service account");
+      assert.equal(mode("bin", "run"), "755", "an executable lost its execute bit, or did not gain read");
+      assert.equal(mode("bin"), "755");
+      assert.equal(mode("packages", "i18n", "src", "index.ts"), "644");
+      assert.equal(mode("packages", "i18n"), "755");
+      assert.equal(mode("packages"), "755", "a parent made under umask 077 is still closed to the service account");
+      assert.equal(mode(), "755", "the base made under umask 077 is still closed to the service account");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
