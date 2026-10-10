@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { agentBuildLines, authorizationExpiry, agentBuildSplit, hostsOnBuild, answeredVpcNames, fleetListing, fleetSummary, hostMatches, hostStateChips, routesView, whyBits, vpcLabel, vpcTone, workloadChip } from "./present.ts";
+import { agentBuildLines, authorizationExpiry, authorizationLines, agentBuildSplit, hostsOnBuild, answeredVpcNames, fleetListing, fleetSummary, hostMatches, hostStateChips, routesView, whyBits, vpcLabel, vpcTone, workloadChip } from "./present.ts";
 // `SiteHost` comes from `./site.ts`; `present.ts` imports it but does not re-export it, so this
 // used to be `type SiteHost` on the line above and was simply broken. Nothing said so: this
 // workspace's tests were outside every tsconfig, and `node --test` strips types rather than
@@ -45,6 +45,19 @@ describe("authorizationExpiry", () => {
 
   it("says it does not know, rather than that it has not lapsed", () => {
     assert.deepEqual(authorizationExpiry(null, NOW), { kind: "unknown" });
+  });
+});
+
+describe("authorizationLines", () => {
+  it("shows both expiries for a host that has applied something", () => {
+    const lines = authorizationLines(host({ authorizationExpiresAt: "A", servedAuthorizationExpiresAt: "S" }));
+    assert.deepEqual(lines, [{ key: "m.authApplied", at: "A" }, { key: "m.authServed", at: "S" }]);
+  });
+
+  it("still shows the served expiry for a host that has applied nothing — a refused first envelope", () => {
+    // Review round 3: both lines sat behind `host.generation`, hiding the one value the relay knew.
+    const lines = authorizationLines(host({ generation: null, servedAuthorizationExpiresAt: "S" }));
+    assert.deepEqual(lines, [{ key: "m.authServed", at: "S" }]);
   });
 });
 

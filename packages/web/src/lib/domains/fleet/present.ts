@@ -123,6 +123,20 @@ export type AuthorizationExpiry =
  * keeps its rules past it, and the case where a lapse blocks anything is reported by the relay.
  * `null` is "not known" and stays that — it is never drawn as time left.
  */
+/**
+ * Which expiry lines a host row shows. The applied one needs something applied; the served one does
+ * not — a host refusing its first envelope has no generation, and that is where the served expiry
+ * matters most.
+ */
+export function authorizationLines(
+  host: Pick<SiteHost, "generation" | "authorizationExpiresAt" | "servedAuthorizationExpiresAt">,
+): Array<{ key: "m.authApplied" | "m.authServed"; at: string | null }> {
+  return [
+    ...(host.generation ? [{ key: "m.authApplied" as const, at: host.authorizationExpiresAt }] : []),
+    { key: "m.authServed" as const, at: host.servedAuthorizationExpiresAt },
+  ];
+}
+
 export function authorizationExpiry(at: string | null, nowMs: number): AuthorizationExpiry {
   if (at === null) return { kind: "unknown" };
   const leftMs = Date.parse(at) - nowMs;
