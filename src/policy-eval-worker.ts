@@ -46,7 +46,7 @@ import type { ScreenSite } from "./policy-screen.ts";
 //
 // ⚠️ That is the send, not the message. Plenty that runs before it still resolves at call time: the
 // reads of `site`, the resolver call, `Object.values`/`Array.isArray`/iteration in `collectModuleFacts`,
-// and the `toJSON` that the captured `JSON.stringify` still calls on the value — inherited ones
+// and the `toJSON` that `JSON.stringify` calls on the value — inherited ones
 // included. An independent review delivered a complete forged message through every capture intact by
 // defining `Object.prototype.toJSON`. So the content of this message is the module's to choose, and
 // the parent does not rely on it: of what arrives it keeps `site` and `services`, which are the
@@ -60,10 +60,9 @@ import type { ScreenSite } from "./policy-screen.ts";
 const send = MessagePort.prototype.postMessage;
 const apply = Reflect.apply;
 
-// The serialisation that produces the bytes. §2's requirement 1: the module's half is serialised in
-// here, so nothing that cannot be written reaches the parent as a value. Captured for the same reason
-// as ③.
-const writeWire = JSON.stringify;
+// The serialisation that produces the bytes is plain `JSON.stringify`, looked up after the import (#117).
+// It is not captured: what it writes is the module's to choose anyway (above), and reverting the
+// capture it once had left the repository suite green. The send is what has to be captured.
 
 // `wire` is what this file *means* to send — `{ site, services }` as JSON. A module can make it carry
 // more (see above); the parent reads only those two keys from it. Exported so the test and the parent
@@ -168,7 +167,7 @@ try {
   // `build` are filled in by the parent. This sends the module's half; the parent keeps only that
   // half from whatever actually arrives.
   // @see bin/heliopause-policy-render.ts, and the decision note in docs/policy-eval-worker-notes.md
-  apply(send, reply, [{ ok: true, wire: writeWire(collectModuleFacts(mod.site)) } satisfies EvalReply]);
+  apply(send, reply, [{ ok: true, wire: JSON.stringify(collectModuleFacts(mod.site)) } satisfies EvalReply]);
 } catch (thrown) {
   apply(send, reply, [{ ok: false, message: failureText(thrown) } satisfies EvalReply]);
 }

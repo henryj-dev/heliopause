@@ -117,45 +117,25 @@ const log = (m: string): void => console.log(`[policy-render] ${oneLine(m)}`);
  * @see src/policy-render-service.test.ts "a module cannot force a refusal by throwing the renderer's
  *      own error class"
  */
-const OUR_ZONE_MISMATCHES = new WeakSet<ZoneMismatchError>();
+const OUR_ZONE_MISMATCHES = new WeakSet<object>();
 
-// ## Bound before any policy module is imported
+// ## No intrinsic is captured in this process any more (#117)
 //
-// ⚠️ This section is a pre-#134 record (same-realm evaluation).
+// Until #134 a policy module was imported into this realm, so this file captured the intrinsics a
+// shared path resolves at call time — `WeakSet.prototype.has`/`add` for the set above, `Error`,
+// `String`, `setTimeout`/`clearTimeout`, `Date.now`, and `JSON.stringify`/`JSON.parse` for responses and
+// the wire — each one because a module replacing it was measured to crash the process or take another
+// site down. The tables are in `AGENTS.md`, marked as pre-#134 records.
 //
-// `foundHere` called `OUR_ZONE_MISMATCHES.has(...)`, which looks the method up on
-// `WeakSet.prototype` **at call time** — and a policy module runs in this realm, so
-// `WeakSet.prototype.has = () => true` in one makes every error look like ours. Measured: it turned an
-// ordinary content fault into `exit 2` with a refusal nobody configured. The set is unreachable to a
-// module, but the *lookup* was not; capturing it here, before the first `import()`, is what makes the
-// unreachability of the set the only thing that matters.
-const zoneMismatchIsOurs = WeakSet.prototype.has.bind(OUR_ZONE_MISMATCHES) as (e: object) => boolean;
-const rememberOurZoneMismatch = WeakSet.prototype.add.bind(OUR_ZONE_MISMATCHES) as (e: object) => unknown;
-
-// ## The value was guarded; the constructor used to describe it was not
+// Since #134 no policy module runs here: each is evaluated in its own worker, and what comes back is
+// bytes. Reverting every one of those captures to a call-time lookup left the whole repository suite
+// green, so they were removed rather than kept as lines that look protective and protect nothing.
+// Measured 2026-10-10 against `5c5be0e`, one capture at a time, then all together.
 //
-// ⚠️ This section is a pre-#134 record (same-realm evaluation).
-//
-// A policy module is evaluated by `import()` in **this process's own realm** — the same `globalThis` —
-// so `globalThis.Error = function () { throw 1; };` is two tokens that replace the constructor every
-// later `new Error(...)` resolves. The guards below all read the thrown value carefully and then build
-// an `Error` to carry it, which called the module's function instead.
-//
-// Where that lands is the whole severity. `asError` runs inside `evaluateWithin`'s rejection handler,
-// the single point every module failure funnels through, and a throw inside a rejection handler is an
-// unhandled rejection: **exit 1 during the startup loop, before `server.listen`.** Measured — a module
-// that replaces `Error` and then throws a string takes the process down at boot, so it restarts and
-// does it again. At `replicas: 1` with `Recreate` that is every co-served site's console dark on a
-// crashloop, the same outage `asError` was added to prevent, reached through `asError` itself. The
-// handler's own comment describes this mechanism and did not close it, because the comment was about
-// the *value* being unreadable and this is the *constructor* being replaced.
-//
-// Captured here, before the first dynamic import, for the reason the block above gives. `extends Error`
-// needs no capture: the superclass is resolved when the class definition is evaluated, which is also
-// before any import, so `ZoneCheckedError` and `ZoneMismatchError` already hold the real one.
-//
-// @see src/policy-render-service.test.ts "survives a module that replaces the globals it will be described with"
-const RealError = Error;
+// 🔑 **This holds only while nothing imports policy code into this process.** A path that does —
+// a preview, a cache warm-up, a debugging shortcut — reopens every row of those tables at once. The
+// captures the boundary still needs live in the worker (`src/policy-eval-worker.ts`), where the module
+// runs.
 
 // ## A module's callback outlives the handler that was watching its import
 //
@@ -173,8 +153,6 @@ const RealError = Error;
 // file no longer crashes loudly either — so it is not swallowed: every one is logged and counted, and
 // the count is on `/readyz`, where an operator polling readiness sees it without reading logs.
 //
-// Installed before the first dynamic import, like the captures above.
-//
 // @see src/policy-render-service.test.ts "keeps serving when a module's own callback throws later"
 let faults = 0;
 for (const signal of ["uncaughtException", "unhandledRejection"] as const) {
@@ -186,69 +164,6 @@ for (const signal of ["uncaughtException", "unhandledRejection"] as const) {
     console.error(`[policy-render]   this cannot be attributed to one site; check /readyz and the policy commits`);
   });
 }
-
-// ⚠️ This section is a pre-#134 record (same-realm evaluation).
-//
-// The same capture, for the same reason, on the coercion two shared paths use. `globalThis.String =
-// function () { throw 1; };` in one module made **another site** answer 503: `sourceStamp` and
-// `hostIds` run for every site, so a module that replaces `String` un-serves the modules it does not
-// own, and the log says only that they failed to evaluate. Measured. That is quieter than the crash
-// above and worse — a correct prod policy stops rendering because a dev commit is hostile or broken.
-//
-// Not substituted inside `reasonOf` and `asError`: those calls are already wrapped in the `try`/`catch`
-// that exists for a value whose coercion throws, so a replaced `String` lands in the same fallback.
-// `boundedInteger`'s runs before the first import, where nothing has been replaced yet.
-const toText = String;
-
-// ⚠️ This section is a pre-#134 record (same-realm evaluation).
-//
-// And the rest of what a shared path resolves at call time. `evaluateWithin` arms a timer for **every**
-// site, so `globalThis.setTimeout = function () { throw 1; };` in one module throws inside the
-// `new Promise` executor of another site's evaluation — measured, alpha answered 503 because beta was
-// hostile. `send` serialises every response including `/healthz`, and the readiness memo reads the
-// clock, so a replaced `JSON` or `Date` is the same reach by a different name.
-//
-// Captured rather than each call being wrapped: a `try` around a timer that was replaced still has no
-// timer, and the point is that the module never gets to participate in another site's request at all.
-const arm = setTimeout;
-const disarm = clearTimeout;
-const readClock = Date.now;
-const toJson = JSON.stringify;
-// ## The wire pair, captured for the same reason and with the same limit
-//
-// ⚠️ This section is a pre-#134 record (same-realm evaluation).
-//
-// `evaluated` serialises the outgoing `PolicySource` and its caller parses it back. Both functions
-// are resolved here, before the first `import()`, because a policy module runs in this realm and a
-// call-time lookup would be the module's function — and the value being serialised is the one thing
-// a module fully controls.
-//
-// ⚠️ Capturing the function is not the same as the operation being safe. `JSON.stringify` calls a
-// `toJSON` it finds **on the value**, inherited ones included, so a poisoned `Object.prototype` is
-// not closed by this line — that is why the caller treats a throw here as this site's failure
-// rather than assuming the conversion cannot throw.
-const writeWire = JSON.stringify;
-const parseWire = JSON.parse;
-
-// ## ⚠️ What this does **not** do, stated because leaving it implied is the same silence
-//
-// ⚠️ This section is a pre-#134 record (same-realm evaluation).
-//
-// The substitutions above are the call sites that were *measured* to reach another site or the
-// process. Nothing stops the next edit from adding a bare `JSON.stringify(`, `String(` or
-// `setTimeout(` on a shared path, and the tests will not catch it: they exercise the shapes known
-// today, and a new unguarded call is only reachable by a shape nobody has written yet.
-//
-// A check over this file's source text would find it, and that is deliberately not here: `AGENTS.md`
-// records three separate times that asserting on source text in this repo missed the thing it was
-// written for, and the test file's own preamble says the same. So this is a gap held open on purpose,
-// not an oversight — and it is a second reason the captures are a patch on measured paths rather than
-// a boundary. Evaluating policy in its own realm removes the whole class, including this.
-//
-// Until then, the rule for anyone editing this file: an intrinsic resolved at call time on a path
-// more than one site reaches must use the captured name. Ask what the operation looks up **on the
-// value** as well — `JSON.stringify` calls an inherited `toJSON`, resolving a promise reads an
-// inherited `then`, and capturing the global closes neither.
 
 // ## "The zone check had already passed" is no longer a fact this file carries
 //
@@ -265,7 +180,7 @@ const parseWire = JSON.parse;
 /** A zone mismatch this process found. Registered so `foundHere` can recognise it later. */
 function ownZoneMismatch(message: string): ZoneMismatchError {
   const error = new ZoneMismatchError(message);
-  rememberOurZoneMismatch(error);
+  OUR_ZONE_MISMATCHES.add(error);
   return error;
 }
 
@@ -273,10 +188,10 @@ function ownZoneMismatch(message: string): ZoneMismatchError {
 function foundHere(error: unknown): error is ZoneMismatchError {
   // No `instanceof` here. It cannot help — membership already implies this process built the object —
   // and it can hurt: `instanceof` runs a Proxy's `getPrototypeOf` trap, so the check meant to
-  // establish provenance could itself throw. `typeof` is enough to keep the bound `has` from being
+  // establish provenance could itself throw. `typeof` is enough to keep `has` from being
   // handed a primitive.
   if (error === null || (typeof error !== "object" && typeof error !== "function")) return false;
-  return zoneMismatchIsOurs(error);
+  return OUR_ZONE_MISMATCHES.has(error);
 }
 
 /**
@@ -361,7 +276,7 @@ function asError(thrown: unknown): Error {
   } catch {
     described = `a ${typeof thrown} that cannot be described`;
   }
-  return new RealError(`policy module threw a non-error value: ${described}`);
+  return new Error(`policy module threw a non-error value: ${described}`);
 }
 
 const env = (name: string, fallback?: string): string => {
@@ -673,7 +588,7 @@ function sourceStamp(sitePath: string): string | ScanFailure {
   const dir = dirname(resolve(sitePath));
   const mtime = (p: string): string => {
     try {
-      return toText(statSync(p).mtimeMs);
+      return String(statSync(p).mtimeMs);
     } catch {
       return "-";
     }
@@ -811,7 +726,7 @@ function sourceStamp(sitePath: string): string | ScanFailure {
 /** The host ids a rendered site declares, for the zone check. */
 function hostIdsOf(site: ScreenSite): string[] {
   const hosts = (site as { hosts?: readonly { id?: unknown }[] }).hosts ?? [];
-  return hosts.map((h) => toText(h?.id ?? "")).filter(Boolean);
+  return hosts.map((h) => String(h?.id ?? "")).filter(Boolean);
 }
 
 async function currentSource(site: { name: string | null; path: string }): Promise<string> {
@@ -840,7 +755,7 @@ async function currentSource(site: { name: string | null; path: string }): Promi
   // why the cap sits far above a measured checkout rather than near it.
   const stamped = sourceStamp(sitePath);
   if (typeof stamped !== "string") {
-    throw new RealError(
+    throw new Error(
       `${sitePath}: ${scanFailureReason(stamped)} — so this site is refused rather than served from a ` +
         "key that cannot move",
     );
@@ -886,7 +801,7 @@ function accepted(
   //
   // A module controls what its worker sends — measured twice: once by replacing
   // `Function.prototype.call` to intercept the send, once by an inherited `Object.prototype.toJSON` that
-  // the worker's captured `JSON.stringify` still calls. So the only fields taken from the message are
+  // the worker's `JSON.stringify` calls. So the only fields taken from the message are
   // the ones the module is entitled to choose anyway: `site` and the resolver table. `label`,
   // `siteName`, `build`, `repo`, `head` and `files` are taken here from the renderer's configuration and
   // the checkout, and any other key in the message is dropped, so a value placed in the message cannot
@@ -897,11 +812,11 @@ function accepted(
   // text served in `files`. That predates the worker, and closing it is a separate change, #131.
   //
   // @see src/policy-render-service.test.ts "does not take anything but the module's own half from the worker"
-  const half = parseWire(moduleWire) as { site?: unknown; services?: unknown } | null;
+  const half = JSON.parse(moduleWire) as { site?: unknown; services?: unknown } | null;
   if (typeof half !== "object" || half === null || Array.isArray(half)) {
-    throw new RealError(`${sitePath}: the evaluation sent something that is not an object`);
+    throw new Error(`${sitePath}: the evaluation sent something that is not an object`);
   }
-  const wire = writeWire(assemblePolicySource({
+  const wire = JSON.stringify(assemblePolicySource({
     module: { site: half.site as ScreenSite, services: half.services as Record<string, never> },
     sitePath,
     allowPaths,
@@ -931,7 +846,7 @@ function accepted(
   // The sentence above still holds for what gets cached and served: those are the bytes.
   //
   // @see src/policy-render-service.test.ts "no guard had named" — shape `serialisableButInvalid`
-  const parsed = parsePolicySource(parseWire(wire));
+  const parsed = parsePolicySource(JSON.parse(wire));
   // ## The zone check reads the wire, because the worker's realm belongs to the module
   //
   // This check used to run in the parent on the module's own `site` object, before collection. Now
@@ -1270,8 +1185,8 @@ let readyMemo: {
  *
  * There is no fix for this in the same realm, which is why the sentence is a warning rather than a
  * TODO: interrupting the module means evaluating it somewhere with its own event loop — a
- * `worker_thread` or a `vm` context. That is also the boundary the intrinsic captures above are
- * explicitly *not*. The budget still does what it says for a module that hangs **asynchronously**,
+ * `worker_thread` or a `vm` context. That is also the boundary the intrinsic captures this file once held
+ * explicitly were *not*. The budget still does what it says for a module that hangs **asynchronously**,
  * which is the common case and the one the test covers.
  *
  * ⚠️ This section is a pre-#134 record (same-realm evaluation). @see src/policy-render-service.test.ts
@@ -1300,15 +1215,15 @@ function evaluateWithin(
     //
     // Holding the loop open costs at most one budget, and the timer is cleared on every normal path,
     // so a fast answer leaves nothing behind.
-    const timer = arm(
-      () => reject(new RealError(`evaluation did not finish within ${budgetMs}ms`)),
+    const timer = setTimeout(
+      () => reject(new Error(`evaluation did not finish within ${budgetMs}ms`)),
       budgetMs,
     );
     void currentSource(site).then(
       // No `try` around `resolve`. Resolving an object does read `.then` off it, and a module can
       // make that throw — but `currentSource` resolves its own object first, so its promise rejects
       // and this handler is never entered. Written, then deleted when no mutation could make it fire.
-      (wire) => { disarm(timer); resolve(wire); },
+      (wire) => { clearTimeout(timer); resolve(wire); },
       // `asError`, not a cast. `throw null` in a policy module rejected the import with `null`,
       // which `/source`'s handler then read `.message` off — a `TypeError` in a rejection handler,
       // so an unhandled rejection, so **exit 1 on the first request**. The startup loop had its own
@@ -1320,10 +1235,10 @@ function evaluateWithin(
       // A throw *in this handler* is an unhandled rejection, so the process would be gone — which is
       // exactly what a module that replaced `globalThis.Error` achieved through `asError`, measured as
       // exit 1 during the startup loop. The fix is that `asError` cannot throw: every inspection in it
-      // is wrapped, `typeof` has no trap, and the constructor is captured before the first import. A
+      // is wrapped, `typeof` has no trap, and — since #134 — no module runs in this realm to replace `Error`. A
       // `try` here as well was written and then deleted — no mutation could make it fire, and a guard
       // no test can reach also hides the code it wraps from single-point mutation.
-      (e: unknown) => { disarm(timer); reject(asError(e)); },
+      (e: unknown) => { clearTimeout(timer); reject(asError(e)); },
     );
   });
 }
@@ -1354,7 +1269,7 @@ function evaluateWithin(
  * the only kind that can be stale.
  */
 function readiness(): Promise<{ serving: number; total: number }> {
-  if (readyMemo && (readyMemo.settledAt === null || readClock() - readyMemo.settledAt < READY_MEMO_MS)) {
+  if (readyMemo && (readyMemo.settledAt === null || Date.now() - readyMemo.settledAt < READY_MEMO_MS)) {
     return readyMemo.answer;
   }
   // Not `Promise.all`: it resolves an array, and an array inherits a `then` a policy module can
@@ -1384,7 +1299,7 @@ function readiness(): Promise<{ serving: number; total: number }> {
   // check that is not here and never was; the behaviour was right and the mechanism described was
   // fiction, which is the worse of the two ways to be wrong in a comment.)
   const stamp = (): void => {
-    memo.settledAt = readClock();
+    memo.settledAt = Date.now();
   };
   void answer.then(stamp, stamp);
   return answer;
@@ -1432,7 +1347,7 @@ const HEALTHZ_BODY = '{"ok":true}';
 // Reported by the operator of the cluster this serves, who had just been bitten by reading a table's
 // zero rows as "verified".
 //
-// Built by concatenation rather than `toJson`: interpolating a **number primitive** uses the spec's
+// Built by concatenation rather than `JSON.stringify`: interpolating a **number primitive** uses the spec's
 // Number::toString, not `Number.prototype.toString`, so a module cannot hook it — which matters
 // because the only way to get here is a module having hooked something.
 const unserialisableBody = (): string =>
@@ -1450,7 +1365,7 @@ const server = createServer((req, res) => {
   const send = (code: number, body: unknown): void => {
     let text: unknown;
     try {
-      text = toJson(body);
+      text = JSON.stringify(body);
     } catch {
       log(`a response body could not be serialised — answering ${code >= 400 ? code : 500} without it`);
       raw(code >= 400 ? code : 500, unserialisableBody());
@@ -1612,7 +1527,7 @@ const server = createServer((req, res) => {
       // 404 and not a fallback. Answering a name this process does not serve with the site it
       // happens to hold is the whole of the 2026-09-28 incident, reproduced inside the renderer by a
       // typo instead of by a manifest.
-      if (!site) return send(404, { error: `no site named ${toJson(asked)} here — this renderer serves ${named}` });
+      if (!site) return send(404, { error: `no site named ${JSON.stringify(asked)} here — this renderer serves ${named}` });
     } else if (sites.length === 1) {
       // The old manager's request, and the single-site deployment's. Unchanged.
       site = sites[0]!;
@@ -1630,7 +1545,7 @@ const server = createServer((req, res) => {
     // sentence still never ships.
     void evaluateWithin(site, SOURCE_SITE_BUDGET_MS).then(
       // `raw`, not `send`. The body is already the wire text this evaluation produced; `send` takes a
-      // **value** and writes it with the captured `JSON.stringify`, so passing the string there would
+      // **value** and writes it with `JSON.stringify`, so passing the string there would
       // send a JSON string literal rather than the object. `raw` writes what it is given and sets
       // `content-length` from it — the same path `/healthz` uses for its literal body.
       (wire) => raw(200, wire),
@@ -1691,7 +1606,7 @@ async function runPreview(req: IncomingMessage, site: { name: string | null; pat
   const raw = await readBoundedNodeBody(req, MAX_PREVIEW_BYTES + 64 * 1024, "the preview request");
   let body: unknown;
   try {
-    body = parseWire(raw.toString("utf8"));
+    body = JSON.parse(raw.toString("utf8"));
   } catch {
     throw new PreviewRefused("expected a JSON body");
   }
@@ -1699,18 +1614,18 @@ async function runPreview(req: IncomingMessage, site: { name: string | null; pat
   if (typeof path !== "string" || typeof content !== "string") {
     throw new PreviewRefused("expected { path, content } as strings");
   }
-  const current = parseWire(await evaluateWithin(site, SOURCE_SITE_BUDGET_MS)) as { site: ScreenSite; services: Record<string, unknown> };
+  const current = JSON.parse(await evaluateWithin(site, SOURCE_SITE_BUDGET_MS)) as { site: ScreenSite; services: Record<string, unknown> };
   const copy = makePreviewCopy({ sitePath: site.path, path, content, allowPaths, codeRoot: CODE_ROOT });
   log(`preview: copied ${copy.files} files, ${Math.round(copy.bytes / 1024)} KiB in ${Math.round(copy.ms)} ms`);
   let edited: { site: ScreenSite; services: Record<string, unknown> };
   try {
-    edited = parseWire(await evaluateInWorker({ sitePath: copy.sitePath, label: `${site.name ?? label} (preview)` })) as typeof edited;
+    edited = JSON.parse(await evaluateInWorker({ sitePath: copy.sitePath, label: `${site.name ?? label} (preview)` })) as typeof edited;
   } finally {
     copy.remove();
   }
   const before = siteRules(withResolver(current));
   const after = siteRules(withResolver(edited));
-  return writeWire({ site: site.name, changes: diffRules(before, after) });
+  return JSON.stringify({ site: site.name, changes: diffRules(before, after) });
 }
 
 /** The worker's half carries the resolver as a table; planning wants it as a function again. */
@@ -1771,7 +1686,7 @@ const pending = sites.map(async (site) => {
     // Parsed only to count hosts for this line. `evaluateWithin` now carries the wire bytes, and the
     // one thing startup wants from them is a number to print — so the parse is local to the log
     // rather than something the evaluation path hands around.
-    log(`verified ${site.name} — ${parsePolicySource(parseWire(wire)).site.hosts?.length ?? 0} hosts`);
+    log(`verified ${site.name} — ${parsePolicySource(JSON.parse(wire)).site.hosts?.length ?? 0} hosts`);
   } catch (e) {
     failures.push({ site, error: asError(e) });
   }
