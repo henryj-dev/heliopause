@@ -5668,12 +5668,7 @@ class TestBootRestore(unittest.TestCase):
         self.assertTrue(installed, why)
 
     def test_main_calls_the_restore_after_the_commitment_recoveries(self):
-        """A tripwire, named as one: main() is read, not run. The invariants are the tests above.
-
-        Order matters for one reason: the commitment recoveries own every non-confirmed state, and the
-        restore acts only on `confirmed`. A restore that moved before them would still refuse those
-        states, so this guards the call's presence more than its position.
-        """
+        """A tripwire, named as one: main() is read, not run. The invariants are the tests above."""
         tree = ast.parse(Path(hp.__file__).read_text())
         main = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "main")
         calls = [n.func.id for n in ast.walk(main) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
