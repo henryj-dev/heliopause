@@ -5,6 +5,7 @@
 //   - drift references keyed by generation, without which a correct deploy looks like tampering
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { contains, excludes } from "./test-util.ts";
 import { emptyState, fleetView, handleHeartbeat, type RelayState } from "./relay.ts";
 import { SCHEMA_VERSION, type Heartbeat, type HeartbeatReply, type Manifest } from "./protocol.ts";
@@ -1506,21 +1507,26 @@ describe("a refused generation says so where an operator looks", () => {
 describe("authorization expiry", () => {
   const PAST = "2026-07-29T00:00:00Z";
   const FUTURE = "2026-07-31T00:00:00Z";
-  const trust = (currentExpiresAt?: string | null) => ({
+  const trust = (currentExpiresAt?: string | null, currentPayloadHash = "sha256:pppp") => ({
     managerKeyIds: ["mk-1"], breakGlassKeyIds: [], trustDigest: "sha256:aaaaaaaaaaaa",
-    currentKeyId: "mk-1", currentPayloadHash: "sha256:pppp", currentAuthorizationMode: "two-person" as const,
+    currentKeyId: "mk-1", currentPayloadHash, currentAuthorizationMode: "two-person" as const,
     currentAuthorizedAt: "2026-07-28T00:00:00Z", currentPlanHash: "sha256:hhhh",
     ...(currentExpiresAt === undefined ? {} : { currentExpiresAt }),
   });
-  /** The envelope this relay serves the host, with only the field the check reads. */
-  const serving = (s: RelayState, host: string, expiresAt: string) => {
+  /**
+   * The envelope this relay serves the host, with only the field the check reads. Returns its payload
+   * hash the way the agent records it: sha256 of the decoded payload bytes.
+   */
+  const serving = (s: RelayState, host: string, expiresAt: string): string => {
+    const bytes = Buffer.from(JSON.stringify({ expiresAt }));
     s.artifacts = {
       ...s.artifacts,
       [host]: {
         version: "heliopause-ed25519-v1", algorithm: "Ed25519", keyId: "k",
-        payload: Buffer.from(JSON.stringify({ expiresAt })).toString("base64url"), signature: "s",
+        payload: bytes.toString("base64url"), signature: "s",
       } as RelayState["artifacts"][string],
     };
+    return "sha256:" + createHash("sha256").update(bytes).digest("hex");
   };
   const lines = (s: RelayState) =>
     fleetView(s, new Date(AT), 300).problems.filter((p) => p.includes("authorization") && p.includes("expired"));
@@ -1569,8 +1575,32 @@ describe("authorization expiry", () => {
 
   it("says nothing about a confirmed host whose authorization has lapsed — the ordinary day after a publish", () => {
     const s = state();
+    const served = serving(s, "h-canary", PAST);
+    handleHeartbeat(s, "h-canary", hb({ ...at(GEN, "confirmed"), artifactTrust: trust(PAST, served) }), AT);
+    assert.deepEqual(lines(s), []);
+  });
+
+  it("says nothing about a host that accepted it before it lapsed and is confirming now", () => {
+    // Review round 1: the agent confirms an already-applied generation without re-checking expiry.
+    const s = state();
     serving(s, "h-canary", PAST);
-    handleHeartbeat(s, "h-canary", hb({ ...at(GEN, "confirmed"), artifactTrust: trust(PAST) }), AT);
+    handleHeartbeat(s, "h-canary", hb(at(GEN, "pending")), AT);
+    assert.deepEqual(lines(s), []);
+  });
+
+  it("reports a host confirmed on the generation under a different authorization than the one served", () => {
+    // Review round 1: the same generation republished under a new authorization. The agent's escape
+    // needs the authorization itself to match, so this host cannot re-apply what it is served.
+    const s = state();
+    serving(s, "h-canary", PAST);
+    handleHeartbeat(s, "h-canary", hb({ ...at(GEN, "confirmed"), artifactTrust: trust(PAST, "sha256:another") }), AT);
+    assert.equal(lines(s).length, 1);
+  });
+
+  it("falls back to the generation for a confirmed host too old to name its authorization", () => {
+    const s = state();
+    serving(s, "h-canary", PAST);
+    handleHeartbeat(s, "h-canary", hb(at(GEN, "confirmed")), AT);
     assert.deepEqual(lines(s), []);
   });
 

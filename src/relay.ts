@@ -33,6 +33,7 @@ import { certificateIsRevoked } from "./certificate-revocation.ts";
 import { certFactsFromPeer, type CertFacts, type PeerCertificateLike } from "./cert-watch.ts";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { lstat, readFile, stat } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import {
   schemaSupported,
   SCHEMA_VERSION,
@@ -323,12 +324,15 @@ export interface FleetView {
  * read. Read only to report on it; the agent verifies the signature, and an unreadable value says
  * nothing rather than guessing.
  */
-function servedExpiry(envelope: HostArtifactEnvelope | undefined): string | null {
+function servedAuthorization(envelope: HostArtifactEnvelope | undefined): { expiresAt: string; payloadHash: string } | null {
   if (!envelope || typeof envelope.payload !== "string") return null;
   try {
-    const payload = JSON.parse(Buffer.from(envelope.payload, "base64url").toString("utf8")) as { expiresAt?: unknown };
+    const bytes = Buffer.from(envelope.payload, "base64url");
+    const payload = JSON.parse(bytes.toString("utf8")) as { expiresAt?: unknown };
     // Not checked for being a time: an unparseable one compares false below, which says nothing.
-    return typeof payload.expiresAt === "string" ? payload.expiresAt : null;
+    if (typeof payload.expiresAt !== "string") return null;
+    // The agent's `payloadHash`: sha256 of the decoded payload bytes (`verify_artifact_envelope`).
+    return { expiresAt: payload.expiresAt, payloadHash: "sha256:" + createHash("sha256").update(bytes).digest("hex") };
   } catch {
     return null;
   }
@@ -659,20 +663,25 @@ export function fleetView(
     // ## What this relay serves the host has lapsed, and the host still needs it (#138)
     //
     // An agent refuses an expired authorization unless it is already confirmed on that generation
-    // (`accept_artifact_authorization`). So a host that is not confirmed on the generation served here
-    // cannot apply it once the served authorization lapses — until something new is published. That
-    // is the case worth a line. A lapse alone is not: every confirmed host passes its expiry a day after
-    // the last publish and keeps its rules (boot restore and the same-generation escape accept it).
+    // under that same authorization (`accept_artifact_authorization`). So once the authorization served
+    // here lapses, a host that does not hold it cannot apply it — until something new is published.
+    // That is the case worth a line. A lapse alone is not: every confirmed host passes its expiry a day
+    // after the last publish and keeps its rules (boot restore and the same-generation escape).
     // Read from the envelope served, not from the host's report — the host's is for what it enforces.
+    //   · `pending` on the served generation: accepted before the lapse; `confirm` does not re-check.
+    //   · `confirmed` on it: covered when its authorization is the served one, or it cannot name one
+    //     (an older agent) — then the generation is all there is to go on.
     // @see "authorization expiry" in relay.test.ts
-    const served = servedExpiry(state.artifacts[host]);
-    if (
-      served !== null && Date.parse(served) <= now.getTime() &&
-      !(st?.state === "confirmed" && st.generation === m?.generation)
-    ) {
+    const served = servedAuthorization(state.artifacts[host]);
+    const enforced = st?.artifactTrust?.currentPayloadHash ?? null;
+    const holds = st?.generation === m?.generation && (
+      st?.state === "pending" ||
+      (st?.state === "confirmed" && (enforced === null || enforced === served?.payloadHash))
+    );
+    if (served !== null && Date.parse(served.expiresAt) <= now.getTime() && !holds) {
       problems.push(
-        `${host}: the authorization served for generation ${m?.generation} expired at ${served}, and ` +
-          `the host is not confirmed on it — it cannot apply it until a new generation is published`,
+        `${host}: the authorization served for generation ${m?.generation} expired at ${served.expiresAt}, ` +
+          `and the host does not hold it — it cannot apply it until a new generation is published`,
       );
     }
 
