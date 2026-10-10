@@ -1138,7 +1138,9 @@ async function readChecks(
 }
 
 export async function startManager(opts: ManagerOptions): Promise<{ server: Server }> {
-  const writeLog = opts.log ?? ((m: string) => console.error(`[manager] ${m}`));
+  // No prefix here: `logEvent` and `log` add `[manager] `, and a caller's `opts.log` receives the line
+  // with it. Adding it here as well printed `[manager] [manager] …` on the first line of every message (#163).
+  const writeLog = opts.log ?? ((m: string) => console.error(m));
   const logEvent = (key: Parameters<typeof formatOperatorLog>[1], params: Record<string, string | number> = {}) =>
     writeLog(`[manager] ${formatOperatorLog(opts.logLang ?? "en", key, params)}`);
   const log = (en: string, ko: string) => writeLog(`[manager] ${formatOperatorEvent(opts.logLang ?? "en", { en, ko })}`);

@@ -74,6 +74,12 @@ describe("the manager binary passes each plan limit on its own (#161)", () => {
     assert.match(line, /plan TTL 2m \(env\); at most 32 pending plans \(default\)$/);
   });
 
+  it("prefixes the line once (#163)", { timeout: 30_000 }, async () => {
+    // The default writer and `log`/`logEvent` each added `[manager] `, so the first line of every message
+    // `startManager` wrote read `[manager] [manager] …` while the entry point's own lines read `[manager] …`.
+    assert.match(await startupLimitsLine({}), /^\[manager\] limits: /);
+  });
+
   it("names the defaults when neither is set, with the authorization TTL beside the protocol cap", { timeout: 30_000 }, async () => {
     const line = await startupLimitsLine({});
     assert.match(line, /limits: artifact authorization TTL 24h \(default\), protocol cap 168h; plan TTL 10m \(default\); at most 32 pending plans \(default\)$/);
