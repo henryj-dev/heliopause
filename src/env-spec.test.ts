@@ -4,7 +4,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   boundedInteger, boundedNumber, ENV_BOUNDS, parsePairs, parseRelays, parsePolicySites, EnvSpecError,
-  type BoundedEnvName,
+  planLimitsFromEnv, startupLimitSources, type BoundedEnvName,
 } from "./env-spec.ts";
 
 /**
@@ -370,5 +370,43 @@ describe("boundedNumber", () => {
   test("still refuses NaN and the range", () => {
     assert.throws(() => boundedNumber("X", "soon", { min: 0, max: 10, fallback: 5 }), EnvSpecError);
     assert.throws(() => boundedNumber("X", "11", { min: 0, max: 10, fallback: 5 }), EnvSpecError);
+  });
+});
+
+describe("where the manager's startup limits came from (#154)", () => {
+  test("names nothing set as default", () => {
+    assert.deepEqual(startupLimitSources({}), { authorizationTtlSec: "default", planTtlSec: "default", maxPending: "default" });
+    assert.equal(planLimitsFromEnv({}), false);
+  });
+
+  test("names each variable that was given as env", () => {
+    const env = {
+      HELIOPAUSE_ARTIFACT_AUTHORIZATION_TTL_SEC: "3600",
+      HELIOPAUSE_PLAN_TTL_SEC: "120",
+      HELIOPAUSE_MAX_PENDING_PLANS: "5",
+    };
+    assert.deepEqual(startupLimitSources(env), { authorizationTtlSec: "env", planTtlSec: "env", maxPending: "env" });
+    assert.equal(planLimitsFromEnv(env), true);
+  });
+
+  test("treats an empty value as unset, as the bounded parsers do", () => {
+    assert.deepEqual(startupLimitSources({ HELIOPAUSE_ARTIFACT_AUTHORIZATION_TTL_SEC: "", HELIOPAUSE_PLAN_TTL_SEC: "" }),
+      { authorizationTtlSec: "default", planTtlSec: "default", maxPending: "default" });
+  });
+
+  test("treats a blank value as the default it parses to, while the wiring gate still opens on it", () => {
+    // Review round 1: the bounded parsers trim, so " " is the fallback — but `planLimitsFromEnv` keeps
+    // the entry point's old truthiness, so a blank plan TTL still passes limits (with fallback values),
+    // and a pending cap beside it is then used rather than ignored.
+    const env = { HELIOPAUSE_ARTIFACT_AUTHORIZATION_TTL_SEC: " ", HELIOPAUSE_PLAN_TTL_SEC: " ", HELIOPAUSE_MAX_PENDING_PLANS: "5" };
+    assert.equal(planLimitsFromEnv(env), true);
+    assert.deepEqual(startupLimitSources(env), { authorizationTtlSec: "default", planTtlSec: "default", maxPending: "env" });
+    assert.equal(startupLimitSources({ HELIOPAUSE_MAX_PENDING_PLANS: " " }).maxPending, "default");
+  });
+
+  test("says a pending cap given without a plan TTL is ignored, because the entry point ignores it", () => {
+    const env = { HELIOPAUSE_MAX_PENDING_PLANS: "5" };
+    assert.equal(planLimitsFromEnv(env), false);
+    assert.match(startupLimitSources(env).maxPending, /^default — HELIOPAUSE_MAX_PENDING_PLANS is ignored/);
   });
 });

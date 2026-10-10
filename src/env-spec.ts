@@ -235,6 +235,43 @@ export const ENV_BOUNDS = {
 export type BoundedEnvName = keyof typeof ENV_BOUNDS;
 
 /**
+ * Whether the manager passes plan limits from the environment at all. The entry point passes them only
+ * when `HELIOPAUSE_PLAN_TTL_SEC` is set, and otherwise `startManager` uses `DEFAULT_LIMITS`. One
+ * predicate, so the wiring and the startup log line below cannot describe two different rules.
+ *
+ * Plain truthiness, exactly as the entry point tested it before: a whitespace-only value passes this
+ * gate and then parses to the fallback (the bounded parsers trim).
+ */
+export function planLimitsFromEnv(env: NodeJS.ProcessEnv): boolean {
+  return Boolean(env.HELIOPAUSE_PLAN_TTL_SEC);
+}
+
+/** Whether `name` carries a value the bounded parsers will use — they trim, so blank is the fallback. */
+const supplied = (env: NodeJS.ProcessEnv, name: string): boolean => (env[name] ?? "").trim() !== "";
+
+/**
+ * Where each limit on the manager's startup line came from (#154): `env` or `default`.
+ *
+ * ⚠️ `HELIOPAUSE_MAX_PENDING_PLANS` set **without** `HELIOPAUSE_PLAN_TTL_SEC` is ignored, because of
+ * `planLimitsFromEnv` — the label says so instead of reporting a value nobody is using.
+ */
+export function startupLimitSources(env: NodeJS.ProcessEnv): {
+  authorizationTtlSec: string;
+  planTtlSec: string;
+  maxPending: string;
+} {
+  const fromEnv = planLimitsFromEnv(env);
+  const pendingGiven = supplied(env, "HELIOPAUSE_MAX_PENDING_PLANS");
+  return {
+    authorizationTtlSec: supplied(env, "HELIOPAUSE_ARTIFACT_AUTHORIZATION_TTL_SEC") ? "env" : "default",
+    planTtlSec: supplied(env, "HELIOPAUSE_PLAN_TTL_SEC") ? "env" : "default",
+    maxPending: fromEnv
+      ? (pendingGiven ? "env" : "default")
+      : (pendingGiven ? "default — HELIOPAUSE_MAX_PENDING_PLANS is ignored without HELIOPAUSE_PLAN_TTL_SEC" : "default"),
+  };
+}
+
+/**
  * `dev=https://192.0.2.1:8443=./pki,prod=https://192.0.2.2:8443=./pki-prod`
  *
  * Three fields because each VPC has its own CA (V39): the manager presents a different operator
