@@ -171,7 +171,11 @@ for p in $paths; do
 done
 T=$(mktemp -d)
 tar xzf /tmp/hp-code.tgz -C "$T"
-for p in $paths; do sudo mkdir -p "/opt/heliopause/$p"; sudo rsync -a --delete "$T/$p/" "/opt/heliopause/$p/"; done
+# `chmod` after the copy because tar carries the operator's modes and `rsync -a` keeps them: with
+# `umask 077` on the Mac, a freshly pulled file is 0600 and the relay's service account cannot read it
+# (2026-10-10, EACCES on src/relay.ts). `go+rX` adds read, and execute only where it already exists or
+# on directories. Not `rsync --chmod` — see src/deploy-fleet.test.ts for why.
+for p in $paths; do sudo mkdir -p "/opt/heliopause/$p"; sudo rsync -a --delete "$T/$p/" "/opt/heliopause/$p/"; sudo chmod -R go+rX "/opt/heliopause/$p"; done
 rm -rf "$T" /tmp/hp-code.tgz
 
 # `is-active` was the whole check here, and it is not one.

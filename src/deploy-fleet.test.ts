@@ -14,7 +14,10 @@
 // This pins the invariant so the next such import is caught here instead of on a gateway: every
 // `packages/<x>` a non-test `src` file imports must be in the relay's ship list.
 import assert from "node:assert/strict";
-import { readdirSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 
@@ -194,5 +197,49 @@ describe("deploy-fleet.sh proves the restart happened", () => {
     assert.match(script, /f=\/opt\/heliopause\/agent\/heliopause-pull\.py/);
     assert.match(script, /f=\/opt\/heliopause\/src\/relay\.ts/);
     assert.doesNotMatch(script, /agent-schema=/);
+  });
+});
+
+// ## The operator's umask travels with the files
+//
+// `tar` packs the checkout's modes and the host-side `rsync -a` keeps them. On 2026-10-10 the operator's
+// shell had `umask 077`, the pull before the rollout rewrote eight tracked files as 0600, and the first
+// relay deploy died with `EACCES … open '/opt/heliopause/src/relay.ts'` — the relay's service account
+// could not read its own source. `heliopause-pull.py` was among the eight, and the agent ships through
+// the same install loop.
+//
+// The script now runs `chmod` on what it installed. Not `rsync --chmod`: macOS's `openrsync` accepts
+// that option, exits 0 and changes nothing (measured the same day), so a test of it on a Mac would pass
+// while proving nothing, and the hosts' rsync was not measured. `chmod` behaves the same on both.
+//
+// This runs the script's own `chmod` argument against a staged tree, so the mode is tested by effect.
+describe("deploy-fleet.sh installs files the service account can read", () => {
+  /** The install loop's `chmod` mode, read from the script so the test runs what the host runs. */
+  function installChmod(): string {
+    const script = read("../scripts/deploy-fleet.sh");
+    const m = /sudo rsync -a --delete "\$T\/\$p\/" "\/opt\/heliopause\/\$p\/"; sudo chmod -R (\S+) "\/opt\/heliopause\/\$p"; done/
+      .exec(script);
+    assert.ok(m, "the install loop no longer runs chmod on what it installed, right after rsync");
+    return m[1]!;
+  }
+
+  it("makes a 0600 file go-readable and keeps an executable executable", () => {
+    const dir = mkdtempSync(join(tmpdir(), "hp-deploy-modes-"));
+    try {
+      const sub = join(dir, "sub");
+      mkdirSync(sub);
+      writeFileSync(join(sub, "relay.ts"), "x");
+      writeFileSync(join(sub, "run"), "#!/bin/sh\n");
+      chmodSync(join(sub, "relay.ts"), 0o600);
+      chmodSync(join(sub, "run"), 0o700);
+      chmodSync(sub, 0o700);
+      execFileSync("chmod", ["-R", installChmod(), dir]);
+      const mode = (p: string) => (statSync(p).mode & 0o777).toString(8);
+      assert.equal(mode(join(sub, "relay.ts")), "644", "a 0600 source is still unreadable to the service account");
+      assert.equal(mode(join(sub, "run")), "755", "an executable lost its execute bit, or did not gain read");
+      assert.equal(mode(sub), "755", "a 0700 directory is still closed to the service account");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
