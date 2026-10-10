@@ -2582,20 +2582,22 @@ def confirm(state):
             # `None`, read in three places, and assigned in none — measured 2026-09-28, on every
             # host in the fleet.
             #
-            # Four things were dead because of it, and none of them failed loudly:
+            # Three things were dead because of it, and none of them failed loudly:
             #
             #   1. `accept_artifact_authorization` lets an expired authorization stand when it is
             #      the one already confirmed. That comparison is `current == record`, so it was
             #      `None == dict` — always false. **An expired authorization could never be
             #      re-applied by any host**, which is how `gw-01.prod-icn-vtr` came back from a
             #      reboot with no ruleset and could not restore itself.
-            #   2. Every `artifactTrust.current*` field the heartbeat carries was null.
+            #   2. Every `artifactTrust.current*` field would have been null. (They were in fact not
+            #      sent at all — `artifact_trust_report` was called nowhere until issue #145.)
             #   3. The relay's break-glass alarm reads `currentAuthorizationMode`, and its own
             #      comment calls it "the one sentence in the system that can say a break-glass is
             #      still on". It could never say it.
-            #   4. `fleetView` reads exactly two things from that block, and the other one is
-            #      "did a key rotation reach every host?" — without it, "the new signing key is
-            #      deployed" is an assumption about a file rather than an observation of the fleet.
+            #
+            # This list used to have a fourth item, key-rotation reach. That check reads
+            # `trustDigest`, which does not depend on `currentAuthorization`; it was dark for #145's
+            # reason, not this one.
             #
             # This is the line. The test for it runs a real apply and confirm rather than building
             # the state by hand — the existing test did the latter, passed, and described a state

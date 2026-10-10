@@ -598,8 +598,10 @@ export function fleetView(
     //     and collapsing it would turn a reporting gap into an alarm about the firewall.
     //   · a generation applied — a host that has applied nothing has no authorization to name, and
     //     saying otherwise would make the line fire loudest on the hosts it has nothing to say about.
+    //   · that generation `confirmed` — the agent promotes the authorization only in `confirm()`, so
+    //     every healthy first apply reports `pending` with a null mode for one beat. #145's review.
     const trust = st?.artifactTrust;
-    if (trust && trust.currentAuthorizationMode === null && st?.generation !== null) {
+    if (trust && trust.currentAuthorizationMode === null && st?.generation !== null && st?.state === "confirmed") {
       problems.push(
         `${host}: enforcing generation ${st?.generation} but cannot name the authorization for it — ` +
           `an expired authorization can never be re-applied on this host, and a break-glass one ` +

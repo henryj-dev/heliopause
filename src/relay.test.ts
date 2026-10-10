@@ -209,6 +209,26 @@ describe("what the fleet reports about which keys may sign", () => {
     );
   });
 
+  it("says nothing about a healthy first apply that has not been confirmed yet", () => {
+    // The agent promotes `pendingAuthorization` into `currentAuthorization` only in `confirm()`, after
+    // the relay has answered the `pending` heartbeat. So the first beat of every healthy first apply
+    // carries a null mode. This was hidden while the agent sent no `artifactTrust` at all (#145); the
+    // review of that fix reproduced the false alarm.
+    const s = state();
+    handleHeartbeat(
+      s, "h-canary",
+      hb({
+        artifactTrust: trust({ currentAuthorizationMode: null, currentAuthorizedAt: null }),
+        applied: { generation: "g-first", state: "pending", artifactHash: null, observedHash: null },
+      }),
+      AT,
+    );
+    assert.equal(
+      fleetView(s, new Date(AT), 300).problems.find((p) => p.includes("cannot name")), undefined,
+      "a pending first apply was reported as enforcing an authorization it cannot name",
+    );
+  });
+
   it("says nothing about a host that has applied nothing at all", () => {
     // A host with no generation has no authorization to name, so this would otherwise fire loudest on
     // the hosts it has nothing to say about — every freshly enrolled machine.
