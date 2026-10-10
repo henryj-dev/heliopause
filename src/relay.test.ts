@@ -65,9 +65,13 @@ const reply = (o: { body: HeartbeatReply | { error: string } }) => o.body as Hea
 
 // ## The heartbeat field the relay used to drop
 //
-// `Heartbeat.artifactTrust` was built and transmitted by the agent every interval and read by
-// nothing: `handleHeartbeat` copied the heartbeat into `HostStatus` field by field — with a comment
-// on each explaining why it was kept — and this one was absent, so it stopped at the relay.
+// `handleHeartbeat` copied the heartbeat into `HostStatus` field by field — with a comment on each
+// explaining why it was kept — and `artifactTrust` was absent, so it stopped at the relay.
+//
+// ⚠️ This used to say the agent built and transmitted it every interval. **It did not** — the agent
+// defined `artifact_trust_report` and called it nowhere until issue #145. These tests hand the relay
+// an object the agent never sent, so they were green while every check here was silent in the
+// fleet. What the agent sends is pinned on its side, by `TestTheHeartbeatCarriesArtifactTrust`.
 //
 // The block that used to be here pinned that. It said, in as many words, that the day it failed
 // because something started reading the field would be the day the feature arrived and the note on
@@ -205,6 +209,26 @@ describe("what the fleet reports about which keys may sign", () => {
     );
   });
 
+  it("says nothing about a healthy first apply that has not been confirmed yet", () => {
+    // The agent promotes `pendingAuthorization` into `currentAuthorization` only in `confirm()`, after
+    // the relay has answered the `pending` heartbeat. So the first beat of every healthy first apply
+    // carries a null mode. This was hidden while the agent sent no `artifactTrust` at all (#145); the
+    // review of that fix reproduced the false alarm.
+    const s = state();
+    handleHeartbeat(
+      s, "h-canary",
+      hb({
+        artifactTrust: trust({ currentAuthorizationMode: null, currentAuthorizedAt: null }),
+        applied: { generation: "g-first", state: "pending", artifactHash: null, observedHash: null },
+      }),
+      AT,
+    );
+    assert.equal(
+      fleetView(s, new Date(AT), 300).problems.find((p) => p.includes("cannot name")), undefined,
+      "a pending first apply was reported as enforcing an authorization it cannot name",
+    );
+  });
+
   it("says nothing about a host that has applied nothing at all", () => {
     // A host with no generation has no authorization to name, so this would otherwise fire loudest on
     // the hosts it has nothing to say about — every freshly enrolled machine.
@@ -229,6 +253,26 @@ describe("what the fleet reports about which keys may sign", () => {
       fleetView(s, new Date(AT), 300).problems.filter((p) => p.includes("break-glass")),
       [],
     );
+  });
+
+  it("reports a host that could not read its signing trust, and keeps why", () => {
+    // Issue #145. Without this the host looks exactly like an agent too old to send `artifactTrust`,
+    // and every check in this block skips it.
+    const s = state();
+    handleHeartbeat(s, "h-canary", hb({ artifactTrustError: "manager artifact public key directory is not configured" }), AT);
+    assert.equal(s.statuses["h-canary"]?.artifactTrustError, "manager artifact public key directory is not configured");
+    const line = fleetView(s, new Date(AT), 300).problems.find((p) => p.includes("signing trust"));
+    assert.ok(line, "a host that could not read its trust must be reported");
+    assert.match(line!, /h-canary/);
+    assert.match(line!, /not configured/);
+  });
+
+  it("does not report an agent that said nothing about its trust", () => {
+    // The known negative: an older agent sends neither field, and that is not a failure to read.
+    const s = state();
+    handleHeartbeat(s, "h-canary", hb(), AT);
+    assert.equal(s.statuses["h-canary"]?.artifactTrustError, null);
+    assert.deepEqual(fleetView(s, new Date(AT), 300).problems.filter((p) => p.includes("signing trust")), []);
   });
 });
 

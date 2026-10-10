@@ -549,6 +549,12 @@ export function fleetView(
       );
     }
 
+    // A host that could not read its own signing trust. Without this it would look exactly like an
+    // agent too old to send `artifactTrust`, and every check above and below would skip it. #145.
+    if (st?.artifactTrustError) {
+      problems.push(`${host}: cannot read its artifact signing trust — ${st.artifactTrustError}`);
+    }
+
     // ## A host enforcing a ruleset it cannot name
     //
     // The line above compares `=== "break-glass"`, so a host whose `currentAuthorizationMode` is
@@ -592,8 +598,10 @@ export function fleetView(
     //     and collapsing it would turn a reporting gap into an alarm about the firewall.
     //   · a generation applied — a host that has applied nothing has no authorization to name, and
     //     saying otherwise would make the line fire loudest on the hosts it has nothing to say about.
+    //   · that generation `confirmed` — the agent promotes the authorization only in `confirm()`, so
+    //     every healthy first apply reports `pending` with a null mode for one beat. #145's review.
     const trust = st?.artifactTrust;
-    if (trust && trust.currentAuthorizationMode === null && st?.generation !== null) {
+    if (trust && trust.currentAuthorizationMode === null && st?.generation !== null && st?.state === "confirmed") {
       problems.push(
         `${host}: enforcing generation ${st?.generation} but cannot name the authorization for it — ` +
           `an expired authorization can never be re-applied on this host, and a break-glass one ` +
@@ -771,6 +779,7 @@ export function handleHeartbeat(
     // different things. `fleetView` reads two of its fields; see `HostStatus.artifactTrust` for
     // which, and for why the other two are carried and not compared.
     artifactTrust: hb.artifactTrust ?? null,
+    artifactTrustError: hb.artifactTrustError ?? null,
     // Changes to **our** table that the agent does not claim as its own.
     //
     // ## Both halves of the filter are needed, and I checked rather than assumed
