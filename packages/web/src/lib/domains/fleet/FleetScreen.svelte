@@ -6,7 +6,7 @@
   import { chromeFreshness } from "$lib/shell/freshness.svelte";
   import { chromePrefs } from "$lib/shell/prefs.svelte";
   import { ageLabel } from "$lib/age";
-  import { agentBuildLines, hostsOnBuild,
+  import { agentBuildLines, authorizationExpiry, hostsOnBuild,
     answeredVpcNames, fleetListing, fleetSummary, hostMatches, hostRowClass, hostsOnVpc, hostStateChips,
     membershipPodCount, routesView, vpcLabel, vpcTone, wantedGeneration, whyBits, workloadChip,
   } from "./present";
@@ -225,6 +225,18 @@
                   {/if}
                 {:else}
                   <Chip kind="none">{t(prefs.lang, "m.unreported")}</Chip>
+                {/if}
+                {#if host.generation}
+                  {@const auth = authorizationExpiry(host.authorizationExpiresAt, Date.now())}
+                  <div class="dim">
+                    {#if auth.kind === "left"}
+                      {t(prefs.lang, "m.authExpiresIn", { at: auth.at, h: auth.hours, m: auth.minutes })}
+                    {:else if auth.kind === "lapsed"}
+                      {t(prefs.lang, "m.authLapsed", { at: auth.at })}
+                    {:else}
+                      {t(prefs.lang, "m.authExpiryUnknown")}
+                    {/if}
+                  </div>
                 {/if}
               </td>
               <td>

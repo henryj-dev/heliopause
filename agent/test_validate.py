@@ -5346,6 +5346,26 @@ class TestTheHeartbeatCarriesArtifactTrust(unittest.TestCase):
         self.assertIn("artifactTrust", beat)
         self.assertIsNone(beat["artifactTrust"]["currentAuthorizationMode"])
 
+    def test_the_enforced_authorization_says_when_it_expires(self):
+        # Issue #138. The record has carried `expiresAt` since it was added for an operator's script;
+        # the heartbeat did not, so nothing upstream could show it.
+        hp._artifact_keys_cache = self.TRUST
+        st = dict(hp._EMPTY_STATE)
+        st["currentAuthorization"] = {"authorizationMode": "two-person", "expiresAt": "2026-10-11T04:28:36Z"}
+        self.assertEqual(hp.build_heartbeat(st)["artifactTrust"]["currentExpiresAt"], "2026-10-11T04:28:36Z")
+
+    def test_an_unrecorded_expiry_is_sent_as_null_not_dropped(self):
+        # A record from before the field existed, or no record at all. Present and null — "not
+        # recorded" — so it is never confused with an agent too old to send the key.
+        hp._artifact_keys_cache = self.TRUST
+        for current in (None, {"authorizationMode": "two-person"}):
+            with self.subTest(current=current):
+                st = dict(hp._EMPTY_STATE)
+                st["currentAuthorization"] = current
+                trust = hp.build_heartbeat(st)["artifactTrust"]
+                self.assertIn("currentExpiresAt", trust)
+                self.assertIsNone(trust["currentExpiresAt"])
+
     def test_an_unreadable_trust_is_said_and_the_heartbeat_still_goes(self):
         hp._artifact_keys_cache = None
         for manager_dir, expect in (

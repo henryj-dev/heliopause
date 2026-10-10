@@ -113,6 +113,24 @@ export function fleetSummary(site: SiteView): { problems: number; generations: s
   };
 }
 
+export type AuthorizationExpiry =
+  | { kind: "left"; at: string; hours: number; minutes: number }
+  | { kind: "lapsed"; at: string }
+  | { kind: "unknown" };
+
+/**
+ * The enforced authorization's expiry, for the host row (#138). Information only: a confirmed host
+ * keeps its rules past it, and the case where a lapse blocks anything is reported by the relay.
+ * `null` is "not known" and stays that — it is never drawn as time left.
+ */
+export function authorizationExpiry(at: string | null, nowMs: number): AuthorizationExpiry {
+  if (at === null) return { kind: "unknown" };
+  const leftMs = Date.parse(at) - nowMs;
+  if (leftMs <= 0) return { kind: "lapsed", at };
+  const totalMinutes = Math.floor(leftMs / 60_000);
+  return { kind: "left", at, hours: Math.floor(totalMinutes / 60), minutes: totalMinutes % 60 };
+}
+
 /**
  * How many distinct agent builds the fleet is running, and how many hosts could not say.
  *

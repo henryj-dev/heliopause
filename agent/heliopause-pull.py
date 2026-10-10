@@ -4649,6 +4649,10 @@ def artifact_trust_report(st):
             "currentPayloadHash": current.get("payloadHash"),
             "currentAuthorizationMode": current.get("authorizationMode"),
             "currentAuthorizedAt": current.get("authorizedAt"),
+            # When the authorization this host enforces lapses. `None` when it has none or the record
+            # predates the field — sent, not dropped, so "not recorded" differs from "too old to say".
+            # @see TestTheHeartbeatCarriesArtifactTrust (issue #138)
+            "currentExpiresAt": current.get("expiresAt"),
             "currentPlanHash": current.get("planHash"),
         }
     }

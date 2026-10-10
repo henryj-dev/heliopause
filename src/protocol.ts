@@ -509,6 +509,11 @@ export interface Heartbeat {
     currentPayloadHash: string | null;
     currentAuthorizationMode: ArtifactAuthorizationMode | null;
     currentAuthorizedAt: string | null;
+    /**
+     * When the enforced authorization lapses (#138). Absent from agents too old to send it; `null`
+     * when there is none or its record predates the field. Neither means "not expired".
+     */
+    currentExpiresAt?: string | null;
     currentPlanHash: string | null;
   };
 
