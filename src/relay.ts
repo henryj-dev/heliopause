@@ -126,7 +126,19 @@ export interface RelayState {
    * only, refilled on the next beat — `observedAt` says how old a reading is.
    */
   agentCerts: Record<string, AgentCertObservation>;
+  /**
+   * Per host, consecutive heartbeats that reported `confirmed` with no observed table (#139).
+   *
+   * Counted rather than read from `detail`: the agent sends a null observation for a table that is
+   * absent and for one it could not read yet, and telling them apart would mean matching its words.
+   * A healthy reboot re-applies within one or two beats, which resets this. Memory only — a relay
+   * restart starts every host at zero, so it can delay the line but not invent one.
+   */
+  tableUnseen: Record<string, number>;
 }
+
+/** Heartbeats in a row with no table before a confirmed host is reported. @see tableUnseen */
+export const TABLE_UNSEEN_BEATS = 3;
 
 /** One agent certificate as the relay saw it. */
 export interface AgentCertObservation extends CertFacts {
@@ -145,6 +157,7 @@ export function emptyState(): RelayState {
     contradictions: {},
     membership: {},
     agentCerts: {},
+    tableUnseen: {},
   };
 }
 
@@ -345,6 +358,14 @@ export function fleetView(
     const gate = m ? computeGate(m, host, state.statuses) : { open: false, reason: "no manifest", stage: null };
     const drifted = state.drifted.has(host);
     const current = st?.generation === m?.generation;
+    const unseen = state.tableUnseen[host] ?? 0;
+    // A refusal of a generation the host has since moved past is history, and history in a status
+    // view reads as a live problem. But a refusal of the generation it is **on** is history only while
+    // that generation is in force — confirmed, with its table. A rebooted host fetches its own
+    // generation again, and on 2026-09-28 that apply was refused while this filter hid it (#139).
+    const refusalAnswered = st?.lastRefusal?.generation === st?.generation &&
+      st?.state === "confirmed" && unseen === 0;
+    const liveRefusal = st?.lastRefusal && !refusalAnswered ? st.lastRefusal : null;
 
     hosts.push({
       host,
@@ -365,10 +386,8 @@ export function fleetView(
       agentVersion: st?.agentVersion ?? null,
       agentBuild: st?.agentBuild ?? null,
       agentCert: state.agentCerts[host] ?? null,
-      // Only while it still matters. A refusal of a generation the host has since moved past is
-      // history, and history in a status view reads as a live problem.
-      lastRefusal: st?.lastRefusal && st.lastRefusal.generation !== st?.generation
-        ? st.lastRefusal : null,
+      // Only while it still matters — see `liveRefusal` above.
+      lastRefusal: liveRefusal,
       publishedPorts: st?.publishedPorts ?? null,
       routes: st?.routes ?? null,
       ciliumExposure: st?.ciliumExposure ?? null,
@@ -396,9 +415,19 @@ export function fleetView(
     //
     // Phrased with the generation it refused, because "this host refuses" and "this host refuses
     // *what you just published*" are different problems and only the second one is urgent.
-    const refusal = st?.lastRefusal;
-    if (refusal && refusal.generation !== st?.generation) {
-      problems.push(`${host}: refused generation ${refusal.generation} — ${refusal.reason}`);
+    if (liveRefusal) {
+      problems.push(`${host}: refused generation ${liveRefusal.generation} — ${liveRefusal.reason}`);
+    }
+    // ## Confirmed, and no table (#139)
+    //
+    // The state file says `confirmed`; the kernel holds no heliopause table. A reboot does that until
+    // the agent re-applies, which needs the relay and the artifact. Counted in beats so the healthy
+    // reboot — one or two beats, then `pending` — says nothing. @see RelayState.tableUnseen
+    if (unseen >= TABLE_UNSEEN_BEATS) {
+      problems.push(
+        `${host}: confirmed generation ${st?.generation} but has shown no ruleset for ${unseen} heartbeats — ` +
+          `${st?.detail ?? "no detail"}`,
+      );
     }
     if (drifted) problems.push(`${host}: ruleset no longer matches the dump it confirmed`);
     // Next to drift on purpose: drift is the consequence (the dump changed), this is the cause (who
@@ -823,6 +852,12 @@ export function handleHeartbeat(
   const found = reportContradictions(hb, state.references[certCN], state.manifest);
   if (found.length) state.contradictions[certCN] = found;
   else delete state.contradictions[certCN];
+
+  if (hb.applied.state === "confirmed" && hb.applied.observedHash === null) {
+    state.tableUnseen[certCN] = (state.tableUnseen[certCN] ?? 0) + 1;
+  } else {
+    delete state.tableUnseen[certCN];
+  }
 
   // Record the drift reference the first time a host confirms a generation, and compare against it
   // on every beat after. Rebinding it on each confirm is what makes a legitimate apply reset the

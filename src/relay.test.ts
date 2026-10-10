@@ -1494,6 +1494,79 @@ describe("a refused generation says so where an operator looks", () => {
   });
 });
 
+// ── A confirmed host with no table (#139) ─────────────────────────────────────
+//
+// After a reboot the agent's table is gone until it re-applies, and it can re-apply only after the
+// relay answers and the artifact arrives. If that never happens the host holds zero heliopause rules
+// while reporting `confirmed`, and 2026-09-28 showed both halves of the silence: no problem for the
+// absent table, and the refusal hidden because it was of the generation the host was already on.
+describe("a confirmed host that shows no table", () => {
+  const absent = (over: HeartbeatOverride = {}) =>
+    hb({
+      ...over,
+      applied: {
+        generation: "gen1", state: "confirmed", artifactHash: "a", observedHash: null,
+        detail: "table inet heliopause is absent", ...(over.applied ?? {}),
+      },
+    });
+  const withTable = hb({ applied: { generation: "gen1", state: "confirmed", artifactHash: "a", observedHash: "h" } });
+  const reapplying = hb({ applied: { generation: "gen1", state: "pending", artifactHash: "a", observedHash: "h" } });
+  const unseen = (s: RelayState) =>
+    fleetView(s, new Date(AT), 300).problems.filter((p) => p.includes("no ruleset"));
+
+  it("is reported after three heartbeats in a row, with the host's own words", () => {
+    const s = state();
+    for (let i = 0; i < 3; i++) handleHeartbeat(s, "h-canary", absent(), AT);
+    const lines = unseen(s);
+    assert.equal(lines.length, 1, `expected one line, got ${JSON.stringify(lines)}`);
+    assert.match(lines[0]!, /h-canary/);
+    assert.match(lines[0]!, /gen1/);
+    assert.match(lines[0]!, /table inet heliopause is absent/);
+  });
+
+  it("says nothing for the beats a normal reboot spends before it re-applies", () => {
+    // The healthy reboot: one or two beats with no table, then the agent re-applies (`pending`) and
+    // confirms with its table. The same class of transient as #146's first-apply false alarm.
+    const s = state();
+    for (const beat of [absent(), absent(), reapplying, withTable]) {
+      handleHeartbeat(s, "h-canary", beat, AT);
+      assert.deepEqual(unseen(s), [], "a normal reboot was reported as a host with no ruleset");
+    }
+    // And the count restarted: two more absent beats are still within the window.
+    handleHeartbeat(s, "h-canary", absent(), AT);
+    handleHeartbeat(s, "h-canary", absent(), AT);
+    assert.deepEqual(unseen(s), [], "beats from before the re-apply were still being counted");
+  });
+
+  it("says nothing for a first apply that is not confirmed yet", () => {
+    const s = state();
+    const first = hb({ applied: { generation: "gen1", state: "pending", artifactHash: "a", observedHash: null } });
+    for (let i = 0; i < 3; i++) handleHeartbeat(s, "h-canary", first, AT);
+    assert.deepEqual(unseen(s), []);
+  });
+
+  it("shows a refusal of the generation it is on, when it has no table", () => {
+    // 2026-09-28: the rebooted host fetched its own generation again and the apply was refused. The
+    // refusal was of the generation it reported, so the filter that hides answered refusals hid it.
+    const s = state();
+    handleHeartbeat(s, "h-canary", absent({
+      lastRefusal: { generation: "gen1", reason: "signed artifact authorization has expired", at: AT },
+    }), AT);
+    const v = fleetView(s, new Date(AT), 300);
+    contains(v.problems.join("|"), "refused generation gen1");
+    assert.equal(v.hosts[0]!.lastRefusal?.generation, "gen1");
+  });
+
+  it("shows a refusal of the generation it is on, when it is not confirmed", () => {
+    const s = state();
+    handleHeartbeat(s, "h-canary", hb({
+      applied: { generation: "gen1", state: "rolled-back", artifactHash: "a", observedHash: "h" },
+      lastRefusal: { generation: "gen1", reason: "an apply that did not settle", at: AT },
+    }), AT);
+    contains(fleetView(s, new Date(AT), 300).problems.join("|"), "refused generation gen1");
+  });
+});
+
 describe("the agent certificate each heartbeat presented", () => {
   const presented = {
     cn: "h-canary", serial: "0A", sha256: "ab".repeat(32),
