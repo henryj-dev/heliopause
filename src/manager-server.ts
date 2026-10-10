@@ -4627,8 +4627,9 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
   //
   // On 2026-09-28 the authorization TTL was read as 7 days. Seven days is the protocol's cap; what
   // the manager issued was 24 hours, and the difference surfaced only when the whole fleet's
-  // authorizations lapsed. Every value here can be changed by environment, so only the running
-  // process can say which one it is using — a manifest says what was configured.
+  // authorizations lapsed. The TTL and the two plan limits can be changed by environment, so only the
+  // running process can say which ones it is using — a manifest says what was configured. The protocol
+  // cap is a constant and is printed beside the TTL so the two are not confused again.
   //
   // The values are the ones the code below uses, not re-derived: `authorizationTtlSec` and `limits`
   // are the same bindings the signing and approval paths read.

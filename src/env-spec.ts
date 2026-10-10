@@ -234,16 +234,20 @@ export const ENV_BOUNDS = {
 
 export type BoundedEnvName = keyof typeof ENV_BOUNDS;
 
-const given = (env: NodeJS.ProcessEnv, name: string): boolean => env[name] !== undefined && env[name] !== "";
-
 /**
  * Whether the manager passes plan limits from the environment at all. The entry point passes them only
  * when `HELIOPAUSE_PLAN_TTL_SEC` is set, and otherwise `startManager` uses `DEFAULT_LIMITS`. One
  * predicate, so the wiring and the startup log line below cannot describe two different rules.
+ *
+ * Plain truthiness, exactly as the entry point tested it before: a whitespace-only value passes this
+ * gate and then parses to the fallback (the bounded parsers trim).
  */
 export function planLimitsFromEnv(env: NodeJS.ProcessEnv): boolean {
-  return given(env, "HELIOPAUSE_PLAN_TTL_SEC");
+  return Boolean(env.HELIOPAUSE_PLAN_TTL_SEC);
 }
+
+/** Whether `name` carries a value the bounded parsers will use — they trim, so blank is the fallback. */
+const supplied = (env: NodeJS.ProcessEnv, name: string): boolean => (env[name] ?? "").trim() !== "";
 
 /**
  * Where each limit on the manager's startup line came from (#154): `env` or `default`.
@@ -257,10 +261,10 @@ export function startupLimitSources(env: NodeJS.ProcessEnv): {
   maxPending: string;
 } {
   const fromEnv = planLimitsFromEnv(env);
-  const pendingGiven = given(env, "HELIOPAUSE_MAX_PENDING_PLANS");
+  const pendingGiven = supplied(env, "HELIOPAUSE_MAX_PENDING_PLANS");
   return {
-    authorizationTtlSec: given(env, "HELIOPAUSE_ARTIFACT_AUTHORIZATION_TTL_SEC") ? "env" : "default",
-    planTtlSec: fromEnv ? "env" : "default",
+    authorizationTtlSec: supplied(env, "HELIOPAUSE_ARTIFACT_AUTHORIZATION_TTL_SEC") ? "env" : "default",
+    planTtlSec: supplied(env, "HELIOPAUSE_PLAN_TTL_SEC") ? "env" : "default",
     maxPending: fromEnv
       ? (pendingGiven ? "env" : "default")
       : (pendingGiven ? "default — HELIOPAUSE_MAX_PENDING_PLANS is ignored without HELIOPAUSE_PLAN_TTL_SEC" : "default"),

@@ -394,6 +394,16 @@ describe("where the manager's startup limits came from (#154)", () => {
       { authorizationTtlSec: "default", planTtlSec: "default", maxPending: "default" });
   });
 
+  test("treats a blank value as the default it parses to, while the wiring gate still opens on it", () => {
+    // Review round 1: the bounded parsers trim, so " " is the fallback — but `planLimitsFromEnv` keeps
+    // the entry point's old truthiness, so a blank plan TTL still passes limits (with fallback values),
+    // and a pending cap beside it is then used rather than ignored.
+    const env = { HELIOPAUSE_ARTIFACT_AUTHORIZATION_TTL_SEC: " ", HELIOPAUSE_PLAN_TTL_SEC: " ", HELIOPAUSE_MAX_PENDING_PLANS: "5" };
+    assert.equal(planLimitsFromEnv(env), true);
+    assert.deepEqual(startupLimitSources(env), { authorizationTtlSec: "default", planTtlSec: "default", maxPending: "env" });
+    assert.equal(startupLimitSources({ HELIOPAUSE_MAX_PENDING_PLANS: " " }).maxPending, "default");
+  });
+
   test("says a pending cap given without a plan TTL is ignored, because the entry point ignores it", () => {
     const env = { HELIOPAUSE_MAX_PENDING_PLANS: "5" };
     assert.equal(planLimitsFromEnv(env), false);
