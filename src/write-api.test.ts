@@ -19,6 +19,7 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { request } from "node:https";
+import { createServer as createTcpServer, type Socket } from "node:net";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash, generateKeyPairSync } from "node:crypto";
 import { startManager } from "./manager-server.ts";
@@ -39,6 +40,28 @@ const enrollmentFile = join(dir, "enrollment.json");
 let managerPort = 0;
 let relayPort = 0;
 const closers: Array<() => void> = [];
+
+// ── A relay that answers when the test says so ───────────────────────────────
+//
+// Accepts a connection and says nothing. While `stall.holding` is true every connection is kept open,
+// so a publish to this target is in flight for exactly as long as the test wants; `stall.fail()` then
+// drops them and refuses the rest, and the publish fails having pushed nothing. That window is where
+// a concurrent request used to delete the claimed plan (#151).
+const stall = {
+  port: 0,
+  holding: false,
+  held: [] as Socket[],
+  /** Resolves once a connection is being held — the publish has claimed the plan and is on the wire. */
+  connected: (): Promise<void> =>
+    new Promise((ok) => {
+      const poll = () => (stall.held.length > 0 ? ok() : setTimeout(poll, 5));
+      poll();
+    }),
+  fail(): void {
+    stall.holding = false;
+    for (const s of stall.held.splice(0)) s.destroy();
+  },
+};
 
 const sha = (s: string) => "sha256:" + createHash("sha256").update(s).digest("hex");
 const read = (f: string) => readFileSync(join(dir, f));
@@ -224,11 +247,22 @@ before(async () => {
   relayPort = (relay.server.address() as { port: number }).port;
   closers.push(() => relay.server.close());
 
+  const stallServer = createTcpServer((socket) => {
+    if (stall.holding) stall.held.push(socket);
+    else socket.destroy();
+  });
+  await new Promise<void>((ok) => stallServer.listen(0, "127.0.0.1", ok));
+  stall.port = (stallServer.address() as { port: number }).port;
+  closers.push(() => { stall.fail(); stallServer.close(); });
+
   initializeEnrollmentDocument(enrollmentFile);
   const manager = await startManager({
     port: 0,
     hostname: "127.0.0.1",
-    relays: [{ name: "dev", url: `https://127.0.0.1:${relayPort}/`, pkiDir: join(dir, "relay-pki") }],
+    relays: [
+      { name: "dev", url: `https://127.0.0.1:${relayPort}/`, pkiDir: join(dir, "relay-pki") },
+      { name: "stall", url: `https://127.0.0.1:${stall.port}/`, pkiDir: join(dir, "relay-pki") },
+    ],
     tls: {
       certFile: join(dir, "mgr-server.pem"),
       keyFile: join(dir, "mgr-server.key"),
@@ -891,6 +925,132 @@ describe("listing plans", () => {
     const p = await call<{ hash: string }>(managerPort, "/plan", "POST", { target: "dev", bundle: bundle() }, "henry");
     const r = await call(managerPort, "/approve", "POST", { hash: p.json.hash }, "watcher");
     assert.equal(r.status, 403);
+  });
+});
+
+// ## A claimed plan survives everything else the manager does while its push is in flight (#151)
+//
+// `/publish` claims the plan (sets `publishedAt`) and then awaits the fleet read and the relay push.
+// Every other request that reads or writes the plan list sweeps it, and the sweep used to delete any
+// plan with `publishedAt` set — so a console poll during a slow push removed the plan, and when the
+// push then failed `release()` had nothing to restore. The operator got 404 and had to re-propose.
+//
+// Each case below runs one of those requests inside the window, then fails the push, and asserts the
+// plan is back to "approved, not published" and that `/publish` reaches it again.
+describe("a plan claimed by a publish in flight", () => {
+  /** A bundle for the stalling target: its host id has to end in that zone, or the proposal is refused. */
+  function stallBundle(n: number): PlanBundle {
+    const b = bundle();
+    const rules = b.rulesets["gw-01.dev"]!;
+    return {
+      manifest: { ...b.manifest, generation: `gen-stall-${n}`, hosts: { "gw-01.stall": b.manifest.hosts["gw-01.dev"]! } },
+      rulesets: { "gw-01.stall": rules },
+      workload: {},
+    };
+  }
+
+  let n = 0;
+  async function approvedForStall(): Promise<string> {
+    const p = await call<{ hash: string }>(managerPort, "/plan", "POST", { target: "stall", bundle: stallBundle(++n) }, "henry");
+    assert.equal(p.status, 200, p.text);
+    const a = await call(managerPort, "/approve", "POST", { hash: p.json.hash }, "jae");
+    assert.equal(a.status, 200, a.text);
+    return p.json.hash;
+  }
+
+  async function row(hash: string) {
+    const r = await call<{ plans: Array<{ hash: string; approval: unknown; publishedAt: string | null }> }>(
+      managerPort, "/plans", "GET", undefined, "watcher",
+    );
+    return r.json.plans.find((p) => p.hash === hash);
+  }
+
+  /** Publish to the stalling target, run `meanwhile` while it is in flight, then fail the push. */
+  async function failedPublishAround(hash: string, meanwhile: () => Promise<void>) {
+    stall.holding = true;
+    const publishing = call<{ error: string }>(managerPort, "/publish", "POST", { hash }, "henry");
+    await stall.connected();
+    try {
+      await meanwhile();
+    } finally {
+      stall.fail();
+    }
+    const r = await publishing;
+    assert.equal(r.status, 502, `the push was meant to fail: ${r.text}`);
+  }
+
+  async function assertStillPublishable(hash: string) {
+    const after = await row(hash);
+    assert.ok(after, "the failed push lost the plan — release() had nothing to restore");
+    assert.ok(after.approval, "the plan came back without its approval");
+    assert.equal(after.publishedAt, null, "the plan is still marked as published");
+    // Reaches the plan again: 502 because the target still fails, not 404 because the plan is gone.
+    const again = await call(managerPort, "/publish", "POST", { hash }, "henry");
+    assert.equal(again.status, 502, again.text);
+  }
+
+  it("lets go of a plan once its push has landed", async () => {
+    // The protection is for the push in flight, not after it. A published plan that stayed would be
+    // what a re-proposal of the same bytes gets back — approved and "already published" — instead of
+    // a fresh plan someone can review.
+    const b = { ...bundle(), manifest: { ...bundle().manifest, generation: "gen-settle" } };
+    const hash = await approved(b);
+    assert.equal((await call(managerPort, "/publish", "POST", { hash }, "henry")).status, 200);
+    const again = await call<{ hash: string; approval: unknown }>(managerPort, "/plan", "POST", { target: "dev", bundle: b }, "henry");
+    assert.equal(again.json.hash, hash);
+    assert.equal(again.json.approval, null, "re-proposing returned the published plan instead of a new one");
+  });
+
+  it("is not listed as pending while its push is in flight", async () => {
+    // The other half of what the sweep did: a plan being published is not one to offer for approval.
+    const hash = await approvedForStall();
+    await failedPublishAround(hash, async () => {
+      assert.equal(await row(hash), undefined, "a plan mid-publish is listed as pending");
+    });
+  });
+
+  it("survives a plan listing", async () => {
+    const hash = await approvedForStall();
+    await failedPublishAround(hash, async () => {
+      assert.equal((await call(managerPort, "/plans", "GET", undefined, "watcher")).status, 200);
+    });
+    await assertStillPublishable(hash);
+  });
+
+  it("survives the pending count on /authz", async () => {
+    const hash = await approvedForStall();
+    await failedPublishAround(hash, async () => {
+      assert.equal((await call(managerPort, "/authz", "GET", undefined, "watcher")).status, 200);
+    });
+    await assertStillPublishable(hash);
+  });
+
+  it("survives another plan being proposed", async () => {
+    const hash = await approvedForStall();
+    await failedPublishAround(hash, async () => {
+      const p = await call(managerPort, "/plan", "POST", { target: "dev", bundle: bundle(RULES2) }, "henry");
+      assert.equal(p.status, 200, p.text);
+    });
+    await assertStillPublishable(hash);
+  });
+
+  it("survives another plan being approved", async () => {
+    const hash = await approvedForStall();
+    const other = await call<{ hash: string }>(managerPort, "/plan", "POST", { target: "stall", bundle: stallBundle(++n) }, "henry");
+    await failedPublishAround(hash, async () => {
+      assert.equal((await call(managerPort, "/approve", "POST", { hash: other.json.hash }, "jae")).status, 200);
+    });
+    await assertStillPublishable(hash);
+  });
+
+  it("survives another plan's publish being claimed", async () => {
+    // A claim that fails still sweeps first, so an unapproved plan is enough to drive it.
+    const hash = await approvedForStall();
+    const other = await call<{ hash: string }>(managerPort, "/plan", "POST", { target: "stall", bundle: stallBundle(++n) }, "henry");
+    await failedPublishAround(hash, async () => {
+      assert.equal((await call(managerPort, "/publish", "POST", { hash: other.json.hash }, "henry")).status, 403);
+    });
+    await assertStillPublishable(hash);
   });
 });
 

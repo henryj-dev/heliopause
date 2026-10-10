@@ -125,6 +125,7 @@ import {
   listPlans,
   propose,
   release,
+  settle,
   soloApproveAndPublishRefusal,
   type ApprovalLimits,
   type Plan,
@@ -3714,7 +3715,9 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       // Released below only if nothing was written anywhere — see `release`.
       let plan;
       try {
-        plan = claimForPublish(approvals, { hash, by: who, now: at }, limits);
+        // Held for the longest this request can take to fail: the fleet read, the push, and a margin.
+        // Past that the claim stops protecting the plan, so one nobody released is not kept forever.
+        plan = claimForPublish(approvals, { hash, by: who, now: at, holdMs: timeoutMs + publishTimeoutMs + 30_000 }, limits);
       } catch (e) {
         return sendApprovalError(res, e);
       }
@@ -3794,6 +3797,8 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         });
       }
 
+      // The relay accepted it: the plan is published, and no longer needs the claim's protection.
+      settle(approvals, hash);
       // Remembered only after the relay accepted it, so the base is something the fleet actually got.
       lastPublished.set(target.name, { generation: plan.generation, bundle });
       log(
