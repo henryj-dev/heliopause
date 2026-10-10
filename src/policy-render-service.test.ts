@@ -3154,6 +3154,27 @@ export const site = {
     }
   });
 
+  it("gives the module an empty environment under the model", { timeout: 60_000 }, async () => {
+    // Evaluation reads no environment variable (none of the modules a site imports does), so the worker
+    // gets none — the allow-list that also covers whatever `NODE_*` knob Node adds next.
+    const { dir, sites } = twoSites();
+    writeFileSync(join(dir, "alpha.ts"), `export const site = {
+  cfg: { hookPolicy: { input: "drop", output: "accept" } },
+  hosts: [{ id: "gw-01.alpha", stage: "canary", items: [] }],
+  objects: [{ id: "ao-env", kind: "address", name: String(Object.keys(process.env).length),
+              members: [{ kind: "cidr", value: "10.0.0.0/8" }] }],
+};\n`);
+    let started: Started | undefined;
+    try {
+      started = await start(dir, { ...MULTI(sites), HELIOPAUSE_POLICY_EVAL_PERMISSION: "on", HELIOPAUSE_PROBE_VALUE: "visible" });
+      const body = await (await fetchAt(started.port, "/source?site=alpha")).json() as { site: { objects: { name: string }[] } };
+      assert.equal(body.site.objects[0]!.name, "0", "the module saw the renderer's environment");
+    } finally {
+      started?.stop();
+      rmSync(rootOf(dir), { recursive: true, force: true });
+    }
+  });
+
   it("renders a site the same with the model on as off", { timeout: 60_000 }, async () => {
     const { dir, sites } = twoSites();
     const siteOf = async (env: Record<string, string>) => {

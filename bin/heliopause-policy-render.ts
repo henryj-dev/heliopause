@@ -1062,16 +1062,10 @@ const WORKER_ENTRY = new URL("../src/policy-eval-worker.ts", import.meta.url);
  * parent's own grants (`--allow-fs-write`, `--allow-worker`, …) into the worker — the first was review
  * round 1, the second round 2, both measured. An empty inheritance is the allow-list that cannot miss the
  * next `--allow-*` Node adds. The cost: runtime flags the deployment gives node do not reach the worker
- * while this is on. `spawn` drops `NODE_OPTIONS` from the worker's environment.
+ * while this is on. `spawn` gives the worker an empty environment.
  *
  * @see src/policy-render-service.test.ts "evaluating a site under Node's permission model (#131)"
  */
-/** A copy of `env` without `NODE_OPTIONS`, for a worker that must not pick up this process's grants. */
-function withoutNodeOptions(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const { NODE_OPTIONS: _dropped, ...rest } = env;
-  return rest;
-}
-
 function evalExecArgv(sitePath: string): string[] | undefined {
   if (!EVAL_PERMISSION) return undefined;
   const siteDir = realpathSync(dirname(sitePath));
@@ -1119,10 +1113,12 @@ function evaluateInWorker(task: { sitePath: string; label: string }): Promise<st
       // on the way (`/var` on macOS was refused, measured), and granting the link would grant all
       // beneath it. Node evaluates a module at its real path either way, so the result is the same.
       const sitePath = execArgv ? realpathSync(task.sitePath) : task.sitePath;
-      // And without `NODE_OPTIONS`: a worker parses its environment's, so grants given to this process
-      // that way reached the worker even with an empty `execArgv` (review round 2, measured).
-      const env = execArgv ? withoutNodeOptions(process.env) : undefined;
-      return new Worker(WORKER_ENTRY, { workerData: { sitePath }, ...(execArgv ? { execArgv, env } : {}) });
+      // And with an empty environment: a worker parses its environment's `NODE_OPTIONS`, so grants given
+      // to this process that way reached the worker even with an empty `execArgv` (review round 2,
+      // measured). Evaluation reads no variable — the modules that read `process.env` (`env-spec`,
+      // `operator-i18n`, …) are imported by the manager and the relay, not on this path — so none is
+      // given, which also covers whatever `NODE_*` knob Node adds next.
+      return new Worker(WORKER_ENTRY, { workerData: { sitePath }, ...(execArgv ? { execArgv, env: {} } : {}) });
     },
     budgetMs: SOURCE_SITE_BUDGET_MS,
     graceMs: WORKER_GRACE_MS,
