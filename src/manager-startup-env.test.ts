@@ -54,7 +54,9 @@ function startupLimitsLine(extraEnv: Record<string, string>): Promise<string> {
     const timer = setTimeout(() => { proc.kill("SIGKILL"); reject(new Error(`no limits line in 20s:\n${err}`)); }, 20_000);
     proc.stderr.on("data", (b: Buffer) => {
       err += b;
-      const line = err.split("\n").find((l) => / limits: /.test(l));
+      // Complete lines only: a chunk can end mid-line, and the last piece of the split is that
+      // unterminated fragment (review round 1).
+      const line = err.split("\n").slice(0, -1).find((l) => / limits: /.test(l));
       if (line) { clearTimeout(timer); proc.kill("SIGKILL"); resolve(line); }
     });
     proc.on("exit", (code) => { clearTimeout(timer); reject(new Error(`the manager exited ${code} first:\n${err}`)); });
