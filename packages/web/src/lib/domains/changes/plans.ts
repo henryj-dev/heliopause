@@ -142,6 +142,20 @@ export function canOfferApprove(
   return maySoloApprove;
 }
 
+/**
+ * Approve and publish on one code: only the proposer's own unapproved plan, under solo approval.
+ * Mirrors the server's `soloApproveAndPublishRefusal`, which refuses everything else before the code
+ * is spent.
+ */
+export function canOfferApproveAndPublish(
+  plan: PlanRow,
+  you: string,
+  canWrite: boolean,
+  maySoloApprove: boolean,
+): boolean {
+  return canWrite && maySoloApprove && plan.proposedBy === you && !plan.approval && !plan.publishedAt;
+}
+
 export function canOfferPublish(plan: PlanRow, canWrite: boolean): boolean {
   return canWrite && plan.approval !== null && plan.publishedAt === null;
 }

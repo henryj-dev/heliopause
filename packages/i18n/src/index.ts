@@ -389,6 +389,12 @@ export const MESSAGES = {
   },
   "m.otpApprove": { en: "approve this plan", ko: "이 플랜 승인" },
   "m.otpPublish": { en: "publish this generation", ko: "이 세대 발행" },
+  "m.approveAndPublish": { en: "approve & publish · solo · one code", ko: "승인하고 발행 · 단독 · 코드 한 번" },
+  "m.otpApproveAndPublish": { en: "approve your own plan and publish it", ko: "자기 플랜을 승인하고 발행" },
+  "m.approvedNotPublished": {
+    en: "approved, but not published: {message}",
+    ko: "승인은 됐지만 발행되지 않았다: {message}",
+  },
 
   "m.readingEnrollment": { en: "Reading enrollment…", ko: "등록을 읽는 중…" },
   "m.signInEnrollment": {
