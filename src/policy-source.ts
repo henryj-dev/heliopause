@@ -46,13 +46,8 @@ import { buildId } from "./build-id.ts";
 import { generationLabel, policyCommits, policyHead, readCoverageProbes } from "./policy-screen.ts";
 import type { RepoFacts, ScreenSite } from "./policy-screen.ts";
 
-// Captured before anything a policy module could replace — see the block at the `toWire` call.
-// The **functions**, detached. Writing the body as `JSON.parse(JSON.stringify(v))` would capture
-// nothing: an arrow body resolves `JSON` when it runs, which is after the module has been imported.
-// Neither of these reads `this`.
-const parseJson = JSON.parse;
-const writeJson = JSON.stringify;
-const toWire = <T>(value: T): unknown => parseJson(writeJson(value)) as unknown;
+// The wire crossing, applied where the value is made — see the block at the `toWire` call.
+const toWire = <T>(value: T): unknown => JSON.parse(JSON.stringify(value)) as unknown;
 
 /** Bumped when a field changes meaning. A mismatch is refused rather than guessed at. */
 export const POLICY_SOURCE_SCHEMA = 1;
@@ -410,12 +405,11 @@ export function collectModuleFacts(site: ScreenSite): { site: ScreenSite; servic
   // that cannot survive the crossing fails in the process that owns the mistake instead of arriving
   // as a silently missing table three seconds later in the manager's log.
   //
-  // ⚠️ `toWire`, not `JSON`. When this ran in the renderer's own realm, `globalThis.JSON = {
-  // stringify() { throw 1; } }` was two tokens in a policy commit and this line ran for every site;
-  // capturing at module load was the measured fix. In a worker the capture still matters for the
-  // module's *own* answer, and no longer has to protect any other site's.
-  //
-  // @see src/policy-render-service.test.ts "survives a module that replaces the globals it will be described with"
+  // ⚠️ `JSON` is looked up when this runs, after the module was imported, and that is deliberate (#117).
+  // When this ran in the renderer's own realm a module replacing `JSON` took every site down, and
+  // `JSON` was captured at load. In a worker the only answer it can reach is its own, which is the
+  // module's to choose anyway; the parent parses and checks what arrives. Reverting the capture left
+  // the repository suite green, so it was removed.
   return { site: toWire({ ...site, resolveService: undefined }) as ScreenSite, services };
 }
 
