@@ -1054,6 +1054,85 @@ describe("a plan claimed by a publish in flight", () => {
   });
 });
 
+// ## The claim is held for the manager's own worst case, not a fixed default
+//
+// The hold is what this manager's fleet read and push could take, plus a margin. A deployment with
+// long timeouts needs a long hold, or a slow push loses its plan exactly as before. A second manager
+// with timeouts past the default hold and a clock the test moves: nothing here waits for real, because
+// the stalling target is failed by hand long before either timeout.
+describe("the claim's hold follows the manager's timeouts", () => {
+  let port = 0;
+  let close: () => void = () => {};
+  let offsetMs = 0;
+  // timeoutMs + publishTimeoutMs + 30 s = 330 s, past the 120 s default.
+  const TIMEOUT_MS = 100_000;
+  const PUBLISH_TIMEOUT_MS = 200_000;
+
+  before(async () => {
+    const m = await startManager({
+      port: 0,
+      hostname: "127.0.0.1",
+      relays: [{ name: "stall", url: `https://127.0.0.1:${stall.port}/`, pkiDir: join(dir, "relay-pki") }],
+      tls: { certFile: join(dir, "mgr-server.pem"), keyFile: join(dir, "mgr-server.key"), caFile: join(dir, "ca.pem") },
+      operatorCNs: ["ops-alice", "ops-jae", "ops-watcher"],
+      writerCNs: ["ops-alice", "ops-jae"],
+      artifactSigning: { privateKey: generateKeyPairSync("ed25519").privateKey },
+      now: () => new Date(Date.now() + offsetMs),
+      timeoutMs: TIMEOUT_MS,
+      publishTimeoutMs: PUBLISH_TIMEOUT_MS,
+      log: () => {},
+    });
+    port = (m.server.address() as { port: number }).port;
+    close = () => m.server.close();
+  });
+  after(() => close());
+
+  async function inFlight(): Promise<{ hash: string; publishing: Promise<{ status: number; text: string }> }> {
+    const b = bundle();
+    const sb: PlanBundle = {
+      manifest: { ...b.manifest, generation: `gen-hold-${offsetMs}`, hosts: { "gw-01.stall": b.manifest.hosts["gw-01.dev"]! } },
+      rulesets: { "gw-01.stall": b.rulesets["gw-01.dev"]! },
+      workload: {},
+    };
+    const p = await call<{ hash: string }>(port, "/plan", "POST", { target: "stall", bundle: sb }, "henry");
+    assert.equal(p.status, 200, p.text);
+    assert.equal((await call(port, "/approve", "POST", { hash: p.json.hash }, "jae")).status, 200);
+    stall.holding = true;
+    const publishing = call(port, "/publish", "POST", { hash: p.json.hash }, "henry");
+    await stall.connected();
+    return { hash: p.json.hash, publishing };
+  }
+
+  async function listed(hash: string): Promise<boolean> {
+    const r = await call<{ plans: Array<{ hash: string }> }>(port, "/plans", "GET", undefined, "watcher");
+    return r.json.plans.some((x) => x.hash === hash);
+  }
+
+  it("keeps the plan through a sweep past the default hold, while inside its own", async () => {
+    const { hash, publishing } = await inFlight();
+    offsetMs += 200_000; // past 120 s, inside 330 s
+    try {
+      assert.equal((await call(port, "/plans", "GET", undefined, "watcher")).status, 200);
+    } finally {
+      stall.fail();
+    }
+    assert.equal((await publishing).status, 502);
+    assert.equal(await listed(hash), true, "a sweep inside the manager's hold dropped the plan");
+  });
+
+  it("lets a sweep drop the plan once its own hold has run out", async () => {
+    const { hash, publishing } = await inFlight();
+    offsetMs += 340_000; // past 330 s; still inside the 600 s proposal window
+    try {
+      assert.equal((await call(port, "/plans", "GET", undefined, "watcher")).status, 200);
+    } finally {
+      stall.fail();
+    }
+    assert.equal((await publishing).status, 502);
+    assert.equal(await listed(hash), false, "a claim outlived the manager's hold");
+  });
+});
+
 // ## The classic console's write surface was removed with the page it drew
 //
 // This file used to assert against `consolePage` — its plans list, its approve gating, its confirm
