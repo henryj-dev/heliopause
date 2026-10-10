@@ -235,7 +235,7 @@ describe("deploy-fleet.sh installs files the service account can read", () => {
       const opt = join(root, "opt");
       mkdirSync(join(staged, "bin"), { recursive: true });
       mkdirSync(join(staged, "packages", "i18n", "src"), { recursive: true });
-      mkdirSync(opt);
+      // `opt` is not made here: a first install creates the base itself, under umask 077 (review round 2).
       writeFileSync(join(staged, "bin", "relay.ts"), "x");
       writeFileSync(join(staged, "bin", "run"), "#!/bin/sh\n");
       writeFileSync(join(staged, "packages", "i18n", "src", "index.ts"), "x");
@@ -251,6 +251,7 @@ describe("deploy-fleet.sh installs files the service account can read", () => {
       assert.equal(mode("packages", "i18n", "src", "index.ts"), "644");
       assert.equal(mode("packages", "i18n"), "755");
       assert.equal(mode("packages"), "755", "a parent made under umask 077 is still closed to the service account");
+      assert.equal(mode(), "755", "the base made under umask 077 is still closed to the service account");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
