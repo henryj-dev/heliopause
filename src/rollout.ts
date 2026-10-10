@@ -32,6 +32,9 @@ export interface HostStatus {
    */
   detail?: string | null;
 
+  /** What the agent said about its table on the latest beat, or `null`. See `Heartbeat.applied.table`. */
+  table?: "present" | "absent" | "unread" | null;
+
   /**
    * The agent build that sent this heartbeat.
    *

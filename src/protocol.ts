@@ -546,6 +546,16 @@ export interface Heartbeat {
 
     /** Set when `state` is `unsupported` or `rolled-back`, so the manager can show a reason. */
     detail?: string;
+
+    /**
+     * Whether the agent's last read of the kernel found its table: `present`, `absent`, or `unread`
+     * (not read yet, or `nft` failed). Issue #139.
+     *
+     * `observedHash` is null for both `absent` and `unread`. A relay-side attempt to tell them apart by
+     * timing was held, unmerged, after two review rounds found three false alarms in it. The agent
+     * knows. Absent from agents that predate it, which the relay reads as "did not say".
+     */
+    table?: "present" | "absent" | "unread";
   };
 
   /**
