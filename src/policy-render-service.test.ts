@@ -27,7 +27,7 @@ import { spawn, type ChildProcessByStdio } from "node:child_process";
 import { connect } from "node:net";
 import type { Readable } from "node:stream";
 import {
-  chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync,
+  chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -3005,6 +3005,153 @@ describe("concurrent requests share one evaluation", () => {
     } finally {
       started?.stop();
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── Node's permission model on the evaluation worker (#131) ──────────────────
+//
+// A policy module ran with the renderer's own filesystem rights, so one that wrote into the checkout
+// changed what the renderer then read and served. `HELIOPAUSE_POLICY_EVAL_PERMISSION=on` starts each
+// evaluation worker with `--permission` and read access to what evaluation reads; Node's fs write APIs
+// are then denied inside the worker. Off by default.
+//
+// What this establishes is exactly that — a write through `node:fs` from the module is refused and the
+// site fails alone. It is not an OS boundary and is not claimed as one.
+describe("evaluating a site under Node's permission model (#131)", () => {
+  /** Two sites; `beta` writes a file into the checkout while it is evaluated. */
+  function writingSite(): { dir: string; sites: string; marker: string } {
+    const { dir, sites } = twoSites();
+    const marker = join(dir, "written-by-beta.txt");
+    writeFileSync(join(dir, "beta.ts"), `import { writeFileSync } from "node:fs";
+writeFileSync(new URL("./written-by-beta.txt", import.meta.url), "x");
+export const site = {
+  cfg: { hookPolicy: { input: "drop", output: "accept" } },
+  hosts: [{ id: "gw-01.beta", stage: "canary", items: [] }],
+  objects: [],
+};\n`);
+    return { dir, sites, marker };
+  }
+  const rootOf = (dir: string) => join(dir, "..");
+
+  it("lets the write through when the model is off — the known positive", { timeout: 60_000 }, async () => {
+    const { dir, sites, marker } = writingSite();
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      await fetchAt(started.port, "/source?site=beta");
+      assert.equal(existsSync(marker), true, "the module's write did not happen, so the case below proves nothing");
+    } finally {
+      started?.stop();
+      rmSync(rootOf(dir), { recursive: true, force: true });
+    }
+  });
+
+  it("refuses the write when the model is on, and fails only that site", { timeout: 60_000 }, async () => {
+    const { dir, sites, marker } = writingSite();
+    let started: Started | undefined;
+    try {
+      started = await start(dir, { ...MULTI(sites), HELIOPAUSE_POLICY_EVAL_PERMISSION: "on" });
+      const beta = await fetchAt(started.port, "/source?site=beta");
+      assert.equal(beta.status, 503, await beta.text());
+      assert.equal(existsSync(marker), false, "the module wrote into the checkout under the permission model");
+      const alpha = await fetchAt(started.port, "/source?site=alpha");
+      assert.equal(alpha.status, 200, "a site that writes nothing failed under the model");
+    } finally {
+      started?.stop();
+      rmSync(rootOf(dir), { recursive: true, force: true });
+    }
+  });
+
+  it("lets a module import from its own ../src under the model", { timeout: 60_000 }, async () => {
+    // Every real site module does — that is how it reaches the model. The fixture `src` here is the
+    // checkout's, not this process's, which is the layout a symlinked policy checkout produces.
+    const { dir, sites } = twoSites();
+    writeFileSync(join(dir, "..", "src", "zone.ts"), 'export const ZONE = "alpha";\n');
+    writeFileSync(join(dir, "alpha.ts"), `import { ZONE } from "../src/zone.ts";
+export const site = {
+  cfg: { hookPolicy: { input: "drop", output: "accept" } },
+  hosts: [{ id: \`gw-01.\${ZONE}\`, stage: "canary", items: [] }],
+  objects: [],
+};\n`);
+    let started: Started | undefined;
+    try {
+      started = await start(dir, { ...MULTI(sites), HELIOPAUSE_POLICY_EVAL_PERMISSION: "on" });
+      const res = await fetchAt(started.port, "/source?site=alpha");
+      assert.equal(res.status, 200, await res.text());
+    } finally {
+      started?.stop();
+      rmSync(rootOf(dir), { recursive: true, force: true });
+    }
+  });
+
+  it("renders a site the same with the model on as off", { timeout: 60_000 }, async () => {
+    const { dir, sites } = twoSites();
+    const siteOf = async (env: Record<string, string>) => {
+      const started = await start(dir, { ...MULTI(sites), ...env });
+      try {
+        const body = await (await fetchAt(started.port, "/source?site=alpha")).json() as { site: unknown };
+        return JSON.stringify(body.site);
+      } finally {
+        started.stop();
+      }
+    };
+    try {
+      assert.equal(await siteOf({ HELIOPAUSE_POLICY_EVAL_PERMISSION: "on" }), await siteOf({}));
+    } finally {
+      rmSync(rootOf(dir), { recursive: true, force: true });
+    }
+  });
+
+  it("previews under the model too — the preview copy lives in a temporary directory", { timeout: 60_000 }, async () => {
+    // A site that renders (a baseline), and whose rules read `policies.json`, so an edit shows up.
+    const root = mkdtempSync(join(tmpdir(), "hp-policy-perm-preview-"));
+    mkdirSync(join(root, "src"));
+    const dir = join(root, "policy");
+    mkdirSync(dir);
+    writeFileSync(join(dir, "policies.json"), JSON.stringify({ sources: ["10.1.0.0/16"] }));
+    const site = join(dir, "alpha.ts");
+    writeFileSync(site, `import P from "./policies.json" with { type: "json" };
+export const site = {
+  cfg: {
+    tableName: "heliopause", internalSupernet: "10.0.0.0/8",
+    hookPolicy: { input: "drop", output: "accept" },
+    baseline: [{ desc: "ssh", proto: "tcp", ports: "22", srcCidrs: ["10.9.0.0/16"] }],
+  },
+  hosts: [{ id: "h1.alpha", stage: "canary", items: [{
+    policy: { id: "web", name: "web", src: { kind: "cidr", value: "10.0.0.0/8" }, dst: { kind: "host", value: "h1.alpha" },
+              proto: "tcp", ports: "443", action: "allow", denyMode: "drop", priority: 100, enabled: true, notes: "" },
+    srcCidrs: P.sources, dstCidrs: ["10.2.0.7/32"],
+  }] }],
+};\n`);
+    let started: Started | undefined;
+    try {
+      started = await start(dir, { ...MULTI(`alpha=${site}`), HELIOPAUSE_POLICY_EVAL_PERMISSION: "on", TMPDIR: tmpdir() });
+      const res = await fetchAt(started.port, "/preview?site=alpha", {
+        method: "POST",
+        body: JSON.stringify({ path: "policies.json", content: JSON.stringify({ sources: ["10.0.0.0/8"] }) }),
+        signal: AbortSignal.timeout(20_000),
+      });
+      const text = await res.text();
+      assert.equal(res.status, 200, text);
+      const got = JSON.parse(text) as { changes: { host: string }[] };
+      assert.deepEqual(got.changes.map((c) => c.host), ["h1.alpha"], "the preview evaluated nothing");
+    } finally {
+      started?.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses to start on a value that is neither on nor off", async () => {
+    const { dir, sites } = twoSites();
+    try {
+      const { code, err } = await startExpectingRefusal(dir, {
+        ...MULTI(sites), HELIOPAUSE_POLICY_RENDER_TOKEN: "t", HELIOPAUSE_POLICY_EVAL_PERMISSION: "yes",
+      });
+      assert.notEqual(code, 0);
+      assert.match(err, /HELIOPAUSE_POLICY_EVAL_PERMISSION/);
+    } finally {
+      rmSync(rootOf(dir), { recursive: true, force: true });
     }
   });
 });
