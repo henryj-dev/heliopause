@@ -1498,8 +1498,8 @@ describe("a refused generation says so where an operator looks", () => {
 //
 // After a reboot the table is gone until the agent puts it back. The agent now says which of three
 // it saw — `present`, `absent`, or `unread` (not read yet, or `nft` failed) — and the relay reads that
-// rather than guessing from a null `observedHash`. Guessing by beat count, then by time, produced
-// three false alarms in two review rounds; the scenarios below are those three.
+// rather than guessing from a null `observedHash`. A held, unmerged attempt guessed by beat count and
+// then by time, and two review rounds found three false alarms in it; the scenarios below are those three.
 describe("a confirmed host that says its table is absent", () => {
   const beat = (table: "present" | "absent" | "unread" | undefined, over: HeartbeatOverride = {}) =>
     hb({

@@ -3971,6 +3971,15 @@ def _envelope_path(kind):
     return os.path.join(os.path.dirname(STATE_FILE) or ".", f"{kind}-envelope.json")
 
 
+def _fsync_directory(directory):
+    """Make a rename in `directory` durable — without it, power loss can bring back the old name."""
+    dir_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
 def _write_private_json(path, value):
     """Atomically and durably replace `path` with `value`, mode 0600. Same steps as the state file."""
     directory = os.path.dirname(path) or "."
@@ -3986,11 +3995,7 @@ def _write_private_json(path, value):
             os.fsync(f.fileno())
         os.replace(tmp, path)
         tmp = None
-        dir_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
+        _fsync_directory(directory)
         return True
     except (OSError, TypeError, ValueError) as e:
         log(f"cannot write {path}: {e}")
@@ -4045,6 +4050,7 @@ def _promote_confirmed_envelope(generation):
         return False
     try:
         os.replace(_envelope_path("pending"), _envelope_path("confirmed"))
+        _fsync_directory(os.path.dirname(_envelope_path("confirmed")))
     except OSError as e:
         log(f"cannot keep the confirmed envelope for boot restore: {e}")
         return False
@@ -4054,15 +4060,16 @@ def _promote_confirmed_envelope(generation):
 def restore_confirmed_ruleset():
     """At boot, before the relay: re-install the confirmed ruleset if the kernel lost it.
 
-    Returns `(installed, reason)`. Installs only if every condition holds — the state is `confirmed`;
-    the table is read and absent; the kept envelope verifies; it is the generation the state is on; its
-    authorization is the one `currentAuthorization` names. An expired authorization passes only then,
+    Returns `(installed, reason)`. Installs only if every check below passes — the state is
+    `confirmed`; the table is read and absent; the kept envelope verifies; its signed generation is the
+    one the state is on; its authorization is the one `currentAuthorization` names; the replay watermark
+    would accept it; the host-half preflight passes; nft takes it. An expired authorization passes only then,
     which is the escape hatch's condition in `accept_artifact_authorization` — so "expired, another
     generation" is never installed.
 
     No rollback timer and no state write. This is not a commitment awaiting confirmation; it puts back
     what was already confirmed, and with no relay a timer would roll back to the empty table this is
-    repairing. The watermark is not advanced, so replay protection is unchanged. Routes are not
+    repairing. The replay watermark is checked as the normal path checks it and never advanced. Routes are not
     restored (said in the log when declared). A refusal leaves the table absent, which the heartbeat
     reports as `table: absent`.
 
@@ -4090,6 +4097,16 @@ def restore_confirmed_ruleset():
     current = st.get("currentAuthorization")
     if not isinstance(current, dict) or _authorization_identity(current) != _authorization_identity(record):
         return False, "kept envelope's authorization is not the one this host is enforcing"
+    # The replay checks `accept_artifact_authorization` makes, read-only. A newer authorization accepted
+    # after this one was confirmed (and never applied — a crash, a failed workload half) moved the
+    # watermark; the normal path would refuse this envelope, so the restore does too. Review P1.
+    prior = st.get("authorizationWatermark")
+    if isinstance(prior, dict):
+        if record["authorizedAt"] < prior.get("authorizedAt", ""):
+            return False, "kept envelope is older than the durable authorization watermark"
+        if record["authorizedAt"] == prior.get("authorizedAt") and \
+                _authorization_identity(record) != _authorization_identity(prior):
+            return False, "kept envelope and the watermark are different authorizations with one timestamp"
     doc, _timeout, reason = _preflight_host_artifact(artifact)
     if doc is None:
         return False, reason
@@ -4773,6 +4790,11 @@ _host_observe_value = None
 _host_observe_failure = ""
 _host_observe_at = 0.0
 _host_observe_refreshing = False
+# Moved by every invalidation. A read publishes only if it is unchanged since the read began. Review of
+# #139: an in-flight read that saw no table finished after an apply and published `absent` for a host
+# that had its table. Only a successful apply invalidates — a rollback does not, so a read begun before
+# a rollback can still publish `present` until the next refresh; the boot restore runs before any read.
+_host_observe_epoch = 0
 
 
 def _read_host_observation():
@@ -4809,9 +4831,14 @@ def _read_host_observation():
 def _refresh_host_observation():
     global _host_observe_value, _host_observe_at, _host_observe_refreshing
     global _host_observe_failure
+    with _host_observe_lock:
+        began = _host_observe_epoch
     try:
         value = _read_host_observation()
         with _host_observe_lock:
+            if _host_observe_epoch != began:
+                # Overtaken by an apply; the next refresh reads the kernel as it is now.
+                return
             _host_observe_value = value
             _host_observe_at = time.monotonic()
             _host_observe_failure = ""
@@ -4833,10 +4860,11 @@ def _refresh_host_observation():
 
 def _invalidate_host_observation():
     """Do not let a prior generation's TTL entry describe a newly applied ruleset."""
-    global _host_observe_value, _host_observe_at
+    global _host_observe_value, _host_observe_at, _host_observe_epoch
     with _host_observe_lock:
         _host_observe_value = None
         _host_observe_at = 0.0
+        _host_observe_epoch += 1
 
 
 def _host_observation_report():
@@ -5588,7 +5616,8 @@ def main():
     recover_workload_commitment()
     reconcile_recovered_commitments()
     # A reboot took the table; put back what was confirmed without waiting for the relay (#139).
-    # After the commitment recoveries, which own every non-confirmed state, and before the monitor
+    # After the commitment recoveries (they handle prepared/pending/rollback-failed; the restore acts
+    # only on `confirmed`), and before the monitor
     # starts, so the restore is not observed as a change this agent did not make. Writes no state.
     installed, why = restore_confirmed_ruleset()
     log(f"boot restore: {'installed' if installed else 'not installed'} — {why}")

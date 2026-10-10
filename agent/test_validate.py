@@ -5465,7 +5465,8 @@ class TestBootRestore(unittest.TestCase):
         # The escape hatch's generation clause on its own: the authorization matches the one the state
         # names, and the confirmed generation is a different one. Only the generation check refuses.
         self.expired = True
-        self._confirmed_host(generation="g0", currentAuthorization={**self.RECORD, "generation": "g1"})
+        g1 = {**self.RECORD, "generation": "g1"}
+        self._confirmed_host(generation="g0", currentAuthorization=g1, authorizationWatermark=g1)
         self._keep(generation="g1")
         installed, why = hp.restore_confirmed_ruleset()
         self.assertFalse(installed)
@@ -5487,6 +5488,64 @@ class TestBootRestore(unittest.TestCase):
         self.assertFalse(installed)
         self.assertEqual(self.applied, [])
         self.assertIn("authorization", why)
+
+    def test_does_not_install_behind_the_replay_watermark(self):
+        # Review P1: g1 confirmed and kept, then a newer g2 authorization accepted (the watermark moves)
+        # and the host crashed before applying it. The normal path refuses g1 as older than the
+        # watermark; the restore must too, without moving the watermark.
+        self.expired = True
+        newer = {**self.RECORD, "generation": "g2", "authorizedAt": "2026-09-30T00:00:00.000Z",
+                 "payloadHash": "sha256:" + "f" * 64}
+        self._confirmed_host(authorizationWatermark=newer)
+        self._keep()
+        installed, why = hp.restore_confirmed_ruleset()
+        self.assertFalse(installed)
+        self.assertEqual(self.applied, [])
+        self.assertIn("watermark", why)
+        self.assertEqual(hp.load_state()["authorizationWatermark"], newer, "the watermark moved")
+
+    def test_the_review_probe_normal_path_and_restore_both_refuse_g1(self):
+        """Review P1's probe, kept as it was run: the real acceptance moves the watermark to g2, then
+        refuses g1 — and the restore must refuse g1 the same way, with no kernel write."""
+        real_accept = hp.accept_artifact_authorization
+        hp.accept_artifact_authorization = _REAL_ACCEPT_AUTHORIZATION
+        try:
+            self._confirmed_host()
+            self._keep()
+            self.expired = True
+            newer = {**self.RECORD, "generation": "g2",
+                     "authorizedAt": "2026-09-30T00:00:00.000Z",
+                     "payloadHash": "sha256:" + "f" * 64}
+            hp.accept_artifact_authorization(newer, {}, False)
+            normal = hp.accept_artifact_authorization(self.RECORD, {}, True)
+            restored = hp.restore_confirmed_ruleset()
+        finally:
+            hp.accept_artifact_authorization = real_accept
+        self.assertEqual(normal, (None, "signed artifact is older than the durable authorization watermark"))
+        self.assertFalse(restored[0], restored[1])
+        self.assertEqual(len(self.applied), 0, "kernel writes")
+
+    def test_does_not_install_another_authorization_at_the_watermarks_moment(self):
+        same_time_other = {**self.RECORD, "payloadHash": "sha256:" + "f" * 64}
+        self._confirmed_host(authorizationWatermark=same_time_other)
+        self._keep()
+        installed, why = hp.restore_confirmed_ruleset()
+        self.assertFalse(installed)
+        self.assertIn("timestamp", why)
+
+    def test_the_promotion_is_made_durable(self):
+        # Review P2: a rename that power loss can undo leaves the confirmed state without its envelope.
+        synced = []
+        real = hp._fsync_directory
+        hp._fsync_directory = lambda d: (synced.append(d), real(d))[1]
+        try:
+            self._confirmed_host()
+            self.assertTrue(hp._remember_accepted_envelope("g1", json.dumps({"generation": "g1"})))
+            synced.clear()
+            self.assertTrue(hp._promote_confirmed_envelope("g1"))
+        finally:
+            hp._fsync_directory = real
+        self.assertEqual(synced, [os.path.dirname(hp._envelope_path("confirmed"))])
 
     def test_does_not_install_an_envelope_that_fails_verification(self):
         self._confirmed_host()
@@ -5632,6 +5691,32 @@ class TestTheHeartbeatSaysWhetherTheTableIsThere(unittest.TestCase):
             with self.subTest(expect=expect):
                 hp.nft_json = lambda args, items=items: (items, "" if items is not None else "nft exited 1")
                 self.assertEqual(hp._read_host_observation()["table"], expect)
+
+    def test_an_observation_overtaken_by_an_apply_is_not_published(self):
+        # Review P2: the read saw no table, an apply then invalidated the cache, and the read finished
+        # afterwards — publishing the pre-apply absence with a fresh timestamp. A confirmed host would
+        # then report `absent` while its table exists.
+        saved = (hp._host_observe_value, hp._host_observe_at, hp._host_observe_refreshing, hp._read_host_observation)
+
+        def read_then_get_overtaken():
+            hp._invalidate_host_observation()          # an apply lands while this read is in flight
+            return {"observed": None, "detail": "table inet heliopause is absent", "table": "absent",
+                    "foreignFilters": [], "publishedPorts": [], "routes": []}
+
+        try:
+            hp._host_observe_value, hp._host_observe_at, hp._host_observe_refreshing = None, 0.0, True
+            hp._read_host_observation = read_then_get_overtaken
+            hp._refresh_host_observation()
+            self.assertIsNone(hp._host_observe_value, "a read that began before the apply was published")
+            # The known positive: an uninterrupted read is published.
+            hp._host_observe_refreshing = True
+            hp._read_host_observation = lambda: {"observed": "h", "detail": "", "table": "present",
+                                                 "foreignFilters": [], "publishedPorts": [], "routes": []}
+            hp._refresh_host_observation()
+            self.assertEqual((hp._host_observe_value or {}).get("table"), "present")
+        finally:
+            (hp._host_observe_value, hp._host_observe_at, hp._host_observe_refreshing,
+             hp._read_host_observation) = saved
 
     def test_a_report_not_read_yet_says_unread(self):
         saved = (hp._host_observe_value, hp._host_observe_at, hp._host_observe_refreshing)
