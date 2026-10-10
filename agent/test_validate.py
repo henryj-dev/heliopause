@@ -8315,7 +8315,12 @@ class TestAnApplyStopsWhenARollbackIsStillOwed(unittest.TestCase):
 
         guard reverted to `_timer is None`     what went red
         the route guard (`:2459`)              test_no_route_is_written_after_a_rollback_that_did_not_settle
+                                               test_an_unsaved_rollback_inside_the_apply_stops_the_route_write
         the final guard (`:2486`)              test_a_route_less_apply_stops_at_the_final_guard_too
+                                               test_an_unsaved_rollback_inside_the_apply_stops_it_at_the_final_guard
+
+    The second test in each row is the save-failure side of the `or`; the first is the restore-failure
+    side. Measured 2026-10-10 against `b8677dd`, where those guards sit at `:2507` and `:2524`.
 
     ⚠️ The second row took three attempts, and the first two are worth keeping:
 
@@ -8414,6 +8419,34 @@ class TestAnApplyStopsWhenARollbackIsStillOwed(unittest.TestCase):
             "the rollback cleared what it owes, so it took the settled path",
         )
         self.assertIsNotNone(hp._timer, "the rollback did not re-arm, so no timer misleads the apply")
+
+    def _rollback_whose_save_fails(self):
+        """The other side of `if not ok or not saved:` — the restore succeeds, the result write fails.
+
+        Only the rollback's own write is refused; every other write goes through, so an apply this
+        interrupts keeps its normal persistence.
+        """
+        real_save = self._real["_save_state_unlocked"]
+
+        def fail_the_rollback_save(st):
+            if st.get("state") in {"rolled-back", "rollback-failed"}:
+                return False
+            return real_save(st)
+
+        hp._nft_apply_json = lambda _doc: (0, "")          # the restore itself succeeds
+        hp._save_state_unlocked = fail_the_rollback_save
+        try:
+            self.assertFalse(
+                hp.rollback("a rollback whose result cannot be written", "g-first"),
+                "the rollback reported success, so the save failure did not land",
+            )
+        finally:
+            hp._save_state_unlocked = real_save
+        self.assertIsNotNone(
+            hp._nft_rollback_owed,
+            "the rollback cleared what it owes, so it took the settled path and this tests nothing",
+        )
+        self.assertIsNotNone(hp._timer, "it did not re-arm, so no timer misleads the apply")
 
     def test_a_second_apply_is_refused_while_the_rollback_is_owed(self):
         """The entry guard's case, and it already held — the known positive for the two below."""
@@ -8659,8 +8692,9 @@ class TestAnApplyStopsWhenARollbackIsStillOwed(unittest.TestCase):
         re-armed timer alone satisfies the entry guard. And the first version of this docstring said
         the fixture leaves the durable state at `prepared` — it leaves it at **`pending`**, since
         `_arm_a_commitment` already completed an apply. Covering the mid-apply window for this side
-        of the `or` means injecting the save failure **inside one apply, after its entry guard**, and
-        that is recorded as open rather than claimed here.
+        of the `or` means injecting the save failure **inside one apply, after its entry guard** —
+        `test_an_unsaved_rollback_inside_the_apply_stops_the_route_write` and
+        `test_an_unsaved_rollback_inside_the_apply_stops_it_at_the_final_guard` do that.
 
         It is also the outcome the issue describes as hardest to read: the apply reports
         `(True, "pending", "")` for a generation `confirm()` will refuse, so the log looks ordinary.
@@ -8704,6 +8738,76 @@ class TestAnApplyStopsWhenARollbackIsStillOwed(unittest.TestCase):
         self.assertIn(
             "already awaiting confirmation", detail,
             f"it was refused for another reason: {detail}",
+        )
+
+    def test_an_unsaved_rollback_inside_the_apply_stops_the_route_write(self):
+        """The save-failure side of the `or`, inside one apply, at the route guard.
+
+        Same pause point as `test_no_route_is_written_after_a_rollback_that_did_not_settle`; only the
+        way the rollback fails to settle differs. The route recorder's positive control is in that
+        test — both use the `_ip_route` stub from `setUp`.
+        """
+        paused = []
+
+        def observe_then_roll_back():
+            if self._came_from_observation():
+                return []
+            paused.append("observed")
+            self._rollback_whose_save_fails()
+            return []
+
+        hp.observed_routes = observe_then_roll_back
+        hp._nft_apply_json = lambda _doc: (0, "")
+        snapshots = iter((([], [], ""), ([{"table": TABLE}], [], "")))
+        hp.snapshot = lambda: next(snapshots)
+        self.route_calls.clear()
+        ok, state, detail = hp.apply_artifact({
+            "generation": "g-first", "ruleset": VALID, "rulesetHash": VALID_HASH,
+            "confirmTimeoutSec": hp.NFT_CONFIRM_MIN_SEC,
+            "routes": [self.ROUTE["spec"]], "routeGuard": ["198.51.100.0/24"],
+        })
+        self.assertEqual(paused, ["observed"], "the apply did not reach the route block exactly once")
+        self.assertFalse(ok, f"the apply reported success after an unsaved rollback: {state} — {detail}")
+        self.assertEqual(
+            detail, "confirmation deadline elapsed before routes",
+            f"the apply was refused by something other than the route guard: {detail}",
+        )
+        self.assertEqual(
+            self.route_calls, [],
+            f"routes were written after a rollback ran against them: {self.route_calls}",
+        )
+
+    def test_an_unsaved_rollback_inside_the_apply_stops_it_at_the_final_guard(self):
+        """The save-failure side of the `or`, inside one apply, at the final guard.
+
+        Same pause point as `test_a_route_less_apply_stops_at_the_final_guard_too`: the post-apply
+        `snapshot()`, outside `_apply_lock`.
+        """
+        rolled = []
+        snapshots = [([], [], ""), ([{"table": TABLE}], [], "")]
+
+        def snapshot_then_roll_back():
+            answer = snapshots.pop(0) if snapshots else ([{"table": TABLE}], [], "")
+            if not rolled and not snapshots:
+                rolled.append("mid-verify")
+                self._rollback_whose_save_fails()
+            return answer
+
+        hp._nft_apply_json = lambda _doc: (0, "")
+        hp.snapshot = snapshot_then_roll_back
+        ok, state, detail = hp.apply_artifact({
+            "generation": "g-first", "ruleset": VALID, "rulesetHash": VALID_HASH,
+            "confirmTimeoutSec": hp.NFT_CONFIRM_MIN_SEC,
+        })
+        self.assertEqual(rolled, ["mid-verify"], "the rollback never fired inside the apply")
+        self.assertFalse(ok, f"the apply settled while an unsaved rollback was owed: {state} — {detail}")
+        self.assertEqual(
+            detail, "confirmation deadline elapsed during apply",
+            f"the apply was refused by something other than the guard under test: {detail}",
+        )
+        self.assertNotEqual(
+            hp.load_state().get("state"), "pending",
+            f"a pending state was written for a generation that cannot be confirmed: {hp.load_state()}",
         )
 
 
