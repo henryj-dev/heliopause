@@ -1047,26 +1047,32 @@ const WORKER_ENTRY = new URL("../src/policy-eval-worker.ts", import.meta.url);
 /**
  * The worker's `execArgv` under `HELIOPAUSE_POLICY_EVAL_PERMISSION=on`, or `undefined` when it is off.
  *
- * `--permission` with read access to the site module's directory and the `src` its `../src` imports
- * resolve to — each by real path, because the worker is handed the real site path (see `spawn`) and
- * Node resolves imports through a symlinked checkout to where it lives. An existing directory grants
- * its contents (Node expands it to `dir/*`). The worker entry needs no grant: Node allows an entrypoint.
+ * `--permission` with read access to the site module's directory and the `src` beside it — the one its
+ * `../src` imports resolve to. Both by real path, and the sibling is taken from the resolved directory:
+ * Node resolves imports through a symlinked checkout to where it lives, and `join(link, "..")` would
+ * name the link's parent instead (review round 1; this repository's own `policy/` is such a link). The
+ * worker is handed the real site path too (see `spawn`). An existing directory grants its contents (Node
+ * expands it to `dir/*`). The worker entry needs no grant: Node allows an entrypoint.
+ *
  * Writes, child processes and further workers get none, so `node:fs` write APIs are denied in the
  * worker. Node documents what this is not: symlinks are followed out of the granted paths and file
  * descriptors bypass it — so the claim is the denied writes, not a sandbox.
  *
- * This process's own `execArgv` is passed on first, because a worker given one does not inherit it.
- * No test sees that line (the renderer is started without flags here); it keeps whatever the deployment
- * starts node with reaching the worker, as it did before.
+ * 🔑 **Nothing of this process's `execArgv` is passed on.** A worker given `execArgv` does not inherit
+ * the parent's, and inheriting it would carry the parent's own grants (`--allow-fs-write`,
+ * `--allow-worker`, …) into the worker (review round 1). An empty inheritance is the allow-list that
+ * cannot miss the next `--allow-*` Node adds. The cost: runtime flags the deployment starts node with do
+ * not reach the worker while this is on.
  *
  * @see src/policy-render-service.test.ts "evaluating a site under Node's permission model (#131)"
  */
 function evalExecArgv(sitePath: string): string[] | undefined {
   if (!EVAL_PERMISSION) return undefined;
-  const reads = new Set<string>([realpathSync(dirname(sitePath))]);
-  const modelDir = join(dirname(sitePath), "..", "src");
+  const siteDir = realpathSync(dirname(sitePath));
+  const reads = new Set<string>([siteDir]);
+  const modelDir = join(siteDir, "..", "src");
   if (existsSync(modelDir)) reads.add(realpathSync(modelDir));
-  return [...process.execArgv, "--permission", ...[...reads].map((p) => `--allow-fs-read=${p}`)];
+  return ["--permission", ...[...reads].map((p) => `--allow-fs-read=${p}`)];
 }
 
 /**

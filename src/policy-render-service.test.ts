@@ -105,8 +105,8 @@ const fetchSource = (port: number, init: RequestInit = {}) =>
     headers: { authorization: `Bearer ${BEARER}`, ...(init.headers ?? {}) },
   });
 
-function start(dir: string, extraEnv: Record<string, string> = {}): Promise<Started> {
-  const proc = spawn(process.execPath, [BIN], {
+function start(dir: string, extraEnv: Record<string, string> = {}, nodeArgs: string[] = []): Promise<Started> {
+  const proc = spawn(process.execPath, [...nodeArgs, BIN], {
     env: {
       PATH: process.env.PATH ?? "",
       HOME: process.env.HOME ?? "",
@@ -3079,6 +3079,56 @@ export const site = {
       started = await start(dir, { ...MULTI(sites), HELIOPAUSE_POLICY_EVAL_PERMISSION: "on" });
       const res = await fetchAt(started.port, "/source?site=alpha");
       assert.equal(res.status, 200, await res.text());
+    } finally {
+      started?.stop();
+      rmSync(rootOf(dir), { recursive: true, force: true });
+    }
+  });
+
+  it("grants the src beside a symlinked checkout's real location, not beside the link", { timeout: 60_000 }, async () => {
+    // Review round 1: `join(dir, "..", "src")` collapsed `policy/..` before the link was resolved, so a
+    // checkout mounted by symlink — this repository's own `policy/` — was granted the wrong `src`.
+    const real = mkdtempSync(join(tmpdir(), "hp-policy-real-"));
+    mkdirSync(join(real, "src"));
+    mkdirSync(join(real, "policy"));
+    writeFileSync(join(real, "src", "zone.ts"), 'export const ZONE = "alpha";\n');
+    writeFileSync(join(real, "policy", "policies.json"), '{\n  "schemaVersion": 1,\n  "groups": []\n}\n');
+    writeFileSync(join(real, "policy", "alpha.ts"), `import { ZONE } from "../src/zone.ts";
+export const site = {
+  cfg: { hookPolicy: { input: "drop", output: "accept" } },
+  hosts: [{ id: \`gw-01.\${ZONE}\`, stage: "canary", items: [] }],
+  objects: [],
+};\n`);
+    const mount = mkdtempSync(join(tmpdir(), "hp-policy-mount-"));
+    mkdirSync(join(mount, "src"));
+    symlinkSync(join(real, "policy"), join(mount, "policy"));
+    const dir = join(mount, "policy");
+    let started: Started | undefined;
+    try {
+      started = await start(dir, { ...MULTI(`alpha=${join(dir, "alpha.ts")}`), HELIOPAUSE_POLICY_EVAL_PERMISSION: "on" });
+      const res = await fetchAt(started.port, "/source?site=alpha");
+      assert.equal(res.status, 200, await res.text());
+    } finally {
+      started?.stop();
+      rmSync(mount, { recursive: true, force: true });
+      rmSync(real, { recursive: true, force: true });
+    }
+  });
+
+  it("does not hand the worker permission grants the renderer itself was started with", { timeout: 60_000 }, async () => {
+    // Review round 1: passing `process.execArgv` on wholesale carried `--allow-fs-write` into the worker.
+    const { dir, sites, marker } = writingSite();
+    // The renderer itself has to listen; newer Node puts the network under the model too, older does not
+    // know the flag. Asked of this Node rather than of a version number.
+    const grants = ["--permission", "--allow-fs-read=*", "--allow-fs-write=*", "--allow-worker", "--allow-child-process",
+      ...(process.allowedNodeEnvironmentFlags.has("--allow-net") ? ["--allow-net"] : [])];
+    let started: Started | undefined;
+    try {
+      started = await start(dir, { ...MULTI(sites), HELIOPAUSE_POLICY_EVAL_PERMISSION: "on" }, grants);
+      const beta = await fetchAt(started.port, "/source?site=beta");
+      assert.equal(beta.status, 503, await beta.text());
+      assert.equal(existsSync(marker), false, "the worker inherited the renderer's write grant");
+      assert.equal((await fetchAt(started.port, "/source?site=alpha")).status, 200);
     } finally {
       started?.stop();
       rmSync(rootOf(dir), { recursive: true, force: true });
