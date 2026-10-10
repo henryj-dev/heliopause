@@ -3135,6 +3135,25 @@ export const site = {
     }
   });
 
+  it("does not hand the worker grants that arrived through NODE_OPTIONS either", { timeout: 60_000 }, async () => {
+    // Review round 2: an empty `execArgv` dropped the command-line grants, but a worker still parsed
+    // the parent's `NODE_OPTIONS`. Measured: write and worker grants survived with `execArgv` alone.
+    const { dir, sites, marker } = writingSite();
+    const grants = ["--permission", "--allow-fs-read=*", "--allow-fs-write=*", "--allow-worker", "--allow-child-process",
+      ...(process.allowedNodeEnvironmentFlags.has("--allow-net") ? ["--allow-net"] : [])];
+    let started: Started | undefined;
+    try {
+      started = await start(dir, { ...MULTI(sites), HELIOPAUSE_POLICY_EVAL_PERMISSION: "on", NODE_OPTIONS: grants.join(" ") });
+      const beta = await fetchAt(started.port, "/source?site=beta");
+      assert.equal(beta.status, 503, await beta.text());
+      assert.equal(existsSync(marker), false, "the worker inherited the renderer's write grant through NODE_OPTIONS");
+      assert.equal((await fetchAt(started.port, "/source?site=alpha")).status, 200);
+    } finally {
+      started?.stop();
+      rmSync(rootOf(dir), { recursive: true, force: true });
+    }
+  });
+
   it("renders a site the same with the model on as off", { timeout: 60_000 }, async () => {
     const { dir, sites } = twoSites();
     const siteOf = async (env: Record<string, string>) => {
