@@ -234,6 +234,39 @@ export const ENV_BOUNDS = {
 
 export type BoundedEnvName = keyof typeof ENV_BOUNDS;
 
+const given = (env: NodeJS.ProcessEnv, name: string): boolean => env[name] !== undefined && env[name] !== "";
+
+/**
+ * Whether the manager passes plan limits from the environment at all. The entry point passes them only
+ * when `HELIOPAUSE_PLAN_TTL_SEC` is set, and otherwise `startManager` uses `DEFAULT_LIMITS`. One
+ * predicate, so the wiring and the startup log line below cannot describe two different rules.
+ */
+export function planLimitsFromEnv(env: NodeJS.ProcessEnv): boolean {
+  return given(env, "HELIOPAUSE_PLAN_TTL_SEC");
+}
+
+/**
+ * Where each limit on the manager's startup line came from (#154): `env` or `default`.
+ *
+ * ⚠️ `HELIOPAUSE_MAX_PENDING_PLANS` set **without** `HELIOPAUSE_PLAN_TTL_SEC` is ignored, because of
+ * `planLimitsFromEnv` — the label says so instead of reporting a value nobody is using.
+ */
+export function startupLimitSources(env: NodeJS.ProcessEnv): {
+  authorizationTtlSec: string;
+  planTtlSec: string;
+  maxPending: string;
+} {
+  const fromEnv = planLimitsFromEnv(env);
+  const pendingGiven = given(env, "HELIOPAUSE_MAX_PENDING_PLANS");
+  return {
+    authorizationTtlSec: given(env, "HELIOPAUSE_ARTIFACT_AUTHORIZATION_TTL_SEC") ? "env" : "default",
+    planTtlSec: fromEnv ? "env" : "default",
+    maxPending: fromEnv
+      ? (pendingGiven ? "env" : "default")
+      : (pendingGiven ? "default — HELIOPAUSE_MAX_PENDING_PLANS is ignored without HELIOPAUSE_PLAN_TTL_SEC" : "default"),
+  };
+}
+
 /**
  * `dev=https://192.0.2.1:8443=./pki,prod=https://192.0.2.2:8443=./pki-prod`
  *

@@ -113,6 +113,7 @@ import { zoneMismatch } from "./site-zone.ts";
 import { diffRulesets } from "./ruleset-diff.ts";
 import {
   AuthorizationTimestampIssuer,
+  MAX_MANAGER_AUTHORIZATION_LIFETIME_MS,
   artifactSigningKeyId,
   signAuthorizedArtifactBundle,
 } from "./artifact-signature.ts";
@@ -659,6 +660,12 @@ export interface ManagerOptions {
   publishTimeoutMs?: number;
   /** Approval window and pending-plan bound. Defaults in `approval.ts`. */
   limits?: ApprovalLimits;
+  /**
+   * Where each value on the startup limits line came from, as the entry point knows it (`env`,
+   * `default`, …). Only the log line reads it; absent, the line names no source. @see
+   * `startupLimitSources` in `./env-spec.ts`
+   */
+  limitSources?: { authorizationTtlSec?: string; planTtlSec?: string; maxPending?: string };
   /** Overridable for tests. */
   now?: () => Date;
   log?: (m: string) => void;
@@ -4613,6 +4620,35 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         `[manager]   역할 변경 이벤트 키 ${oidc.conf.roleChangeEvent}\n` +
         `[manager]   로그아웃 URI 가 비어 있으면 IdP 의 강제 로그아웃이 여기서 아무것도 끝내지 ` +
         `못하면서 성공을 보고함. 역할 변경 키가 발급자의 것과 다르면 모든 권한 변경이 조용히 버려짐.`,
+    );
+  }
+
+  // ## The limits this process actually uses (#154)
+  //
+  // On 2026-09-28 the authorization TTL was read as 7 days. Seven days is the protocol's cap; what
+  // the manager issued was 24 hours, and the difference surfaced only when the whole fleet's
+  // authorizations lapsed. Every value here can be changed by environment, so only the running
+  // process can say which one it is using — a manifest says what was configured.
+  //
+  // The values are the ones the code below uses, not re-derived: `authorizationTtlSec` and `limits`
+  // are the same bindings the signing and approval paths read.
+  {
+    const span = (sec: number): string =>
+      sec % 3600 === 0 ? `${sec / 3600}h` : sec % 60 === 0 ? `${sec / 60}m` : `${sec}s`;
+    const from = (s: string | undefined): string => (s ? ` (${s})` : "");
+    const capSec = MAX_MANAGER_AUTHORIZATION_LIFETIME_MS / 1000;
+    const sources = opts.limitSources ?? {};
+    const ttlEn = opts.artifactSigning
+      ? `artifact authorization TTL ${span(authorizationTtlSec)}${from(sources.authorizationTtlSec)}, protocol cap ${span(capSec)}`
+      : "artifact signing off";
+    const ttlKo = opts.artifactSigning
+      ? `아티팩트 인가 TTL ${span(authorizationTtlSec)}${from(sources.authorizationTtlSec)}, 프로토콜 상한 ${span(capSec)}`
+      : "아티팩트 서명 꺼짐";
+    log(
+      `limits: ${ttlEn}; plan TTL ${span(limits.ttlSec)}${from(sources.planTtlSec)}; ` +
+        `at most ${limits.maxPending} pending plans${from(sources.maxPending)}`,
+      `한도: ${ttlKo}; 플랜 유효기간 ${span(limits.ttlSec)}${from(sources.planTtlSec)}; ` +
+        `대기 플랜 최대 ${limits.maxPending}개${from(sources.maxPending)}`,
     );
   }
 

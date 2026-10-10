@@ -4,7 +4,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   boundedInteger, boundedNumber, ENV_BOUNDS, parsePairs, parseRelays, parsePolicySites, EnvSpecError,
-  type BoundedEnvName,
+  planLimitsFromEnv, startupLimitSources, type BoundedEnvName,
 } from "./env-spec.ts";
 
 /**
@@ -370,5 +370,33 @@ describe("boundedNumber", () => {
   test("still refuses NaN and the range", () => {
     assert.throws(() => boundedNumber("X", "soon", { min: 0, max: 10, fallback: 5 }), EnvSpecError);
     assert.throws(() => boundedNumber("X", "11", { min: 0, max: 10, fallback: 5 }), EnvSpecError);
+  });
+});
+
+describe("where the manager's startup limits came from (#154)", () => {
+  test("names nothing set as default", () => {
+    assert.deepEqual(startupLimitSources({}), { authorizationTtlSec: "default", planTtlSec: "default", maxPending: "default" });
+    assert.equal(planLimitsFromEnv({}), false);
+  });
+
+  test("names each variable that was given as env", () => {
+    const env = {
+      HELIOPAUSE_ARTIFACT_AUTHORIZATION_TTL_SEC: "3600",
+      HELIOPAUSE_PLAN_TTL_SEC: "120",
+      HELIOPAUSE_MAX_PENDING_PLANS: "5",
+    };
+    assert.deepEqual(startupLimitSources(env), { authorizationTtlSec: "env", planTtlSec: "env", maxPending: "env" });
+    assert.equal(planLimitsFromEnv(env), true);
+  });
+
+  test("treats an empty value as unset, as the bounded parsers do", () => {
+    assert.deepEqual(startupLimitSources({ HELIOPAUSE_ARTIFACT_AUTHORIZATION_TTL_SEC: "", HELIOPAUSE_PLAN_TTL_SEC: "" }),
+      { authorizationTtlSec: "default", planTtlSec: "default", maxPending: "default" });
+  });
+
+  test("says a pending cap given without a plan TTL is ignored, because the entry point ignores it", () => {
+    const env = { HELIOPAUSE_MAX_PENDING_PLANS: "5" };
+    assert.equal(planLimitsFromEnv(env), false);
+    assert.match(startupLimitSources(env).maxPending, /^default — HELIOPAUSE_MAX_PENDING_PLANS is ignored/);
   });
 });

@@ -20,7 +20,7 @@ import { fetchCert } from "../src/cert-api.ts";
 import { measureNamespaces } from "../src/kube-read.ts";
 import {
   boundedInteger, boundedNumber, ENV_BOUNDS, EnvSpecError, parsePairs, parseRelays,
-  type BoundedEnvName,
+  planLimitsFromEnv, startupLimitSources, type BoundedEnvName,
 } from "../src/env-spec.ts";
 import { startManager } from "../src/manager-server.ts";
 import type { RelaySource } from "../src/manager.ts";
@@ -427,7 +427,7 @@ const { server } = await startManager({
   // Both bounded, and both were fail-open: an unreadable TTL made every approved plan publishable
   // forever, and an unreadable cap removed the bound entirely. `approval.ts` explains what the
   // window is for — an approval from yesterday published today applies rules nobody approved.
-  ...(process.env.HELIOPAUSE_PLAN_TTL_SEC
+  ...(planLimitsFromEnv(process.env)
     ? {
         limits: {
           ttlSec: number("HELIOPAUSE_PLAN_TTL_SEC"),
@@ -435,6 +435,7 @@ const { server } = await startManager({
         },
       }
     : {}),
+  limitSources: startupLimitSources(process.env),
 });
 
 if (webRoot) console.error(`[manager] console at /app from ${webRoot}`);

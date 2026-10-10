@@ -2846,3 +2846,46 @@ describe("proposing asks the repository what it actually holds", () => {
     assert.match(String(body.freshness), /unreachable/);
   });
 });
+
+describe("the startup line names the limits this process uses (#154)", () => {
+  // On 2026-09-28 the 7-day protocol cap was read as the TTL; the manager was issuing 24 hours.
+  const startupLimitsLine = async (extra: Partial<Parameters<typeof startManager>[0]>): Promise<string> => {
+    const logs: string[] = [];
+    const started = await startManager({
+      port: 0,
+      hostname: "127.0.0.1",
+      relays: [],
+      tls: { certFile: join(dir, "server.pem"), keyFile: join(dir, "server.key"), caFile: join(dir, "ca.pem") },
+      operatorCNs: ["ops-alice"],
+      log: (m) => logs.push(m),
+      ...extra,
+    });
+    started.server.close();
+    const lines = logs.filter((m) => /\] (limits|한도): /.test(m));
+    assert.equal(lines.length, 1, logs.join("\n"));
+    return lines[0]!;
+  };
+
+  it("states the defaults it falls back to", async () => {
+    const line = await startupLimitsLine({ artifactSigning: { privateKey: generateKeyPairSync("ed25519").privateKey } });
+    assert.match(line, /limits: artifact authorization TTL 24h, protocol cap 168h; plan TTL 10m; at most 32 pending plans$/);
+  });
+
+  it("states the values it was given, and where the entry point says they came from", async () => {
+    const line = await startupLimitsLine({
+      artifactSigning: { privateKey: generateKeyPairSync("ed25519").privateKey, authorizationTtlSec: 3600 },
+      limits: { ttlSec: 120, maxPending: 5 },
+      limitSources: { authorizationTtlSec: "env", planTtlSec: "env", maxPending: "env" },
+    });
+    assert.match(line, /artifact authorization TTL 1h \(env\), protocol cap 168h; plan TTL 2m \(env\); at most 5 pending plans \(env\)$/);
+  });
+
+  it("says when nothing is being signed", async () => {
+    assert.match(await startupLimitsLine({}), /limits: artifact signing off; plan TTL 10m; at most 32 pending plans$/);
+  });
+
+  it("writes it in Korean when the journal is Korean", async () => {
+    const line = await startupLimitsLine({ logLang: "ko", artifactSigning: { privateKey: generateKeyPairSync("ed25519").privateKey } });
+    assert.match(line, /한도: 아티팩트 인가 TTL 24h, 프로토콜 상한 168h; 플랜 유효기간 10m; 대기 플랜 최대 32개$/);
+  });
+});
