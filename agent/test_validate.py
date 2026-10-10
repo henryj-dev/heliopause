@@ -5462,8 +5462,8 @@ class TestBootRestore(unittest.TestCase):
         self.assertEqual(len(self.applied), 1)
 
     def test_does_not_install_an_expired_authorization_for_another_generation(self):
-        # The escape hatch's generation clause on its own: the authorization matches the one the state
-        # names, and the confirmed generation is a different one. Only the generation check refuses.
+        # The authorization matches the one the state names and the watermark; the confirmed
+        # generation is a different one.
         self.expired = True
         g1 = {**self.RECORD, "generation": "g1"}
         self._confirmed_host(generation="g0", currentAuthorization=g1, authorizationWatermark=g1)
@@ -5474,12 +5474,55 @@ class TestBootRestore(unittest.TestCase):
         self.assertIn("confirmed generation is g0", why)
 
     def test_does_not_install_another_generation_even_unexpired(self):
-        # Refused by the authorization comparison here, which carries the generation too.
         self._confirmed_host(generation="g0")
         self._keep(generation="g1")
-        installed, _ = hp.restore_confirmed_ruleset()
+        compared = []
+        real = hp._authorization_identity
+        hp._authorization_identity = lambda record: (compared.append(record), real(record))[1]
+        try:
+            installed, _ = hp.restore_confirmed_ruleset()
+        finally:
+            hp._authorization_identity = real
         self.assertFalse(installed)
         self.assertEqual(self.applied, [])
+        self.assertEqual(compared, [], "refused at the generation check, before any authorization comparison")
+
+    def test_a_kept_file_that_is_not_an_object_does_not_stop_the_boot(self):
+        # Review P2 (round 2): `[]` · `null` · a number · a string raised out of the restore, and on a
+        # confirmed host with no table `main()` died before its first heartbeat — on every restart.
+        # This drives `_boot_restore`, the call `main()` makes; that `main()` makes it is the tripwire
+        # below. It does not run the heartbeat loop itself.
+        self._confirmed_host()
+        for content in ("[]", "null", "1", '"x"'):
+            with self.subTest(content=content):
+                with open(hp._envelope_path("confirmed"), "w", encoding="utf-8") as f:
+                    f.write(content)
+                self.logged.clear()
+                hp._boot_restore()                     # must return, not raise
+                self.assertEqual(self.applied, [])
+                self.assertTrue(any("boot restore" in line for line in self.logged), self.logged)
+
+    def test_a_pending_file_that_is_not_an_object_is_not_promoted(self):
+        # The same reader runs inside `confirm()`, outside the boot guard.
+        for content in ("[]", "null", "1", '"x"'):
+            with self.subTest(content=content):
+                with open(hp._envelope_path("pending"), "w", encoding="utf-8") as f:
+                    f.write(content)
+                self.assertFalse(hp._promote_confirmed_envelope("g1"))
+
+    def test_a_restore_that_raises_does_not_stop_the_boot(self):
+        # The general guard, for whatever the restore did not anticipate.
+        real = hp.restore_confirmed_ruleset
+
+        def raises():
+            raise RuntimeError("unanticipated")
+
+        hp.restore_confirmed_ruleset = raises
+        try:
+            hp._boot_restore()
+        finally:
+            hp.restore_confirmed_ruleset = real
+        self.assertTrue(any("boot restore: failed — unanticipated" in line for line in self.logged), self.logged)
 
     def test_does_not_install_an_authorization_the_host_is_not_enforcing(self):
         self._confirmed_host(currentAuthorization={**self.RECORD, "payloadHash": "sha256:" + "f" * 64})
@@ -5634,8 +5677,9 @@ class TestBootRestore(unittest.TestCase):
         tree = ast.parse(Path(hp.__file__).read_text())
         main = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "main")
         calls = [n.func.id for n in ast.walk(main) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
-        self.assertIn("restore_confirmed_ruleset", calls, "main() no longer restores at boot")
-        self.assertLess(calls.index("reconcile_recovered_commitments"), calls.index("restore_confirmed_ruleset"))
+        self.assertIn("_boot_restore", calls, "main() no longer restores at boot")
+        self.assertNotIn("restore_confirmed_ruleset", calls, "main() calls the restore without its guard")
+        self.assertLess(calls.index("reconcile_recovered_commitments"), calls.index("_boot_restore"))
 
     def test_handle_reply_keeps_the_envelope_it_accepted(self):
         """Through the real `handle_reply`: accepted → kept as pending, before the kernel is touched."""

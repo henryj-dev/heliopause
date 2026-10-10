@@ -4022,10 +4022,12 @@ def _read_kept_envelope(kind):
     try:
         with open(_envelope_path(kind), encoding="utf-8") as f:
             kept = json.load(f)
-        envelope = json.loads(kept["envelopeJson"]) if isinstance(kept, dict) else None
+        envelope = json.loads(kept["envelopeJson"])
     except FileNotFoundError:
         return None, f"no {kind} envelope is kept"
     except (OSError, ValueError, KeyError, TypeError) as e:
+        # TypeError: a root that is not an object. This reader also runs inside `confirm()` (promotion),
+        # where no boot guard surrounds it. @see test_a_pending_file_that_is_not_an_object_is_not_promoted
         return None, f"{kind} envelope is unreadable: {e}"
     if not isinstance(kept.get("generation"), str) or not isinstance(envelope, dict):
         return None, f"{kind} envelope is malformed"
@@ -4119,6 +4121,21 @@ def restore_confirmed_ruleset():
     if artifact.get("routes"):
         log("boot restore installed the ruleset but not its declared routes")
     return True, f"generation {artifact.get('generation')} restored"
+
+
+def _boot_restore():
+    """`main()`'s call to the restore. A restore that fails for any reason is logged and the agent goes
+    on to its heartbeat loop — the relay path is the other way back, and it must not be blocked by the
+    one that failed. Review of #139: a malformed kept file raised here and stopped every restart.
+
+    @see TestBootRestore.test_a_kept_file_that_is_not_an_object_does_not_stop_the_boot
+    """
+    try:
+        installed, why = restore_confirmed_ruleset()
+    except Exception as e:  # noqa: BLE001 — the heartbeat must start whatever went wrong here
+        log(f"boot restore: failed — {e}")
+        return
+    log(f"boot restore: {'installed' if installed else 'not installed'} — {why}")
 
 
 def update_state(mutator):
@@ -5619,8 +5636,7 @@ def main():
     # After the commitment recoveries (they handle prepared/pending/rollback-failed; the restore acts
     # only on `confirmed`), and before the monitor
     # starts, so the restore is not observed as a change this agent did not make. Writes no state.
-    installed, why = restore_confirmed_ruleset()
-    log(f"boot restore: {'installed' if installed else 'not installed'} — {why}")
+    _boot_restore()
 
     # Watches the ruleset for changes this agent did not make. Daemon, so a wedged monitor can
     # never keep the process alive; the heartbeat loop is what must not stop.

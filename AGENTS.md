@@ -163,7 +163,7 @@ python3 scripts/git-hooks/test-pre-commit.py              # 실패 0 (사람 통
 39개)가 정의조차 되지 않은 채 몇 달을 지났고, 초록불은 그동안 한 번도 흔들리지 않았다
 — 수가 줄어든 게 아니라 센 적이 없어 비교할 기준선이 없었다. 현재 기대값(정책 심링크 연결):
 `npm test` 2,290 + 8 (`@heliopause/manager`) + 251 (`@heliopause/web`) ·
-`test_validate.py` 363 (수집 363 · 리눅스에서 실행 363 · macOS 에서 351 통과 + 12 skip) ·
+`test_validate.py` 366 (수집 366 · 리눅스에서 실행 366 · macOS 에서 354 통과 + 12 skip) ·
 `test_enroll.py` 16 (수집 16 · skip 0).
 그 2,290 은 **이 저장소 2,175(`src` + `examples`) + `policy` 115** 이다. 둘로 나눠 적는 이유는
 바로 아래에 있다 — 뒤의 115 는 이 저장소의 코드를 안 읽는다.
