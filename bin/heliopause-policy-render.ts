@@ -44,7 +44,7 @@
 import { createServer, type IncomingMessage } from "node:http";
 import { Worker } from "node:worker_threads";
 import { evaluateWithLifecycle } from "../src/policy-eval-lifecycle.ts";
-import { existsSync, opendirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, opendirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { timingSafeEqual } from "node:crypto";
@@ -437,6 +437,21 @@ const sites: { name: string | null; path: string }[] = (() => {
     }
   }
   return [{ name: null, path: resolve(env("HELIOPAUSE_POLICY_SITE")) }];
+})();
+
+/**
+ * `HELIOPAUSE_POLICY_EVAL_PERMISSION`: `on` runs each evaluation worker under Node's permission model
+ * (#131). Unset, empty or `off` leaves the worker as it was. Anything else refuses to start rather than
+ * guessing which was meant. Changing it takes a restart.
+ *
+ * @see src/policy-render-service.test.ts "evaluating a site under Node's permission model (#131)"
+ */
+const EVAL_PERMISSION: boolean = (() => {
+  const value = process.env.HELIOPAUSE_POLICY_EVAL_PERMISSION ?? "";
+  if (value === "" || value === "off") return false;
+  if (value === "on") return true;
+  console.error(`[policy-render] ${oneLine(`refusing to start: HELIOPAUSE_POLICY_EVAL_PERMISSION must be on or off, got ${JSON.stringify(value)}`)}`);
+  process.exit(2);
 })();
 
 /**
@@ -1030,6 +1045,38 @@ const WORKER_GRACE_MS = 1_000;
 const WORKER_ENTRY = new URL("../src/policy-eval-worker.ts", import.meta.url);
 
 /**
+ * The worker's `execArgv` under `HELIOPAUSE_POLICY_EVAL_PERMISSION=on`, or `undefined` when it is off.
+ *
+ * `--permission` with read access to the site module's directory and the `src` beside it — the one its
+ * `../src` imports resolve to. Both by real path, and the sibling is taken from the resolved directory:
+ * Node resolves imports through a symlinked checkout to where it lives, and `join(link, "..")` would
+ * name the link's parent instead (review round 1; this repository's own `policy/` is such a link). The
+ * worker is handed the real site path too (see `spawn`). An existing directory grants its contents (Node
+ * expands it to `dir/*`). The worker entry needs no grant: Node allows an entrypoint.
+ *
+ * Writes, child processes and further workers get none, so `node:fs` write APIs are denied in the
+ * worker. Node documents what this is not: symlinks are followed out of the granted paths and file
+ * descriptors bypass it — so the claim is the denied writes, not a sandbox.
+ *
+ * 🔑 **Nothing of this process's `execArgv` or `NODE_OPTIONS` is passed on.** Either would carry the
+ * parent's own grants (`--allow-fs-write`, `--allow-worker`, …) into the worker — the first was review
+ * round 1, the second round 2, both measured. An empty inheritance is the allow-list that cannot miss the
+ * next `--allow-*` Node adds. What it removes is the parent's option lists — the grants and the preloads
+ * (`--import`, `--require`) in them; flags V8 applies to the whole process, such as the heap size, still
+ * govern the worker (review round 3, measured). `spawn` gives the worker an empty environment.
+ *
+ * @see src/policy-render-service.test.ts "evaluating a site under Node's permission model (#131)"
+ */
+function evalExecArgv(sitePath: string): string[] | undefined {
+  if (!EVAL_PERMISSION) return undefined;
+  const siteDir = realpathSync(dirname(sitePath));
+  const reads = new Set<string>([siteDir]);
+  const modelDir = join(siteDir, "..", "src");
+  if (existsSync(modelDir)) reads.add(realpathSync(modelDir));
+  return ["--permission", ...[...reads].map((p) => `--allow-fs-read=${p}`)];
+}
+
+/**
  * Workers alive right now, including ones inside their grace window.
  *
  * 🔑 **Counted rather than capped, on purpose.** A cap needs a number, and the number depends on the
@@ -1061,7 +1108,19 @@ function evaluateInWorker(task: { sitePath: string; label: string }): Promise<st
     // The port is **not** in `workerData` — a module reads `workerData` and posts on the port itself,
     // which §3-b ② measured arriving at the parent. The path and nothing else goes in it; the label,
     // name and allowlist were never the module's to see, and the parent fills them in (see `accepted`).
-    spawn: () => new Worker(WORKER_ENTRY, { workerData: { sitePath: task.sitePath } }),
+    spawn: () => {
+      const execArgv = evalExecArgv(task.sitePath);
+      // Under the model the worker is handed the real path. Resolving a symlinked one reads each link
+      // on the way (`/var` on macOS was refused, measured), and granting the link would grant all
+      // beneath it. Node evaluates a module at its real path either way, so the result is the same.
+      const sitePath = execArgv ? realpathSync(task.sitePath) : task.sitePath;
+      // And with an empty environment: a worker parses its environment's `NODE_OPTIONS`, so grants given
+      // to this process that way reached the worker even with an empty `execArgv` (review round 2,
+      // measured). Evaluation reads no variable — the modules that read `process.env` (`env-spec`,
+      // `operator-i18n`, …) are imported by the manager and the relay, not on this path — so none is
+      // given, which also covers whatever `NODE_*` knob Node adds next.
+      return new Worker(WORKER_ENTRY, { workerData: { sitePath }, ...(execArgv ? { execArgv, env: {} } : {}) });
+    },
     budgetMs: SOURCE_SITE_BUDGET_MS,
     graceMs: WORKER_GRACE_MS,
     sitePath: task.sitePath,
