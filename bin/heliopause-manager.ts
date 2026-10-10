@@ -157,6 +157,20 @@ const artifactSigningKey = loadArtifactSigningKey(env("HELIOPAUSE_ARTIFACT_SIGNI
 // being reported as a violated protocol bound.
 const artifactAuthorizationTtlSec = number("HELIOPAUSE_ARTIFACT_AUTHORIZATION_TTL_SEC");
 
+// Both bounded, and both were fail-open once: an unreadable TTL made every approved plan publishable
+// forever, and an unreadable cap removed the bound entirely. `approval.ts` explains what the window is
+// for — an approval from yesterday published today applies rules nobody approved. Refused the way
+// `number` refuses.
+const planLimits = (() => {
+  try {
+    return planLimitsFromEnv(process.env);
+  } catch (error) {
+    if (!(error instanceof EnvSpecError)) throw error;
+    console.error(`[manager] ${error.message}`);
+    process.exit(2);
+  }
+})();
+
 // Unset means nobody may read, which is the right default. The site view is strictly more than any
 // single relay exposes — every host across every VPC — so defaulting it open would make this the
 // easiest way to enumerate the fleet.
@@ -424,17 +438,9 @@ const { server } = await startManager({
   writerCNs,
   timeoutMs: number("HELIOPAUSE_RELAY_TIMEOUT_MS"),
   publishTimeoutMs: number("HELIOPAUSE_PUBLISH_TIMEOUT_MS"),
-  // Both bounded, and both were fail-open: an unreadable TTL made every approved plan publishable
-  // forever, and an unreadable cap removed the bound entirely. `approval.ts` explains what the
-  // window is for — an approval from yesterday published today applies rules nobody approved.
-  ...(planLimitsFromEnv(process.env)
-    ? {
-        limits: {
-          ttlSec: number("HELIOPAUSE_PLAN_TTL_SEC"),
-          maxPending: number("HELIOPAUSE_MAX_PENDING_PLANS"),
-        },
-      }
-    : {}),
+  // Always passed, each variable on its own (#161): passing them only when the TTL was set made a
+  // pending cap given alone silently stay 32. Parsed and bounded above, at `planLimits`.
+  limits: planLimits,
   limitSources: startupLimitSources(process.env),
 });
 

@@ -235,39 +235,37 @@ export const ENV_BOUNDS = {
 export type BoundedEnvName = keyof typeof ENV_BOUNDS;
 
 /**
- * Whether the manager passes plan limits from the environment at all. The entry point passes them only
- * when `HELIOPAUSE_PLAN_TTL_SEC` is set, and otherwise `startManager` uses `DEFAULT_LIMITS`. One
- * predicate, so the wiring and the startup log line below cannot describe two different rules.
+ * The manager's plan limits, each variable on its own (#161).
  *
- * Plain truthiness, exactly as the entry point tested it before: a whitespace-only value passes this
- * gate and then parses to the fallback (the bounded parsers trim).
+ * The entry point used to pass limits only when `HELIOPAUSE_PLAN_TTL_SEC` was set, so a
+ * `HELIOPAUSE_MAX_PENDING_PLANS` given alone was silently ignored and the cap stayed 32. Unset, each
+ * falls back to its `ENV_BOUNDS` value, which equals `DEFAULT_LIMITS` in `approval.ts` — a test holds
+ * the two together. Throws `EnvSpecError` for a value out of range, as the other bounded variables do.
  */
-export function planLimitsFromEnv(env: NodeJS.ProcessEnv): boolean {
-  return Boolean(env.HELIOPAUSE_PLAN_TTL_SEC);
+export function planLimitsFromEnv(env: NodeJS.ProcessEnv): { ttlSec: number; maxPending: number } {
+  return {
+    ttlSec: boundedInteger("HELIOPAUSE_PLAN_TTL_SEC", env.HELIOPAUSE_PLAN_TTL_SEC, ENV_BOUNDS.HELIOPAUSE_PLAN_TTL_SEC),
+    maxPending: boundedInteger("HELIOPAUSE_MAX_PENDING_PLANS", env.HELIOPAUSE_MAX_PENDING_PLANS, ENV_BOUNDS.HELIOPAUSE_MAX_PENDING_PLANS),
+  };
 }
 
 /** Whether `name` carries a value the bounded parsers will use — they trim, so blank is the fallback. */
 const supplied = (env: NodeJS.ProcessEnv, name: string): boolean => (env[name] ?? "").trim() !== "";
 
 /**
- * Where each limit on the manager's startup line came from (#154): `env` or `default`.
- *
- * ⚠️ `HELIOPAUSE_MAX_PENDING_PLANS` set **without** `HELIOPAUSE_PLAN_TTL_SEC` is ignored, because of
- * `planLimitsFromEnv` — the label says so instead of reporting a value nobody is using.
+ * Where each limit on the manager's startup line came from (#154): `env` or `default`. Each variable
+ * takes effect on its own (`planLimitsFromEnv`, #161), so each is labelled on its own.
  */
 export function startupLimitSources(env: NodeJS.ProcessEnv): {
   authorizationTtlSec: string;
   planTtlSec: string;
   maxPending: string;
 } {
-  const fromEnv = planLimitsFromEnv(env);
-  const pendingGiven = supplied(env, "HELIOPAUSE_MAX_PENDING_PLANS");
+  const label = (name: string): string => (supplied(env, name) ? "env" : "default");
   return {
-    authorizationTtlSec: supplied(env, "HELIOPAUSE_ARTIFACT_AUTHORIZATION_TTL_SEC") ? "env" : "default",
-    planTtlSec: supplied(env, "HELIOPAUSE_PLAN_TTL_SEC") ? "env" : "default",
-    maxPending: fromEnv
-      ? (pendingGiven ? "env" : "default")
-      : (pendingGiven ? "default — HELIOPAUSE_MAX_PENDING_PLANS is ignored without HELIOPAUSE_PLAN_TTL_SEC" : "default"),
+    authorizationTtlSec: label("HELIOPAUSE_ARTIFACT_AUTHORIZATION_TTL_SEC"),
+    planTtlSec: label("HELIOPAUSE_PLAN_TTL_SEC"),
+    maxPending: label("HELIOPAUSE_MAX_PENDING_PLANS"),
   };
 }
 
