@@ -125,6 +125,7 @@ import {
   listPlans,
   propose,
   release,
+  soloApproveAndPublishRefusal,
   type ApprovalLimits,
   type Plan,
   type PlanSummary,
@@ -256,6 +257,7 @@ export const API_ROUTES: ReadonlySet<string> = new Set([
   "/plans",
   "/plan",
   "/approve",
+  "/approve-and-publish",
   "/publish",
   "/routes",
   "/workload-traffic",
@@ -3623,16 +3625,46 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
           },
           limits,
         );
-        log(
-          `plan ${plan.hash.slice(0, 20)} approved by ${who} (proposed by ${plan.proposedBy})` +
-            (plan.approval?.solo ? " — SOLO APPROVAL, no second operator was involved" : ""),
-          `${who}이(가) 계획 ${plan.hash.slice(0, 20)}을(를) 승인함 (제안자 ${plan.proposedBy})` +
-            (plan.approval?.solo ? " — 단독 승인, 두 번째 운영자가 관여하지 않음" : ""),
-        );
+        logApproval(plan, false);
         return send(res, 200, publicPlan(plan, planTargets.get(plan.hash) ?? null));
       } catch (e) {
         return sendApprovalError(res, e);
       }
+    }
+
+    // One person, one one-time code: approve their own plan and publish it.
+    //
+    // The IdP refuses a code at or below the last TOTP step it accepted (`otp.ts`), so a solo operator
+    // who approved and then published waited out a code window between two clicks — for nothing, since
+    // the two-person rule was already off for them by role. This is `/approve` and `/publish` joined
+    // behind one code; both halves are the existing functions, deciding again on the state they find.
+    // Tested in `approve-and-publish.test.ts`.
+    if (req.method === "POST" && url.pathname === "/approve-and-publish") {
+      if (!mayWrite) return refuseWrite(res, who, url.pathname, principal.via);
+      let body: { hash?: string; otp?: string };
+      try {
+        body = JSON.parse(await readBody(req)) as typeof body;
+      } catch (e) {
+        return send(res, 400, { error: `bad request body: ${(e as Error).message}` });
+      }
+      const hash = String(body.hash ?? "");
+      const alsoKnownAs = sameHumanAs.get(who) ?? [];
+      // Before the code: a refusal decided from state must not spend it.
+      const why = soloApproveAndPublishRefusal(
+        approvals,
+        { hash, by: who, now: now(), mayApproveOwn: maySoloApprove, alsoKnownAs },
+        limits,
+      );
+      if (why) return sendApprovalError(res, why);
+      if ((await requireOtp(principal, body, res, url.pathname)) === "answered") return;
+      let plan;
+      try {
+        plan = approve(approvals, { hash, by: who, now: now(), mayApproveOwn: maySoloApprove, alsoKnownAs }, limits);
+      } catch (e) {
+        return sendApprovalError(res, e);
+      }
+      logApproval(plan, true);
+      return publishApproved(hash, true);
     }
 
     if (req.method === "POST" && url.pathname === "/publish") {
@@ -3644,7 +3676,31 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         return send(res, 400, { error: `bad request body: ${(e as Error).message}` });
       }
       if ((await requireOtp(principal, body, res, url.pathname)) === "answered") return;
-      const hash = String(body.hash ?? "");
+      return publishApproved(String(body.hash ?? ""), false);
+    }
+
+    function logApproval(plan: Plan, combined: boolean): void {
+      log(
+        `plan ${plan.hash.slice(0, 20)} approved by ${who} (proposed by ${plan.proposedBy})` +
+          (plan.approval?.solo ? " — SOLO APPROVAL, no second operator was involved" : "") +
+          (combined ? COMBINED_EN : ""),
+        `${who}이(가) 계획 ${plan.hash.slice(0, 20)}을(를) 승인함 (제안자 ${plan.proposedBy})` +
+          (plan.approval?.solo ? " — 단독 승인, 두 번째 운영자가 관여하지 않음" : "") +
+          (combined ? COMBINED_KO : ""),
+      );
+    }
+
+    /**
+     * Publish an approved plan: claim, compare with the fleet, sign, push, answer.
+     *
+     * `combined` is `/approve-and-publish`: every answer then also says the approval stood, because a
+     * publish that fails here leaves the plan approved and the ordinary publish button is the way on.
+     */
+    async function publishApproved(hash: string, combined: boolean): Promise<void> {
+      // Every answer below goes through `reply`: under `/approve-and-publish` the approval already stood,
+      // and an operator reading a refusal needs to know that the publish button is now the way on.
+      const reply = (status: number, body: Record<string, unknown>) =>
+        send(res, status, combined ? { ...body, approved: true, combined: true } : body);
       // Claimed before anything is pushed, so two concurrent publishes cannot both pass the check.
       // Released below only if nothing was written anywhere — see `release`.
       let plan;
@@ -3660,7 +3716,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         // claim is released because nothing was pushed: this must read as "re-propose it", not as "that
         // generation is already published".
         release(approvals, hash);
-        return send(res, 409, {
+        return reply(409, {
           error: `plan ${hash} is no longer held by this manager (it restarted, or its target VPC was ` +
             `reconfigured) — re-propose it`,
         });
@@ -3678,7 +3734,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       if (noop) {
         release(approvals, hash);
         log(`publish REFUSED for ${who}: ${noop}`, `${who}의 발행 거부: ${noop}`);
-        return send(res, 409, { error: noop });
+        return reply(409, { error: noop });
       }
       if (already.kind === "unknown") {
         log(
@@ -3722,7 +3778,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         // during whatever incident prompted the change.
         release(approvals, hash);
         log(`publish of ${hash.slice(0, 20)} to ${target.name} FAILED: ${(e as Error).message}`, `${target.name}에 계획 ${hash.slice(0, 20)} 발행 실패: ${(e as Error).message}`);
-        return send(res, 502, {
+        return reply(502, {
           error: `${target.name} did not accept the generation: ${(e as Error).message}`,
           // Said explicitly, because the operator's next question is whether to retry.
           published: false,
@@ -3734,12 +3790,14 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       log(
         `published ${plan.generation} to ${target.name}: proposed by ${plan.proposedBy}, ` +
           `approved by ${plan.approval?.by}, pushed by ${who}, signed by ` +
-          `${artifactSigningKeyId(createPublicKey(opts.artifactSigning!.privateKey))}`,
+          `${artifactSigningKeyId(createPublicKey(opts.artifactSigning!.privateKey))}` +
+          (combined ? COMBINED_EN : ""),
         `${target.name}에 세대 ${plan.generation}을(를) 발행함: 제안 ${plan.proposedBy}, ` +
           `승인 ${plan.approval?.by}, 전송 ${who}, 서명 ` +
-          `${artifactSigningKeyId(createPublicKey(opts.artifactSigning!.privateKey))}`,
+          `${artifactSigningKeyId(createPublicKey(opts.artifactSigning!.privateKey))}` +
+          (combined ? COMBINED_KO : ""),
       );
-      return send(res, 200, {
+      return reply(200, {
         published: true,
         target: target.name,
         generation: pushed.generation,
@@ -4636,6 +4694,10 @@ function pendingCsrCount(storeFile: string | undefined): number | undefined {
  * drops the mapping — the same way it drops the bundle. Omitting it would make every VPC's
  * plans look the same on the approval screen.
  */
+/** Marks both log lines of `/approve-and-publish`, so the audit trail shows they were one act. */
+const COMBINED_EN = " — combined approve+publish, one one-time code";
+const COMBINED_KO = " — 승인과 발행을 함께, 일회용 코드 하나";
+
 function publicPlan(p: Plan, target: string | null) {
   return {
     hash: p.hash,

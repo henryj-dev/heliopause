@@ -291,6 +291,52 @@ export function approve(
 }
 
 /**
+ * Why `approve-and-publish` would be refused for this caller, decided from state alone — or null.
+ *
+ * Changes nothing. The route asks this **before** it spends the operator's one-time code, so a
+ * request that was going to fail anyway does not burn the code or the IdP's rate-limit budget; it
+ * then calls `approve` and `claimForPublish`, which decide again on the state as it is by then.
+ *
+ * Narrower than `approve`: only the proposer's own, unapproved plan, and only with solo approval.
+ * Someone else's plan is the two-person path, and an already-approved one is the publish button.
+ */
+export function soloApproveAndPublishRefusal(
+  state: ApprovalState,
+  input: { hash: string; by: string; now: Date; mayApproveOwn: boolean; alsoKnownAs?: readonly string[] },
+  limits = DEFAULT_LIMITS,
+): ApprovalError | null {
+  if (!input.by) return new ApprovalError("no operator identity on the request", 401);
+  const plan = state.plans.get(input.hash);
+  if (!plan || plan.publishedAt) {
+    return new ApprovalError(
+      `no pending plan ${input.hash} — it may have expired (${limits.ttlSec}s) or already been published`,
+      404,
+    );
+  }
+  if (expired(plan, input.now, limits)) {
+    return new ApprovalError(`plan ${input.hash} expired after ${limits.ttlSec}s — re-propose it`, 410);
+  }
+  const sameHuman = plan.proposedBy === input.by || (input.alsoKnownAs ?? []).includes(plan.proposedBy);
+  if (!sameHuman) {
+    return new ApprovalError(
+      `plan ${input.hash} was proposed by ${plan.proposedBy} — approving and publishing in one step is ` +
+        `only for a plan you proposed yourself; another operator's plan is approved, then published`,
+      403,
+    );
+  }
+  if (!input.mayApproveOwn) {
+    return new ApprovalError(
+      `${input.by} may not approve their own plan — approving and publishing in one step needs solo approval`,
+      403,
+    );
+  }
+  if (plan.approval) {
+    return new ApprovalError(`plan ${input.hash} is already approved by ${plan.approval.by} — publish it`, 409);
+  }
+  return null;
+}
+
+/**
  * Check a plan may be published, and mark it used.
  *
  * Returns the plan so the caller can log who proposed and who approved. Throws on every path that

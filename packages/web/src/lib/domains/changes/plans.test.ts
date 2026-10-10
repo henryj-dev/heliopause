@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   canOfferApprove,
+  canOfferApproveAndPublish,
   canOfferPublish,
   planStage,
   readPlansView,
@@ -97,5 +98,27 @@ describe("plan actions", () => {
     assert.equal(planStage(pending), "awaiting");
     assert.equal(planStage(approved), "approved");
     assert.equal(planStage({ ...approved, publishedAt: "2026-08-18T00:02:00.000Z" }), "published");
+  });
+});
+
+describe("approve and publish in one step", () => {
+  // The server refuses everything this does not offer, before it spends the code. The page offers it
+  // only where it would succeed, so the button is never one that exists to be refused.
+  it("offers it to the proposer with solo approval, on a plan nobody has approved", () => {
+    assert.equal(canOfferApproveAndPublish(pending, "ops-alice", true, true), true);
+  });
+
+  it("does not offer it without solo approval, to anyone else, or to a reader", () => {
+    assert.equal(canOfferApproveAndPublish(pending, "ops-alice", true, false), false, "no solo role");
+    assert.equal(canOfferApproveAndPublish(pending, "ops-bob", true, true), false, "someone else's plan");
+    assert.equal(canOfferApproveAndPublish(pending, "ops-alice", false, true), false, "may not write");
+  });
+
+  it("does not offer it once the plan is approved or published", () => {
+    const approved = { ...pending, approval: { by: "ops-alice", at: "2026-08-18T00:01:00.000Z" } };
+    assert.equal(canOfferApproveAndPublish(approved, "ops-alice", true, true), false, "the publish button is the way on");
+    assert.equal(
+      canOfferApproveAndPublish({ ...pending, publishedAt: "2026-08-18T00:02:00.000Z" }, "ops-alice", true, true), false,
+    );
   });
 });

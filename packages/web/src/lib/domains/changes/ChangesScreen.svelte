@@ -10,7 +10,7 @@
   import type { WriteSpec } from "$lib/shell/write-ask";
   import { shouldAskOtp } from "$lib/shell/who";
   import { whoQuery } from "$lib/shell/who.svelte";
-  import { canOfferApprove, canOfferPublish, planStage, type PlanRow } from "./plans";
+  import { canOfferApprove, canOfferApproveAndPublish, canOfferPublish, planStage, type PlanRow } from "./plans";
   import {
     clockLabel, expireRatio, expireTone, hostRuleTotal, planDomId, planPath, remainingSec, shortPlanHash,
   } from "./present";
@@ -78,10 +78,12 @@
     return write.ask({ ...spec, needsOtp: shouldAskOtp(view) });
   }
 
-  async function act(kind: "approve" | "publish", plan: PlanRow): Promise<void> {
+  async function act(kind: "approve" | "publish" | "approve-and-publish", plan: PlanRow): Promise<void> {
     const answer = await askWrite({
-      what: t(prefs.lang, kind === "approve" ? "m.otpApprove" : "m.otpPublish"),
-      warning: kind === "publish"
+      what: t(prefs.lang, kind === "approve" ? "m.otpApprove" : kind === "publish" ? "m.otpPublish" : "m.otpApproveAndPublish"),
+      // The combined action publishes too, so it carries the publish warning — there is no second
+      // dialog after the approval in which to read it.
+      warning: kind !== "approve"
         ? t(prefs.lang, "m.publishConfirm", { hash: plan.hash.slice(0, 20) })
         : undefined,
     });
@@ -92,9 +94,19 @@
         method: "POST",
         credentials: "same-origin",
         headers: writeHeaders(csrf()),
-        body: kind === "approve" ? approveBody(plan.hash, answer.otp) : publishBody(plan.hash, answer.otp),
+        body: kind === "publish" ? publishBody(plan.hash, answer.otp) : approveBody(plan.hash, answer.otp),
       });
-      const body = await res.json() as { error?: string; approval?: { by: string }; generation?: string; target?: string; serving?: string };
+      const body = await res.json() as {
+        error?: string; approval?: { by: string }; generation?: string; target?: string; serving?: string; approved?: boolean;
+      };
+      if (!res.ok && body.approved === true) {
+        // The approval stood and the publish did not. The plan is approved now, so the ordinary
+        // publish button is what the operator needs next — say so rather than "failed".
+        noteKind = "bad";
+        note = t(prefs.lang, "m.approvedNotPublished", { message: body.error ?? `HTTP ${res.status}` });
+        await plans.refresh();
+        return;
+      }
       if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
       noteKind = "ok";
       note = kind === "approve"
@@ -325,6 +337,11 @@
           {/if}
           <div style="flex:1"></div>
           <div class="acts">
+            {#if canOfferApproveAndPublish(plan, view.you, view.canWrite, view.maySoloApprove)}
+              <button type="button" data-act="approve-and-publish" disabled={busy !== ""} onclick={() => void act("approve-and-publish", plan)}>
+                {t(prefs.lang, "m.approveAndPublish")}
+              </button>
+            {/if}
             {#if canOfferApprove(plan, view.you, view.canWrite, view.maySoloApprove)}
               <button type="button" disabled={busy !== ""} onclick={() => void act("approve", plan)}>
                 {plan.proposedBy === view.you ? t(prefs.lang, "m.approveSolo") : t(prefs.lang, "m.approve")}

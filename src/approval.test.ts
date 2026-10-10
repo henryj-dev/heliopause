@@ -13,6 +13,7 @@ import {
   listPlans,
   propose,
   release,
+  soloApproveAndPublishRefusal,
   sweep,
   type PlanSummary,
 } from "./approval.ts";
@@ -183,6 +184,65 @@ describe("publishing", () => {
     claimForPublish(st, { hash: H, by: "ops-alice", now: at(20) });
     release(st, H);
     assert.ok(claimForPublish(st, { hash: H, by: "ops-alice", now: at(25) }));
+  });
+});
+
+describe("soloApproveAndPublishRefusal — decided before a one-time code is spent", () => {
+  // Each branch is a refusal the route answers without asking the IdP. The state must come out of
+  // every one of them unchanged: this function only reads.
+  const solo = { by: "ops-alice", now: at(5), mayApproveOwn: true };
+
+  it("allows the proposer's own pending plan under solo approval — the known positive", () => {
+    assert.equal(soloApproveAndPublishRefusal(pending(), { hash: H, ...solo }), null);
+  });
+
+  it("allows another name the deployment declares to be the same person", () => {
+    assert.equal(
+      soloApproveAndPublishRefusal(pending(), { hash: H, ...solo, by: "ops-alice-review", alsoKnownAs: ["ops-alice"] }),
+      null,
+    );
+  });
+
+  it("refuses a plan it does not hold", () => {
+    assert.equal(soloApproveAndPublishRefusal(pending(), { hash: H2, ...solo })?.status, 404);
+  });
+
+  it("refuses an expired plan as expired, not as missing", () => {
+    const st = pending();
+    const why = soloApproveAndPublishRefusal(st, { hash: H, ...solo, now: at(601) });
+    assert.equal(why?.status, 410);
+    assert.equal(st.plans.size, 1, "a read-only check removed the plan");
+  });
+
+  it("refuses a published plan as gone, not as approved", () => {
+    const st = pending();
+    approve(st, { hash: H, by: "ops-jae", now: at(1) });
+    claimForPublish(st, { hash: H, by: "ops-jae", now: at(2) });
+    assert.equal(soloApproveAndPublishRefusal(st, { hash: H, ...solo })?.status, 404);
+  });
+
+  it("refuses someone else's plan, naming who proposed it", () => {
+    const why = soloApproveAndPublishRefusal(pending(), { hash: H, ...solo, by: "ops-jae" });
+    assert.equal(why?.status, 403);
+    assert.match(why!.message, /proposed by ops-alice/);
+  });
+
+  it("refuses the proposer without solo approval", () => {
+    const why = soloApproveAndPublishRefusal(pending(), { hash: H, ...solo, mayApproveOwn: false });
+    assert.equal(why?.status, 403);
+    assert.match(why!.message, /solo approval/);
+  });
+
+  it("refuses a plan that is already approved, and leaves it as it was", () => {
+    const st = pending();
+    approve(st, { hash: H, by: "ops-alice", now: at(1), mayApproveOwn: true });
+    const why = soloApproveAndPublishRefusal(st, { hash: H, ...solo });
+    assert.equal(why?.status, 409);
+    assert.equal(st.plans.get(H)?.publishedAt, null);
+  });
+
+  it("refuses a request with no identity", () => {
+    assert.equal(soloApproveAndPublishRefusal(pending(), { hash: H, ...solo, by: "" })?.status, 401);
   });
 });
 
