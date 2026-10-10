@@ -174,8 +174,10 @@ tar xzf /tmp/hp-code.tgz -C "$T"
 # `chmod` after the copy because tar carries the operator's modes and `rsync -a` keeps them: with
 # `umask 077` on the Mac, a freshly pulled file is 0600 and the relay's service account cannot read it
 # (2026-10-10, EACCES on src/relay.ts). `go+rX` adds read, and execute only where it already exists or
-# on directories. Not `rsync --chmod` — see src/deploy-fleet.test.ts for why.
-for p in $paths; do sudo mkdir -p "/opt/heliopause/$p"; sudo rsync -a --delete "$T/$p/" "/opt/heliopause/$p/"; sudo chmod -R go+rX "/opt/heliopause/$p"; done
+# on directories. Then each ancestor between /opt/heliopause and the path (`packages` for
+# `packages/i18n`), not recursively: `mkdir -p` makes a new parent under sudo's umask. Not
+# `rsync --chmod` — see src/deploy-fleet.test.ts for why.
+for p in $paths; do sudo mkdir -p "/opt/heliopause/$p"; sudo rsync -a --delete "$T/$p/" "/opt/heliopause/$p/"; sudo chmod -R go+rX "/opt/heliopause/$p"; d="$(dirname "$p")"; while [ "$d" != "." ]; do sudo chmod go+rx "/opt/heliopause/$d"; d="$(dirname "$d")"; done; done
 rm -rf "$T" /tmp/hp-code.tgz
 
 # `is-active` was the whole check here, and it is not one.
