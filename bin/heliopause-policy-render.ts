@@ -1061,8 +1061,9 @@ const WORKER_ENTRY = new URL("../src/policy-eval-worker.ts", import.meta.url);
  * 🔑 **Nothing of this process's `execArgv` or `NODE_OPTIONS` is passed on.** Either would carry the
  * parent's own grants (`--allow-fs-write`, `--allow-worker`, …) into the worker — the first was review
  * round 1, the second round 2, both measured. An empty inheritance is the allow-list that cannot miss the
- * next `--allow-*` Node adds. The cost: runtime flags the deployment gives node do not reach the worker
- * while this is on. `spawn` gives the worker an empty environment.
+ * next `--allow-*` Node adds. What it removes is the parent's option lists — the grants and the preloads
+ * (`--import`, `--require`) in them; flags V8 applies to the whole process, such as the heap size, still
+ * govern the worker (review round 3, measured). `spawn` gives the worker an empty environment.
  *
  * @see src/policy-render-service.test.ts "evaluating a site under Node's permission model (#131)"
  */
