@@ -3649,22 +3649,32 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       }
       const hash = String(body.hash ?? "");
       const alsoKnownAs = sameHumanAs.get(who) ?? [];
-      // Before the code: a refusal decided from state must not spend it.
-      const why = soloApproveAndPublishRefusal(
+      const refusal = (at: Date) => soloApproveAndPublishRefusal(
         approvals,
-        { hash, by: who, now: now(), mayApproveOwn: maySoloApprove, alsoKnownAs },
+        { hash, by: who, now: at, mayApproveOwn: maySoloApprove, alsoKnownAs },
         limits,
       );
-      if (why) return sendApprovalError(res, why);
+      // Before the code: a refusal decided from state must not spend it.
+      const early = refusal(now());
+      if (early) return sendApprovalError(res, early);
       if ((await requireOtp(principal, body, res, url.pathname)) === "answered") return;
+      // And again after it. The IdP call is an `await`: in that window the plan can expire and another
+      // operator can propose the same bundle, which is the same hash with someone else as proposer —
+      // and `approve` would take that as an ordinary two-person approval.
+      //
+      // One instant for the check, the approval and the claim, so a plan that passes here cannot
+      // expire between them.
+      const at = now();
+      const late = refusal(at);
+      if (late) return sendApprovalError(res, late);
       let plan;
       try {
-        plan = approve(approvals, { hash, by: who, now: now(), mayApproveOwn: maySoloApprove, alsoKnownAs }, limits);
+        plan = approve(approvals, { hash, by: who, now: at, mayApproveOwn: maySoloApprove, alsoKnownAs }, limits);
       } catch (e) {
         return sendApprovalError(res, e);
       }
       logApproval(plan, true);
-      return publishApproved(hash, true);
+      return publishApproved(hash, true, at);
     }
 
     if (req.method === "POST" && url.pathname === "/publish") {
@@ -3696,16 +3706,16 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
      * `combined` is `/approve-and-publish`: every answer then also says the approval stood, because a
      * publish that fails here leaves the plan approved and the ordinary publish button is the way on.
      */
-    async function publishApproved(hash: string, combined: boolean): Promise<void> {
-      // Every answer below goes through `reply`: under `/approve-and-publish` the approval already stood,
-      // and an operator reading a refusal needs to know that the publish button is now the way on.
+    async function publishApproved(hash: string, combined: boolean, at: Date = now()): Promise<void> {
+      // Every answer after the claim goes through `reply`: under `/approve-and-publish` the approval
+      // already stood, and an operator reading a failure needs to know the publish button is the way on.
       const reply = (status: number, body: Record<string, unknown>) =>
         send(res, status, combined ? { ...body, approved: true, combined: true } : body);
       // Claimed before anything is pushed, so two concurrent publishes cannot both pass the check.
       // Released below only if nothing was written anywhere — see `release`.
       let plan;
       try {
-        plan = claimForPublish(approvals, { hash, by: who, now: now() }, limits);
+        plan = claimForPublish(approvals, { hash, by: who, now: at }, limits);
       } catch (e) {
         return sendApprovalError(res, e);
       }

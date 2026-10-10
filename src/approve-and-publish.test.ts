@@ -46,9 +46,12 @@ const logs: string[] = [];
 // same property for a test that never advances a clock: a code works once.
 const otpAsked: string[] = [];
 const otpUsed = new Set<string>();
+/** Runs while the IdP is "checking" this code — the window between the route's pre-check and approval. */
+const duringOtp = new Map<string, () => Promise<void>>();
 const otpFetch = (async (_u: string | URL, init?: RequestInit) => {
   const { code } = JSON.parse(String(init?.body ?? "{}")) as { code: string };
   otpAsked.push(code);
+  await duringOtp.get(code)?.();
   if (code === "000000" || otpUsed.has(code)) return new Response(JSON.stringify({ ok: false }), { status: 401 });
   otpUsed.add(code);
   return new Response(JSON.stringify({ ok: true }), { status: 200 });
@@ -187,8 +190,13 @@ function bundle(target: string): PlanBundle {
   return { manifest, rulesets: { [host]: rules }, workload: {} };
 }
 
-async function proposeAs(headers: Record<string, string>, target = "dev", cert?: "alice" | "jae"): Promise<string> {
-  const r = await call("/plan", "POST", headers, { target, bundle: bundle(target) }, cert);
+/** The manager's clock. Moved forward only by the test that needs a plan to expire. */
+let clockOffsetMs = 0;
+
+async function proposeAs(
+  headers: Record<string, string>, target = "dev", cert?: "alice" | "jae", b = bundle(target),
+): Promise<string> {
+  const r = await call("/plan", "POST", headers, { target, bundle: b }, cert);
   assert.equal(r.status, 200, `propose: ${r.body}`);
   return r.json.hash as string;
 }
@@ -243,6 +251,7 @@ before(async () => {
       fetchImpl: otpFetch,
     },
     artifactSigning: { privateKey: generateKeyPairSync("ed25519").privateKey },
+    now: () => new Date(Date.now() + clockOffsetMs),
     timeoutMs: 1_000,
     publishTimeoutMs: 3_000,
     log: (m) => logs.push(m),
@@ -360,6 +369,31 @@ describe("approve and publish refuses before spending a code", () => {
     assert.equal(r.status, 409, r.body);
     assert.match(r.body, /already approved/);
     assert.equal(otpAsked.length, asked);
+  });
+});
+
+describe("approve and publish decides again after the code", () => {
+  it("refuses when the plan became someone else's while the IdP was checking the code", async () => {
+    // The pre-check runs before an `await` on the IdP. In that window the plan can expire and another
+    // operator can propose the same bundle — same target, same bytes, so the same hash, now with them
+    // as the proposer. `approve` accepts that as an ordinary two-person approval; the combined route
+    // must not, or one code publishes another operator's plan.
+    const admin = await session(ADMIN);
+    const b = bundle("dev");
+    const hash = await proposeAs(admin, "dev", undefined, b);
+    const c = code();
+    duringOtp.set(c, async () => {
+      clockOffsetMs += 11 * 60 * 1000;
+      assert.equal(await proposeAs({}, "dev", "jae", b), hash, "the re-proposal did not reproduce the hash");
+    });
+
+    const r = await call("/approve-and-publish", "POST", admin, { hash, otp: c });
+
+    assert.equal(r.status, 403, r.body);
+    assert.match(r.body, /proposed by ops-jae/);
+    const row = await planRow(admin, hash);
+    assert.equal(row?.approval, null, "one code approved another operator's plan");
+    assert.equal(row?.publishedAt, null);
   });
 });
 
