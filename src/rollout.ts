@@ -94,10 +94,11 @@ export interface HostStatus {
    *
    * ## Why this is kept
    *
-   * The agent has built and transmitted it every interval since the signed-artifact path landed, and
-   * the relay copied the heartbeat into this record field by field without it. So it stopped here and
-   * never reached the manager — a repository-wide grep found the producer, the declaration, and no
-   * consumer.
+   * The relay copied the heartbeat into this record field by field without it, so it never reached
+   * the manager. That was fixed on 2026-08-24, and this said the agent had been transmitting it all
+   * along. **It had not** — the agent's `artifact_trust_report` was defined and called nowhere until
+   * issue #145, so this field was `null` on every real host. The grep that "found the producer" found
+   * a definition, not a call.
    *
    * Only the host knows which keys it will accept. Nothing else in this system can answer:
    *
@@ -116,6 +117,9 @@ export interface HostStatus {
    * that sent it empty are different things, and neither is "trusts nothing".
    */
   artifactTrust?: Heartbeat["artifactTrust"] | null;
+
+  /** Why the agent could not read its signing trust, or `null`. See `Heartbeat.artifactTrustError`. */
+  artifactTrustError?: string | null;
 
   /**
    * Other nftables tables the host reported filtering on `input` or `forward`.

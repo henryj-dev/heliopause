@@ -4470,6 +4470,24 @@ def artifact_trust_report(st):
     }
 
 
+def _trust_report_or_error(st):
+    """`artifactTrust` for the heartbeat, or one sentence saying why it could not be read.
+
+    Never raises the trust-read failures, so a heartbeat cannot stop over them. Today `main()` loads
+    the trust before the first heartbeat and exits if it is unusable, and the result is cached, so
+    the second branch is not reached by a running agent — it is here so that moving or clearing that
+    read later cannot silence the host. `artifactTrustError` and not plain omission: an agent too old
+    to send `artifactTrust` omits it, and "could not read" must not look like "did not say".
+    Issue #145: `artifact_trust_report` was defined from the first commit and called nowhere.
+
+    @see TestTheHeartbeatCarriesArtifactTrust
+    """
+    try:
+        return artifact_trust_report(st)
+    except (OSError, ValueError) as e:
+        return {"artifactTrustError": str(e)[:400]}
+
+
 # ── transport ─────────────────────────────────────────────────────────────────
 
 
@@ -4762,6 +4780,9 @@ def build_heartbeat(st):
         # Absent when there is nothing to say. Present, it is the sentence that was only ever in the
         # journal before — see `lastRefusal` in `_EMPTY_STATE`.
         **({"lastRefusal": st["lastRefusal"]} if st.get("lastRefusal") else {}),
+        # Which keys this host accepts and which authorization it enforces — what the relay's
+        # break-glass, unnamed-authorization and key-rotation checks read. Issue #145.
+        **_trust_report_or_error(st),
         "schemaVersion": SCHEMA_VERSION,
         "applied": {
             "generation": st["generation"],

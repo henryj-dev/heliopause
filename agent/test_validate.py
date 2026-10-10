@@ -5296,6 +5296,71 @@ class TestAgentBuildIdentity(unittest.TestCase):
         self.assertEqual(beat["lastRefusal"]["generation"], "gen9")
 
 
+class TestTheHeartbeatCarriesArtifactTrust(unittest.TestCase):
+    """Issue #145: `artifact_trust_report` was defined from the first commit and called nowhere.
+
+    The relay's break-glass alarm, its "cannot name the authorization" line and its key-rotation
+    check all read `artifactTrust`, and the relay tests built that object by hand — so every one of
+    them was green while the agent never sent it. These drive the real `build_heartbeat`.
+
+    The trust cache is set directly: what is under test is that the heartbeat carries the report, not
+    the key-directory loader, which `TestEd25519Verification` drives with real keys.
+    """
+
+    TRUST = {
+        "keys": {},
+        "managerKeyIds": ["sha256:" + "a" * 64],
+        "breakGlassKeyIds": ["sha256:" + "b" * 64],
+        "trustDigest": "sha256:" + "c" * 64,
+    }
+
+    def setUp(self):
+        self.saved = (hp._artifact_keys_cache, hp.MANAGER_SIGNING_KEYS_DIR, hp.BREAK_GLASS_KEYS_DIR)
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        hp._artifact_keys_cache, hp.MANAGER_SIGNING_KEYS_DIR, hp.BREAK_GLASS_KEYS_DIR = self.saved
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_the_trust_report_travels_on_the_heartbeat(self):
+        hp._artifact_keys_cache = self.TRUST
+        st = dict(hp._EMPTY_STATE)
+        st["currentAuthorization"] = {
+            "keyId": "sha256:" + "a" * 64, "payloadHash": "sha256:" + "d" * 64,
+            "authorizationMode": "break-glass", "authorizedAt": "2026-10-10T00:00:00Z",
+            "planHash": "sha256:" + "e" * 64,
+        }
+        beat = hp.build_heartbeat(st)
+        self.assertIn("artifactTrust", beat, "the heartbeat does not carry the trust report")
+        trust = beat["artifactTrust"]
+        self.assertEqual(trust["trustDigest"], self.TRUST["trustDigest"])
+        self.assertEqual(trust["managerKeyIds"], self.TRUST["managerKeyIds"])
+        self.assertEqual(trust["currentAuthorizationMode"], "break-glass")
+        self.assertEqual(trust["currentAuthorizedAt"], "2026-10-10T00:00:00Z")
+        self.assertNotIn("artifactTrustError", beat)
+
+    def test_no_current_authorization_is_sent_as_null_not_dropped(self):
+        # The relay's "cannot name the authorization" line fires on exactly this: present, and null.
+        hp._artifact_keys_cache = self.TRUST
+        beat = hp.build_heartbeat(dict(hp._EMPTY_STATE))
+        self.assertIn("artifactTrust", beat)
+        self.assertIsNone(beat["artifactTrust"]["currentAuthorizationMode"])
+
+    def test_an_unreadable_trust_is_said_and_the_heartbeat_still_goes(self):
+        hp._artifact_keys_cache = None
+        for manager_dir, expect in (
+            (os.path.join(self.tmp, "missing"), "No such file"),
+            ("", "not configured"),
+        ):
+            with self.subTest(manager_dir=manager_dir):
+                hp.MANAGER_SIGNING_KEYS_DIR = manager_dir
+                beat = hp.build_heartbeat(dict(hp._EMPTY_STATE))
+                self.assertNotIn("artifactTrust", beat)
+                self.assertIn(expect, beat.get("artifactTrustError", ""))
+                self.assertIn("applied", beat, "the rest of the heartbeat was lost")
+                self.assertIsNone(hp._artifact_keys_cache, "a failed read was cached")
+
+
 class TestRelayRequestDeadline(unittest.TestCase):
     """`HTTP_TIMEOUT_SEC` bounds the whole exchange, not each socket operation.
 

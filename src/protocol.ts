@@ -495,8 +495,11 @@ export interface Heartbeat {
    * to take deliberately, not as a side effect of adding a diagnostic. Stated here rather than left
    * for someone to rediscover that the data is present and unused.
    *
-   * This whole object reached nothing until 2026-08-24: the agent built and sent it every interval
-   * and `handleHeartbeat` copied the heartbeat into `HostStatus` field by field without it.
+   * ⚠️ **The agent never sent this until issue #145.** `artifact_trust_report` was defined in the
+   * agent from its first commit and called nowhere, so every check that reads this object was silent
+   * on a real fleet. On 2026-08-24 `handleHeartbeat` started keeping it, and this comment said the
+   * agent had been sending it all along — the receiving side was fixed and the sending side was not
+   * looked at. The relay tests built the object by hand, which is why they were green.
    */
   artifactTrust?: {
     managerKeyIds: string[];
@@ -508,6 +511,13 @@ export interface Heartbeat {
     currentAuthorizedAt: string | null;
     currentPlanHash: string | null;
   };
+
+  /**
+   * Sent instead of `artifactTrust` when the agent could not read its signing trust, saying why.
+   * Absent on success and from agents too old to send either, so "could not read" is not the same
+   * as "did not say". Issue #145.
+   */
+  artifactTrustError?: string;
 
   applied: {
     generation: string | null;
