@@ -6,6 +6,7 @@ import {
   boundedInteger, boundedNumber, ENV_BOUNDS, parsePairs, parseRelays, parsePolicySites, EnvSpecError,
   planLimitsFromEnv, startupLimitSources, type BoundedEnvName,
 } from "./env-spec.ts";
+import { DEFAULT_LIMITS } from "./approval.ts";
 
 /**
  * The point of this file is one property that had no test when it was fixed: **a refused entry must
@@ -376,7 +377,6 @@ describe("boundedNumber", () => {
 describe("where the manager's startup limits came from (#154)", () => {
   test("names nothing set as default", () => {
     assert.deepEqual(startupLimitSources({}), { authorizationTtlSec: "default", planTtlSec: "default", maxPending: "default" });
-    assert.equal(planLimitsFromEnv({}), false);
   });
 
   test("names each variable that was given as env", () => {
@@ -386,27 +386,41 @@ describe("where the manager's startup limits came from (#154)", () => {
       HELIOPAUSE_MAX_PENDING_PLANS: "5",
     };
     assert.deepEqual(startupLimitSources(env), { authorizationTtlSec: "env", planTtlSec: "env", maxPending: "env" });
-    assert.equal(planLimitsFromEnv(env), true);
   });
 
-  test("treats an empty value as unset, as the bounded parsers do", () => {
-    assert.deepEqual(startupLimitSources({ HELIOPAUSE_ARTIFACT_AUTHORIZATION_TTL_SEC: "", HELIOPAUSE_PLAN_TTL_SEC: "" }),
+  test("treats an empty or blank value as the default it parses to", () => {
+    // The bounded parsers trim, so " " is the fallback.
+    assert.deepEqual(startupLimitSources({ HELIOPAUSE_ARTIFACT_AUTHORIZATION_TTL_SEC: "", HELIOPAUSE_PLAN_TTL_SEC: " ", HELIOPAUSE_MAX_PENDING_PLANS: " " }),
       { authorizationTtlSec: "default", planTtlSec: "default", maxPending: "default" });
   });
 
-  test("treats a blank value as the default it parses to, while the wiring gate still opens on it", () => {
-    // Review round 1: the bounded parsers trim, so " " is the fallback — but `planLimitsFromEnv` keeps
-    // the entry point's old truthiness, so a blank plan TTL still passes limits (with fallback values),
-    // and a pending cap beside it is then used rather than ignored.
-    const env = { HELIOPAUSE_ARTIFACT_AUTHORIZATION_TTL_SEC: " ", HELIOPAUSE_PLAN_TTL_SEC: " ", HELIOPAUSE_MAX_PENDING_PLANS: "5" };
-    assert.equal(planLimitsFromEnv(env), true);
-    assert.deepEqual(startupLimitSources(env), { authorizationTtlSec: "default", planTtlSec: "default", maxPending: "env" });
-    assert.equal(startupLimitSources({ HELIOPAUSE_MAX_PENDING_PLANS: " " }).maxPending, "default");
+  test("names each plan variable on its own, since each now takes effect on its own (#161)", () => {
+    assert.deepEqual(startupLimitSources({ HELIOPAUSE_MAX_PENDING_PLANS: "5" }),
+      { authorizationTtlSec: "default", planTtlSec: "default", maxPending: "env" });
+    assert.deepEqual(startupLimitSources({ HELIOPAUSE_PLAN_TTL_SEC: "120" }),
+      { authorizationTtlSec: "default", planTtlSec: "env", maxPending: "default" });
+  });
+});
+
+describe("the manager's plan limits from the environment (#161)", () => {
+  test("unset is exactly the manager's own default", () => {
+    // The entry point now always passes these, so the fallbacks have to be the defaults it used to
+    // fall back to by passing nothing.
+    assert.deepEqual(planLimitsFromEnv({}), DEFAULT_LIMITS);
   });
 
-  test("says a pending cap given without a plan TTL is ignored, because the entry point ignores it", () => {
-    const env = { HELIOPAUSE_MAX_PENDING_PLANS: "5" };
-    assert.equal(planLimitsFromEnv(env), false);
-    assert.match(startupLimitSources(env).maxPending, /^default — HELIOPAUSE_MAX_PENDING_PLANS is ignored/);
+  test("a pending cap applies without a plan TTL", () => {
+    // It was ignored: limits were passed only when HELIOPAUSE_PLAN_TTL_SEC was set.
+    assert.deepEqual(planLimitsFromEnv({ HELIOPAUSE_MAX_PENDING_PLANS: "5" }), { ttlSec: DEFAULT_LIMITS.ttlSec, maxPending: 5 });
+  });
+
+  test("a plan TTL applies without a pending cap", () => {
+    assert.deepEqual(planLimitsFromEnv({ HELIOPAUSE_PLAN_TTL_SEC: "120" }), { ttlSec: 120, maxPending: DEFAULT_LIMITS.maxPending });
+  });
+
+  test("blank is the default, and out of range is refused rather than clamped", () => {
+    assert.deepEqual(planLimitsFromEnv({ HELIOPAUSE_PLAN_TTL_SEC: " ", HELIOPAUSE_MAX_PENDING_PLANS: "" }), DEFAULT_LIMITS);
+    assert.throws(() => planLimitsFromEnv({ HELIOPAUSE_MAX_PENDING_PLANS: "0" }), EnvSpecError);
+    assert.throws(() => planLimitsFromEnv({ HELIOPAUSE_PLAN_TTL_SEC: "soon" }), EnvSpecError);
   });
 });
