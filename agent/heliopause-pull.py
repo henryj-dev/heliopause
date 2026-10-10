@@ -4553,9 +4553,8 @@ def verify_artifact_envelope(envelope, now=None):
         # `expires`, used once for the `expires <= current` below and then dropped. So every host
         # held the moment its authorization lapses and could not say when that was.
         #
-        # Nothing here can warn about it yet: `artifact_trust_report` does not carry it to the
-        # relay, and adding a heartbeat field is a wire change with an approval-path consequence.
-        # But the state file is read directly by an operator's script, and a copy of
+        # `artifact_trust_report` carries it to the relay as `currentExpiresAt` (#138), where it is
+        # shown on the host row. The state file is also read directly by an operator's script, and a copy of
         # `MAX_MANAGER_AUTHORIZATION_LIFETIME_MS` in that script is a constant that goes silently
         # wrong the day this one moves. This is the field that lets it read the issued value.
         "expiresAt": payload["expiresAt"],
@@ -4649,6 +4648,10 @@ def artifact_trust_report(st):
             "currentPayloadHash": current.get("payloadHash"),
             "currentAuthorizationMode": current.get("authorizationMode"),
             "currentAuthorizedAt": current.get("authorizedAt"),
+            # When the authorization this host enforces lapses. `None` when it has none or the record
+            # predates the field — sent, not dropped, so "not recorded" differs from "too old to say".
+            # @see TestTheHeartbeatCarriesArtifactTrust (issue #138)
+            "currentExpiresAt": current.get("expiresAt"),
             "currentPlanHash": current.get("planHash"),
         }
     }

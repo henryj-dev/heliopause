@@ -69,6 +69,16 @@ export interface SiteHost {
    * silent about it while the value sat one step away.
    */
   agentBuild: string | null;
+  /**
+   * When the authorization this host enforces lapses (#138). `null` = not known — an agent, relay or
+   * manager too old to carry it, or none recorded. Never read as "not lapsed".
+   */
+  authorizationExpiresAt: string | null;
+  /**
+   * When the authorization in the envelope the relay serves this host lapses (#138). Can differ from
+   * the one above — the host may enforce an older one. `null` = not known. Information only.
+   */
+  servedAuthorizationExpiresAt: string | null;
   /** Ports another table redirects inbound. `null` = did not report; `[]` = looked, none. */
   publishedPorts: string[] | null;
   /**
@@ -258,7 +268,14 @@ function readHost(value: unknown): SiteHost | null {
     agentBuild: typeof value.agentBuild === "string" ? value.agentBuild : null,
     publishedPorts: readStringListOrNull(value.publishedPorts),
     routes: readRoutes(value.routes),
+    authorizationExpiresAt: readTime(value.authorizationExpiresAt),
+    servedAuthorizationExpiresAt: readTime(value.servedAuthorizationExpiresAt),
   };
+}
+
+/** A timestamp, or `null` for anything that is not one — "not known", never a default time. */
+function readTime(value: unknown): string | null {
+  return typeof value === "string" && !Number.isNaN(Date.parse(value)) ? value : null;
 }
 
 function readRelay(value: unknown): RelayResult | null {

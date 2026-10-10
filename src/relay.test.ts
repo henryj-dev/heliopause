@@ -1494,6 +1494,69 @@ describe("a refused generation says so where an operator looks", () => {
   });
 });
 
+// ── Two authorization expiries on the host row, as information (#138) ────────
+//
+// The one the agent enforces, and the one this relay serves. Shown, never acted on here: whether a host
+// would accept what it is served depends on state only the host holds, and two review rounds found the
+// gaps each time the relay tried to predict it. An actual refusal reaches the view as `lastRefusal`.
+describe("authorization expiry on the host row", () => {
+  const FUTURE = "2026-07-31T00:00:00Z";
+  const PAST = "2026-07-29T00:00:00Z";
+  const trust = (currentExpiresAt?: string | null) => ({
+    managerKeyIds: ["mk-1"], breakGlassKeyIds: [], trustDigest: "sha256:aaaaaaaaaaaa",
+    currentKeyId: "mk-1", currentPayloadHash: "sha256:pppp", currentAuthorizationMode: "two-person" as const,
+    currentAuthorizedAt: "2026-07-28T00:00:00Z", currentPlanHash: "sha256:hhhh",
+    ...(currentExpiresAt === undefined ? {} : { currentExpiresAt }),
+  });
+  /** An envelope served to the host, carrying only the field the row reads. */
+  const serving = (s: RelayState, host: string, payload: string) => {
+    s.artifacts = {
+      ...s.artifacts,
+      [host]: { version: "heliopause-ed25519-v1", algorithm: "Ed25519", keyId: "k", payload, signature: "s" } as RelayState["artifacts"][string],
+    };
+  };
+  const encode = (o: unknown) => Buffer.from(JSON.stringify(o)).toString("base64url");
+  const row = (s: RelayState) => fleetView(s, new Date(AT), 300).hosts[0]!;
+
+  it("puts the enforced authorization's expiry on the row", () => {
+    const s = state();
+    handleHeartbeat(s, "h-canary", hb({ artifactTrust: trust(FUTURE) }), AT);
+    assert.equal(row(s).authorizationExpiresAt, FUTURE);
+  });
+
+  it("puts null — not knowing — for an agent too old to say, or one with nothing recorded", () => {
+    for (const beat of [hb(), hb({ artifactTrust: trust() }), hb({ artifactTrust: trust(null) })]) {
+      const s = state();
+      handleHeartbeat(s, "h-canary", beat, AT);
+      assert.equal(row(s).authorizationExpiresAt, null);
+    }
+  });
+
+  it("puts the served envelope's expiry on the row, which can differ from the enforced one", () => {
+    const s = state();
+    serving(s, "h-canary", encode({ expiresAt: FUTURE }));
+    handleHeartbeat(s, "h-canary", hb({ artifactTrust: trust(PAST) }), AT);
+    assert.equal(row(s).servedAuthorizationExpiresAt, FUTURE);
+    assert.equal(row(s).authorizationExpiresAt, PAST);
+  });
+
+  it("puts null for an envelope it does not serve or cannot read as a time", () => {
+    for (const payload of [undefined, "not base64 json", encode({}), encode({ expiresAt: "tomorrow" })]) {
+      const s = state();
+      if (payload !== undefined) serving(s, "h-canary", payload);
+      handleHeartbeat(s, "h-canary", hb(), AT);
+      assert.equal(row(s).servedAuthorizationExpiresAt, null, String(payload));
+    }
+  });
+
+  it("raises no problem about expiry, lapsed or not — a refusal is what reports it", () => {
+    const s = state();
+    serving(s, "h-canary", encode({ expiresAt: PAST }));
+    handleHeartbeat(s, "h-canary", hb({ artifactTrust: trust(PAST), applied: { generation: GEN, state: "rolled-back", artifactHash: artifactFor("h-canary"), observedHash: null } }), AT);
+    assert.deepEqual(fleetView(s, new Date(AT), 300).problems.filter((p) => /expir|lapse/i.test(p)), []);
+  });
+});
+
 // ── A confirmed host with no table (#139) ─────────────────────────────────────
 //
 // After a reboot the table is gone until the agent puts it back. The agent now says which of three

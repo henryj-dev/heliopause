@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { agentBuildLines, agentBuildSplit, hostsOnBuild, answeredVpcNames, fleetListing, fleetSummary, hostMatches, hostStateChips, routesView, whyBits, vpcLabel, vpcTone, workloadChip } from "./present.ts";
+import { agentBuildLines, authorizationExpiry, authorizationLines, agentBuildSplit, hostsOnBuild, answeredVpcNames, fleetListing, fleetSummary, hostMatches, hostStateChips, routesView, whyBits, vpcLabel, vpcTone, workloadChip } from "./present.ts";
 // `SiteHost` comes from `./site.ts`; `present.ts` imports it but does not re-export it, so this
 // used to be `type SiteHost` on the line above and was simply broken. Nothing said so: this
 // workspace's tests were outside every tsconfig, and `node --test` strips types rather than
@@ -25,7 +25,40 @@ const host = (over: Partial<SiteHost> = {}): SiteHost => ({
   agentBuild: null,
   publishedPorts: [],
   routes: [],
+  authorizationExpiresAt: null,
+  servedAuthorizationExpiresAt: null,
   ...over,
+});
+
+describe("authorizationExpiry", () => {
+  // #138: information on the row, never an alarm — a confirmed host keeps its rules past it.
+  const NOW = Date.parse("2026-10-10T12:00:00Z");
+
+  it("says how long is left", () => {
+    assert.deepEqual(authorizationExpiry("2026-10-11T04:30:00Z", NOW), { kind: "left", at: "2026-10-11T04:30:00Z", hours: 16, minutes: 30 });
+  });
+
+  it("says it has lapsed, at the moment and after", () => {
+    assert.deepEqual(authorizationExpiry("2026-10-10T12:00:00Z", NOW), { kind: "lapsed", at: "2026-10-10T12:00:00Z" });
+    assert.deepEqual(authorizationExpiry("2026-10-09T00:00:00Z", NOW), { kind: "lapsed", at: "2026-10-09T00:00:00Z" });
+  });
+
+  it("says it does not know, rather than that it has not lapsed", () => {
+    assert.deepEqual(authorizationExpiry(null, NOW), { kind: "unknown" });
+  });
+});
+
+describe("authorizationLines", () => {
+  it("shows both expiries for a host that has applied something", () => {
+    const lines = authorizationLines(host({ authorizationExpiresAt: "A", servedAuthorizationExpiresAt: "S" }));
+    assert.deepEqual(lines, [{ key: "m.authApplied", at: "A" }, { key: "m.authServed", at: "S" }]);
+  });
+
+  it("still shows the served expiry for a host that has applied nothing — a refused first envelope", () => {
+    // Review round 3: both lines sat behind `host.generation`, hiding the one value the relay knew.
+    const lines = authorizationLines(host({ generation: null, servedAuthorizationExpiresAt: "S" }));
+    assert.deepEqual(lines, [{ key: "m.authServed", at: "S" }]);
+  });
 });
 
 describe("hostStateChips", () => {

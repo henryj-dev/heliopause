@@ -389,6 +389,14 @@ export const MESSAGES = {
   },
   "m.otpApprove": { en: "approve this plan", ko: "이 플랜 승인" },
   "m.otpPublish": { en: "publish this generation", ko: "이 세대 발행" },
+  "m.authApplied": { en: "applied authorization", ko: "적용 중인 인가" },
+  "m.authServed": { en: "served authorization", ko: "릴레이가 주는 인가" },
+  "m.authExpiresIn": {
+    en: "{label} lapses {at} · {h}h {m}m left",
+    ko: "{label} 만료 {at} · {h}시간 {m}분 남음",
+  },
+  "m.authLapsed": { en: "{label} lapsed {at}", ko: "{label} 만료됨 {at}" },
+  "m.authExpiryUnknown": { en: "{label}: expiry not reported", ko: "{label} 만료 시각 보고 없음" },
   "m.approveAndPublish": { en: "approve & publish · solo · one code", ko: "승인하고 발행 · 단독 · 코드 한 번" },
   "m.otpApproveAndPublish": { en: "approve your own plan and publish it", ko: "자기 플랜을 승인하고 발행" },
   "m.approvedNotPublished": {

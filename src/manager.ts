@@ -161,6 +161,10 @@ export interface SiteView {
     agentBuild: string | null;
     /** See `HostView.table`. `null` also when the relay is too old to carry it. */
     table: HostView["table"];
+    /** See `HostView.authorizationExpiresAt`. `null` also when the relay is too old to carry it. */
+    authorizationExpiresAt: HostView["authorizationExpiresAt"];
+    /** See `HostView.servedAuthorizationExpiresAt`. `null` also when the relay is too old to carry it. */
+    servedAuthorizationExpiresAt: HostView["servedAuthorizationExpiresAt"];
     /**
      * The client certificate the agent presented on its latest heartbeat, as the relay recorded it.
      * `null` when the relay has not recorded one — including a relay too old to record any, which is
@@ -260,6 +264,8 @@ export function siteView(results: RelayResult[]): SiteView {
         agentVersion: h.agentVersion ?? null,
         agentBuild: h.agentBuild ?? null,
         table: h.table ?? null,
+        authorizationExpiresAt: h.authorizationExpiresAt ?? null,
+        servedAuthorizationExpiresAt: h.servedAuthorizationExpiresAt ?? null,
         agentCert: h.agentCert ?? null,
         lastRefusal: h.lastRefusal ?? null,
         publishedPorts: h.publishedPorts ?? null,

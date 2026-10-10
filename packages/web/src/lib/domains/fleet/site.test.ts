@@ -31,6 +31,25 @@ describe("readSiteView", () => {
       assert.equal(read.site.hosts[0]?.intrusions, null);
       assert.equal(read.site.hosts[0]?.publishedPorts, null);
       assert.equal(read.site.hosts[0]?.routes, null);
+      assert.equal(read.site.hosts[0]?.authorizationExpiresAt, null, "a manager too old to send it is not known");
+    }
+  });
+
+  it("reads both authorization expiries, and not a value that is not a time", () => {
+    const base = { vpc: "dev", host: "gw-01.dev", state: "confirmed", generation: "abc", current: true, drifted: false };
+    const read = readSiteView({
+      asked: 1, reachable: 1, vpcs: [], problems: [],
+      hosts: [
+        { ...base, authorizationExpiresAt: "2026-10-11T04:28:36Z", servedAuthorizationExpiresAt: "2026-10-12T01:00:00Z" },
+        { ...base, host: "gw-02.dev", authorizationExpiresAt: "tomorrow", servedAuthorizationExpiresAt: 7 },
+      ],
+    });
+    assert.equal(read.ok, true);
+    if (read.ok) {
+      assert.equal(read.site.hosts[0]?.authorizationExpiresAt, "2026-10-11T04:28:36Z");
+      assert.equal(read.site.hosts[0]?.servedAuthorizationExpiresAt, "2026-10-12T01:00:00Z");
+      assert.equal(read.site.hosts[1]?.authorizationExpiresAt, null);
+      assert.equal(read.site.hosts[1]?.servedAuthorizationExpiresAt, null);
     }
   });
 
