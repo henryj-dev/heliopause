@@ -53,6 +53,13 @@ export interface Plan {
   approval: { by: string; at: string; solo?: true } | null;
   /** Set once published, which is also what stops it being published again. */
   publishedAt: string | null;
+  /**
+   * Set by `claimForPublish` while the push is in flight: until this instant `sweep` keeps the plan,
+   * expired or not, so `release` still has it to restore if the push fails (#151). Cleared by
+   * `release` and by `settle`. A deadline rather than a flag, so a claim nothing ever released does
+   * not keep the plan forever.
+   */
+  inFlightUntil?: string;
 }
 
 /**
@@ -144,8 +151,13 @@ function expired(p: Plan, now: Date, limits: ApprovalLimits): boolean {
  */
 export function sweep(state: ApprovalState, now: Date, limits = DEFAULT_LIMITS): void {
   for (const [hash, p] of state.plans) {
+    if (inFlight(p, now)) continue;
     if (p.publishedAt || expired(p, now, limits)) state.plans.delete(hash);
   }
+}
+
+function inFlight(p: Plan, now: Date): boolean {
+  return p.inFlightUntil !== undefined && now.getTime() < new Date(p.inFlightUntil).getTime();
 }
 
 export function propose(
@@ -345,15 +357,26 @@ export function soloApproveAndPublishRefusal(
  */
 export function claimForPublish(
   state: ApprovalState,
-  input: { hash: string; by: string; now: Date },
+  input: {
+    hash: string;
+    by: string;
+    now: Date;
+    /**
+     * How long the push may take before the claim stops protecting the plan from `sweep`. The caller
+     * passes its own worst case (fleet read + push timeout + margin); the default is for callers that
+     * have none to state.
+     */
+    holdMs?: number;
+  },
   limits = DEFAULT_LIMITS,
 ): Plan {
   if (!input.by) throw new ApprovalError("no operator identity on the request", 401);
   const plan = state.plans.get(input.hash);
 
   // Deliberately before `sweep`, so an expired plan gets its own message rather than "not found".
-  // "It expired" and "it never existed" send an operator to different places.
-  if (plan && expired(plan, input.now, limits)) {
+  // "It expired" and "it never existed" send an operator to different places. A plan another publish
+  // is still pushing is not expired-and-deleted here: it falls through to "already published".
+  if (plan && !inFlight(plan, input.now) && expired(plan, input.now, limits)) {
     state.plans.delete(plan.hash);
     throw new ApprovalError(
       `plan ${input.hash} expired after ${limits.ttlSec}s — re-propose it, so what is published is ` +
@@ -373,7 +396,17 @@ export function claimForPublish(
   if (plan.publishedAt) throw new ApprovalError(`plan ${input.hash} has already been published`, 409);
 
   plan.publishedAt = input.now.toISOString();
+  plan.inFlightUntil = new Date(input.now.getTime() + (input.holdMs ?? DEFAULT_HOLD_MS)).toISOString();
   return plan;
+}
+
+/** A claim's protection when the caller states no push timeout of its own. */
+export const DEFAULT_HOLD_MS = 120_000;
+
+/** The push landed: the plan is published, and the next `sweep` may drop it. */
+export function settle(state: ApprovalState, hash: string): void {
+  const plan = state.plans.get(hash);
+  if (plan) delete plan.inFlightUntil;
 }
 
 /**
@@ -393,11 +426,19 @@ export function claimForPublish(
  */
 export function release(state: ApprovalState, hash: string): void {
   const plan = state.plans.get(hash);
-  if (plan) plan.publishedAt = null;
+  if (plan) {
+    plan.publishedAt = null;
+    delete plan.inFlightUntil;
+  }
 }
 
-/** Pending plans, newest first, for an operator deciding what to review. */
+/**
+ * Pending plans, newest first, for an operator deciding what to review. A plan whose push is in flight
+ * is not one to review, so it is not listed — it is kept, not shown.
+ */
 export function listPlans(state: ApprovalState, now: Date, limits = DEFAULT_LIMITS): Plan[] {
   sweep(state, now, limits);
-  return [...state.plans.values()].sort((a, b) => b.proposedAt.localeCompare(a.proposedAt));
+  return [...state.plans.values()]
+    .filter((p) => !inFlight(p, now))
+    .sort((a, b) => b.proposedAt.localeCompare(a.proposedAt));
 }

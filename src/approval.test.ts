@@ -13,6 +13,7 @@ import {
   listPlans,
   propose,
   release,
+  settle,
   soloApproveAndPublishRefusal,
   sweep,
   type PlanSummary,
@@ -243,6 +244,68 @@ describe("soloApproveAndPublishRefusal — decided before a one-time code is spe
 
   it("refuses a request with no identity", () => {
     assert.equal(soloApproveAndPublishRefusal(pending(), { hash: H, ...solo, by: "" })?.status, 401);
+  });
+});
+
+describe("a claim while its push is in flight (#151)", () => {
+  /** Approved by a second operator and claimed at `at(c)`, held for `hold` ms. */
+  function claimed(c: number, hold = 30_000) {
+    const st = pending();
+    approve(st, { hash: H, by: "ops-jae", now: at(1) });
+    claimForPublish(st, { hash: H, by: "ops-jae", now: at(c), holdMs: hold });
+    return st;
+  }
+
+  it("is kept by a sweep while the push is in flight — the plan release() will need", () => {
+    const st = claimed(10);
+    sweep(st, at(20));
+    assert.equal(st.plans.size, 1, "a sweep during the push deleted the claimed plan");
+    release(st, H);
+    assert.equal(st.plans.get(H)?.publishedAt, null);
+    assert.ok(st.plans.get(H)?.approval, "release came back without the approval");
+  });
+
+  it("is kept even when its proposal window ends during the push", () => {
+    // Claimed at 590s of a 600s window, swept at 605s with the push still running.
+    const st = claimed(590);
+    sweep(st, at(605));
+    assert.equal(st.plans.size, 1);
+  });
+
+  it("stops being kept once its hold runs out — a claim nobody released is not kept forever", () => {
+    const st = claimed(10, 30_000);
+    sweep(st, at(39));
+    assert.equal(st.plans.size, 1, "dropped before the hold ran out");
+    sweep(st, at(41));
+    assert.equal(st.plans.size, 0, "a stuck claim outlived its hold");
+  });
+
+  it("is dropped by the next sweep once settled", () => {
+    const st = claimed(10);
+    settle(st, H);
+    sweep(st, at(11));
+    assert.equal(st.plans.size, 0, "a published plan stayed after it settled");
+  });
+
+  it("refuses a second claim as already published, even past the window, without deleting it", () => {
+    const st = claimed(590);
+    const e = refusal(() => claimForPublish(st, { hash: H, by: "ops-alice", now: at(605) }));
+    assert.equal(e.status, 409);
+    assert.equal(st.plans.size, 1, "the second claim deleted the plan the first is still pushing");
+  });
+
+  it("is subject to expiry again once released — the next claim does not publish an expired plan", () => {
+    const st = claimed(590);
+    release(st, H);
+    const e = refusal(() => claimForPublish(st, { hash: H, by: "ops-jae", now: at(605) }));
+    assert.equal(e.status, 410);
+    assert.equal(st.plans.size, 0);
+  });
+
+  it("is not listed for review while in flight", () => {
+    const st = claimed(10);
+    assert.deepEqual(listPlans(st, at(11)).map((p) => p.hash), []);
+    assert.equal(st.plans.size, 1, "listing it away deleted it");
   });
 });
 
