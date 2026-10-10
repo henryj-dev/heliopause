@@ -392,8 +392,8 @@ export const MESSAGES = {
   "m.approveAndPublish": { en: "approve & publish · solo · one code", ko: "승인하고 발행 · 단독 · 코드 한 번" },
   "m.otpApproveAndPublish": { en: "approve your own plan and publish it", ko: "자기 플랜을 승인하고 발행" },
   "m.approvedNotPublished": {
-    en: "approved — but the publish failed: {message}. The plan stays approved; publish it again.",
-    ko: "승인은 됐지만 발행이 실패했다: {message}. 플랜은 승인된 채로 남으니 다시 발행하면 된다.",
+    en: "approved, but not published: {message}",
+    ko: "승인은 됐지만 발행되지 않았다: {message}",
   },
 
   "m.readingEnrollment": { en: "Reading enrollment…", ko: "등록을 읽는 중…" },

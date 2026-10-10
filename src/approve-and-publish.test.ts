@@ -11,8 +11,8 @@
 //
 // The route is the existing approval and the existing publish, joined behind one code. So the cases
 // below are mostly refusals — who may not use it, and that each refusal spends no code and leaves the
-// plan as it was — plus the one property the join adds: a publish that fails after the approval
-// leaves the plan approved, so the ordinary publish button still works.
+// plan as it was — plus the one property the join adds: when the push fails after the approval, the
+// approval is not undone, and (with nothing else touching the plan meanwhile) `/publish` still finds it.
 //
 // A real relay and a real OIDC session, because the thing under test is identity (which role the
 // session carries, which name it collapses onto) and the seam to the relay.
@@ -447,8 +447,8 @@ describe("approve and publish when the publish half fails", () => {
       "the approval that stood was not logged",
     );
 
-    // The way on is the existing button with a fresh code. It fails again here only because the
-    // relay is still down — 502, not 403 "not approved", is what says the plan is where it should be.
+    // The existing button with a fresh code reaches the plan. It fails again here only because the
+    // relay is still down — 502, not 403 "not approved", is what says the approval is still there.
     const again = await call("/publish", "POST", admin, { hash, otp: code() });
     assert.equal(again.status, 502, again.body);
   });

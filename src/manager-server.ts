@@ -3703,12 +3703,11 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     /**
      * Publish an approved plan: claim, compare with the fleet, sign, push, answer.
      *
-     * `combined` is `/approve-and-publish`: every answer then also says the approval stood, because a
-     * publish that fails here leaves the plan approved and the ordinary publish button is the way on.
+     * `combined` is `/approve-and-publish`: every answer after the claim then also says the approval
+     * was recorded. Whether the plan can still be published after a failure is not promised here —
+     * the error says why it failed, and `/plans` says whether the plan is still held.
      */
     async function publishApproved(hash: string, combined: boolean, at: Date = now()): Promise<void> {
-      // Every answer after the claim goes through `reply`: under `/approve-and-publish` the approval
-      // already stood, and an operator reading a failure needs to know the publish button is the way on.
       const reply = (status: number, body: Record<string, unknown>) =>
         send(res, status, combined ? { ...body, approved: true, combined: true } : body);
       // Claimed before anything is pushed, so two concurrent publishes cannot both pass the check.

@@ -100,8 +100,9 @@
         error?: string; approval?: { by: string }; generation?: string; target?: string; serving?: string; approved?: boolean;
       };
       if (!res.ok && body.approved === true) {
-        // The approval stood and the publish did not. The plan is approved now, so the ordinary
-        // publish button is what the operator needs next — say so rather than "failed".
+        // The approval was recorded and the publish did not happen. What to do next depends on why —
+        // the server's message says (a relay to retry, or a generation the fleet already holds) — and
+        // the refreshed list shows whether the plan is still there to publish.
         noteKind = "bad";
         note = t(prefs.lang, "m.approvedNotPublished", { message: body.error ?? `HTTP ${res.status}` });
         await plans.refresh();
