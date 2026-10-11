@@ -397,13 +397,18 @@ describe("problem watch runner: lock", () => {
     assert.throws(() => emitLines([{ event: "heliopause.problem.watch", what: "lock_error", errno: "ENOSPC" as "other" }]));
   });
 
-  it("a lock whose close fails is not left behind", () => {
+  it("a lock whose close fails is still ours, and stop releases it", () => {
+    let closes = 0;
+    const failingClose = (fd: number) => { closes += 1; closeSync(fd); throw new Error("EIO on close"); };
     const path = join(dir, "y.lock");
-    assert.throws(() => openLockFile(path, "{\"pid\":2}", undefined, (fd) => { closeSync(fd); throw new Error("EIO on close"); }), /EIO on close/);
-    assert.equal(existsSync(path), false);
-    // Known positive: with a close that succeeds the lock stays, holding the record.
-    openLockFile(path, "{\"pid\":2}");
+    assert.doesNotThrow(() => openLockFile(path, "{\"pid\":2}", undefined, failingClose));
     assert.equal(readFileSync(path, "utf8"), "{\"pid\":2}");
+    const h = start({ fs: { openLock: (p, o) => openLockFile(p, o, undefined, failingClose) } });
+    assert.equal(closes, 2);
+    assert.deepEqual(whats(h), ["lock_acquired", "state_initialized", "started"]);
+    assert.ok(existsSync(lockPath(h)));
+    h.watch.stop();
+    assert.equal(existsSync(lockPath(h)), false);
   });
 
   it("a lock error other than EEXIST refuses to start", () => {

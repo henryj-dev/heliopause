@@ -80,7 +80,12 @@ export interface ProblemWatchFs {
   rename(from: string, to: string): void;
 }
 
-/** `open(wx, 0600)`, then the owner record; a failed write unlinks the inode it created. */
+/**
+ * `open(wx, 0600)`, then the owner record; a failed write unlinks the inode it created. A failed
+ * close after the record is written does not fail the lock: the file holds our record, so the
+ * caller owns it and releases it the usual way.
+ * @see "a lock whose close fails is still ours, and stop releases it" in problem-watch-runner.test.ts
+ */
 export function openLockFile(
   path: string,
   owner: string,
@@ -94,13 +99,7 @@ export function openLockFile(
     discardOwnedPath(path, fd);
     throw error;
   }
-  try {
-    close(fd);
-  } catch (error) {
-    // The descriptor may be gone, so the inode cannot be compared; the owner record can.
-    try { if (readFileSync(path, "utf8") === owner) unlinkSync(path); } catch { /* nothing left to remove */ }
-    throw error;
-  }
+  try { close(fd); } catch { /* the record is written; the lock is ours */ }
 }
 
 /** tmp file with `wx` and 0600, fsync, rename over `path`, fsync the directory. */

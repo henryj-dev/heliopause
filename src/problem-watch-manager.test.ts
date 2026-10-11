@@ -6,7 +6,7 @@ import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { generateKeyPairSync } from "node:crypto";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { request } from "node:https";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -167,9 +167,11 @@ describe("problem watch in the manager binary", () => {
   /** Run the binary to its exit and return the code and stderr; fails after 20 s. */
   function exitOf(extraEnv: Record<string, string>): Promise<{ code: number | null; err: string }> {
     const signingKey = join(dir, "signing.pem");
-    if (!existsSync(signingKey)) {
-      writeFileSync(signingKey, generateKeyPairSync("ed25519").privateKey.export({ type: "pkcs8", format: "pem" }));
-      chmodSync(signingKey, 0o600);
+    try {
+      writeFileSync(signingKey, generateKeyPairSync("ed25519").privateKey.export({ type: "pkcs8", format: "pem" }),
+        { mode: 0o600, flag: "wx" });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     }
     const proc = spawn(process.execPath, [BIN], {
       env: {
