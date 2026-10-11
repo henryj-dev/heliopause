@@ -21,6 +21,7 @@ export const CONFIRM_CYCLES = 2;
 /** Cycles a key keeps emitting `active: 0` after it resolves or leaves scope, then is dropped. */
 export const ZERO_TAIL_CYCLES = 20;
 
+// Narrowing this makes `loadWatchState` treat existing state files as broken: it needs a state file migration.
 const ALIAS_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
 const ALIASES_ENV = "HELIOPAUSE_PROBLEM_WATCH_ALIASES_FILE";
 

@@ -309,7 +309,7 @@ export function startProblemWatch(deps: ProblemWatchDeps): ProblemWatch {
         try {
           got = acquire();
         } catch (e) {
-          say([{ event: "heliopause.problem.watch", what: "lock_error", errno: (e as ProblemWatchLockError).errno ?? "other" }]);
+          say([{ event: "heliopause.problem.watch", what: "lock_error", errno: e instanceof ProblemWatchLockError ? e.errno : "other" }]);
           return;
         }
         if (!got) {

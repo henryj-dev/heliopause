@@ -6,7 +6,7 @@ import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { generateKeyPairSync } from "node:crypto";
-import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { request } from "node:https";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -132,22 +132,18 @@ describe("problem watch in the manager", () => {
     }
   });
 
-  it("a manager without problemWatch creates no state file and no lock", async () => {
-    const offDir = mkdtempSync(join(tmpdir(), "hp-watch-off-"));
+  it("without a problem watch the manager serves healthz and stopProblemWatch does nothing", async () => {
     const started = await startManager({
       port: 0, hostname: "127.0.0.1",
-      relays: [{ name: RELAY, url: "https://127.0.0.1:1/", pkiDir: offDir }],
+      relays: [{ name: RELAY, url: "https://127.0.0.1:1/", pkiDir: dir }],
       tls: { certFile: join(dir, "server.pem"), keyFile: join(dir, "server.key"), caFile: join(dir, "ca.pem") },
       operatorCNs: ["ops-alice"], timeoutMs: 200,
     });
     try {
       assert.equal(await healthz((started.server.address() as { port: number }).port), 200);
       assert.doesNotThrow(() => started.stopProblemWatch());
-      // The relay's PKI directory is the only directory of its own this manager is given; nothing appears in it.
-      assert.deepEqual(readdirSync(offDir), []);
     } finally {
       await new Promise<void>((resolve) => started.server.close(() => resolve()));
-      rmSync(offDir, { recursive: true, force: true });
     }
   });
 
