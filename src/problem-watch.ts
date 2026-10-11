@@ -727,12 +727,14 @@ export function emitLines(events: readonly WatchEvent[]): string[] {
 //
 // Rolling back: the #173 manager (a308ebf) reads only version 1 with exactly its three fields, so it
 // moves a version 2 file to `.corrupt-<ms>` and turns the watch off. To run the watch on that manager
-// again, delete the state file and `<state>.initialized` and start it once with
-// HELIOPAUSE_PROBLEM_WATCH_ALLOW_EMPTY_STATE=1.
+// again, leave the moved file where it is, delete `<state>.initialized`, start it once with
+// HELIOPAUSE_PROBLEM_WATCH_ALLOW_EMPTY_STATE=1, then remove that env again. Problems open at that
+// moment are opened again.
 //
 // From version 2 on, a top-level field this loader does not know is ignored, so a later version that
 // only adds fields does not lock this one out; a `v` above `STATE_VERSION` is still refused, since its
-// fields may mean something else.
+// fields may mean something else. This manager writes back only its own five fields, so a field a
+// later version added is gone after the first save following a rollback to this one.
 const STATE_VERSION = 2;
 
 /** The state file's text: every key as a record, so the loader re-derives each key from its fields. */
