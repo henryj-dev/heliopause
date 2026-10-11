@@ -129,13 +129,15 @@ export interface RelayState {
   /**
    * Per host, whether its drift reference was bound by this process moving it from one confirmed
    * generation to another (#148). `false` when the reference was taken on first contact — after a
-   * restart that is whatever the kernel held then, tampered or not. Absent reads as `false`.
+   * restart that is whatever the kernel held then, tampered or not — or on a beat that also produced
+   * a contradiction. Absent reads as `false`.
    *
    * @see "R9: the first confirm after a restart re-baselines without trust" in relay.test.ts
+   * @see "a new-generation confirm with an unchanged kernel does not earn trust" in relay.test.ts
    */
-  referenceTrusted: Record<string, boolean>;
+  referenceTrusted?: Record<string, boolean>;
   /** The `artifactHash` each host's latest beat carried, so `fleetView` can tell when it had none. */
-  reportedArtifactHash: Record<string, string | null>;
+  reportedArtifactHash?: Record<string, string | null>;
 }
 
 /** One agent certificate as the relay saw it. */
@@ -381,9 +383,10 @@ export type ProblemKind =
   | "trust-ring-split";
 
 /**
- * One problem, without its prose. `host` is null for a fleet-wide problem. `value` carries only an
- * identifier the problem is about (a generation, an apply state, `unread`) — never a detail, reason,
- * raw event, address or certificate. `count` is always an integer; 0 where the problem has no count.
+ * One problem, without its prose. `host` is null for a fleet-wide problem. `value` is what the agent
+ * sent in the field the problem is about (a generation, a workload state), `unread`, or the trust-ring
+ * group sizes; this code does not put a detail, reason or raw event in it. `count` is always an
+ * integer; 0 where the problem has no count.
  */
 export interface ProblemFinding {
   kind: ProblemKind;
@@ -396,6 +399,10 @@ export interface ProblemFinding {
  * Whether this view's inputs let it judge a kind: `yes` — a finding's presence and absence both mean
  * something; `no-resolve` — a finding is real, its absence is not evidence the problem ended; `no` —
  * neither. Where two rules apply, the stricter wins (`no` > `no-resolve` > `yes`).
+ *
+ * The three event-shaped contradictions (`artifact-hash-changed`, `unknown-generation`,
+ * `kernel-unchanged`) are `no`: they sit outside this open/resolve model, and whether to treat their
+ * findings as events is the consumer's decision.
  */
 export type ProblemEvaluation = "yes" | "no-resolve" | "no";
 
@@ -460,11 +467,16 @@ export function fleetView(
   const reportTextOnly = (text: string) => reports.push({ text, finding: null });
   const evaluated: Record<string, Partial<Record<ProblemKind, ProblemEvaluation>>> = {};
   const relayAgeSec = startedAt ? (now.getTime() - startedAt.getTime()) / 1000 : Infinity;
+  /** Seconds since `host` last beat, or null if never seen. The one rounding both silence checks use. */
+  const ageOf = (host: string): number | null => {
+    const seen = state.lastSeen[host];
+    return seen ? Math.round((now.getTime() - new Date(seen).getTime()) / 1000) : null;
+  };
 
   for (const [host, entry] of Object.entries(m?.hosts ?? {})) {
     const st = state.statuses[host];
     const seen = state.lastSeen[host] ?? null;
-    const ageSec = seen ? Math.round((now.getTime() - new Date(seen).getTime()) / 1000) : null;
+    const ageSec = ageOf(host);
     const gate = m ? computeGate(m, host, state.statuses) : { open: false, reason: "no manifest", stage: null };
     const drifted = state.drifted.has(host);
     const current = st?.generation === m?.generation;
@@ -778,11 +790,15 @@ export function fleetView(
     const silentNow = ageSec !== null && ageSec > staleAfterSec;
     const own: Record<Exclude<ProblemKind, "trust-ring-split">, ProblemEvaluation> = {
       "rolled-back": st ? "yes" : "no",
-      "refused-generation": st ? "yes" : "no",
+      // A refusal of the generation the host is on is hidden while the table is unread — the case the
+      // `refusalAnswered` comment describes — so it disappearing then is not a resolution.
+      "refused-generation": !st ? "no"
+        : st.table === "unread" && st.lastRefusal?.generation === st.generation ? "no-resolve"
+        : "yes",
       // A reboot leaves a confirmed host pending re-apply; the finding disappearing then is not a fix.
       "table-absent": !st?.table || st.table === "unread" ? "no" : st.state !== "confirmed" ? "no-resolve" : "yes",
       // A reference taken on first contact may be the tampered dump itself — see `referenceTrusted`.
-      "ruleset-changed": !st ? "no" : state.referenceTrusted[host] === true ? "yes" : "no-resolve",
+      "ruleset-changed": !st ? "no" : state.referenceTrusted?.[host] === true ? "yes" : "no-resolve",
       "published-ports": st?.publishedPorts ? "yes" : "no",
       // The protected lists above apply only on this generation's confirmed workload; elsewhere every
       // service reads as unprotected.
@@ -791,12 +807,12 @@ export function fleetView(
         : "yes",
       // Judged from the latest beat against the manifest: confirmed, on this generation, with an artifact.
       "contradiction-artifact-hash-wrong":
-        st?.state === "confirmed" && current && (state.reportedArtifactHash[host] ?? null) !== null ? "yes" : "no",
-      // The other three compare a beat with the reference that beat then replaces: a finding is an
-      // event, and the next beat not repeating it says nothing about the host.
-      "contradiction-artifact-hash-changed": st ? "no-resolve" : "no",
-      "contradiction-unknown-generation": st ? "no-resolve" : "no",
-      "contradiction-kernel-unchanged": st ? "no-resolve" : "no",
+        st?.state === "confirmed" && current && (state.reportedArtifactHash?.[host] ?? null) !== null ? "yes" : "no",
+      // The other three compare a beat with the reference that beat then replaces: events, outside
+      // this model — see `ProblemEvaluation`.
+      "contradiction-artifact-hash-changed": "no",
+      "contradiction-unknown-generation": "no",
+      "contradiction-kernel-unchanged": "no",
       "unexpected-filters": st?.foreignFilters ? "yes" : "no",
       "workload-unreported": !entry.workload ? "yes" : workloadCurrent ? "yes" : "no",
       "workload-not-confirmed": !entry.workload ? "yes" : workloadCurrent ? "yes" : "no",
@@ -870,8 +886,7 @@ export function fleetView(
   // but agreement among the rest is not agreement of the fleet (#148 decision 4). A silent host's
   // digest is as old as its last beat and counts as not sent.
   const everyHostSentDigest = Object.keys(m?.hosts ?? {}).every((host) => {
-    const seen = state.lastSeen[host];
-    const ageSec = seen ? (now.getTime() - new Date(seen).getTime()) / 1000 : null;
+    const ageSec = ageOf(host);
     return !!state.statuses[host]?.artifactTrust?.trustDigest && ageSec !== null && ageSec <= staleAfterSec;
   });
   const fleetEvaluated: Partial<Record<ProblemKind, ProblemEvaluation>> = {
@@ -1039,7 +1054,7 @@ export function handleHeartbeat(
   // merged: a host that reports nothing this beat must not silently keep an older reading alive
   // under a fresh timestamp, because the timestamp is what tells an operator whether to trust it.
   if (hb.membership) state.membership[certCN] = hb.membership;
-  state.reportedArtifactHash[certCN] = hb.applied.artifactHash ?? null;
+  (state.reportedArtifactHash ??= {})[certCN] = hb.applied.artifactHash ?? null;
 
   // H30, and it must run **before** the reference below is rebound. Every check in it compares this
   // beat against what the host said last time, so overwriting the baseline first would leave it
@@ -1080,10 +1095,11 @@ export function handleHeartbeat(
       // unchanged kernel" (not normal) are indistinguishable. Omitting it left
       // `artifact-hash-changed` unable to fire at all — the relay's own integration test caught that,
       // and the pure unit tests could not, because they are handed a reference rather than building one.
-      // Trusted only when this process saw the host move from one confirmed generation to this one.
-      // First contact and a null-hash reference are not that.
+      // Trusted only when this process saw the host move from one confirmed generation to this one
+      // on a beat that contradicted nothing. First contact and a null-hash reference are not that.
       // @see "R9: the first confirm after a restart re-baselines without trust" in relay.test.ts
-      state.referenceTrusted[certCN] =
+      // @see "a new-generation confirm with an unchanged kernel does not earn trust" in relay.test.ts
+      (state.referenceTrusted ??= {})[certCN] = found.length === 0 &&
         !!reference && reference.hash !== null && reference.generation !== hb.applied.generation;
       state.references[certCN] = {
         generation: hb.applied.generation,

@@ -1960,9 +1960,9 @@ describe("structured findings (#148)", () => {
       build: one("h", good("h", { applied: { artifactHash: null } })), expect: "no", finding: false,
     },
     { kind: "contradiction-artifact-hash-wrong", why: "not on this generation", build: one("h", good("h", {}, "g-old")), expect: "no", finding: false },
-    { kind: "contradiction-artifact-hash-changed", why: "an event, replaced by the next beat", build: one("h", good("h")), expect: "no-resolve", finding: false },
-    { kind: "contradiction-unknown-generation", why: "an event, replaced by the next beat", build: one("h", good("h")), expect: "no-resolve", finding: false },
-    { kind: "contradiction-kernel-unchanged", why: "an event, replaced by the next beat", build: one("h", good("h")), expect: "no-resolve", finding: false },
+    { kind: "contradiction-artifact-hash-changed", why: "an event, outside the open/resolve model", build: one("h", good("h")), expect: "no", finding: false },
+    { kind: "contradiction-unknown-generation", why: "an event, outside the open/resolve model", build: one("h", good("h")), expect: "no", finding: false },
+    { kind: "contradiction-kernel-unchanged", why: "an event, outside the open/resolve model", build: one("h", good("h")), expect: "no", finding: false },
     { kind: "unexpected-filters", why: "not reported", build: one("h", good("h")), expect: "no", finding: false },
     { kind: "workload-unreported", why: "older generation", build: one("h", good("h", {}, "g-old"), true), expect: "no", finding: false },
     {
@@ -2113,7 +2113,7 @@ describe("structured findings (#148)", () => {
     assert.ok(view(before).findings.some((f) => f.kind === "ruleset-changed"));
 
     const restarted = one("h", good("h", { applied: { observedHash: "dump:tampered" } }))();
-    assert.equal(restarted.referenceTrusted.h, false);
+    assert.equal(restarted.referenceTrusted?.h, false);
     const v = view(restarted);
     assert.equal(v.findings.some((f) => f.kind === "ruleset-changed"), false);
     assert.equal(v.evaluated.h!["ruleset-changed"], "no-resolve");
@@ -2125,7 +2125,7 @@ describe("structured findings (#148)", () => {
   it("R9: a new generation confirmed in this process re-baselines with trust, and drift then opens and resolves", () => {
     const s = one("h", good("h", {}, "g-old"))();
     handleHeartbeat(s, "h", good("h", { applied: { observedHash: "dump:2" } }), AT);
-    assert.equal(s.referenceTrusted.h, true);
+    assert.equal(s.referenceTrusted?.h, true);
     handleHeartbeat(s, "h", good("h", { applied: { observedHash: "dump:3" } }), AT);
     const open = view(s);
     assert.ok(open.findings.some((f) => f.kind === "ruleset-changed"));
@@ -2142,7 +2142,77 @@ describe("structured findings (#148)", () => {
     const s = unheard();
     s.references.h = { generation: "g-old", hash: null, artifactHash: null };
     handleHeartbeat(s, "h", good("h"), AT);
-    assert.equal(s.referenceTrusted.h, false);
+    assert.equal(s.referenceTrusted?.h, false);
+  });
+
+  it("a new-generation confirm with an unchanged kernel does not earn trust", () => {
+    // Different artifact, same dump: `kernel-unchanged` on the beat that would otherwise rebind with trust.
+    const s = one("h", good("h", { applied: { artifactHash: "sha256:o" } }, "g-old"))();
+    handleHeartbeat(s, "h", good("h"), AT);
+    assert.deepEqual(s.contradictions.h?.map((c) => c.kind), ["kernel-unchanged"]);
+    assert.equal(s.referenceTrusted?.h, false);
+    assert.equal(view(s).evaluated.h!["ruleset-changed"], "no-resolve");
+    // Known positive: the same move with a changed dump contradicts nothing and earns trust.
+    const ok = one("h", good("h", { applied: { artifactHash: "sha256:o" } }, "g-old"))();
+    handleHeartbeat(ok, "h", good("h", { applied: { observedHash: "dump:2" } }), AT);
+    assert.equal(ok.contradictions.h, undefined);
+    assert.equal(ok.referenceTrusted?.h, true);
+  });
+
+  it("a confirm of a generation this relay never served does not earn trust", () => {
+    const s = one("h", good("h", {}, "g-old"))();
+    handleHeartbeat(s, "h", good("h", { applied: { observedHash: "dump:2" } }, "g-other"), AT);
+    assert.deepEqual(s.contradictions.h?.map((c) => c.kind), ["unknown-generation"]);
+    assert.equal(s.referenceTrusted?.h, false);
+  });
+
+  it("a healthy host with every input judges every state kind", () => {
+    const s = one("h", good("h", {}, "g-old"), true)();
+    handleHeartbeat(s, "h", good("h", {
+      applied: { observedHash: "dump:2", table: "present" },
+      foreignFilters: [],
+      publishedPorts: [],
+      ciliumExposure: { nodePortAddresses: ["192.0.2.1"], services: [] },
+      workload: { state: "confirmed", policiesHash: "sha256:w1", observed: ["util/hp-dev-p700"] },
+    }), AT);
+    const v = view(s);
+    assert.deepEqual(v.findings, []);
+    // Written out here rather than derived from the code: every kind, and what a healthy host gives.
+    assert.deepEqual(v.evaluated.h, {
+      "rolled-back": "yes",
+      "refused-generation": "yes",
+      "table-absent": "yes",
+      "ruleset-changed": "yes",
+      "published-ports": "yes",
+      "cilium-nodeport-unrestricted": "yes",
+      "contradiction-artifact-hash-changed": "no",
+      "contradiction-artifact-hash-wrong": "yes",
+      "contradiction-unknown-generation": "no",
+      "contradiction-kernel-unchanged": "no",
+      "unexpected-filters": "yes",
+      "workload-unreported": "yes",
+      "workload-not-confirmed": "yes",
+      "workload-objects-missing": "yes",
+      "workload-document-mismatch": "yes",
+      "agent-version-behind": "yes",
+      "break-glass-authorization": "yes",
+      "artifact-trust-unreadable": "yes",
+      "authorization-unnamed": "yes",
+      "never-reported": "yes",
+      silent: "yes",
+    });
+    assert.equal(v.fleetEvaluated["trust-ring-split"], "yes");
+  });
+
+  it("refused-generation is not resolvable while the table is unread and the refusal is of its own generation", () => {
+    // The `refusalAnswered` filter hides this refusal; its disappearing is not the host taking the generation.
+    const refusal = { generation: GEN, reason: "schema too new", at: AT };
+    const v = view(one("h", good("h", { applied: { table: "unread" }, lastRefusal: refusal }))());
+    assert.equal(v.findings.some((f) => f.kind === "refused-generation"), false);
+    assert.equal(v.evaluated.h!["refused-generation"], "no-resolve");
+    // Known positive: the same refusal with the table present is judged.
+    const ok = view(one("h", good("h", { applied: { table: "present" }, lastRefusal: refusal }))());
+    assert.equal(ok.evaluated.h!["refused-generation"], "yes");
   });
 });
 
