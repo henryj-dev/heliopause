@@ -18,7 +18,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { request } from "node:https";
+import { createServer as createHttpsServer, request } from "node:https";
 import { createServer as createTcpServer, type Socket } from "node:net";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash, generateKeyPairSync } from "node:crypto";
@@ -887,6 +887,237 @@ describe("cross-site requests", () => {
   });
 });
 
+describe("plan target observations", () => {
+  let port = 0;
+  let manager: Awaited<ReturnType<typeof startManager>>;
+  let relay: ReturnType<typeof createHttpsServer>;
+  let failedRelay: ReturnType<typeof createHttpsServer>;
+  let relays: Array<Parameters<typeof startManager>[0]["relays"][number]>;
+  let hosts: Array<{ generation: string | null }> = [];
+  let statusCalls = 0;
+  let failedCalls = 0;
+  let publishCalls = 0;
+  let failStatus = false;
+  const at = new Date("2026-10-11T00:00:00.000Z");
+  type Listed = { hash: string; targetGeneration: { kind: string; generation?: string; observedAt: string | null } };
+  const listing = () => call<{ plans: Listed[] }>(port, "/plans", "GET", undefined, "watcher");
+  const proposal = async (generation: string, target = "dev") => {
+    const b = bundle();
+    if (target !== "dev") {
+      b.manifest.hosts = { [`gw-01.${target}`]: b.manifest.hosts["gw-01.dev"]! };
+      b.rulesets = { [`gw-01.${target}`]: RULES };
+    }
+    b.manifest.generation = generation;
+    const result = await call<{ hash: string }>(port, "/plan", "POST", { target, bundle: b }, "henry");
+    assert.equal(result.status, 200, result.text);
+    assert.equal(statusCalls, 0, "proposing must not poll for a list observation");
+    assert.equal((result.json as Record<string, unknown>).targetGeneration, undefined);
+    return result.json.hash;
+  };
+
+  before(async () => {
+    relay = createHttpsServer({ cert: read("relay-server.pem"), key: read("relay-server.key") }, (req, res) => {
+      res.setHeader("content-type", "application/json");
+      if (req.url === "/status") {
+        statusCalls++;
+        res.statusCode = failStatus ? 503 : 200;
+        res.end(JSON.stringify(failStatus ? { error: "offline" } : { hosts, generation: "relay-generation", problems: [] }));
+      } else if (req.url === "/publish") {
+        publishCalls++;
+        req.resume();
+        res.end(JSON.stringify({ generation: "fresh-plan", serving: "fresh-plan" }));
+      } else {
+        res.statusCode = 404;
+        res.end("{}");
+      }
+    });
+    failedRelay = createHttpsServer({ cert: read("relay-server.pem"), key: read("relay-server.key") }, (_req, res) => {
+      failedCalls++;
+      res.statusCode = 503;
+      res.end(JSON.stringify({ error: "offline" }));
+    });
+    await new Promise<void>((resolve) => relay.listen(0, "127.0.0.1", resolve));
+    await new Promise<void>((resolve) => failedRelay.listen(0, "127.0.0.1", resolve));
+    const relayUrl = `https://127.0.0.1:${(relay.address() as { port: number }).port}/`;
+    relays = [
+      { name: "dev", url: relayUrl, pkiDir: join(dir, "relay-pki") },
+      { name: "failing", url: `https://127.0.0.1:${(failedRelay.address() as { port: number }).port}/`, pkiDir: join(dir, "relay-pki") },
+    ];
+    manager = await startManager({
+      port: 0, hostname: "127.0.0.1", relays,
+      tls: { certFile: join(dir, "mgr-server.pem"), keyFile: join(dir, "mgr-server.key"), caFile: join(dir, "ca.pem") },
+      operatorCNs: ["ops-alice", "ops-jae", "ops-watcher"], writerCNs: ["ops-alice", "ops-jae"],
+      artifactSigning: { privateKey: generateKeyPairSync("ed25519").privateKey },
+      now: () => at, timeoutMs: 200, log: () => {},
+    });
+    port = (manager.server.address() as { port: number }).port;
+  });
+  after(() => { manager.server.close(); relay.close(); failedRelay.close(); });
+
+  it("does not poll with zero plans", async () => {
+    const result = await listing();
+    assert.equal(result.status, 200);
+    assert.deepEqual(result.json.plans, []);
+    assert.equal(statusCalls, 0);
+    assert.equal(failedCalls, 0);
+  });
+
+  it("polls a repeated target once and keeps a failing target's plan", async () => {
+    statusCalls = 0;
+    const first = await proposal("list-first");
+    const second = await proposal("list-second");
+    const failed = await proposal("list-failed", "failing");
+    hosts = [{ generation: "fleet-one" }, { generation: null }];
+    const result = await listing();
+    assert.equal(result.status, 200);
+    assert.equal(statusCalls, 1);
+    assert.equal(failedCalls, 1, "U=2 makes exactly two target requests, including the failed one");
+    for (const hash of [first, second]) {
+      assert.deepEqual(result.json.plans.find((p) => p.hash === hash)?.targetGeneration,
+        { kind: "one", generation: "fleet-one", observedAt: at.toISOString() });
+    }
+    assert.equal(result.json.plans.find((p) => p.hash === failed)?.targetGeneration.kind, "unknown");
+    assert.equal(result.json.plans.find((p) => p.hash === failed)?.targetGeneration.observedAt, at.toISOString());
+  });
+
+  it("lists mixed and unknown observations without losing plans", async () => {
+    for (const [reported, kind] of [
+      [[{ generation: "fleet-one" }, { generation: "fleet-two" }], "mixed"],
+      [[{ generation: null }], "unknown"],
+    ] as const) {
+      hosts = [...reported];
+      const result = await listing();
+      assert.equal(result.status, 200);
+      assert.equal(result.json.plans.length, 3);
+      assert.equal(result.json.plans.find((p) => p.targetGeneration.kind === kind)?.targetGeneration.observedAt, at.toISOString());
+      assert.equal(result.json.plans.filter((p) => p.targetGeneration.kind === kind).length, kind === "mixed" ? 2 : 3);
+    }
+  });
+
+  it("does not poll any relay when every plan target was removed", async () => {
+    const configured = relays.splice(0);
+    relays.push({ ...configured[0]!, name: "unrelated" });
+    const before = statusCalls;
+    const failedBefore = failedCalls;
+    try {
+      const result = await listing();
+      assert.equal(result.status, 200);
+      assert.equal(result.json.plans.length, 3);
+      assert.ok(result.json.plans.every((p) => p.targetGeneration.kind === "unknown" && p.targetGeneration.observedAt === null));
+      assert.equal(statusCalls, before);
+      assert.equal(failedCalls, failedBefore);
+    } finally {
+      relays.splice(0, relays.length, ...configured);
+    }
+  });
+
+  it("publishing reads the fleet again after a list, and unknown still permits publishing", async () => {
+    statusCalls = 0;
+    const hash = await proposal("fresh-plan");
+    const approval = await call(port, "/approve", "POST", { hash }, "jae");
+    assert.equal(approval.status, 200, approval.text);
+    assert.equal(statusCalls, 0, "approving must not poll for a list observation");
+    assert.equal((approval.json as Record<string, unknown>).targetGeneration, undefined);
+    hosts = [{ generation: "old-fleet" }];
+    assert.equal((await listing()).json.plans.find((p) => p.hash === hash)?.targetGeneration.generation, "old-fleet");
+    assert.equal(statusCalls, 1);
+    hosts = [{ generation: "fresh-plan" }];
+    const refused = await call(port, "/publish", "POST", { hash }, "henry");
+    assert.equal(refused.status, 409, refused.text);
+    assert.match(refused.text, /already confirmed on fresh-plan/);
+    assert.equal(statusCalls, 2);
+    assert.equal(publishCalls, 0);
+    failStatus = true;
+    try {
+      const published = await call(port, "/publish", "POST", { hash }, "henry");
+      assert.equal(published.status, 200, published.text);
+      assert.equal(statusCalls, 3);
+      assert.equal(publishCalls, 1);
+    } finally {
+      failStatus = false;
+    }
+  });
+});
+
+describe("plan target observations with a stalled target", () => {
+  let port = 0;
+  let manager: Awaited<ReturnType<typeof startManager>>;
+  let healthy: ReturnType<typeof createHttpsServer>;
+  let stalled: ReturnType<typeof createHttpsServer>;
+  const late: Array<ReturnType<typeof setTimeout>> = [];
+  let stalledCalls = 0;
+  let cutBeforeAnswer = 0;
+  let onCut: () => void = () => {};
+  const cut = new Promise<void>((resolve) => { onCut = resolve; });
+
+  before(async () => {
+    const tls = { cert: read("relay-server.pem"), key: read("relay-server.key") };
+    healthy = createHttpsServer(tls, (_req, res) => {
+      res.end(JSON.stringify({ hosts: [{ generation: "healthy-gen" }], generation: "relay-generation", problems: [] }));
+    });
+    // Answers only after four seconds: past the list's bound, inside the manager's own timeout.
+    stalled = createHttpsServer(tls, (_req, res) => {
+      stalledCalls++;
+      res.on("close", () => {
+        if (!res.writableEnded) { cutBeforeAnswer++; onCut(); }
+      });
+      late.push(setTimeout(() => {
+        if (!res.destroyed) res.end(JSON.stringify({ hosts: [{ generation: "late-gen" }], generation: "relay-generation", problems: [] }));
+      }, 4_000));
+    });
+    await new Promise<void>((resolve) => healthy.listen(0, "127.0.0.1", resolve));
+    await new Promise<void>((resolve) => stalled.listen(0, "127.0.0.1", resolve));
+    const url = (s: typeof healthy) => `https://127.0.0.1:${(s.address() as { port: number }).port}/`;
+    manager = await startManager({
+      port: 0, hostname: "127.0.0.1",
+      relays: [
+        { name: "dev", url: url(healthy), pkiDir: join(dir, "relay-pki") },
+        { name: "stuck", url: url(stalled), pkiDir: join(dir, "relay-pki") },
+      ],
+      tls: { certFile: join(dir, "mgr-server.pem"), keyFile: join(dir, "mgr-server.key"), caFile: join(dir, "ca.pem") },
+      operatorCNs: ["ops-alice", "ops-jae", "ops-watcher"], writerCNs: ["ops-alice", "ops-jae"],
+      artifactSigning: { privateKey: generateKeyPairSync("ed25519").privateKey },
+      timeoutMs: 10_000, log: () => {},
+    });
+    port = (manager.server.address() as { port: number }).port;
+  });
+  after(() => {
+    for (const t of late) clearTimeout(t);
+    manager.server.close();
+    healthy.closeAllConnections();
+    stalled.closeAllConnections();
+    healthy.close();
+    stalled.close();
+  });
+
+  it("a stalled target does not hold up another target's observation or the list", async () => {
+    const hashes: Record<string, string> = {};
+    for (const target of ["dev", "stuck"]) {
+      const b = bundle();
+      if (target !== "dev") {
+        b.manifest.hosts = { [`gw-01.${target}`]: b.manifest.hosts["gw-01.dev"]! };
+        b.rulesets = { [`gw-01.${target}`]: RULES };
+      }
+      b.manifest.generation = `stalled-list-${target}`;
+      const p = await call<{ hash: string }>(port, "/plan", "POST", { target, bundle: b }, "henry");
+      assert.equal(p.status, 200, p.text);
+      hashes[target] = p.json.hash;
+    }
+    type Listed = { hash: string; targetGeneration: { kind: string; generation?: string; why?: string } };
+    const result = await call<{ plans: Listed[] }>(port, "/plans", "GET", undefined, "watcher");
+    assert.equal(result.status, 200, result.text);
+    assert.equal(stalledCalls, 1, "the stalled relay was never asked");
+    assert.deepEqual(result.json.plans.find((p) => p.hash === hashes.dev)?.targetGeneration.generation, "healthy-gen");
+    const stuck = result.json.plans.find((p) => p.hash === hashes.stuck)?.targetGeneration;
+    assert.equal(stuck?.kind, "unknown", `the list waited for the stalled relay: ${JSON.stringify(stuck)}`);
+    // The known positive: the request arrived and the manager hung up before any answer.
+    let bound: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([cut, new Promise<void>((resolve) => { bound = setTimeout(resolve, 1_000); })]);
+    clearTimeout(bound);
+    assert.equal(cutBeforeAnswer, 1, "the stalled relay was not cut off before it answered");
+  });
+});
+
 describe("listing plans", () => {
   it("shows a pending plan to any reader and its approval state", async () => {
     const p = await call<{ hash: string }>(managerPort, "/plan", "POST", { target: "dev", bundle: bundle() }, "henry");
@@ -1058,8 +1289,10 @@ describe("a plan claimed by a publish in flight", () => {
 //
 // The hold is what this manager's fleet read and push could take, plus a margin. A deployment with
 // long timeouts needs a long hold, or a slow push loses its plan exactly as before. A second manager
-// with timeouts past the default hold and a clock the test moves: nothing here waits for real, because
-// the stalling target is failed by hand long before either timeout.
+// with timeouts past the default hold and a clock the test moves. The push is failed by hand long
+// before either timeout, but one wait remains: the second case lists while the first case's plan is
+// still pending on the stalling target, so `/plans` waits out its own list bound on that target.
+// Measured 2026-10-11: 32 ms and 2,023 ms (100,036 ms before the list had a bound of its own).
 describe("the claim's hold follows the manager's timeouts", () => {
   let port = 0;
   let close: () => void = () => {};

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { clockLabel, expireTone, hostRuleTotal, planDomId, planPath, remainingSec, shortPlanHash } from "./present.ts";
+import { clockLabel, expireTone, hostRuleTotal, planDomId, planPath, remainingSec, sameTargetGeneration, shortPlanHash } from "./present.ts";
+import { applyHeldPoll } from "../../poll.ts";
 import type { PlanRow } from "./plans.ts";
 
 const plan = (over: Partial<PlanRow> = {}): PlanRow => ({
@@ -18,6 +19,32 @@ const plan = (over: Partial<PlanRow> = {}): PlanRow => ({
   publishedAt: null,
   target: "dev",
   ...over,
+});
+
+describe("sameTargetGeneration", () => {
+  const observedAt = "2026-10-11T00:00:00.000Z";
+  it("compares the full strings, not commit prefixes", () => {
+    assert.equal(sameTargetGeneration(plan({ targetGeneration: { kind: "one", generation: "4a91c7f", observedAt } }), false), true);
+    for (const generation of ["4a91c7f00000000000000000000000000000000000", "4A91C7F", "other"]) {
+      assert.equal(sameTargetGeneration(plan({ targetGeneration: { kind: "one", generation, observedAt } }), false), false);
+    }
+    for (const targetGeneration of [undefined, { kind: "mixed" as const, observedAt },
+      { kind: "unknown" as const, why: "timeout", observedAt }]) {
+      assert.equal(sameTargetGeneration(plan({ targetGeneration }), false), false);
+    }
+  });
+
+  it("keeps the old observation's time after a failed poll but stops the matching-generation advice", () => {
+    const value = plan({ targetGeneration: { kind: "one", generation: "4a91c7f", observedAt } });
+    const first = applyHeldPoll(null, { kind: "ok", value, at: 1000 });
+    assert.ok(first);
+    assert.equal(sameTargetGeneration(first.value, first.failCount > 0), true);
+    const held = applyHeldPoll(first, { kind: "fail", reason: "offline" });
+    assert.ok(held);
+    assert.equal(held.value.targetGeneration?.observedAt, observedAt);
+    assert.equal(held.failCount, 1);
+    assert.equal(sameTargetGeneration(held.value, held.failCount > 0), false);
+  });
 });
 
 describe("planPath", () => {

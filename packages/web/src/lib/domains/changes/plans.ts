@@ -11,6 +11,12 @@ export interface PlanHost {
   rulesetHash: string;
 }
 
+export type TargetGeneration = (
+  | { kind: "one"; generation: string }
+  | { kind: "mixed" }
+  | { kind: "unknown"; why: string }
+) & { observedAt: string | null };
+
 export interface PlanRow {
   hash: string;
   generation: string;
@@ -21,6 +27,7 @@ export interface PlanRow {
   publishedAt: string | null;
   /** VPC this plan was proposed for. Null when the manager no longer holds the mapping. */
   target: string | null;
+  targetGeneration?: TargetGeneration;
 }
 
 export interface PlansView {
@@ -61,6 +68,21 @@ function readApproval(value: unknown): PlanRow["approval"] {
   return { by: value.by, at: value.at, ...(value.solo === true ? { solo: true as const } : {}) };
 }
 
+function readTargetGeneration(value: unknown): TargetGeneration {
+  const unread: TargetGeneration = { kind: "unknown", why: "target generation was not read", observedAt: null };
+  if (!isRecord(value)) return unread;
+  const at = value.observedAt;
+  if (at !== null && (typeof at !== "string" || !Number.isFinite(Date.parse(at)))) return unread;
+  if (value.kind === "unknown" && typeof value.why === "string") {
+    return { kind: "unknown", why: value.why, observedAt: at };
+  }
+  if (typeof at !== "string") return unread;
+  if (value.kind === "one" && typeof value.generation === "string" && value.generation !== "") {
+    return { kind: "one", generation: value.generation, observedAt: at };
+  }
+  return value.kind === "mixed" ? { kind: "mixed", observedAt: at } : unread;
+}
+
 function readPlan(value: unknown): PlanRow | null {
   if (!isRecord(value)) return null;
   if (typeof value.hash !== "string" || typeof value.generation !== "string") return null;
@@ -87,6 +109,7 @@ function readPlan(value: unknown): PlanRow | null {
     approval,
     publishedAt,
     target: typeof value.target === "string" && value.target !== "" ? value.target : null,
+    targetGeneration: readTargetGeneration(value.targetGeneration),
   };
 }
 
