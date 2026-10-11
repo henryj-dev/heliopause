@@ -138,6 +138,32 @@ export interface RelayState {
   referenceTrusted?: Record<string, boolean>;
   /** The `artifactHash` each host's latest beat carried, so `fleetView` can tell when it had none. */
   reportedArtifactHash?: Record<string, string | null>;
+  /**
+   * Per host and event-shaped contradiction kind, how many beats since this process started produced
+   * that kind, and when the latest did (#148 PR 4). Memory-only like the rest: a restart starts every
+   * count at 0, which `FleetView.processStartedAt` lets a reader tell apart from a decrease.
+   * @see "counts each beat that produced an event-shaped contradiction, and starts again at 0 in a new process" in relay.test.ts
+   */
+  eventCounts?: Record<string, Partial<Record<EventKind, { count: number; lastAt: string }>>>;
+}
+
+/** The contradiction kinds that are events rather than states — see `ProblemEvaluation`. */
+export type EventKind =
+  | "contradiction-artifact-hash-changed"
+  | "contradiction-unknown-generation"
+  | "contradiction-kernel-unchanged";
+export const EVENT_KINDS: readonly EventKind[] = [
+  "contradiction-artifact-hash-changed",
+  "contradiction-unknown-generation",
+  "contradiction-kernel-unchanged",
+];
+
+/** One host's count of one event kind since this relay process started. Only counts above 0 are listed. */
+export interface ProblemEventCount {
+  host: string;
+  kind: EventKind;
+  count: number;
+  lastAt: string;
 }
 
 /** One agent certificate as the relay saw it. */
@@ -159,6 +185,7 @@ export function emptyState(): RelayState {
     agentCerts: {},
     referenceTrusted: {},
     reportedArtifactHash: {},
+    eventCounts: {},
   };
 }
 
@@ -346,11 +373,25 @@ export interface FleetView {
     /** True while this relay is younger than the silence threshold, when `never-reported` is withheld. */
     graceActive: boolean;
   };
+  /**
+   * Per manifest host, the event-shaped contradiction counts since `processStartedAt` (#148 PR 4).
+   * Absent from a relay older than this field.
+   */
+  events?: ProblemEventCount[];
+  /** When the process whose counts `events` holds started; null when this view was not told. */
+  processStartedAt?: string | null;
+  /**
+   * Per manifest host, whether this view has a current report from it: heard from since this process
+   * started and not silent. The same condition that makes every kind but `silent` and `never-reported`
+   * `no` in `evaluated`.
+   */
+  hostObservable?: Record<string, boolean>;
 }
 
 /** What `fleetView` returns: a `FleetView` with every #148 field present. */
 export type StructuredFleetView = FleetView &
-  Required<Pick<FleetView, "findings" | "evaluated" | "fleetEvaluated" | "observability">>;
+  Required<Pick<FleetView,
+    "findings" | "evaluated" | "fleetEvaluated" | "observability" | "events" | "processStartedAt" | "hostObservable">>;
 
 /**
  * Stable names for the problems `fleetView` reports. A name, once published, is not renamed: a
@@ -401,8 +442,8 @@ export interface ProblemFinding {
  * neither. Where two rules apply, the stricter wins (`no` > `no-resolve` > `yes`).
  *
  * The three event-shaped contradictions (`artifact-hash-changed`, `unknown-generation`,
- * `kernel-unchanged`) are `no`: they sit outside this open/resolve model, and whether to treat their
- * findings as events is the consumer's decision.
+ * `kernel-unchanged`) are `no`: they sit outside this open/resolve model. `FleetView.events` counts
+ * the beats that produced each.
  */
 export type ProblemEvaluation = "yes" | "no-resolve" | "no";
 
@@ -466,7 +507,9 @@ export function fleetView(
   // @see "intrusion events stay a problems line with no finding" in relay.test.ts
   const reportTextOnly = (text: string) => reports.push({ text, finding: null });
   const evaluated: Record<string, Partial<Record<ProblemKind, ProblemEvaluation>>> = {};
-  const relayAgeSec = startedAt ? (now.getTime() - startedAt.getTime()) / 1000 : Infinity;
+  const hostObservable: Record<string, boolean> = {};
+  const events: ProblemEventCount[] = [];
+  const relayAgeSec =startedAt ? (now.getTime() - startedAt.getTime()) / 1000 : Infinity;
   /** Seconds since `host` last beat, or null if never seen. The one rounding both silence checks use. */
   const ageOf = (host: string): number | null => {
     const seen = state.lastSeen[host];
@@ -840,12 +883,18 @@ export function fleetView(
     };
     // Nothing from a host that has not reported since this process started, or has gone silent, is
     // current — except the two kinds that describe exactly that.
-    if (!st || silentNow) {
+    const observable = !!st && !silentNow;
+    if (!observable) {
       for (const kind of Object.keys(own) as (keyof typeof own)[]) {
         if (kind !== "silent" && kind !== "never-reported") own[kind] = "no";
       }
     }
     evaluated[host] = own;
+    hostObservable[host] = observable;
+    for (const kind of EVENT_KINDS) {
+      const counted = state.eventCounts?.[host]?.[kind];
+      if (counted && counted.count > 0) events.push({ host, kind, count: counted.count, lastAt: counted.lastAt });
+    }
   }
 
   // ## Do these hosts agree about which keys may sign a ruleset?
@@ -918,6 +967,9 @@ export function fleetView(
     evaluated,
     fleetEvaluated,
     observability: { manifest: m !== null, graceActive: relayAgeSec <= staleAfterSec },
+    events,
+    processStartedAt: startedAt ? startedAt.toISOString() : null,
+    hostObservable,
   };
 }
 
@@ -1074,6 +1126,12 @@ export function handleHeartbeat(
   const found = reportContradictions(hb, state.references[certCN], state.manifest);
   if (found.length) state.contradictions[certCN] = found;
   else delete state.contradictions[certCN];
+  // One count per beat and kind, however many contradictions of that kind the beat produced.
+  const counts = ((state.eventCounts ??= {})[certCN] ??= {});
+  for (const kind of EVENT_KINDS) {
+    if (!found.some((c) => `contradiction-${c.kind}` === kind)) continue;
+    counts[kind] = { count: (counts[kind]?.count ?? 0) + 1, lastAt: at };
+  }
 
   // Record the drift reference the first time a host confirms a generation, and compare against it
   // on every beat after. Rebinding it on each confirm is what makes a legitimate apply reset the

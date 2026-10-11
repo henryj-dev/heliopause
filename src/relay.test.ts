@@ -2214,6 +2214,52 @@ describe("structured findings (#148)", () => {
     const ok = view(one("h", good("h", { applied: { table: "present" }, lastRefusal: refusal }))());
     assert.equal(ok.evaluated.h!["refused-generation"], "yes");
   });
+
+  // ## PR 4 — event counts
+
+  it("counts each beat that produced an event-shaped contradiction, and starts again at 0 in a new process", () => {
+    const s = one("h", good("h"))();
+    assert.deepEqual(view(s).events, []);
+    handleHeartbeat(s, "h", good("h", { applied: { artifactHash: "sha256:other" } }), "2026-07-30T00:00:15Z");
+    handleHeartbeat(s, "h", good("h", { applied: { artifactHash: "sha256:other" } }), "2026-07-30T00:00:30Z");
+    assert.deepEqual(view(s).events, [
+      { host: "h", kind: "contradiction-artifact-hash-changed", count: 2, lastAt: "2026-07-30T00:00:30Z" },
+    ]);
+    // A beat without one leaves the count as it was.
+    s.manifest = { ...s.manifest!, generation: "g-next" };
+    handleHeartbeat(s, "h", good("h", { applied: { observedHash: "dump:2" } }, "g-next"), "2026-07-30T00:00:45Z");
+    assert.equal(s.contradictions.h, undefined);
+    assert.equal(view(s).events[0]!.count, 2);
+    // A new process: the same beats again count from 0.
+    const restarted = one("h", good("h"))();
+    handleHeartbeat(restarted, "h", good("h", { applied: { artifactHash: "sha256:other" } }), AT);
+    assert.equal(view(restarted).events[0]!.count, 1);
+  });
+
+  it("counts the other two event kinds, and the catalog's problems are unchanged by the counts", () => {
+    const v = view(catalog());
+    assert.deepEqual(v.events.map((e) => `${e.host} ${e.kind} ${e.count}`).sort(), [
+      "c-contra contradiction-artifact-hash-changed 1",
+      "c-contra2 contradiction-kernel-unchanged 1",
+      "c-contra2 contradiction-unknown-generation 1",
+    ]);
+    assert.deepEqual(v.problems, CATALOG_PROBLEMS_BEFORE_148);
+  });
+
+  it("names when the process whose counts these are started, or null when not told", () => {
+    assert.equal(view(state()).processStartedAt, LONG_AGO.toISOString());
+    assert.equal(fleetView(state(), NOW).processStartedAt, null);
+  });
+
+  it("a host is observable when heard from since this process started and not silent", () => {
+    const v = view(catalog());
+    assert.equal(v.hostObservable["c-never"], false);
+    assert.equal(v.hostObservable["c-silent"], false);
+    assert.equal(v.hostObservable["c-rolled"], true);
+    // The same rule that makes every kind but silent and never-reported `no`.
+    for (const [host, ev] of Object.entries(v.evaluated)) assert.equal(v.hostObservable[host], ev["rolled-back"] !== "no", host);
+    assert.deepEqual(Object.keys(v.hostObservable).sort(), Object.keys(v.evaluated).sort());
+  });
 });
 
 const CATALOG_PROBLEMS_BEFORE_148 = [

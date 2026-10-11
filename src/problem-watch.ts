@@ -12,14 +12,20 @@
  *
  * A host without an alias is counted in one `unaliased-hosts` problem per relay; its own problems do
  * not reach a line, so they reach no email — only the console shows them.
+ *
+ * The three event-shaped contradictions take a second path (#148 PR 4): no opened or resolved, one
+ * `heliopause.problem.event` line when the relay's count for that host and kind goes up after
+ * `EVENT_QUIET_CYCLES` cycles without going up.
  */
 import { EnvSpecError } from "./env-spec.ts";
-import type { ProblemEvaluation, ProblemKind } from "./relay.ts";
+import type { EventKind, ProblemEvaluation, ProblemKind } from "./relay.ts";
 
 /** Consecutive counted observations that open or resolve a problem (#148: 30 s, twice). */
 export const CONFIRM_CYCLES = 2;
 /** Cycles a key keeps emitting `active: 0` after it resolves or leaves scope, then is dropped. */
 export const ZERO_TAIL_CYCLES = 20;
+/** Cycles an event count must stay put before its next increase raises a new event (#148: 10 × 30 s). */
+export const EVENT_QUIET_CYCLES = 10;
 
 // Narrowing this makes `loadWatchState` treat existing state files as broken: it needs a state file migration.
 const ALIAS_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
@@ -51,6 +57,15 @@ const RELAY_KINDS: Record<ProblemKind, true> = {
   "trust-ring-split": true,
 };
 const KINDS = Object.keys(RELAY_KINDS) as ProblemKind[];
+
+/** The relay's `EVENT_KINDS`, as a `Record` for the same reason as `RELAY_KINDS`. */
+const EVENT_KIND_RECORD: Record<EventKind, true> = {
+  "contradiction-artifact-hash-changed": true,
+  "contradiction-unknown-generation": true,
+  "contradiction-kernel-unchanged": true,
+};
+const EVENT_KINDS = Object.keys(EVENT_KIND_RECORD) as EventKind[];
+const EVENT_KIND_SET = new Set<string>(EVENT_KINDS);
 
 /** Problems the watch raises itself, about a relay or about its own configuration. */
 export type WatchKind = ProblemKind | "relay-unobservable" | "relay-not-configured" | "unaliased-hosts";
@@ -169,8 +184,17 @@ export type RelayRead =
     fleetEvaluated: Map<ProblemKind, ProblemEvaluation>;
     /** Distinct kind names this build does not know, skipped in `findings` and both evaluations. */
     unknownKinds: number;
+    /** Null from a relay without `events`, or one that did not say when it started: the event path is then off. */
+    eventCounts: RelayEventCounts | null;
   }
   | { ok: false; reason: RelayUnobservable };
+
+/** A relay's event counts since `startedAt`, and which of its manifest hosts it currently hears, by host id. */
+export interface RelayEventCounts {
+  startedAt: string;
+  counts: Map<string, Map<EventKind, number>>;
+  observable: Map<string, boolean>;
+}
 
 const SCHEMA = { ok: false, reason: "schema" } as const;
 
@@ -223,8 +247,44 @@ export function readRelayStatus(body: unknown): RelayRead {
   }
   const fleetEvaluated = readEvaluations(body.fleetEvaluated, unknown);
   if (!fleetEvaluated) return SCHEMA;
+  const eventCounts = readEventCounts(body, unknown);
+  if (eventCounts === "schema") return SCHEMA;
   if (!obs.manifest) return { ok: false, reason: "no-manifest" };
-  return { ok: true, findings, evaluated, fleetEvaluated, unknownKinds: unknown.size };
+  return { ok: true, findings, evaluated, fleetEvaluated, unknownKinds: unknown.size, eventCounts };
+}
+
+/**
+ * `events`, `processStartedAt` and `hostObservable` together. A body without `events` is a relay
+ * older than them: null, and the state path is unaffected. An event kind this build does not know is
+ * skipped and counted, as in `findings`.
+ * @see "a relay without events turns only the event path off" in problem-watch.test.ts
+ */
+function readEventCounts(body: Record<string, unknown>, unknown: Set<string>): RelayEventCounts | null | "schema" {
+  if (body.events === undefined) return null;
+  const started = body.processStartedAt;
+  if (!Array.isArray(body.events) || !isObject(body.hostObservable) || (started !== null && typeof started !== "string")) {
+    return "schema";
+  }
+  const observable = new Map<string, boolean>();
+  for (const [host, b] of Object.entries(body.hostObservable)) {
+    if (typeof b !== "boolean") return "schema";
+    observable.set(host, b);
+  }
+  const counts = new Map<string, Map<EventKind, number>>();
+  for (const e of body.events) {
+    if (!isObject(e)) return "schema";
+    const { kind, host, count } = e;
+    if (typeof kind !== "string" || typeof host !== "string") return "schema";
+    if (!EVENT_KIND_SET.has(kind)) {
+      unknown.add(kind);
+      continue;
+    }
+    if (!Number.isSafeInteger(count) || (count as number) < 0) return "schema";
+    const byKind = counts.get(host) ?? new Map<EventKind, number>();
+    byKind.set(kind as EventKind, count as number);
+    counts.set(host, byKind);
+  }
+  return started === null ? null : { startedAt: started, counts, observable };
 }
 
 // ## The state machine
@@ -242,12 +302,26 @@ export interface KeyState {
   tail: number;
 }
 
-export interface WatchState {
-  seq: number;
-  keys: Record<string, KeyState>;
+/** One (relay alias, host alias, event kind): the relay's count last read, and cycles since it last went up. */
+export interface EventKeyState {
+  relay: string;
+  host: string;
+  kind: EventKind;
+  count: number;
+  /** Capped at `EVENT_QUIET_CYCLES`; at the cap the next increase raises an event. */
+  quiet: number;
 }
 
-export const emptyWatchState = (): WatchState => ({ seq: 0, keys: {} });
+export interface WatchState {
+  /** One sequence for transition and event lines. */
+  seq: number;
+  keys: Record<string, KeyState>;
+  /** Relay alias → the `processStartedAt` its stored event counts were read under. */
+  eventRelays: Record<string, string>;
+  events: Record<string, EventKeyState>;
+}
+
+export const emptyWatchState = (): WatchState => ({ seq: 0, keys: {}, eventRelays: {}, events: {} });
 
 export interface WatchCycle {
   cycle: number;
@@ -268,6 +342,11 @@ export interface StateLine {
 export interface TransitionLine {
   event: "heliopause.problem.transition";
   seq: number; transition: Transition; relay: string; host: string; kind: WatchKind; count: number;
+}
+export interface EventLine {
+  event: "heliopause.problem.event";
+  /** `count`: how much the relay's count went up on the cycle that raised this line. */
+  seq: number; relay: string; host: string; kind: EventKind; count: number;
 }
 export interface CycleLine {
   event: "heliopause.problem.cycle";
@@ -295,11 +374,13 @@ export interface WatchLine {
 }
 export type LockErrno = "EACCES" | "ENOENT" | "EROFS" | "EPERM" | "EIO" | "other";
 export const LOCK_ERRNOS = new Set<string>(["EACCES", "ENOENT", "EROFS", "EPERM", "EIO"]);
-export type WatchEvent = StateLine | TransitionLine | CycleLine | WatchLine;
+export type WatchEvent = StateLine | TransitionLine | EventLine | CycleLine | WatchLine;
 
 export interface StepResult {
   next: WatchState;
   transitions: TransitionLine[];
+  /** After every transition of the cycle, so `seq` rises in the order the runner writes them. */
+  events: EventLine[];
   snapshot: { states: StateLine[]; cycle: CycleLine };
 }
 
@@ -436,6 +517,7 @@ export function stepWatch(prev: WatchState, input: WatchCycle): StepResult {
   for (const [k, rec] of Object.entries(next.keys)) {
     if (!expectedAliases.has(rec.relay)) removeFromScope(k, rec);
   }
+  const events = stepEvents(next, input, expectedAliases);
 
   const states: StateLine[] = [];
   for (const [k, rec] of Object.entries(next.keys).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
@@ -455,6 +537,7 @@ export function stepWatch(prev: WatchState, input: WatchCycle): StepResult {
   return {
     next,
     transitions,
+    events,
     snapshot: {
       states,
       cycle: {
@@ -463,6 +546,60 @@ export function stepWatch(prev: WatchState, input: WatchCycle): StepResult {
       },
     },
   };
+}
+
+/**
+ * The event path, for every relay whose answer carries event counts. Counts are compared with the
+ * stored ones under the same relay `processStartedAt`; under a different one — a relay restart, or
+ * this watch's first look at the relay — they are only stored, so beats between the last read and the
+ * restart are missed. A key seen for the first time is stored the same way. On a host the relay does
+ * not currently hear, an increase is stored and not raised. Mutates `next`.
+ *
+ * @see "an increase raises one event, and a run of increases raises one" in problem-watch.test.ts
+ * @see "an increase after EVENT_QUIET_CYCLES quiet cycles raises a new event" in problem-watch.test.ts
+ * @see "a relay restart re-baselines the counts and raises nothing, and the next increase raises" in problem-watch.test.ts
+ * @see "an increase on a cycle where the host is unobservable is stored, not raised" in problem-watch.test.ts
+ */
+function stepEvents(next: WatchState, input: WatchCycle, expectedAliases: ReadonlySet<string>): EventLine[] {
+  const lines: EventLine[] = [];
+  for (const relay of Object.keys(next.eventRelays)) if (!expectedAliases.has(relay)) delete next.eventRelays[relay];
+  for (const [k, rec] of Object.entries(next.events)) if (!expectedAliases.has(rec.relay)) delete next.events[k];
+  for (const [name, relay] of input.aliases.relays) {
+    const poll = input.relays.get(name);
+    if (!poll?.ok || !poll.eventCounts) continue;
+    const { startedAt, counts, observable } = poll.eventCounts;
+    const sameProcess = Object.hasOwn(next.eventRelays, relay) && next.eventRelays[relay] === startedAt;
+    next.eventRelays[relay] = startedAt;
+    const hostAliases = input.aliases.hosts.get(name) ?? new Map<string, string>();
+    const seen = new Set<string>();
+    for (const [hostId, hostObservable] of observable) {
+      const host = hostAliases.get(hostId);
+      if (host === undefined) continue;
+      for (const kind of EVENT_KINDS) {
+        const k = keyOf(relay, host, kind);
+        seen.add(k);
+        const now = counts.get(hostId)?.get(kind) ?? 0;
+        const rec = next.events[k];
+        if (!rec) {
+          next.events[k] = { relay, host, kind, count: now, quiet: EVENT_QUIET_CYCLES };
+          continue;
+        }
+        const increase = sameProcess && hostObservable && now > rec.count ? now - rec.count : 0;
+        rec.count = now;
+        if (increase === 0) {
+          rec.quiet = Math.min(rec.quiet + 1, EVENT_QUIET_CYCLES);
+          continue;
+        }
+        if (rec.quiet >= EVENT_QUIET_CYCLES) {
+          next.seq += 1;
+          lines.push({ event: "heliopause.problem.event", seq: next.seq, relay, host, kind, count: increase });
+        }
+        rec.quiet = 0;
+      }
+    }
+    for (const [k, rec] of Object.entries(next.events)) if (rec.relay === relay && !seen.has(k)) delete next.events[k];
+  }
+  return lines;
 }
 
 // ## Output
@@ -529,6 +666,13 @@ export function emitLines(events: readonly WatchEvent[]): string[] {
           kind: oneOf(t.kind, WATCH_KINDS, event), count: count(t.count, event),
         });
       }
+      case "heliopause.problem.event": {
+        const x = e as EventLine;
+        return JSON.stringify({
+          event, v: 1, seq: count(x.seq, event), relay: relayAlias(x.relay, event),
+          host: relayAlias(x.host, event), kind: oneOf(x.kind, EVENT_KIND_SET, event), count: count(x.count, event),
+        });
+      }
       case "heliopause.problem.cycle": {
         const c = e as CycleLine;
         if (!Array.isArray(c.relays)) throw new OutOfSchema(event);
@@ -566,11 +710,16 @@ export function emitLines(events: readonly WatchEvent[]): string[] {
 
 // ## Persisted state
 
-const STATE_VERSION = 1;
+// Version 2 adds `eventRelays` and `events`. A version 1 file loads with neither; a manager older than
+// version 2 refuses a version 2 file as unreadable.
+const STATE_VERSION = 2;
 
 /** The state file's text: every key as a record, so the loader re-derives each key from its fields. */
 export function serializeWatchState(state: WatchState): string {
-  return JSON.stringify({ v: STATE_VERSION, seq: state.seq, keys: Object.values(state.keys) }) + "\n";
+  return JSON.stringify({
+    v: STATE_VERSION, seq: state.seq, keys: Object.values(state.keys),
+    eventRelays: state.eventRelays, events: Object.values(state.events),
+  }) + "\n";
 }
 
 export type LoadedWatchState =
@@ -585,18 +734,46 @@ const bounded = (v: unknown, max: number): boolean => Number.isSafeInteger(v) &&
  * counted: `stepWatch` takes it out of scope on the next cycle, with `scope_removed` and the zero tail.
  * A key whose kind this build does not know is dropped and counted — kept, it would be held forever
  * and `emitLines` would refuse the cycle — so its resolution, after a downgrade, rests on the series
- * disappearing.
+ * disappearing. Event keys and `eventRelays` are read under the same rules.
  * @see "state loader drops unknown kinds and keeps stale aliases for scope removal" in problem-watch-runner.test.ts
  */
 export function loadWatchState(text: string, aliases: WatchAliases): LoadedWatchState {
   let doc: unknown;
   try { doc = JSON.parse(text); } catch { return { ok: false }; }
-  if (!isObject(doc) || doc.v !== STATE_VERSION || !Number.isSafeInteger(doc.seq) || (doc.seq as number) < 0
-    || !Array.isArray(doc.keys) || Object.keys(doc).length !== 3) return { ok: false };
+  if (!isObject(doc) || (doc.v !== 1 && doc.v !== STATE_VERSION) || !Number.isSafeInteger(doc.seq) || (doc.seq as number) < 0
+    || !Array.isArray(doc.keys) || Object.keys(doc).length !== (doc.v === 1 ? 3 : 5)) return { ok: false };
   const relayByAlias = new Map([...aliases.relays].map(([name, alias]) => [alias, name]));
-  const state: WatchState = { seq: doc.seq as number, keys: {} };
+  const state: WatchState = { seq: doc.seq as number, keys: {}, eventRelays: {}, events: {} };
   let unknownKinds = 0;
   let staleAliases = 0;
+  /** Whether a relay and host alias pair is in the current alias file; reserved hosts count as in it. */
+  const current = (relay: string, host: string): boolean => {
+    const relayName = relayByAlias.get(relay);
+    const hostAliases = relayName === undefined ? null : new Set(aliases.hosts.get(relayName)?.values() ?? []);
+    return !!hostAliases && (RESERVED_HOSTS.has(host) || hostAliases.has(host));
+  };
+  if (doc.v === STATE_VERSION) {
+    if (!isObject(doc.eventRelays) || !Array.isArray(doc.events)) return { ok: false };
+    for (const [relay, startedAt] of Object.entries(doc.eventRelays)) {
+      if (!ALIAS_RE.test(relay) || typeof startedAt !== "string") return { ok: false };
+      if (!relayByAlias.has(relay)) staleAliases += 1;
+      state.eventRelays[relay] = startedAt;
+    }
+    for (const r of doc.events as unknown[]) {
+      if (!isObject(r) || typeof r.relay !== "string" || typeof r.host !== "string" || typeof r.kind !== "string"
+        || !bounded(r.count, Number.MAX_SAFE_INTEGER) || !bounded(r.quiet, EVENT_QUIET_CYCLES)
+        || Object.keys(r).length !== 5) return { ok: false };
+      const k = keyOf(r.relay, r.host, r.kind);
+      if (Object.hasOwn(state.events, k)) return { ok: false };
+      if (!EVENT_KIND_SET.has(r.kind)) {
+        unknownKinds += 1;
+        continue;
+      }
+      if (!ALIAS_RE.test(r.relay) || !ALIAS_RE.test(r.host)) return { ok: false };
+      if (!current(r.relay, r.host)) staleAliases += 1;
+      state.events[k] = { relay: r.relay, host: r.host, kind: r.kind as EventKind, count: r.count as number, quiet: r.quiet as number };
+    }
+  }
   for (const r of doc.keys as unknown[]) {
     if (!isObject(r) || typeof r.relay !== "string" || typeof r.host !== "string" || typeof r.kind !== "string"
       || typeof r.active !== "boolean" || !bounded(r.openStreak, CONFIRM_CYCLES) || !bounded(r.resolveStreak, CONFIRM_CYCLES)
@@ -608,9 +785,7 @@ export function loadWatchState(text: string, aliases: WatchAliases): LoadedWatch
       continue;
     }
     if (!ALIAS_RE.test(r.relay) || !(ALIAS_RE.test(r.host) || RESERVED_HOSTS.has(r.host))) return { ok: false };
-    const relayName = relayByAlias.get(r.relay);
-    const hostAliases = relayName === undefined ? null : new Set(aliases.hosts.get(relayName)?.values() ?? []);
-    if (!hostAliases || !(RESERVED_HOSTS.has(r.host) || hostAliases.has(r.host))) staleAliases += 1;
+    if (!current(r.relay, r.host)) staleAliases += 1;
     state.keys[k] = {
       relay: r.relay, host: r.host, kind: r.kind as WatchKind, active: r.active,
       openStreak: r.openStreak as number, resolveStreak: r.resolveStreak as number,
