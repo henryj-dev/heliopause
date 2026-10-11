@@ -126,6 +126,18 @@ export interface RelayState {
    * only, refilled on the next beat — `observedAt` says how old a reading is.
    */
   agentCerts: Record<string, AgentCertObservation>;
+  /**
+   * Per host, whether its drift reference was bound by this process moving it from one confirmed
+   * generation to another (#148). `false` when the reference was taken on first contact — after a
+   * restart that is whatever the kernel held then, tampered or not — or on a beat that also produced
+   * a contradiction. Absent reads as `false`.
+   *
+   * @see "R9: the first confirm after a restart re-baselines without trust" in relay.test.ts
+   * @see "a new-generation confirm with an unchanged kernel does not earn trust" in relay.test.ts
+   */
+  referenceTrusted?: Record<string, boolean>;
+  /** The `artifactHash` each host's latest beat carried, so `fleetView` can tell when it had none. */
+  reportedArtifactHash?: Record<string, string | null>;
 }
 
 /** One agent certificate as the relay saw it. */
@@ -145,6 +157,8 @@ export function emptyState(): RelayState {
     contradictions: {},
     membership: {},
     agentCerts: {},
+    referenceTrusted: {},
+    reportedArtifactHash: {},
   };
 }
 
@@ -317,7 +331,80 @@ export interface FleetView {
    * not heard from anyone yet" — relay state is memory-only, so those look identical otherwise.
    */
   relayAgeSec: number | null;
+  /**
+   * One entry per problem kind and host, derived from the same reports as `problems` (#148). Absent
+   * from a relay older than this field — a caller must not read that as "no problems".
+   */
+  findings?: ProblemFinding[];
+  /** Per host, for each problem kind, whether this view could judge it. See `ProblemEvaluation`. */
+  evaluated?: Record<string, Partial<Record<ProblemKind, ProblemEvaluation>>>;
+  /** The same, for the problems that belong to no single host. */
+  fleetEvaluated?: Partial<Record<ProblemKind, ProblemEvaluation>>;
+  observability?: {
+    /** False when no manifest is loaded: an empty `findings` then says nothing about the fleet. */
+    manifest: boolean;
+    /** True while this relay is younger than the silence threshold, when `never-reported` is withheld. */
+    graceActive: boolean;
+  };
 }
+
+/** What `fleetView` returns: a `FleetView` with every #148 field present. */
+export type StructuredFleetView = FleetView &
+  Required<Pick<FleetView, "findings" | "evaluated" | "fleetEvaluated" | "observability">>;
+
+/**
+ * Stable names for the problems `fleetView` reports. A name, once published, is not renamed: a
+ * consumer keys on it.
+ *
+ * Intrusion events have no kind — they stay a `problems` line only.
+ */
+export type ProblemKind =
+  | "rolled-back"
+  | "refused-generation"
+  | "table-absent"
+  | "ruleset-changed"
+  | "published-ports"
+  | "cilium-nodeport-unrestricted"
+  | "contradiction-artifact-hash-changed"
+  | "contradiction-artifact-hash-wrong"
+  | "contradiction-unknown-generation"
+  | "contradiction-kernel-unchanged"
+  | "unexpected-filters"
+  | "workload-unreported"
+  | "workload-not-confirmed"
+  | "workload-objects-missing"
+  | "workload-document-mismatch"
+  | "agent-version-behind"
+  | "break-glass-authorization"
+  | "artifact-trust-unreadable"
+  | "authorization-unnamed"
+  | "never-reported"
+  | "silent"
+  | "trust-ring-split";
+
+/**
+ * One problem, without its prose. `host` is null for a fleet-wide problem. `value` is what the agent
+ * sent in the field the problem is about (a generation, a workload state), `unread`, or the trust-ring
+ * group sizes; this code does not put a detail, reason or raw event in it. `count` is always an
+ * integer; 0 where the problem has no count.
+ */
+export interface ProblemFinding {
+  kind: ProblemKind;
+  host: string | null;
+  value: string | null;
+  count: number;
+}
+
+/**
+ * Whether this view's inputs let it judge a kind: `yes` — a finding's presence and absence both mean
+ * something; `no-resolve` — a finding is real, its absence is not evidence the problem ended; `no` —
+ * neither. Where two rules apply, the stricter wins (`no` > `no-resolve` > `yes`).
+ *
+ * The three event-shaped contradictions (`artifact-hash-changed`, `unknown-generation`,
+ * `kernel-unchanged`) are `no`: they sit outside this open/resolve model, and whether to treat their
+ * findings as events is the consumer's decision.
+ */
+export type ProblemEvaluation = "yes" | "no-resolve" | "no";
 
 /**
  * `expiresAt` from the envelope this relay serves a host, or `null` when there is none or it is not a
@@ -367,15 +454,29 @@ export function fleetView(
    * Reported, never gated: see `agentVersionConcern`.
    */
   minAgentVersion?: readonly [number, number, number],
-): FleetView {
+): StructuredFleetView {
   const m = state.manifest;
   const hosts: HostView[] = [];
-  const problems: string[] = [];
+  // Every problem line goes through one of these two, and `problems` and `findings` are both built
+  // from `reports` below — so a line and its finding come from the same call.
+  const reports: { text: string; finding: ProblemFinding | null }[] = [];
+  const report = (kind: ProblemKind, host: string | null, value: string | null, count: number, text: string) =>
+    reports.push({ text, finding: { kind, host, value, count } });
+  // A line with no finding: intrusion events, which open no problem of their own (#148 R14).
+  // @see "intrusion events stay a problems line with no finding" in relay.test.ts
+  const reportTextOnly = (text: string) => reports.push({ text, finding: null });
+  const evaluated: Record<string, Partial<Record<ProblemKind, ProblemEvaluation>>> = {};
+  const relayAgeSec = startedAt ? (now.getTime() - startedAt.getTime()) / 1000 : Infinity;
+  /** Seconds since `host` last beat, or null if never seen. The one rounding both silence checks use. */
+  const ageOf = (host: string): number | null => {
+    const seen = state.lastSeen[host];
+    return seen ? Math.round((now.getTime() - new Date(seen).getTime()) / 1000) : null;
+  };
 
   for (const [host, entry] of Object.entries(m?.hosts ?? {})) {
     const st = state.statuses[host];
     const seen = state.lastSeen[host] ?? null;
-    const ageSec = seen ? Math.round((now.getTime() - new Date(seen).getTime()) / 1000) : null;
+    const ageSec = ageOf(host);
     const gate = m ? computeGate(m, host, state.statuses) : { open: false, reason: "no manifest", stage: null };
     const drifted = state.drifted.has(host);
     const current = st?.generation === m?.generation;
@@ -428,7 +529,7 @@ export function fleetView(
         : null,
     });
 
-    if (st?.state === "rolled-back") problems.push(`${host}: rolled back — ${st.detail ?? "see its journal"}`);
+    if (st?.state === "rolled-back") report("rolled-back", host, null, 0, `${host}: rolled back — ${st.detail ?? "see its journal"}`);
     // ## The sentence that used to live only on the host
     //
     // A refused artifact leaves a host sitting on an old generation with nothing wrong: `state` is
@@ -442,7 +543,8 @@ export function fleetView(
     // Phrased with the generation it refused, because "this host refuses" and "this host refuses
     // *what you just published*" are different problems and only the second one is urgent.
     if (liveRefusal) {
-      problems.push(`${host}: refused generation ${liveRefusal.generation} — ${liveRefusal.reason}`);
+      report("refused-generation", host, liveRefusal.generation, 0,
+        `${host}: refused generation ${liveRefusal.generation} — ${liveRefusal.reason}`);
     }
     // ## Confirmed, and the agent says its table is absent (#139)
     //
@@ -450,11 +552,11 @@ export function fleetView(
     // the boot restore or a re-apply puts it back. Read from the agent's own `applied.table`, not
     // inferred from a null `observedHash` — which also means "not read yet".
     if (tableAbsent) {
-      problems.push(
+      report("table-absent", host, st?.generation ?? null, 0,
         `${host}: confirmed generation ${st?.generation} but its table is absent — ${st?.detail ?? "no detail"}`,
       );
     }
-    if (drifted) problems.push(`${host}: ruleset no longer matches the dump it confirmed`);
+    if (drifted) report("ruleset-changed", host, null, 0, `${host}: ruleset no longer matches the dump it confirmed`);
     // Next to drift on purpose: drift is the consequence (the dump changed), this is the cause (who
     // changed it, when, from which process). A host showing both is one story, and reading them
     // together is what turns "something moved" into "this moved it".
@@ -466,7 +568,7 @@ export function fleetView(
     // operator reading "confirmed" needs to know that this port is outside what that word covers.
     const pub = st?.publishedPorts;
     if (pub && pub.length) {
-      problems.push(
+      report("published-ports", host, null, pub.length,
         `${host}: ${pub.length} port(s) are published by another table and bypass this ruleset ` +
           `(DNAT on prerouting, before any input hook): ${pub.slice(0, 3).join("; ")}` +
           `${pub.length > 3 ? ` (+${pub.length - 3} more)` : ""}`,
@@ -494,7 +596,7 @@ export function fleetView(
       });
     }) ?? [];
     if (cilium && cilium.nodePortAddresses.length === 0 && unprotectedCilium.length) {
-      problems.push(
+      report("cilium-nodeport-unrestricted", host, null, unprotectedCilium.length,
         `${host}: Cilium nodeport-addresses is unrestricted; ${unprotectedCilium.length} eBPF ` +
           `HostPort/NodePort frontend(s) bypass this nftables ruleset: ` +
           `${unprotectedCilium.slice(0, 3).join("; ")}` +
@@ -504,7 +606,7 @@ export function fleetView(
     const intr = st?.intrusions;
     if (intr && intr.length) {
       const last = intr[intr.length - 1]!;
-      problems.push(
+      reportTextOnly(
         `${host}: ${intr.length} change(s) to its ruleset were not made by the agent — ` +
           `latest ${last.at} pid=${last.pid ?? "?"} (${last.process ?? "unknown"}): ${last.raw.slice(0, 120)}`,
       );
@@ -512,7 +614,7 @@ export function fleetView(
     // Graded, because a console that calls everything an emergency gets read as noise — and then the
     // certain ones are missed too. `certain` means no honest host produces this.
     for (const c of state.contradictions[host] ?? []) {
-      problems.push(
+      report(`contradiction-${c.kind}`, host, null, 1,
         c.certainty === "certain"
           ? `${host}: reporting contradicts itself — ${c.detail}`
           : `${host}: reporting is unexplained — ${c.detail}`,
@@ -524,7 +626,7 @@ export function fleetView(
     // declared port was still refused by a table nothing reported.
     const unexpected = unexpectedFilters(st, entry);
     if (unexpected?.length) {
-      problems.push(
+      report("unexpected-filters", host, null, unexpected.length,
         `${host}: ${unexpected.join(", ")} also filters here — this host's confirmed rules are ` +
           `not the only thing deciding`,
       );
@@ -535,9 +637,9 @@ export function fleetView(
     if (entry.workload && st && st.generation === m?.generation) {
       const ws = st.workloadState;
       if (ws === undefined || ws === null) {
-        problems.push(`${host}: applied its ruleset but has not reported the workload half`);
+        report("workload-unreported", host, null, 0, `${host}: applied its ruleset but has not reported the workload half`);
       } else if (ws !== "confirmed") {
-        problems.push(
+        report("workload-not-confirmed", host, ws, 0,
           `${host}: workload half is ${ws} on cluster ${entry.workload.cluster}` +
             `${st.workloadDetail ? ` — ${st.workloadDetail}` : ""}`,
         );
@@ -558,7 +660,7 @@ export function fleetView(
         // to different places — one is a broken applier, the other is a policy that did not land.
         const missing = missingObjects(entry.workload.mustExist, st.workloadObserved ?? null);
         if (missing.length) {
-          problems.push(
+          report("workload-objects-missing", host, (st.workloadObserved ?? null) === null ? "unread" : null, missing.length,
             `${host}: workload half reports confirmed but ${missing.length} object(s) are not in ` +
               `cluster ${entry.workload.cluster}: ${missing.slice(0, 4).join(", ")}` +
               `${missing.length > 4 ? ` (+${missing.length - 4} more)` : ""}` +
@@ -572,7 +674,7 @@ export function fleetView(
           st.workloadPoliciesHash != null &&
           st.workloadPoliciesHash !== entry.workload.policiesHash
         ) {
-          problems.push(
+          report("workload-document-mismatch", host, null, 0,
             `${host}: workload half confirmed document ${st.workloadPoliciesHash.slice(0, 20)} but the ` +
               `manifest publishes ${entry.workload.policiesHash.slice(0, 20)} — it applied something else`,
           );
@@ -583,7 +685,7 @@ export function fleetView(
     // against nothing — `MIN_AGENT_SCHEMA` stops a rollout at a host that speaks the wrong schema,
     // and there was no equivalent sentence for a host that speaks the right one from an old build.
     const behind = agentVersionConcern(st, minAgentVersion);
-    if (behind) problems.push(`${host}: ${behind}`);
+    if (behind) report("agent-version-behind", host, null, 0, `${host}: ${behind}`);
 
     // ## A break-glass authorization nobody wound back
     //
@@ -597,7 +699,7 @@ export function fleetView(
     // the relay acting on a policy judgement.
     if (st?.artifactTrust?.currentAuthorizationMode === "break-glass") {
       const at = st.artifactTrust.currentAuthorizedAt;
-      problems.push(
+      report("break-glass-authorization", host, null, 0,
         `${host}: enforcing a break-glass authorization${at ? ` from ${at}` : ""} — that mode skips ` +
           `the two-person rule, and nothing else in this system reports that it is still in force`,
       );
@@ -606,7 +708,7 @@ export function fleetView(
     // A host that could not read its own signing trust. Without this it would look exactly like an
     // agent too old to send `artifactTrust`, and every check above and below would skip it. #145.
     if (st?.artifactTrustError) {
-      problems.push(`${host}: cannot read its artifact signing trust — ${st.artifactTrustError}`);
+      report("artifact-trust-unreadable", host, null, 0, `${host}: cannot read its artifact signing trust — ${st.artifactTrustError}`);
     }
 
     // ## A host enforcing a ruleset it cannot name
@@ -656,7 +758,7 @@ export function fleetView(
     //     every healthy first apply reports `pending` with a null mode for one beat. #145's review.
     const trust = st?.artifactTrust;
     if (trust && trust.currentAuthorizationMode === null && st?.generation !== null && st?.state === "confirmed") {
-      problems.push(
+      report("authorization-unnamed", host, st?.generation ?? null, 0,
         `${host}: enforcing generation ${st?.generation} but cannot name the authorization for it — ` +
           `an expired authorization can never be re-applied on this host, and a break-glass one ` +
           `would not be reported`,
@@ -671,11 +773,75 @@ export function fleetView(
     // schedule and this process has no memory of the ones before it. Reporting that as a problem
     // makes every relay restart look like a fleet-wide outage.
     if (ageSec === null) {
-      const relayAgeSec = startedAt ? (now.getTime() - startedAt.getTime()) / 1000 : Infinity;
-      if (relayAgeSec > staleAfterSec) problems.push(`${host}: has never reported`);
+      if (relayAgeSec > staleAfterSec) report("never-reported", host, null, 0, `${host}: has never reported`);
     } else if (ageSec > staleAfterSec) {
-      problems.push(`${host}: silent for ${ageSec}s`);
+      // No elapsed seconds in the finding: it would change every view without the problem changing.
+      report("silent", host, null, 0, `${host}: silent for ${ageSec}s`);
     }
+
+    // ## Which of the kinds above this view could judge for this host (#148 R8)
+    //
+    // Each entry names the input its judgement above reads; where that input is missing, unread, or
+    // not from this generation, the kind is `no` or `no-resolve`. The absence of a finding is only
+    // evidence the problem ended where the entry says `yes`.
+    const workloadCurrent = !!entry.workload && !!st && st.generation === m?.generation;
+    const workloadConfirmed = workloadCurrent && st?.workloadState === "confirmed";
+    const trustReadable = !!st?.artifactTrust && !st.artifactTrustError;
+    const silentNow = ageSec !== null && ageSec > staleAfterSec;
+    const own: Record<Exclude<ProblemKind, "trust-ring-split">, ProblemEvaluation> = {
+      "rolled-back": st ? "yes" : "no",
+      // A refusal of the generation the host is on is hidden while the table is unread — the case the
+      // `refusalAnswered` comment describes — so it disappearing then is not a resolution.
+      "refused-generation": !st ? "no"
+        : st.table === "unread" && st.lastRefusal?.generation === st.generation ? "no-resolve"
+        : "yes",
+      // A reboot leaves a confirmed host pending re-apply; the finding disappearing then is not a fix.
+      "table-absent": !st?.table || st.table === "unread" ? "no" : st.state !== "confirmed" ? "no-resolve" : "yes",
+      // A reference taken on first contact may be the tampered dump itself — see `referenceTrusted`.
+      "ruleset-changed": !st ? "no" : state.referenceTrusted?.[host] === true ? "yes" : "no-resolve",
+      "published-ports": st?.publishedPorts ? "yes" : "no",
+      // The protected lists above apply only on this generation's confirmed workload; elsewhere every
+      // service reads as unprotected.
+      "cilium-nodeport-unrestricted": !cilium ? "no"
+        : entry.workload && !(current && st?.workloadState === "confirmed" && st.workloadPoliciesHash === entry.workload.policiesHash) ? "no"
+        : "yes",
+      // Judged from the latest beat against the manifest: confirmed, on this generation, with an artifact.
+      "contradiction-artifact-hash-wrong":
+        st?.state === "confirmed" && current && (state.reportedArtifactHash?.[host] ?? null) !== null ? "yes" : "no",
+      // The other three compare a beat with the reference that beat then replaces: events, outside
+      // this model — see `ProblemEvaluation`.
+      "contradiction-artifact-hash-changed": "no",
+      "contradiction-unknown-generation": "no",
+      "contradiction-kernel-unchanged": "no",
+      "unexpected-filters": st?.foreignFilters ? "yes" : "no",
+      "workload-unreported": !entry.workload ? "yes" : workloadCurrent ? "yes" : "no",
+      "workload-not-confirmed": !entry.workload ? "yes" : workloadCurrent ? "yes" : "no",
+      // Judged only on a confirmed workload half, so a re-apply in progress is not a resolution.
+      "workload-objects-missing": !entry.workload ? "yes"
+        : !workloadConfirmed ? "no"
+        : (st?.workloadObserved ?? null) === null ? "no-resolve"
+        : "yes",
+      "workload-document-mismatch": !entry.workload ? "yes"
+        : !workloadConfirmed || st?.workloadPoliciesHash == null ? "no"
+        : "yes",
+      // A missing version is itself the finding; only an unset floor leaves nothing to judge.
+      "agent-version-behind": !minAgentVersion || !st ? "no" : "yes",
+      // Unreadable trust opens `artifact-trust-unreadable`; it must not also resolve these two.
+      "break-glass-authorization": trustReadable ? "yes" : "no",
+      "artifact-trust-unreadable": st ? "yes" : "no",
+      "authorization-unnamed": trustReadable && st?.state === "confirmed" ? "yes" : "no",
+      "never-reported": ageSec === null && relayAgeSec <= staleAfterSec ? "no" : "yes",
+      // After a restart `lastSeen` is empty: the host is not heard from, which is not "no longer silent".
+      silent: ageSec === null ? "no" : "yes",
+    };
+    // Nothing from a host that has not reported since this process started, or has gone silent, is
+    // current — except the two kinds that describe exactly that.
+    if (!st || silentNow) {
+      for (const kind of Object.keys(own) as (keyof typeof own)[]) {
+        if (kind !== "silent" && kind !== "never-reported") own[kind] = "no";
+      }
+    }
+    evaluated[host] = own;
   }
 
   // ## Do these hosts agree about which keys may sign a ruleset?
@@ -709,11 +875,32 @@ export function fleetView(
     // Largest group first, so the sentence reads as "these are the odd ones out" rather than as an
     // arbitrary listing. Ties are broken by digest so the same fleet always produces the same line.
     const groups = [...digests.entries()].sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]));
-    problems.push(
+    report("trust-ring-split", null, groups.map(([, hs]) => hs.length).join(","), groups.length,
       `the fleet does not agree on which keys may sign a ruleset — ` +
         groups.map(([digest, hs]) => `${digest.slice(0, 19)}: ${hs.sort().join(", ")}`).join(" · ") +
         ` — expected during a key rotation and a finding after one`,
     );
+  }
+
+  // A split is judged from the hosts that sent a digest, so one host without one cannot hide a split;
+  // but agreement among the rest is not agreement of the fleet (#148 decision 4). A silent host's
+  // digest is as old as its last beat and counts as not sent.
+  const everyHostSentDigest = Object.keys(m?.hosts ?? {}).every((host) => {
+    const ageSec = ageOf(host);
+    return !!state.statuses[host]?.artifactTrust?.trustDigest && ageSec !== null && ageSec <= staleAfterSec;
+  });
+  const fleetEvaluated: Partial<Record<ProblemKind, ProblemEvaluation>> = {
+    "trust-ring-split": !m ? "no" : everyHostSentDigest ? "yes" : "no-resolve",
+  };
+
+  // Same-kind findings on one host in one view are one finding; their counts add.
+  // @see "joins same-kind contradictions on one host into one finding with their count" in relay.test.ts
+  const findings: ProblemFinding[] = [];
+  for (const { finding } of reports) {
+    if (!finding) continue;
+    const same = findings.find((f) => f.kind === finding.kind && f.host === finding.host);
+    if (same) same.count += finding.count;
+    else findings.push({ ...finding });
   }
 
   return {
@@ -721,8 +908,12 @@ export function fleetView(
     issuedAt: m?.issuedAt ?? null,
     planHash: state.planHash,
     hosts,
-    problems,
+    problems: reports.map((r) => r.text),
     relayAgeSec: startedAt ? Math.round((now.getTime() - startedAt.getTime()) / 1000) : null,
+    findings,
+    evaluated,
+    fleetEvaluated,
+    observability: { manifest: m !== null, graceActive: relayAgeSec <= staleAfterSec },
   };
 }
 
@@ -863,6 +1054,7 @@ export function handleHeartbeat(
   // merged: a host that reports nothing this beat must not silently keep an older reading alive
   // under a fresh timestamp, because the timestamp is what tells an operator whether to trust it.
   if (hb.membership) state.membership[certCN] = hb.membership;
+  (state.reportedArtifactHash ??= {})[certCN] = hb.applied.artifactHash ?? null;
 
   // H30, and it must run **before** the reference below is rebound. Every check in it compares this
   // beat against what the host said last time, so overwriting the baseline first would leave it
@@ -903,6 +1095,12 @@ export function handleHeartbeat(
       // unchanged kernel" (not normal) are indistinguishable. Omitting it left
       // `artifact-hash-changed` unable to fire at all — the relay's own integration test caught that,
       // and the pure unit tests could not, because they are handed a reference rather than building one.
+      // Trusted only when this process saw the host move from one confirmed generation to this one
+      // on a beat that contradicted nothing. First contact and a null-hash reference are not that.
+      // @see "R9: the first confirm after a restart re-baselines without trust" in relay.test.ts
+      // @see "a new-generation confirm with an unchanged kernel does not earn trust" in relay.test.ts
+      (state.referenceTrusted ??= {})[certCN] = found.length === 0 &&
+        !!reference && reference.hash !== null && reference.generation !== hb.applied.generation;
       state.references[certCN] = {
         generation: hb.applied.generation,
         hash: observed,
