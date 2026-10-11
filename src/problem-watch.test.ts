@@ -119,8 +119,11 @@ describe("problem watch: unobservable cycles hold state", () => {
     delete old.findings;
     assert.deepEqual(readRelayStatus(old), { ok: false, reason: "schema" });
     assert.deepEqual(readRelayStatus(body({ manifest: false })), { ok: false, reason: "no-manifest" });
-    assert.deepEqual(readRelayStatus(body({ findings: [{ kind: "not-a-kind", host: H1 }] })), { ok: false, reason: "schema" });
-    assert.deepEqual(readRelayStatus(body({ evaluated: { [H1]: { "not-a-kind": "yes" } } })), { ok: false, reason: "schema" });
+    for (const field of ["evaluated", "fleetEvaluated"]) {
+      const without = body() as Record<string, unknown>;
+      delete without[field];
+      assert.deepEqual(readRelayStatus(without), { ok: false, reason: "schema" }, field);
+    }
     assert.deepEqual(readRelayStatus(body({ evaluated: { [H1]: { silent: "maybe" as Ev } } })), { ok: false, reason: "schema" });
     assert.deepEqual(readRelayStatus(body({ findings: [{ kind: "silent", host: H1, count: -1 }] })), { ok: false, reason: "schema" });
     assert.equal(readRelayStatus(body()).ok, true);
@@ -220,6 +223,29 @@ describe("problem watch: scope and aliases", () => {
       ["opened za/web/silent"]);
   });
 
+  it("an unknown kind is skipped, not a reason to call the relay unobservable", () => {
+    const ahead = body({
+      findings: [silentOn(H1), { kind: "future-kind", host: H1, count: 1 }, { kind: "future-kind", host: H2, count: 1 }],
+      evaluated: { [H1]: { silent: "yes", "future-kind": "yes" }, [H2]: { silent: "yes", "future-kind": "yes" } },
+      fleetEvaluated: { "trust-ring-split": "yes", "future-fleet-kind": "no" },
+    });
+    const read = readRelayStatus(ahead);
+    assert.equal(read.ok && read.unknownKinds, 2);
+    const r = run(repeat(3, ahead));
+    // Known positive: the known kind in the same answer is judged as usual.
+    assert.deepEqual(r.transitions.map(brief), ["opened za/web/silent"]);
+    assert.deepEqual(r.steps.map((st) => st.snapshot.cycle.unknownKinds), [2, 2, 2]);
+    const [line] = emitLines([r.steps[0]!.snapshot.cycle]);
+    assert.equal((JSON.parse(line ?? "{}") as { unknownKinds?: unknown }).unknownKinds, 2);
+  });
+
+  it("a relay dropped from the alias map takes its problems out of scope, not to resolved", () => {
+    const opened = run([silentH1, silentH1]);
+    const other = parseWatchAliases(JSON.stringify({ relays: { "zone-b.example": "zb" } }), ["zone-b.example"]);
+    const r = run([silentH1], other, opened.state);
+    assert.deepEqual(r.transitions.filter((t) => t.relay === "za").map(brief), ["scope_removed za/web/silent"]);
+  });
+
   it("a host dropped from the alias map is scope_removed even while its relay is unobservable", () => {
     const fewer = parseWatchAliases(JSON.stringify({ relays: { [RELAY]: "za" }, hosts: { [RELAY]: { [H2]: "db" } } }), [RELAY]);
     const opened = run([silentH1, silentH1]);
@@ -241,15 +267,19 @@ describe("problem watch: scope and aliases", () => {
     assert.deepEqual(Object.keys(r.state.keys), []);
   });
 
-  it("unaliased hosts are one fleet problem counting them, never named", () => {
-    const three = (present: boolean) => body({
-      findings: present ? [silentOn(H3), silentOn("h4.zone-a.example")] : [],
-      evaluated: { [H1]: { silent: "yes" }, [H3]: { silent: "yes" }, ...(present ? { "h4.zone-a.example": { silent: "yes" } } : {}) },
+  it("unaliased hosts are counted the same whatever their findings, and never named", () => {
+    const H4 = "h4.zone-a.example";
+    const hosts = (unaliased: string[], withFindings: boolean) => body({
+      findings: withFindings ? unaliased.map(silentOn) : [],
+      evaluated: Object.fromEntries([H1, ...unaliased].map((h) => [h, { silent: "yes" as Ev }])),
     });
-    const r = run([three(true), three(true)]);
-    assert.deepEqual(r.transitions.map((t) => [brief(t), t.count]), [["opened za/_fleet/unaliased-hosts", 2]]);
-    assert.equal(r.steps.at(-1)?.snapshot.cycle.unaliasedHosts, 2);
-    const fewer = run([three(false), three(false)], ALIASES, r.state);
+    const quiet = run([hosts([H3, H4], false), hosts([H3, H4], false)]);
+    const noisy = run([hosts([H3, H4], true), hosts([H3, H4], true)]);
+    assert.deepEqual(noisy.transitions, quiet.transitions);
+    assert.deepEqual(noisy.states, quiet.states);
+    assert.deepEqual(noisy.transitions.map((t) => [brief(t), t.count]), [["opened za/_fleet/unaliased-hosts", 2]]);
+    assert.equal(noisy.steps.at(-1)?.snapshot.cycle.unaliasedHosts, 2);
+    const fewer = run([hosts([H3], true), hosts([H3], false)], ALIASES, noisy.state);
     assert.deepEqual(fewer.states.at(-1)?.map((s) => [s.kind, s.active, s.count]), [["unaliased-hosts", 1, 1]]);
     const none = run([clean, clean], ALIASES, fewer.state);
     assert.deepEqual(none.transitions.map(brief), ["resolved za/_fleet/unaliased-hosts"]);
@@ -297,7 +327,7 @@ describe("problem watch: output", () => {
   const ALLOWED: Record<string, string[]> = {
     "heliopause.problem.state": ["event", "v", "relay", "host", "kind", "active", "count", "observed", "cycle"],
     "heliopause.problem.transition": ["event", "v", "seq", "transition", "relay", "host", "kind", "count"],
-    "heliopause.problem.cycle": ["event", "v", "cycle", "relays", "unaliasedHosts", "skippedTicks"],
+    "heliopause.problem.cycle": ["event", "v", "cycle", "relays", "unaliasedHosts", "unknownKinds", "skippedTicks"],
   };
 
   it("carries only allowed fields, no id, address, value or detail from the relay", () => {
@@ -349,7 +379,7 @@ describe("problem watch: aliases", () => {
       return true;
     });
 
-  it("refuses an alias equal to any label of a real name, ignoring case", () => {
+  it("refuses an alias equal to any label of a name in this alias file or HELIOPAUSE_RELAYS, ignoring case", () => {
     refuses(file({ relays: { [RELAY]: "za" }, hosts: { [RELAY]: { "WEB-01.zone-a.example": "web-01" } } }), [RELAY], "WEB-01", "web-01");
     refuses(file({ relays: { [RELAY]: "zone-a" } }), [RELAY], "zone-a");
     refuses(file({ relays: { [RELAY]: "za" }, hosts: { [RELAY]: { [H1]: "example" } } }), [RELAY], "example");
@@ -401,5 +431,42 @@ describe("problem watch: against fleetView", () => {
     const r = run([view(), view()]);
     assert.deepEqual(r.transitions.map(brief), ["opened za/web/never-reported"]);
     assert.deepEqual(readRelayStatus(JSON.parse(JSON.stringify(fleetView(emptyState(), now)))), { ok: false, reason: "no-manifest" });
+  });
+
+  const NOW = new Date("2026-07-30T01:00:00Z");
+  const LONG_AGO = new Date("2026-07-30T00:00:00Z");
+  const relayState = () => {
+    const s = emptyState();
+    s.manifest = {
+      generation: "g1", issuedAt: "2026-07-30T00:00:00Z", schemaVersion: SCHEMA_VERSION,
+      hosts: { [H1]: { stage: "general", rulesetHash: "sha256:1", confirmTimeoutSec: 60, mustContain: [] } },
+    };
+    return s;
+  };
+  const viewOf = (s: ReturnType<typeof emptyState>, startedAt: Date) =>
+    JSON.parse(JSON.stringify(fleetView(s, NOW, 90, startedAt))) as unknown;
+
+  it("resolves never-reported once fleetView hears from the host", () => {
+    const s = relayState();
+    const opened = run([viewOf(s, LONG_AGO), viewOf(s, LONG_AGO)]);
+    assert.deepEqual(opened.transitions.map(brief), ["opened za/web/never-reported"]);
+    s.lastSeen[H1] = NOW.toISOString();
+    const heard = run([viewOf(s, LONG_AGO), viewOf(s, LONG_AGO)], ALIASES, opened.state);
+    assert.deepEqual(heard.transitions.map(brief), ["resolved za/web/never-reported"]);
+  });
+
+  it("a relay restart with empty statuses holds a silent host's problem instead of resolving it", () => {
+    const before = relayState();
+    before.lastSeen[H1] = new Date(NOW.getTime() - 600_000).toISOString();
+    const opened = run([viewOf(before, LONG_AGO), viewOf(before, LONG_AGO)]);
+    assert.deepEqual(opened.transitions.map(brief), ["opened za/web/silent"]);
+    // The restarted relay: new state, nothing heard yet, inside its grace window.
+    const restarted = relayState();
+    const grace = run(repeat(5, viewOf(restarted, NOW)), ALIASES, opened.state);
+    assert.deepEqual(grace.transitions, []);
+    for (const states of grace.states) assert.deepEqual(states.map((l) => [l.kind, l.active, l.observed]), [["silent", 1, false]]);
+    // After the grace window the host is never-reported, and silent is still not resolved.
+    const after = run(repeat(5, viewOf(restarted, LONG_AGO)), ALIASES, grace.state);
+    assert.deepEqual(after.transitions.map(brief), ["opened za/web/never-reported"]);
   });
 });

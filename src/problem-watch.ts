@@ -9,6 +9,9 @@
  * What `emitLines` writes is aliases, reserved names, kind names, enums, booleans and integers. A
  * relay name, a host id, a finding's `value` and anything else a relay sends are not copied into a
  * line. @see "carries only allowed fields, no id, address, value or detail from the relay" in problem-watch.test.ts
+ *
+ * A host without an alias is counted in one `unaliased-hosts` problem per relay; its own problems do
+ * not reach a line, so they reach no email — only the console shows them.
  */
 import { EnvSpecError } from "./env-spec.ts";
 import type { ProblemEvaluation, ProblemKind } from "./relay.ts";
@@ -79,7 +82,8 @@ function labelsOf(name: string): string[] {
 
 /**
  * Parse the alias file: `{ relays: { name: alias }, hosts: { relayName: { hostId: alias } } }`.
- * `configuredRelays` is the names from `HELIOPAUSE_RELAYS`; every one of them needs an alias.
+ * `configuredRelays` is the names from `HELIOPAUSE_RELAYS`; every one of them needs an alias. An alias
+ * is compared with the names written in this file and in `HELIOPAUSE_RELAYS`, not with a manifest.
  *
  * Refusals name positions, never an id or alias: an alias rejected for equalling a real name would
  * otherwise print that name.
@@ -116,7 +120,7 @@ export function parseWatchAliases(text: string, configuredRelays: readonly strin
       throw new EnvSpecError(`${ALIASES_ENV}: ${where} must match ${ALIAS_RE.source}`);
     }
     if (realLabels.has(alias)) {
-      throw new EnvSpecError(`${ALIASES_ENV}: ${where} equals a label of a real relay or host name`);
+      throw new EnvSpecError(`${ALIASES_ENV}: ${where} equals a label of a name in this file or in HELIOPAUSE_RELAYS`);
     }
     return alias;
   };
@@ -162,16 +166,22 @@ export type RelayRead =
     /** Manifest host → kind → evaluation, as the relay sent it. A missing kind is not `yes`. */
     evaluated: Map<string, Map<ProblemKind, ProblemEvaluation>>;
     fleetEvaluated: Map<ProblemKind, ProblemEvaluation>;
+    /** Distinct kind names this build does not know, skipped in `findings` and both evaluations. */
+    unknownKinds: number;
   }
   | { ok: false; reason: RelayUnobservable };
 
 const SCHEMA = { ok: false, reason: "schema" } as const;
 
-function readEvaluations(v: unknown): Map<ProblemKind, ProblemEvaluation> | null {
+function readEvaluations(v: unknown, unknown: Set<string>): Map<ProblemKind, ProblemEvaluation> | null {
   if (!isObject(v)) return null;
   const out = new Map<ProblemKind, ProblemEvaluation>();
   for (const [kind, ev] of Object.entries(v)) {
-    if (!Object.hasOwn(RELAY_KINDS, kind) || typeof ev !== "string" || !EVALUATIONS.has(ev)) return null;
+    if (!Object.hasOwn(RELAY_KINDS, kind)) {
+      unknown.add(kind);
+      continue;
+    }
+    if (typeof ev !== "string" || !EVALUATIONS.has(ev)) return null;
     out.set(kind as ProblemKind, ev as ProblemEvaluation);
   }
   return out;
@@ -180,6 +190,9 @@ function readEvaluations(v: unknown): Map<ProblemKind, ProblemEvaluation> | null
 /**
  * Check a relay `/status` body for the fields the watch reads. A body without `findings` — a relay
  * older than #148 — is `schema`, not an empty fleet; `observability.manifest: false` is `no-manifest`.
+ * A kind this build does not know — a relay deployed ahead of the manager — is skipped and counted:
+ * only known kinds are walked, so a skipped one can neither open nor resolve anything.
+ * @see "an unknown kind is skipped, not a reason to call the relay unobservable" in problem-watch.test.ts
  */
 export function readRelayStatus(body: unknown): RelayRead {
   if (!isObject(body)) return SCHEMA;
@@ -187,25 +200,30 @@ export function readRelayStatus(body: unknown): RelayRead {
   if (!isObject(obs) || typeof obs.manifest !== "boolean") return SCHEMA;
   if (!Array.isArray(body.findings) || !isObject(body.evaluated)) return SCHEMA;
 
+  const unknown = new Set<string>();
   const findings: { kind: ProblemKind; host: string | null; count: number }[] = [];
   for (const f of body.findings) {
     if (!isObject(f)) return SCHEMA;
     const { kind, host, count } = f;
-    if (typeof kind !== "string" || !Object.hasOwn(RELAY_KINDS, kind)) return SCHEMA;
+    if (typeof kind !== "string") return SCHEMA;
+    if (!Object.hasOwn(RELAY_KINDS, kind)) {
+      unknown.add(kind);
+      continue;
+    }
     if (host !== null && typeof host !== "string") return SCHEMA;
     if (!Number.isSafeInteger(count) || (count as number) < 0) return SCHEMA;
     findings.push({ kind: kind as ProblemKind, host, count: count as number });
   }
   const evaluated = new Map<string, Map<ProblemKind, ProblemEvaluation>>();
   for (const [host, evs] of Object.entries(body.evaluated)) {
-    const read = readEvaluations(evs);
+    const read = readEvaluations(evs, unknown);
     if (!read) return SCHEMA;
     evaluated.set(host, read);
   }
-  const fleetEvaluated = readEvaluations(body.fleetEvaluated);
+  const fleetEvaluated = readEvaluations(body.fleetEvaluated, unknown);
   if (!fleetEvaluated) return SCHEMA;
   if (!obs.manifest) return { ok: false, reason: "no-manifest" };
-  return { ok: true, findings, evaluated, fleetEvaluated };
+  return { ok: true, findings, evaluated, fleetEvaluated, unknownKinds: unknown.size };
 }
 
 // ## The state machine
@@ -255,6 +273,8 @@ export interface CycleLine {
   cycle: number;
   relays: { relay: string; observed: boolean; reason: CycleReason | null; active: number }[];
   unaliasedHosts: number;
+  /** Summed over relays: distinct kind names each relay sent that this build does not know. */
+  unknownKinds: number;
   skippedTicks: number;
 }
 export interface WatchLine {
@@ -290,6 +310,7 @@ export function stepWatch(prev: WatchState, input: WatchCycle): StepResult {
   const handled = new Set<string>();
   const cycleRelays: CycleLine["relays"] = [];
   let unaliasedTotal = 0;
+  let unknownKindsTotal = 0;
 
   const emit = (rec: KeyState, transition: Transition) => {
     next.seq += 1;
@@ -388,6 +409,7 @@ export function stepWatch(prev: WatchState, input: WatchCycle): StepResult {
       }
       apply({ relay, host: FLEET_HOST, kind: "unaliased-hosts", present: unaliased > 0, count: unaliased, ev: "yes" });
       unaliasedTotal += unaliased;
+      unknownKindsTotal += poll.unknownKinds;
       cycleRelays.push({ relay, observed: true, reason: null, active: 0 });
     }
     for (const [k, rec] of Object.entries(next.keys)) {
@@ -422,7 +444,7 @@ export function stepWatch(prev: WatchState, input: WatchCycle): StepResult {
       states,
       cycle: {
         event: "heliopause.problem.cycle", cycle: input.cycle, relays: cycleRelays,
-        unaliasedHosts: unaliasedTotal, skippedTicks: input.skippedTicks ?? 0,
+        unaliasedHosts: unaliasedTotal, unknownKinds: unknownKindsTotal, skippedTicks: input.skippedTicks ?? 0,
       },
     },
   };
@@ -497,7 +519,8 @@ export function emitLines(events: readonly WatchEvent[]): string[] {
             relay: relayAlias(r.relay, event), observed: bool(r.observed, event),
             reason: r.reason === null ? null : oneOf(r.reason, REASONS, event), active: count(r.active, event),
           })),
-          unaliasedHosts: count(c.unaliasedHosts, event), skippedTicks: count(c.skippedTicks, event),
+          unaliasedHosts: count(c.unaliasedHosts, event), unknownKinds: count(c.unknownKinds, event),
+          skippedTicks: count(c.skippedTicks, event),
         });
       }
       case "heliopause.problem.watch": {
