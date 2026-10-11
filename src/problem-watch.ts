@@ -21,6 +21,7 @@ export const CONFIRM_CYCLES = 2;
 /** Cycles a key keeps emitting `active: 0` after it resolves or leaves scope, then is dropped. */
 export const ZERO_TAIL_CYCLES = 20;
 
+// Narrowing this makes `loadWatchState` treat existing state files as broken: it needs a state file migration.
 const ALIAS_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
 const ALIASES_ENV = "HELIOPAUSE_PROBLEM_WATCH_ALIASES_FILE";
 
@@ -277,10 +278,23 @@ export interface CycleLine {
   unknownKinds: number;
   skippedTicks: number;
 }
+export type WatchWhat =
+  | "started" | "stopped" | "state_initialized" | "state_unreadable" | "state_write_failed"
+  | "lock_held" | "lock_acquired" | "lock_error" | "state_pruned" | "alias_collision" | "cycle_failed";
 export interface WatchLine {
   event: "heliopause.problem.watch";
-  what: "started" | "stopped" | "state_initialized" | "state_unreadable" | "state_write_failed" | "lock_held" | "lock_acquired";
+  what: WatchWhat;
+  /** `lock_held` only: seconds since the holder's owner record was written, or null when unreadable. */
+  holderAgeSec?: number | null;
+  /** `state_pruned` only: loaded keys dropped for a kind this build does not know. */
+  unknownKinds?: number;
+  /** `state_pruned` only: loaded keys whose relay or host alias the alias file no longer has; kept, and taken out of scope next cycle. */
+  staleAliases?: number;
+  /** `lock_error` only: the error code, or `other`. */
+  errno?: LockErrno;
 }
+export type LockErrno = "EACCES" | "ENOENT" | "EROFS" | "EPERM" | "EIO" | "other";
+export const LOCK_ERRNOS = new Set<string>(["EACCES", "ENOENT", "EROFS", "EPERM", "EIO"]);
 export type WatchEvent = StateLine | TransitionLine | CycleLine | WatchLine;
 
 export interface StepResult {
@@ -289,7 +303,8 @@ export interface StepResult {
   snapshot: { states: StateLine[]; cycle: CycleLine };
 }
 
-const keyOf = (relay: string, host: string, kind: WatchKind) => JSON.stringify([relay, host, kind]);
+/** The identity of one problem: (relay alias, host alias, kind). */
+export const keyOf = (relay: string, host: string, kind: string) => JSON.stringify([relay, host, kind]);
 
 interface Observation { relay: string; host: string; kind: WatchKind; present: boolean; count: number; ev: ProblemEvaluation }
 
@@ -453,8 +468,12 @@ export function stepWatch(prev: WatchState, input: WatchCycle): StepResult {
 // ## Output
 
 const TRANSITIONS = new Set<string>(["opened", "resolved", "scope_removed"]);
+const LOCK_ERRNO_VALUES = new Set<string>([...LOCK_ERRNOS, "other"]);
 const REASONS = new Set<string>(["unreachable", "schema", "no-manifest", "not-configured"]);
-const WHATS = new Set<string>(["started", "stopped", "state_initialized", "state_unreadable", "state_write_failed", "lock_held", "lock_acquired"]);
+const WHATS = new Set<string>([
+  "started", "stopped", "state_initialized", "state_unreadable", "state_write_failed",
+  "lock_held", "lock_acquired", "lock_error", "state_pruned", "alias_collision", "cycle_failed",
+]);
 
 class OutOfSchema extends Error {
   constructor(event: string) {
@@ -525,10 +544,96 @@ export function emitLines(events: readonly WatchEvent[]): string[] {
       }
       case "heliopause.problem.watch": {
         const w = e as WatchLine;
-        return JSON.stringify({ event, v: 1, what: oneOf(w.what, WHATS, event) });
+        const what = oneOf(w.what, WHATS, event);
+        if (what === "lock_held") {
+          return JSON.stringify({ event, v: 1, what, holderAgeSec: w.holderAgeSec === null ? null : count(w.holderAgeSec, event) });
+        }
+        if (what === "lock_error") {
+          return JSON.stringify({ event, v: 1, what, errno: oneOf(w.errno, LOCK_ERRNO_VALUES, event) });
+        }
+        if (what === "state_pruned") {
+          return JSON.stringify({
+            event, v: 1, what, unknownKinds: count(w.unknownKinds, event), staleAliases: count(w.staleAliases, event),
+          });
+        }
+        return JSON.stringify({ event, v: 1, what });
       }
       default:
         throw new OutOfSchema("problem-watch");
     }
   });
+}
+
+// ## Persisted state
+
+const STATE_VERSION = 1;
+
+/** The state file's text: every key as a record, so the loader re-derives each key from its fields. */
+export function serializeWatchState(state: WatchState): string {
+  return JSON.stringify({ v: STATE_VERSION, seq: state.seq, keys: Object.values(state.keys) }) + "\n";
+}
+
+export type LoadedWatchState =
+  | { ok: true; state: WatchState; unknownKinds: number; staleAliases: number }
+  | { ok: false };
+
+const bounded = (v: unknown, max: number): boolean => Number.isSafeInteger(v) && (v as number) >= 0 && (v as number) <= max;
+
+/**
+ * Read a state file's text against the current alias file. Text that is not this shape is
+ * `ok: false`. A key whose relay or host alias the current alias file does not have is kept and
+ * counted: `stepWatch` takes it out of scope on the next cycle, with `scope_removed` and the zero tail.
+ * A key whose kind this build does not know is dropped and counted — kept, it would be held forever
+ * and `emitLines` would refuse the cycle — so its resolution, after a downgrade, rests on the series
+ * disappearing.
+ * @see "state loader drops unknown kinds and keeps stale aliases for scope removal" in problem-watch-runner.test.ts
+ */
+export function loadWatchState(text: string, aliases: WatchAliases): LoadedWatchState {
+  let doc: unknown;
+  try { doc = JSON.parse(text); } catch { return { ok: false }; }
+  if (!isObject(doc) || doc.v !== STATE_VERSION || !Number.isSafeInteger(doc.seq) || (doc.seq as number) < 0
+    || !Array.isArray(doc.keys) || Object.keys(doc).length !== 3) return { ok: false };
+  const relayByAlias = new Map([...aliases.relays].map(([name, alias]) => [alias, name]));
+  const state: WatchState = { seq: doc.seq as number, keys: {} };
+  let unknownKinds = 0;
+  let staleAliases = 0;
+  for (const r of doc.keys as unknown[]) {
+    if (!isObject(r) || typeof r.relay !== "string" || typeof r.host !== "string" || typeof r.kind !== "string"
+      || typeof r.active !== "boolean" || !bounded(r.openStreak, CONFIRM_CYCLES) || !bounded(r.resolveStreak, CONFIRM_CYCLES)
+      || !bounded(r.count, Number.MAX_SAFE_INTEGER) || !bounded(r.tail, ZERO_TAIL_CYCLES)) return { ok: false };
+    const k = keyOf(r.relay, r.host, r.kind);
+    if (Object.hasOwn(state.keys, k)) return { ok: false };
+    if (!WATCH_KINDS.has(r.kind)) {
+      unknownKinds += 1;
+      continue;
+    }
+    if (!ALIAS_RE.test(r.relay) || !(ALIAS_RE.test(r.host) || RESERVED_HOSTS.has(r.host))) return { ok: false };
+    const relayName = relayByAlias.get(r.relay);
+    const hostAliases = relayName === undefined ? null : new Set(aliases.hosts.get(relayName)?.values() ?? []);
+    if (!hostAliases || !(RESERVED_HOSTS.has(r.host) || hostAliases.has(r.host))) staleAliases += 1;
+    state.keys[k] = {
+      relay: r.relay, host: r.host, kind: r.kind as WatchKind, active: r.active,
+      openStreak: r.openStreak as number, resolveStreak: r.resolveStreak as number,
+      count: r.count as number, tail: r.tail as number,
+    };
+  }
+  return { ok: true, state, unknownKinds, staleAliases };
+}
+
+/**
+ * Whether any alias equals, ignoring case, a label of a host id in some relay's `evaluated` — the
+ * hosts its manifest names. `parseWatchAliases` compares aliases with the names it is given at start;
+ * a manifest changes while the manager runs, so this is asked of every cycle's answers.
+ * @see "an alias equal to a manifest host label turns the watch off without stopping the manager" in problem-watch-manager.test.ts
+ */
+export function manifestAliasCollision(aliases: WatchAliases, relays: ReadonlyMap<string, RelayRead>): boolean {
+  const all = new Set<string>(aliases.relays.values());
+  for (const hostMap of aliases.hosts.values()) for (const alias of hostMap.values()) all.add(alias);
+  for (const read of relays.values()) {
+    if (!read.ok) continue;
+    for (const hostId of read.evaluated.keys()) {
+      if (labelsOf(hostId).some((l) => all.has(l))) return true;
+    }
+  }
+  return false;
 }

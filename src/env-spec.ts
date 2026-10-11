@@ -167,6 +167,8 @@ export const ENV_BOUNDS = {
   HELIOPAUSE_PUBLISH_TIMEOUT_MS: { min: 1_000, max: 600_000, fallback: 30_000 },
   HELIOPAUSE_PLAN_TTL_SEC: { min: 60, max: 86_400, fallback: 600 },
   HELIOPAUSE_MAX_PENDING_PLANS: { min: 1, max: 1024, fallback: 32 },
+  /** Seconds between problem watch cycles (#148). */
+  HELIOPAUSE_PROBLEM_WATCH_INTERVAL_SEC: { min: 10, max: 60, fallback: 30 },
 
   /**
    * How long one policy module gets to import before the renderer gives up on it at startup.

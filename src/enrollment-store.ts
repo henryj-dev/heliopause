@@ -724,7 +724,8 @@ export function saveEnrollmentDocument(path: string, document: EnrollmentDocumen
   return valid;
 }
 
-function discardOwnedPath(path: string, fd: number): void {
+/** Unlink `path` only if it is still the inode `fd` opened, then close `fd`. */
+export function discardOwnedPath(path: string, fd: number): void {
   try {
     const owned = fstatSync(fd);
     const current = lstatSync(path);

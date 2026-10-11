@@ -107,6 +107,8 @@ import {
   startHostDeregistrationPolicyWorker,
   type PolicyWorkerPlan,
 } from "./host-deregistration-policy-worker.ts";
+import { readRelayStatus, type RelayRead } from "./problem-watch.ts";
+import { startProblemWatch, type ProblemWatchDeps } from "./problem-watch-runner.ts";
 import { siteView, type RelaySource, type RelayResult, type SiteView } from "./manager.ts";
 import { bundleFromPlan, planHash, validateBundle, type PlanBundle } from "./bundle.ts";
 import { zoneMismatch } from "./site-zone.ts";
@@ -447,6 +449,11 @@ export interface ManagerOptions {
     retiredHostsPath: string;
     intervalMs?: number;
   };
+  /**
+   * The problem watch (#148), from `problemWatchFromEnv`. Unset starts no timer and touches no file.
+   * `poll` defaults to `pollRelays` over `relays`; the other seams default to the real ones.
+   */
+  problemWatch?: Omit<ProblemWatchDeps, "poll"> & { poll?: ProblemWatchDeps["poll"] };
   /**
    * Where to read Cilium's policy-map counters from, if a reader is deployed.
    *
@@ -1150,7 +1157,20 @@ async function readChecks(
   }
 }
 
-export async function startManager(opts: ManagerOptions): Promise<{ server: Server }> {
+/**
+ * A shutdown signal: the problem watch first — synchronously, so its lock is released before the
+ * process can exit — then the server, whose close waits for open connections.
+ * @see "SIGTERM with a poll in flight releases the lock before exit and the late poll writes nothing" in problem-watch-runner.test.ts
+ */
+export function shutdownManager(
+  started: { server: { close(callback: () => void): unknown }; stopProblemWatch: () => void },
+  exit: (code: number) => void,
+): void {
+  started.stopProblemWatch();
+  started.server.close(() => exit(0));
+}
+
+export async function startManager(opts: ManagerOptions): Promise<{ server: Server; stopProblemWatch: () => void }> {
   // No prefix here: `logEvent` and `log` add `[manager] `, and a caller's `opts.log` receives the line
   // with it. Adding it here as well printed `[manager] [manager] …` on the first line of every message (#163).
   const writeLog = opts.log ?? ((m: string) => console.error(m));
@@ -4743,8 +4763,25 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     });
     server.once("close", stopPolicyWorker);
   }
+  let stopProblemWatch = (): void => {};
+  if (opts.problemWatch) {
+    const relays = opts.relays;
+    const poll = opts.problemWatch.poll ?? (async () => new Map<string, RelayRead>(
+      (await pollRelays(relays, timeoutMs)).map((result) => [
+        result.name,
+        result.ok ? readRelayStatus(result.view) : { ok: false, reason: "unreachable" },
+      ]),
+    ));
+    try {
+      stopProblemWatch = startProblemWatch({ ...opts.problemWatch, poll }).stop;
+    } catch (error) {
+      server.close();
+      throw error;
+    }
+    server.once("close", stopProblemWatch);
+  }
 
-  return { server };
+  return { server, stopProblemWatch };
 }
 
 /** Unreadable is not zero. The chrome treats a missing field as "no badge". */
