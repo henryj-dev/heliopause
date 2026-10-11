@@ -6,7 +6,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { contains, excludes } from "./test-util.ts";
-import { emptyState, fleetView, handleHeartbeat, type RelayState } from "./relay.ts";
+import { emptyState, fleetView, handleHeartbeat, type ProblemKind, type RelayState } from "./relay.ts";
 import { SCHEMA_VERSION, type Heartbeat, type HeartbeatReply, type Manifest } from "./protocol.ts";
 
 const GEN = "6f98e0c";
@@ -1687,3 +1687,487 @@ describe("the agent certificate each heartbeat presented", () => {
     assert.equal(s.agentCerts["h-canary"]!.observedAt, AT);
   });
 });
+
+// ── #148: a finding per problem, and whether each kind could be judged ───────
+//
+// The structured half of `problems`, for a consumer that alerts when a problem opens and again when
+// it ends. The second half is the harder one: a finding disappearing is evidence only where the view
+// could judge that kind, and `evaluated` says where.
+
+describe("structured findings (#148)", () => {
+  const NOW = new Date("2026-07-30T00:01:00Z");
+  const LONG_AGO = new Date(NOW.getTime() - 3600_000);
+  const FLOOR = [0, 6, 0] as const;
+  const DIGEST_A = "sha256:aaaaaaaaaaaaaaaaaaaa";
+  const DIGEST_B = "sha256:bbbbbbbbbbbbbbbbbbbb";
+
+  // Written out here, once, and not derived from `ProblemKind` or from what `fleetView` returns: a
+  // kind removed from the code must fail the catalog, and a kind removed from this list must too.
+  const EXPECTED_HOST_KINDS = [
+    "rolled-back", "refused-generation", "table-absent", "ruleset-changed", "published-ports",
+    "cilium-nodeport-unrestricted", "contradiction-artifact-hash-changed",
+    "contradiction-artifact-hash-wrong", "contradiction-unknown-generation",
+    "contradiction-kernel-unchanged", "unexpected-filters", "workload-unreported",
+    "workload-not-confirmed", "workload-objects-missing", "workload-document-mismatch",
+    "agent-version-behind", "break-glass-authorization", "artifact-trust-unreadable",
+    "authorization-unnamed", "never-reported", "silent",
+  ];
+  const EXPECTED_FLEET_KINDS = ["trust-ring-split"];
+
+  const WORKLOAD = {
+    policiesHash: "sha256:w1",
+    cluster: "dev",
+    mustExist: ["util/hp-dev-p700"],
+    confirmTimeoutSec: 300,
+    policyCount: 1,
+    watchSelectors: { namespaces: ["arc-runners"], labels: ["app=idp"] },
+  };
+  const entry = (host: string, withWorkload = false): Manifest["hosts"][string] => ({
+    stage: "general",
+    rulesetHash: `sha256:${host}`,
+    confirmTimeoutSec: 60,
+    mustContain: [],
+    ...(withWorkload ? { workload: WORKLOAD } : {}),
+  });
+  const trustOf = (over: Partial<NonNullable<Heartbeat["artifactTrust"]>> = {}) => ({
+    managerKeyIds: ["mk-1"],
+    breakGlassKeyIds: ["bg-1"],
+    trustDigest: DIGEST_A,
+    currentKeyId: "mk-1",
+    currentPayloadHash: "sha256:pppp",
+    currentAuthorizationMode: "two-person" as const,
+    currentAuthorizedAt: "2026-07-29T00:00:00Z",
+    currentPlanHash: "sha256:hhhh",
+    ...over,
+  });
+  /** A healthy beat: confirmed on `gen`, the artifact the manifest publishes, a current agent. */
+  const good = (host: string, over: HeartbeatOverride = {}, gen = GEN): Heartbeat =>
+    hb({
+      host,
+      agentVersion: "0.6.0",
+      artifactTrust: trustOf(),
+      ...over,
+      applied: {
+        generation: gen, state: "confirmed", artifactHash: `sha256:${host}`, observedHash: "dump:1",
+        ...(over.applied ?? {}),
+      },
+    });
+  const withoutTrust = (b: Heartbeat): Heartbeat => {
+    delete (b as { artifactTrust?: unknown }).artifactTrust;
+    return b;
+  };
+  const view = (
+    s: RelayState,
+    now = NOW,
+    startedAt: Date | undefined = LONG_AGO,
+    floor: readonly [number, number, number] | undefined = FLOOR,
+  ) => fleetView(s, now, 90, startedAt, floor);
+  const stateWith = (hosts: Record<string, Manifest["hosts"][string]>): RelayState => {
+    const s = emptyState();
+    s.manifest = { generation: GEN, issuedAt: AT, schemaVersion: SCHEMA_VERSION, hosts };
+    return s;
+  };
+  const one = (host: string, b: Heartbeat, withWorkload = false) => () => {
+    const s = stateWith({ [host]: entry(host, withWorkload) });
+    handleHeartbeat(s, host, b, AT);
+    return s;
+  };
+
+  /** Every kind at once, one host per finding where it can be. */
+  function catalog(): RelayState {
+    const wl = ["c-wl-unrep", "c-wl-notconf", "c-wl-missing", "c-wl-doc"];
+    const names = [
+      "c-rolled", "c-refused", "c-table", "c-drift", "c-ports", "c-cilium", "c-intr", "c-contra",
+      "c-contra2", "c-filters", ...wl, "c-old", "c-bg", "c-trusterr", "c-unnamed", "c-never",
+      "c-silent", "c-ring",
+    ];
+    const s = stateWith(Object.fromEntries(names.map((n) => [n, entry(n, wl.includes(n))])));
+    const beat = (b: Heartbeat, at = AT) => handleHeartbeat(s, b.host, b, at);
+    beat(good("c-rolled", { applied: { state: "rolled-back", observedHash: null, detail: "baseline absent" } }));
+    beat(good("c-refused", { lastRefusal: { generation: "g-next", reason: "schema too new", at: AT } }));
+    beat(good("c-table", { applied: { observedHash: null, table: "absent", detail: "rebooted" } }));
+    beat(good("c-drift"));
+    beat(good("c-drift", { applied: { observedHash: "dump:2" } }));
+    beat(good("c-ports", { publishedPorts: ["tcp 8080 -> 192.0.2.10:80"] }));
+    beat(good("c-cilium", {
+      ciliumExposure: { nodePortAddresses: [], services: ["HostPort 192.0.2.20:443/TCP web/web"] },
+    }));
+    beat(good("c-intr", {
+      events: [{
+        at: AT, table: "inet heliopause", raw: "add rule inet heliopause input accept", pid: 7, process: "nft",
+        byAgent: false,
+      }],
+    }));
+    beat(good("c-contra", { applied: { artifactHash: "sha256:a1" } }));
+    beat(good("c-contra", { applied: { artifactHash: "sha256:a2" } }));
+    beat(good("c-contra2", { applied: { artifactHash: "sha256:o" } }, "g-old"));
+    beat(good("c-contra2", { applied: { artifactHash: "sha256:x" } }, "g-other"));
+    beat(good("c-filters", { foreignFilters: ["inet firewalld"] }));
+    beat(good("c-wl-unrep"));
+    beat(good("c-wl-notconf", {
+      workload: { state: "rolled-back", policiesHash: null, observed: [], detail: "absent after apply" },
+    }));
+    beat(good("c-wl-missing", { workload: { state: "confirmed", policiesHash: "sha256:w1", observed: [] } }));
+    beat(good("c-wl-doc", {
+      workload: { state: "confirmed", policiesHash: "sha256:other", observed: ["util/hp-dev-p700"] },
+    }));
+    beat(good("c-old", { agentVersion: "0.5.0" }));
+    beat(good("c-bg", { artifactTrust: trustOf({ currentAuthorizationMode: "break-glass" }) }));
+    beat(withoutTrust(good("c-trusterr", { artifactTrustError: "trust directory is not configured" })));
+    beat(good("c-unnamed", { artifactTrust: trustOf({ currentAuthorizationMode: null, currentAuthorizedAt: null }) }));
+    beat(good("c-silent"), "2026-07-29T23:50:00Z");
+    beat(good("c-ring", { artifactTrust: trustOf({ trustDigest: DIGEST_B }) }));
+    return s;
+  }
+
+  it("the catalog raises every kind, and only the kinds written down here", () => {
+    assert.equal(EXPECTED_HOST_KINDS.length + EXPECTED_FLEET_KINDS.length, 22);
+    const v = view(catalog());
+    assert.deepEqual(
+      [...new Set(v.findings.map((f) => f.kind))].sort(),
+      [...EXPECTED_HOST_KINDS, ...EXPECTED_FLEET_KINDS].sort(),
+    );
+    for (const [host, ev] of Object.entries(v.evaluated)) {
+      assert.deepEqual(Object.keys(ev).sort(), [...EXPECTED_HOST_KINDS].sort(), host);
+    }
+    assert.deepEqual(Object.keys(v.fleetEvaluated), EXPECTED_FLEET_KINDS);
+  });
+
+  it("problems strings are unchanged by structured findings", () => {
+    // Captured from `fleetView` at 029831d — before findings existed — run on this same catalog. What
+    // this pins is that the change reworded nothing.
+    assert.deepEqual(view(catalog()).problems, CATALOG_PROBLEMS_BEFORE_148);
+  });
+
+  it("every finding has its problems line, and only the intrusion line has no finding", () => {
+    // Independent of `fleetView`: which words each kind's line carries.
+    const said: Record<string, string> = {
+      "rolled-back": "rolled back", "refused-generation": "refused generation", "table-absent": "table is absent",
+      "ruleset-changed": "no longer matches", "published-ports": "published by another table",
+      "cilium-nodeport-unrestricted": "nodeport-addresses", "contradiction-artifact-hash-changed": "earlier reported the same",
+      "contradiction-artifact-hash-wrong": "manifest publishes", "contradiction-unknown-generation": "never served",
+      "contradiction-kernel-unchanged": "identical kernel dump", "unexpected-filters": "also filters here",
+      "workload-unreported": "not reported the workload", "workload-not-confirmed": "workload half is",
+      "workload-objects-missing": "are not in", "workload-document-mismatch": "applied something else",
+      "agent-version-behind": "floor", "break-glass-authorization": "break-glass",
+      "artifact-trust-unreadable": "signing trust", "authorization-unnamed": "cannot name",
+      "never-reported": "never reported", silent: "silent for", "trust-ring-split": "may sign",
+    };
+    const v = view(catalog());
+    for (const f of v.findings) {
+      const line = v.problems.find((p) => p.includes(said[f.kind]!) && (f.host === null || p.startsWith(`${f.host}: `)));
+      assert.ok(line, `no problems line for ${f.kind} on ${f.host}`);
+    }
+    assert.equal(v.problems.length, v.findings.length + 1);
+  });
+
+  it("intrusion events stay a problems line with no finding", () => {
+    const s = one("c-intr", good("c-intr", {
+      events: [{ at: AT, table: "inet heliopause", raw: "add rule", byAgent: false }],
+    }))();
+    const v = view(s);
+    assert.equal(v.problems.length, 1);
+    contains(v.problems[0]!, "not made by the agent");
+    assert.deepEqual(v.findings, []);
+  });
+
+  it("carries counts as integers and no prose, detail, address or digest in a value", () => {
+    const v = view(catalog());
+    const byKind = Object.fromEntries(v.findings.map((f) => [f.kind, f]));
+    assert.equal(byKind["published-ports"]!.count, 1);
+    assert.equal(byKind["cilium-nodeport-unrestricted"]!.count, 1);
+    assert.equal(byKind["unexpected-filters"]!.count, 1);
+    assert.equal(byKind["workload-objects-missing"]!.count, 1);
+    assert.equal(byKind["workload-objects-missing"]!.value, null);
+    assert.equal(byKind["refused-generation"]!.value, "g-next");
+    assert.equal(byKind["table-absent"]!.value, GEN);
+    assert.equal(byKind["workload-not-confirmed"]!.value, "rolled-back");
+    assert.equal(byKind["authorization-unnamed"]!.value, GEN);
+    assert.deepEqual(byKind["trust-ring-split"], { kind: "trust-ring-split", host: null, value: "18,1", count: 2 });
+    for (const f of v.findings) {
+      assert.ok(Number.isInteger(f.count), `${f.kind} count ${f.count}`);
+      for (const banned of ["192.0.2.", "sha256:", "rebooted", "schema too new", "firewalld", "util/", "dump:"]) {
+        assert.ok(!(f.value ?? "").includes(banned), `${f.kind} value carries ${banned}`);
+      }
+    }
+  });
+
+  it("joins same-kind contradictions on one host into one finding with their count", () => {
+    const s = one("c-a", good("c-a"))();
+    s.contradictions["c-a"] = [
+      { host: "c-a", kind: "unknown-generation", certainty: "certain", detail: "one" },
+      { host: "c-a", kind: "unknown-generation", certainty: "certain", detail: "two" },
+    ];
+    const v = view(s);
+    assert.equal(v.problems.length, 2);
+    assert.deepEqual(v.findings, [{ kind: "contradiction-unknown-generation", host: "c-a", value: null, count: 2 }]);
+  });
+
+  it("silent finding carries no elapsed seconds", () => {
+    const s = catalog();
+    const a = view(s, NOW);
+    const b = view(s, new Date(NOW.getTime() + 20_000));
+    // Known positive: the prose does move between the two.
+    assert.notEqual(a.problems.find((p) => p.startsWith("c-silent")), b.problems.find((p) => p.startsWith("c-silent")));
+    assert.deepEqual(a.findings, b.findings);
+  });
+
+  it("a relay without a manifest reports manifest:false rather than an empty fleet", () => {
+    const v = view(emptyState());
+    assert.deepEqual(v.findings, []);
+    assert.equal(v.observability.manifest, false);
+    assert.equal(v.fleetEvaluated["trust-ring-split"], "no");
+    // Known positive: the same relay with a manifest says so.
+    assert.equal(view(state()).observability.manifest, true);
+  });
+
+  it("says the grace window is active while the relay is younger than the silence threshold", () => {
+    assert.equal(view(state(), NOW, new Date(NOW.getTime() - 5_000)).observability.graceActive, true);
+    assert.equal(view(state(), NOW, LONG_AGO).observability.graceActive, false);
+  });
+
+  // ## R8 — the evaluation table
+  //
+  // One case per input the plan's table names: the state, the value `evaluated` must hold for that
+  // kind, and whether that kind's finding is present.
+  type Case = {
+    kind: ProblemKind; why: string; build: () => RelayState;
+    floor?: readonly [number, number, number] | undefined; expect: string; finding: boolean;
+  };
+  const unheard = () => stateWith({ h: entry("h") });
+  const exposed = { nodePortAddresses: [], services: ["HostPort 192.0.2.20:443/TCP web/web"] };
+  const cases: Case[] = [
+    { kind: "rolled-back", why: "never reported", build: unheard, expect: "no", finding: false },
+    { kind: "refused-generation", why: "never reported", build: unheard, expect: "no", finding: false },
+    { kind: "table-absent", why: "agent too old to report a table", build: one("h", good("h")), expect: "no", finding: false },
+    { kind: "table-absent", why: "table unread", build: one("h", good("h", { applied: { table: "unread" } })), expect: "no", finding: false },
+    {
+      kind: "table-absent", why: "pending re-apply",
+      build: one("h", good("h", { applied: { state: "pending", table: "present" } })), expect: "no-resolve", finding: false,
+    },
+    { kind: "ruleset-changed", why: "reference taken on first contact", build: one("h", good("h")), expect: "no-resolve", finding: false },
+    { kind: "published-ports", why: "not reported", build: one("h", good("h")), expect: "no", finding: false },
+    { kind: "cilium-nodeport-unrestricted", why: "not reported", build: one("h", good("h")), expect: "no", finding: false },
+    {
+      kind: "cilium-nodeport-unrestricted", why: "workload not confirmed on this generation",
+      build: one("h", good("h", {
+        ciliumExposure: exposed, workload: { state: "pending", policiesHash: "sha256:w1", observed: null },
+      }), true),
+      expect: "no", finding: true,
+    },
+    {
+      kind: "contradiction-artifact-hash-wrong", why: "no artifact hash",
+      build: one("h", good("h", { applied: { artifactHash: null } })), expect: "no", finding: false,
+    },
+    { kind: "contradiction-artifact-hash-wrong", why: "not on this generation", build: one("h", good("h", {}, "g-old")), expect: "no", finding: false },
+    { kind: "contradiction-artifact-hash-changed", why: "an event, replaced by the next beat", build: one("h", good("h")), expect: "no-resolve", finding: false },
+    { kind: "contradiction-unknown-generation", why: "an event, replaced by the next beat", build: one("h", good("h")), expect: "no-resolve", finding: false },
+    { kind: "contradiction-kernel-unchanged", why: "an event, replaced by the next beat", build: one("h", good("h")), expect: "no-resolve", finding: false },
+    { kind: "unexpected-filters", why: "not reported", build: one("h", good("h")), expect: "no", finding: false },
+    { kind: "workload-unreported", why: "older generation", build: one("h", good("h", {}, "g-old"), true), expect: "no", finding: false },
+    {
+      kind: "workload-not-confirmed", why: "older generation",
+      build: one("h", good("h", { workload: { state: "rolled-back", policiesHash: null, observed: [] } }, "g-old"), true),
+      expect: "no", finding: false,
+    },
+    {
+      kind: "workload-objects-missing", why: "workload pending",
+      build: one("h", good("h", { workload: { state: "pending", policiesHash: "sha256:w1", observed: [] } }), true),
+      expect: "no", finding: false,
+    },
+    {
+      kind: "workload-objects-missing", why: "cluster not read back",
+      build: one("h", good("h", { workload: { state: "confirmed", policiesHash: "sha256:w1", observed: null } }), true),
+      expect: "no-resolve", finding: true,
+    },
+    {
+      kind: "workload-document-mismatch", why: "workload pending",
+      build: one("h", good("h", { workload: { state: "pending", policiesHash: "sha256:other", observed: [] } }), true),
+      expect: "no", finding: false,
+    },
+    {
+      kind: "workload-document-mismatch", why: "no document hash",
+      build: one("h", good("h", { workload: { state: "confirmed", policiesHash: null, observed: ["util/hp-dev-p700"] } }), true),
+      expect: "no", finding: false,
+    },
+    { kind: "agent-version-behind", why: "no floor", build: one("h", good("h", { agentVersion: "0.1.0" })), floor: undefined, expect: "no", finding: false },
+    { kind: "break-glass-authorization", why: "trust not sent", build: one("h", withoutTrust(good("h"))), expect: "no", finding: false },
+    {
+      kind: "break-glass-authorization", why: "trust unreadable",
+      build: one("h", withoutTrust(good("h", { artifactTrustError: "unreadable" }))), expect: "no", finding: false,
+    },
+    { kind: "artifact-trust-unreadable", why: "never reported", build: unheard, expect: "no", finding: false },
+    {
+      kind: "authorization-unnamed", why: "not confirmed",
+      build: one("h", good("h", { applied: { state: "pending" }, artifactTrust: trustOf({ currentAuthorizationMode: null }) })),
+      expect: "no", finding: false,
+    },
+    {
+      kind: "authorization-unnamed", why: "trust unreadable",
+      build: one("h", withoutTrust(good("h", { artifactTrustError: "unreadable" }))), expect: "no", finding: false,
+    },
+    { kind: "silent", why: "not heard from since this process started", build: unheard, expect: "no", finding: false },
+  ];
+
+  it("every kind whose input is null or absent is not evaluated unless absence is itself the finding", () => {
+    // Every host kind written down above has a case here; `never-reported` is judged by the grace
+    // window and has its own test below.
+    const covered = new Set<string>(cases.map((c) => c.kind));
+    assert.deepEqual(EXPECTED_HOST_KINDS.filter((k) => !covered.has(k) && k !== "never-reported"), []);
+    for (const c of cases) {
+      const v = fleetView(c.build(), NOW, 90, LONG_AGO, "floor" in c ? c.floor : FLOOR);
+      assert.equal(v.evaluated.h![c.kind], c.expect, `${c.kind}: ${c.why}`);
+      assert.equal(v.findings.some((f) => f.kind === c.kind), c.finding, `${c.kind}: ${c.why} — finding`);
+    }
+  });
+
+  it("never-reported is not evaluated inside the grace window, and is after it", () => {
+    const s = unheard();
+    assert.equal(view(s, NOW, new Date(NOW.getTime() - 5_000)).evaluated.h!["never-reported"], "no");
+    const after = view(s, NOW, LONG_AGO);
+    assert.equal(after.evaluated.h!["never-reported"], "yes");
+    assert.ok(after.findings.some((f) => f.kind === "never-reported"));
+  });
+
+  it("agent-version: a missing version with a floor is a finding, judged", () => {
+    // The exception to the rule above: here absence is the finding.
+    const b = good("h");
+    delete (b as { agentVersion?: unknown }).agentVersion;
+    const v = view(one("h", b)());
+    assert.equal(v.evaluated.h!["agent-version-behind"], "yes");
+    assert.ok(v.findings.some((f) => f.kind === "agent-version-behind"));
+  });
+
+  it("break-glass: trust turning unreadable opens artifact-trust-unreadable and does not resolve break-glass", () => {
+    const s = one("h", good("h", { artifactTrust: trustOf({ currentAuthorizationMode: "break-glass" }) }))();
+    const before = view(s);
+    assert.ok(before.findings.some((f) => f.kind === "break-glass-authorization"));
+    assert.equal(before.evaluated.h!["break-glass-authorization"], "yes");
+    handleHeartbeat(s, "h", withoutTrust(good("h", { artifactTrustError: "unreadable" })), AT);
+    const after = view(s);
+    assert.equal(after.findings.some((f) => f.kind === "break-glass-authorization"), false);
+    assert.equal(after.evaluated.h!["break-glass-authorization"], "no");
+    assert.ok(after.findings.some((f) => f.kind === "artifact-trust-unreadable"));
+    assert.equal(after.evaluated.h!["artifact-trust-unreadable"], "yes");
+  });
+
+  it("a silent host judges nothing but its silence", () => {
+    const s = unheard();
+    handleHeartbeat(s, "h", good("h", { publishedPorts: [] }), "2026-07-29T23:50:00Z");
+    const ev = view(s).evaluated.h!;
+    for (const kind of EXPECTED_HOST_KINDS) {
+      const want = kind === "silent" || kind === "never-reported" ? "yes" : "no";
+      assert.equal(ev[kind as ProblemKind], want, kind);
+    }
+    // Known positive: the same beat, recent, judges published-ports.
+    assert.equal(view(one("h", good("h", { publishedPorts: [] }))()).evaluated.h!["published-ports"], "yes");
+  });
+
+  it("a host unheard since restart judges nothing but never-reported, during and after the grace window", () => {
+    const s = unheard();
+    for (const startedAt of [new Date(NOW.getTime() - 5_000), LONG_AGO]) {
+      const ev = view(s, NOW, startedAt).evaluated.h!;
+      for (const kind of EXPECTED_HOST_KINDS) {
+        if (kind === "never-reported") continue;
+        assert.equal(ev[kind as ProblemKind], "no", `${kind} at relay start ${startedAt.toISOString()}`);
+      }
+    }
+  });
+
+  it("workload findings are held while the workload half is pending on this generation", () => {
+    const ev = view(one("h", good("h", { workload: { state: "pending", policiesHash: "sha256:w1", observed: [] } }), true)())
+      .evaluated.h!;
+    assert.equal(ev["workload-objects-missing"], "no");
+    assert.equal(ev["workload-document-mismatch"], "no");
+    // Known positive: confirmed with everything present judges both.
+    const ok = view(one("h", good("h", {
+      workload: { state: "confirmed", policiesHash: "sha256:w1", observed: ["util/hp-dev-p700"] },
+    }), true)()).evaluated.h!;
+    assert.equal(ok["workload-objects-missing"], "yes");
+    assert.equal(ok["workload-document-mismatch"], "yes");
+  });
+
+  it("trust-ring-split still opens with a host missing its digest, but is not resolvable", () => {
+    const s = stateWith({ a: entry("a"), b: entry("b"), c: entry("c") });
+    handleHeartbeat(s, "a", good("a"), AT);
+    handleHeartbeat(s, "b", good("b", { artifactTrust: trustOf({ trustDigest: DIGEST_B }) }), AT);
+    handleHeartbeat(s, "c", withoutTrust(good("c")), AT);
+    const v = view(s);
+    assert.ok(v.findings.some((f) => f.kind === "trust-ring-split"));
+    assert.equal(v.fleetEvaluated["trust-ring-split"], "no-resolve");
+    // Known positive: every host reporting a digest makes it judged.
+    handleHeartbeat(s, "c", good("c"), AT);
+    assert.equal(view(s).fleetEvaluated["trust-ring-split"], "yes");
+    // A digest from a host that has since gone silent is as old as its last beat.
+    handleHeartbeat(s, "c", good("c"), "2026-07-29T23:50:00Z");
+    assert.equal(view(s).fleetEvaluated["trust-ring-split"], "no-resolve");
+  });
+
+  // ## R9 — whether the drift reference can be trusted
+
+  it("R9: the first confirm after a restart re-baselines without trust", () => {
+    // Before the restart: a drift. After it, the same tampered dump is the first thing this process
+    // sees, so it becomes the reference — the finding disappears, and that must not read as resolved.
+    const before = one("h", good("h"))();
+    handleHeartbeat(before, "h", good("h", { applied: { observedHash: "dump:tampered" } }), AT);
+    assert.ok(view(before).findings.some((f) => f.kind === "ruleset-changed"));
+
+    const restarted = one("h", good("h", { applied: { observedHash: "dump:tampered" } }))();
+    assert.equal(restarted.referenceTrusted.h, false);
+    const v = view(restarted);
+    assert.equal(v.findings.some((f) => f.kind === "ruleset-changed"), false);
+    assert.equal(v.evaluated.h!["ruleset-changed"], "no-resolve");
+    // A new change on top of it still opens.
+    handleHeartbeat(restarted, "h", good("h", { applied: { observedHash: "dump:3" } }), AT);
+    assert.ok(view(restarted).findings.some((f) => f.kind === "ruleset-changed"));
+  });
+
+  it("R9: a new generation confirmed in this process re-baselines with trust, and drift then opens and resolves", () => {
+    const s = one("h", good("h", {}, "g-old"))();
+    handleHeartbeat(s, "h", good("h", { applied: { observedHash: "dump:2" } }), AT);
+    assert.equal(s.referenceTrusted.h, true);
+    handleHeartbeat(s, "h", good("h", { applied: { observedHash: "dump:3" } }), AT);
+    const open = view(s);
+    assert.ok(open.findings.some((f) => f.kind === "ruleset-changed"));
+    assert.equal(open.evaluated.h!["ruleset-changed"], "yes");
+    handleHeartbeat(s, "h", good("h", { applied: { observedHash: "dump:2" } }), AT);
+    const resolved = view(s);
+    assert.equal(resolved.findings.some((f) => f.kind === "ruleset-changed"), false);
+    assert.equal(resolved.evaluated.h!["ruleset-changed"], "yes");
+  });
+
+  it("R9: a reference with a null hash is not trusted — reached here only by writing the reference directly", () => {
+    // `handleHeartbeat` never stores a null hash, so nothing in this file reaches this branch through
+    // heartbeats alone.
+    const s = unheard();
+    s.references.h = { generation: "g-old", hash: null, artifactHash: null };
+    handleHeartbeat(s, "h", good("h"), AT);
+    assert.equal(s.referenceTrusted.h, false);
+  });
+});
+
+const CATALOG_PROBLEMS_BEFORE_148 = [
+  "c-rolled: rolled back — baseline absent",
+  "c-refused: refused generation g-next — schema too new",
+  "c-table: confirmed generation 6f98e0c but its table is absent — rebooted",
+  "c-drift: ruleset no longer matches the dump it confirmed",
+  "c-ports: 1 port(s) are published by another table and bypass this ruleset (DNAT on prerouting, before any input hook): tcp 8080 -> 192.0.2.10:80",
+  "c-cilium: Cilium nodeport-addresses is unrestricted; 1 eBPF HostPort/NodePort frontend(s) bypass this nftables ruleset: HostPort 192.0.2.20:443/TCP web/web",
+  "c-intr: 1 change(s) to its ruleset were not made by the agent — latest 2026-07-30T00:00:00Z pid=7 (nft): add rule inet heliopause input accept",
+  "c-contra: reporting contradicts itself — reported generation 6f98e0c with artifact sha256:a2 but earlier reported the same generation with sha256:a1 — a generation names one artifact per host, so one of those reports was false",
+  "c-contra: reporting contradicts itself — confirmed generation 6f98e0c with artifact sha256:a2, but the manifest publishes sha256:c-contra for this host — the agent's own hash check should have refused this artifact and reverted",
+  "c-contra2: reporting contradicts itself — confirmed generation g-other, which is neither the published 6f98e0c nor the g-old it last confirmed — this relay never served it that",
+  "c-contra2: reporting is unexplained — moved from generation g-old to g-other with a different artifact (sha256:o → sha256:x) but an identical kernel dump dump:1 — either the new rules were not applied, or the difference is confined to parts of the artifact a stateless dump does not show",
+  "c-filters: inet firewalld also filters here — this host's confirmed rules are not the only thing deciding",
+  "c-wl-unrep: applied its ruleset but has not reported the workload half",
+  "c-wl-notconf: workload half is rolled-back on cluster dev — absent after apply",
+  "c-wl-missing: workload half reports confirmed but 1 object(s) are not in cluster dev: util/hp-dev-p700",
+  "c-wl-doc: workload half confirmed document sha256:other but the manifest publishes sha256:w1 — it applied something else",
+  "c-old: runs agent 0.5.0, below the 0.6.0 floor",
+  "c-bg: enforcing a break-glass authorization from 2026-07-29T00:00:00Z — that mode skips the two-person rule, and nothing else in this system reports that it is still in force",
+  "c-trusterr: cannot read its artifact signing trust — trust directory is not configured",
+  "c-unnamed: enforcing generation 6f98e0c but cannot name the authorization for it — an expired authorization can never be re-applied on this host, and a break-glass one would not be reported",
+  "c-never: has never reported",
+  "c-silent: silent for 660s",
+  "the fleet does not agree on which keys may sign a ruleset — sha256:aaaaaaaaaaaa: c-bg, c-cilium, c-contra, c-contra2, c-drift, c-filters, c-intr, c-old, c-ports, c-refused, c-rolled, c-silent, c-table, c-unnamed, c-wl-doc, c-wl-missing, c-wl-notconf, c-wl-unrep · sha256:bbbbbbbbbbbb: c-ring — expected during a key rotation and a finding after one",
+];
