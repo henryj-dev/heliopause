@@ -808,8 +808,12 @@ export function fleetView(
       // Judged from the latest beat against the manifest: confirmed, on this generation, with an artifact.
       "contradiction-artifact-hash-wrong":
         st?.state === "confirmed" && current && (state.reportedArtifactHash?.[host] ?? null) !== null ? "yes" : "no",
-      // The other three compare a beat with the reference that beat then replaces: events, outside
-      // this model — see `ProblemEvaluation`.
+      // The other three are outside this model — see `ProblemEvaluation` — and not for one reason.
+      // `unknown-generation` and `kernel-unchanged` need a generation other than the reference's, and a
+      // confirmed beat with a dump rebinds the reference to that generation, so after such a beat
+      // they are not seen again against that reference.
+      // `artifact-hash-changed` compares within one generation, where the reference is not rebound: it
+      // can show on every beat for as long as the host reports the other artifact.
       "contradiction-artifact-hash-changed": "no",
       "contradiction-unknown-generation": "no",
       "contradiction-kernel-unchanged": "no",
