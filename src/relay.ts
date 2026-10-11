@@ -1107,7 +1107,9 @@ async function readBody(req: IncomingMessage, limit = MAX_BODY_BYTES): Promise<s
 export async function startRelay(
   opts: RelayOptions,
 ): Promise<{ server: Server; state: RelayState; reload: () => Promise<void> }> {
-  const writeLog = opts.log ?? ((m: string) => console.error(`[relay] ${m}`));
+  // No prefix here: `logEvent` and `log` add `[relay] `. Adding it here as well printed
+  // `[relay] [relay] …` on the first line of every message (#163).
+  const writeLog = opts.log ?? ((m: string) => console.error(m));
   const logEvent = (key: Parameters<typeof formatOperatorLog>[1], params: Record<string, string | number> = {}) =>
     writeLog(`[relay] ${formatOperatorLog(opts.logLang ?? "en", key, params)}`);
   const log = (en: string, ko: string) => writeLog(`[relay] ${formatOperatorEvent(opts.logLang ?? "en", { en, ko })}`);

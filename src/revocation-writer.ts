@@ -46,7 +46,8 @@ export async function startRevocationWriter(opts: RevocationWriterOptions): Prom
   const initial = await readFile(opts.snapshotFile);
   if (initial.length > MAX_REVOCATION_SNAPSHOT_BYTES) throw new Error("configured revocation denylist is oversized");
   parseRevocationSnapshot(JSON.parse(initial.toString("utf8")));
-  const writeLog = opts.log ?? ((message: string) => console.error(`[revocation-writer] ${message}`));
+  // No prefix here: `logEvent` adds `[revocation-writer] ` (#163).
+  const writeLog = opts.log ?? ((message: string) => console.error(message));
   const logEvent = (key: Parameters<typeof formatOperatorLog>[1], params: Record<string, string | number> = {}) =>
     writeLog(`[revocation-writer] ${formatOperatorLog(opts.logLang ?? "en", key, params)}`);
   const requestTimeoutMs = opts.requestTimeoutMs ?? SOCKET_TIMEOUT_MS;
