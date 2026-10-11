@@ -22,7 +22,8 @@ import {
   boundedInteger, boundedNumber, ENV_BOUNDS, EnvSpecError, parsePairs, parseRelays,
   planLimitsFromEnv, startupLimitSources, type BoundedEnvName,
 } from "../src/env-spec.ts";
-import { startManager } from "../src/manager-server.ts";
+import { shutdownManager, startManager } from "../src/manager-server.ts";
+import { problemWatchFromEnv, ProblemWatchLockError } from "../src/problem-watch-runner.ts";
 import type { RelaySource } from "../src/manager.ts";
 import { resolveWebRoot, serveConsole } from "../src/web-console.ts";
 import { formatOperatorLog, installCliLanguage, logLangFromEnv } from "../src/operator-i18n.ts";
@@ -213,7 +214,17 @@ if (strangers.length) {
 const webRoot = resolveWebRoot(import.meta.dirname);
 const intercept = webRoot ? serveConsole(webRoot) : undefined;
 
-const { server } = await startManager({
+const relayTimeoutMs = number("HELIOPAUSE_RELAY_TIMEOUT_MS");
+// Off unless HELIOPAUSE_PROBLEM_WATCH_STATE_FILE is set. A configuration error refuses startup (#148).
+const problemWatch = (() => {
+  try {
+    return problemWatchFromEnv(process.env, relays.map((r) => r.name), relayTimeoutMs);
+  } catch (error) {
+    return refuse(error);
+  }
+})();
+
+const started = await startManager({
   logLang,
   port,
   hostname,
@@ -436,12 +447,17 @@ const { server } = await startManager({
     : {}),
   operatorCNs,
   writerCNs,
-  timeoutMs: number("HELIOPAUSE_RELAY_TIMEOUT_MS"),
+  ...(problemWatch ? { problemWatch } : {}),
+  timeoutMs: relayTimeoutMs,
   publishTimeoutMs: number("HELIOPAUSE_PUBLISH_TIMEOUT_MS"),
   // Always passed, each variable on its own (#161): passing them only when the TTL was set made a
   // pending cap given alone silently stay 32. Parsed and bounded above, at `planLimits`.
   limits: planLimits,
   limitSources: startupLimitSources(process.env),
+}).catch((error: unknown) => {
+  if (!(error instanceof ProblemWatchLockError)) throw error;
+  console.error(`[manager] ${error.message}`);
+  process.exit(2);
 });
 
 if (webRoot) console.error(`[manager] console at /app from ${webRoot}`);
@@ -449,6 +465,6 @@ if (webRoot) console.error(`[manager] console at /app from ${webRoot}`);
 for (const sig of ["SIGTERM", "SIGINT"] as const) {
   process.on(sig, () => {
     console.error("[manager] shutting down");
-    server.close(() => process.exit(0));
+    shutdownManager(started, (code) => process.exit(code));
   });
 }
