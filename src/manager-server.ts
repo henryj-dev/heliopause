@@ -217,6 +217,19 @@ export type TargetGeneration =
   | { kind: "mixed" }
   | { kind: "unknown"; why: string };
 
+/** Reduces reported generations only; hosts without a generation do not enter the set. */
+export function targetGeneration(results: readonly RelayResult[]): TargetGeneration {
+  try {
+    const view = siteView([...results]);
+    const hosts = view.vpcs.flatMap((v) => ("view" in v && v.view ? v.view.hosts : []));
+    const gens = [...new Set(hosts.map((h) => h.generation).filter((g): g is string => Boolean(g)))];
+    if (gens.length === 1) return { kind: "one", generation: gens[0]! };
+    return gens.length === 0 ? { kind: "unknown", why: "no host reported a generation" } : { kind: "mixed" };
+  } catch (e) {
+    return { kind: "unknown", why: (e as Error).message };
+  }
+}
+
 /**
  * Why publishing this plan would change nothing — or null when it would.
  *
@@ -3289,10 +3302,33 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       return send(res, 200, { host, base: base.generation, head: bundle.manifest.generation, ...diff });
     }
 
+    /** Fresh read for the publish gate, independent of the list's observation. */
+    const generationOnTarget = async (relayName: string): Promise<TargetGeneration> => {
+      try {
+        return targetGeneration(await pollRelays(opts.relays.filter((r) => r.name === relayName), timeoutMs));
+      } catch (e) {
+        return { kind: "unknown", why: (e as Error).message };
+      }
+    };
+
     // Pending plans. Read-only, and the screen an approver works from.
     if (req.method === "GET" && url.pathname === "/plans") {
+      const plans = listPlans(approvals, now(), limits);
+      const targets = new Set(plans.map((p) => planTargets.get(p.hash)));
+      const relays = [...new Map(opts.relays.filter((r) => targets.has(r.name)).map((r) => [r.name, r])).values()];
+      // One batch, U target requests, in addition to the existing pending diffs' up to P requests.
+      // Each target is cut off at the list's own bound; publishing still reads with `timeoutMs`.
+      // @see write-api.test.ts "a stalled target does not hold up another target's observation or the list"
+      const results = relays.length > 0 ? await pollRelays(relays, Math.min(timeoutMs, 2_000)) : [];
+      const observedAt = now().toISOString();
+      const observations = new Map(results.map((r) => [r.name, { ...targetGeneration([r]), observedAt }]));
       return send(res, 200, {
-        plans: listPlans(approvals, now(), limits).map((p) => publicPlan(p, planTargets.get(p.hash) ?? null)),
+        plans: plans.map((p) => {
+          const target = planTargets.get(p.hash) ?? null;
+          return publicPlan(p, target, target ? observations.get(target) ?? {
+            kind: "unknown", why: "target is no longer configured", observedAt: null,
+          } : { kind: "unknown", why: "plan target is missing", observedAt: null });
+        }),
         limits,
         // Who is asking, and whether they may write at all.
         //
@@ -3353,19 +3389,6 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
      * hash, the retention sweep and the log line are the parts that decide what an approver later
      * sees, and two of them would drift the way every other pair in this system has.
      */
-    /** Read one target's fleet and reduce it to a `TargetGeneration`. The rule is `republishRefusal`. */
-    const generationOnTarget = async (relayName: string): Promise<TargetGeneration> => {
-      try {
-        const view = siteView(await pollRelays(opts.relays.filter((r) => r.name === relayName), timeoutMs));
-        const hosts = view.vpcs.flatMap((v) => ("view" in v && v.view ? v.view.hosts : []));
-        const gens = [...new Set(hosts.map((h) => h.generation).filter((g): g is string => Boolean(g)))];
-        if (gens.length === 1) return { kind: "one", generation: gens[0]! };
-        return gens.length === 0 ? { kind: "unknown", why: "no host reported a generation" } : { kind: "mixed" };
-      } catch (e) {
-        return { kind: "unknown", why: (e as Error).message };
-      }
-    };
-
     const recordProposal = (
       response: ServerResponse,
       targetName: string,
@@ -4751,7 +4774,7 @@ function pendingCsrCount(storeFile: string | undefined): number | undefined {
 const COMBINED_EN = " — combined approve+publish, one one-time code";
 const COMBINED_KO = " — 승인과 발행을 함께, 일회용 코드 하나";
 
-function publicPlan(p: Plan, target: string | null) {
+function publicPlan(p: Plan, target: string | null, observation?: TargetGeneration & { observedAt: string | null }) {
   return {
     hash: p.hash,
     generation: p.generation,
@@ -4761,6 +4784,12 @@ function publicPlan(p: Plan, target: string | null) {
     approval: p.approval,
     publishedAt: p.publishedAt,
     target,
+    ...(observation ? { targetGeneration: {
+      kind: observation.kind,
+      ...(observation.kind === "one" ? { generation: observation.generation } : {}),
+      ...(observation.kind === "unknown" ? { why: observation.why } : {}),
+      observedAt: observation.observedAt,
+    } } : {}),
   };
 }
 

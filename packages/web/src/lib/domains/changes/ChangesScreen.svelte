@@ -12,7 +12,7 @@
   import { whoQuery } from "$lib/shell/who.svelte";
   import { canOfferApprove, canOfferApproveAndPublish, canOfferPublish, planStage, type PlanRow } from "./plans";
   import {
-    clockLabel, expireRatio, expireTone, hostRuleTotal, planDomId, planPath, remainingSec, shortPlanHash,
+    clockLabel, expireRatio, expireTone, hostRuleTotal, planDomId, planPath, remainingSec, sameTargetGeneration, shortPlanHash,
   } from "./present";
   import { PLANS_POLL_MS, plansQuery } from "./query.svelte";
   import { approveBody, proposeBody, publishBody, writeHeaders } from "./write";
@@ -317,6 +317,22 @@
                 rules: hostRuleTotal(plan),
               })}
             </p>
+            <p class="dim">
+              {#if plan.targetGeneration?.kind === "one"}
+                {t(prefs.lang, "m.targetGenerationOne", { generation: plan.targetGeneration.generation })}
+              {:else if plan.targetGeneration?.kind === "mixed"}
+                {t(prefs.lang, "m.targetGenerationMixed")}
+              {:else}
+                {t(prefs.lang, "m.targetGenerationUnknown")}
+              {/if}
+              {#if plan.targetGeneration?.observedAt}
+                · {t(prefs.lang, "m.targetGenerationAt", { at: plan.targetGeneration.observedAt })}
+                {#if stale}
+                  · <span class="chip warn">{t(prefs.lang, "m.targetGenerationStale")}</span>
+                {/if}
+              {/if}
+            </p>
+            <p class="dim">{t(prefs.lang, "m.targetGenerationScope")}</p>
             <p>
               {t(prefs.lang, "m.proposedBy", { generation: plan.generation, who: plan.proposedBy, at: plan.proposedAt })}
               {#if plan.approval}
@@ -356,6 +372,9 @@
               <button type="button" data-act="publish" disabled={busy !== ""} onclick={() => void act("publish", plan)}>
                 {t(prefs.lang, "m.publishFleet")}
               </button>
+            {/if}
+            {#if stage !== "published" && sameTargetGeneration(plan, stale)}
+              <p class="dim">{t(prefs.lang, "m.targetGenerationSame")}</p>
             {/if}
             {#if plan.publishedAt}
               <p class="dim">{t(prefs.lang, "m.publishedAt", { at: plan.publishedAt })}</p>

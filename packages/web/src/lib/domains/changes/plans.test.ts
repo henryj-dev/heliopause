@@ -81,6 +81,64 @@ describe("readPlansView", () => {
   });
 });
 
+describe("target generation payloads", () => {
+  const listing = (targetGeneration: unknown) => readPlansView({
+    plans: [{ ...pending, targetGeneration }], limits: { ttlSec: 3600 }, you: "ops-bob", canWrite: true,
+  });
+  const at = "2026-10-11T00:00:00.000Z";
+
+  it("reads one, mixed and unknown observations with their time", () => {
+    for (const observation of [
+      { kind: "one", generation: "gen-1", observedAt: at },
+      { kind: "mixed", observedAt: at },
+      { kind: "unknown", why: "timeout", observedAt: at },
+      { kind: "unknown", why: "missing target", observedAt: null },
+    ]) {
+      const read = listing(observation);
+      assert.ok(read.ok);
+      assert.deepEqual(read.view.plans[0]?.targetGeneration, observation);
+    }
+  });
+
+  it("keeps the plan when an old manager omits the observation or sends an invalid one", () => {
+    for (const observation of [undefined, null, 1, {},
+      { kind: "one", generation: "", observedAt: at },
+      { kind: "one", generation: "gen-1", observedAt: null },
+      { kind: "mixed", observedAt: "bad date" },
+      { kind: "unknown", why: 1, observedAt: at },
+      { kind: "other", observedAt: at },
+    ]) {
+      const read = listing(observation);
+      assert.ok(read.ok);
+      assert.equal(read.view.plans.length, 1);
+      assert.equal(read.view.plans[0]?.hash, pending.hash);
+      assert.equal(read.view.plans[0]?.targetGeneration?.kind, "unknown");
+      assert.equal(read.view.plans[0]?.targetGeneration?.observedAt, null);
+    }
+  });
+
+  it("does not change any action offer when an observation is added", () => {
+    for (const observation of [
+      { kind: "one", generation: "gen-1", observedAt: at },
+      { kind: "mixed", observedAt: at },
+      { kind: "unknown", why: "timeout", observedAt: at },
+    ]) {
+      const read = listing(observation);
+      assert.ok(read.ok);
+      const observed = read.view.plans[0]!;
+      for (const writer of [true, false]) for (const solo of [true, false]) for (const you of ["ops-alice", "ops-bob"]) {
+        for (const approval of [null, { by: "ops-bob", at }]) for (const publishedAt of [null, at]) {
+          const before = { ...pending, approval, publishedAt };
+          const after = { ...observed, approval, publishedAt };
+          assert.equal(canOfferApprove(after, you, writer, solo), canOfferApprove(before, you, writer, solo));
+          assert.equal(canOfferApproveAndPublish(after, you, writer, solo), canOfferApproveAndPublish(before, you, writer, solo));
+          assert.equal(canOfferPublish(after, writer), canOfferPublish(before, writer));
+        }
+      }
+    }
+  });
+});
+
 describe("plan actions", () => {
   it("offers approve to a different writer, not to the proposer", () => {
     assert.equal(canOfferApprove(pending, "ops-bob", true, false), true);

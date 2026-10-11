@@ -28,6 +28,7 @@ import {
   rateLimited,
   republishRefusal,
   startManager,
+  targetGeneration,
   trimPendingOidcLogins,
 } from "./manager-server.ts";
 import type { CertBundle } from "./cert-api.ts";
@@ -2647,6 +2648,35 @@ describe("the enrollment rate limiter", () => {
     assert.equal(seen.size, 4);
     assert.equal(seen.has("10.0.0.9"), true, "the newest source must survive eviction");
     assert.equal(seen.has("10.0.0.0"), false, "the oldest must not");
+  });
+});
+
+describe("targetGeneration", () => {
+  const result = (generations: Array<string | null>) => ({
+    name: "dev", url: "https://relay.example.invalid/", ok: true,
+    view: { generation: "relay-gen", problems: [], hosts: generations.map((generation) => ({ generation })) },
+  }) as unknown as Parameters<typeof targetGeneration>[0][number];
+
+  it("reduces reported host generations, not the relay generation or missing reports", () => {
+    assert.deepEqual(targetGeneration([result(["host-gen", "host-gen", null])]), { kind: "one", generation: "host-gen" });
+    assert.deepEqual(targetGeneration([result(["host-gen", "other"])]), { kind: "mixed" });
+    assert.equal(targetGeneration([result([null])]).kind, "unknown");
+    assert.equal(targetGeneration([]).kind, "unknown");
+  });
+
+  it("keeps failed or malformed relay reads unknown", () => {
+    assert.equal(targetGeneration([{ name: "dev", url: "https://relay.example.invalid/", ok: false, error: "offline" }]).kind, "unknown");
+    assert.equal(targetGeneration([{
+      name: "dev", url: "https://relay.example.invalid/", ok: true, view: { hosts: null },
+    } as unknown as Parameters<typeof targetGeneration>[0][number]]).kind, "unknown");
+  });
+
+  it("keeps a readable host generation unknown when the rest of the fleet view is malformed", () => {
+    const good = result(["host-gen"]);
+    assert.deepEqual(targetGeneration([good]), { kind: "one", generation: "host-gen" });
+    assert.ok(good.ok);
+    const { problems: _missing, ...view } = good.view;
+    assert.equal(targetGeneration([{ ...good, view } as typeof good]).kind, "unknown");
   });
 });
 

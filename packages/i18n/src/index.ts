@@ -325,6 +325,19 @@ export const MESSAGES = {
   "m.pendingCap": { en: "pending {n}/{max}", ko: "대기 {n}/{max}" },
   "m.twoPersonMust": { en: "two-person approval required · maySoloApprove false", ko: "2인 승인 필수 · 단독 승인 불가" },
   "m.planMeta": { en: "generation {generation} · {hosts} host(s) · {rules} rule(s)", ko: "세대 {generation} · 호스트 {hosts}대 · 규칙 {rules}개" },
+  "m.targetGenerationOne": { en: "target fleet reported generation {generation}", ko: "대상 함대 보고 세대 {generation}" },
+  "m.targetGenerationMixed": { en: "target fleet reports several generations", ko: "대상 함대에 여러 세대 혼재" },
+  "m.targetGenerationUnknown": { en: "target fleet generation could not be checked", ko: "대상 함대 세대를 확인하지 못함" },
+  "m.targetGenerationAt": { en: "observed at {at}", ko: "{at}에 관측" },
+  "m.targetGenerationStale": { en: "previous observation · refresh failed", ko: "이전 관측 · 새 조회 실패" },
+  "m.targetGenerationScope": {
+    en: "hosts without a reported generation are excluded; one generation does not mean every host applied it. The diff is read separately.",
+    ko: "세대를 보고하지 않은 호스트는 제외해요. 한 세대여도 모든 호스트가 적용을 마쳤다는 뜻은 아니에요. 차이 비교는 따로 조회해요.",
+  },
+  "m.targetGenerationSame": {
+    en: "the observed generation matches this plan. Publishing checks again; if it still matches, commit the change and propose again.",
+    ko: "관측한 세대가 이 계획과 같아요. 발행할 때 다시 확인해요. 그때도 같으면 변경을 커밋하고 다시 제안해 주세요.",
+  },
   "m.planTargetUnread": { en: "no target", ko: "대상 없음" },
   "m.planTargetUnreadNote": {
     en: "the manager no longer holds which VPC this plan is for — it restarted, or the target was removed",

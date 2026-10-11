@@ -1,5 +1,10 @@
 import type { PlanRow } from "./plans.ts";
 
+export function sameTargetGeneration(plan: PlanRow, stale: boolean): boolean {
+  return !stale && plan.targetGeneration?.kind === "one"
+    && plan.targetGeneration.generation === plan.generation;
+}
+
 export function hostRuleTotal(plan: PlanRow): number {
   return plan.summary.hosts.reduce((n, host) => n + host.ruleCount, 0);
 }
