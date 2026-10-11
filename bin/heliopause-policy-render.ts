@@ -487,10 +487,9 @@ if (!token) {
  * cannot see: a checkout with no git at all (`sha === null`), and an edit that has landed on disk
  * but not in a commit — which is what `dirty` means and what an operator sees mid-edit.
  *
- * The `?v=` on the import specifier is unchanged in purpose: ES modules are cached by URL, so
- * without a moving query a new checkout stays invisible until the process restarts. It reaches the
- * files the module imports only through the resolve hook above — a query on the module alone left
- * `policies.json` at its pod-start content for a month, under this key and this comment.
+ * stamp 는 부모 캐시가 재평가 여부를 결정하는 키다. 현재 import 에는 `?v=` 도
+ * child-version resolve hook 도 없다. 평가마다 새 워커의 모듈 registry 를 사용한다.
+ * @see src/policy-render-service.test.ts "a changed file the module imports is read on the next evaluation"
  *
  * A stale-on-error cache would be wrong here. If the module throws, the console must say so — a
  * screen that keeps drawing the last policy that worked is a screen that lies about what is
