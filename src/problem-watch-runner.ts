@@ -19,7 +19,7 @@ import { discardOwnedPath } from "./enrollment-store.ts";
 import { boundedInteger, ENV_BOUNDS, EnvSpecError } from "./env-spec.ts";
 import {
   emitLines, emptyWatchState, loadWatchState, manifestAliasCollision, parseWatchAliases, serializeWatchState, stepWatch,
-  type RelayRead, type WatchAliases, type WatchEvent, type WatchState, type WatchWhat,
+  LOCK_ERRNOS, type LockErrno, type RelayRead, type WatchAliases, type WatchEvent, type WatchState, type WatchWhat,
 } from "./problem-watch.ts";
 
 export interface ProblemWatchConfig {
@@ -85,6 +85,7 @@ export function openLockFile(
   path: string,
   owner: string,
   write: (fd: number, text: string) => void = (fd, text) => writeFileSync(fd, text, "utf8"),
+  close: (fd: number) => void = closeSync,
 ): void {
   const fd = openSync(path, "wx", 0o600);
   try {
@@ -93,7 +94,13 @@ export function openLockFile(
     discardOwnedPath(path, fd);
     throw error;
   }
-  closeSync(fd);
+  try {
+    close(fd);
+  } catch (error) {
+    // The descriptor may be gone, so the inode cannot be compared; the owner record can.
+    try { if (readFileSync(path, "utf8") === owner) unlinkSync(path); } catch { /* nothing left to remove */ }
+    throw error;
+  }
 }
 
 /** tmp file with `wx` and 0600, fsync, rename over `path`, fsync the directory. */
@@ -123,9 +130,11 @@ export const defaultProblemWatchFs: ProblemWatchFs = {
 
 /** A lock failure other than another owner holding it. The manager refuses to start on this. */
 export class ProblemWatchLockError extends Error {
-  constructor(message: string) {
+  readonly errno: LockErrno;
+  constructor(message: string, code: string) {
     super(message);
     this.name = "ProblemWatchLockError";
+    this.errno = LOCK_ERRNOS.has(code) ? (code as LockErrno) : "other";
   }
 }
 
@@ -194,7 +203,7 @@ export function startProblemWatch(deps: ProblemWatchDeps): ProblemWatch {
       fs.openLock(lockPath, record);
     } catch (e) {
       if (errno(e) === "EEXIST") return false;
-      throw new ProblemWatchLockError(`${lockPath}: cannot create the problem watch lock (${errno(e)})`);
+      throw new ProblemWatchLockError(`${lockPath}: cannot create the problem watch lock (${errno(e)})`, errno(e));
     }
     owner = record;
     return true;
@@ -242,6 +251,12 @@ export function startProblemWatch(deps: ProblemWatchDeps): ProblemWatch {
       return "unreadable";
     }
     state = loaded.state;
+    // A state file written before the marker existed: mark it now, so losing the file later is not a first start.
+    let marked = true;
+    try { fs.readFile(markerPath); } catch (e) { marked = errno(e) !== "ENOENT"; }
+    if (!marked) {
+      try { fs.writeFileAtomic(markerPath, `${now().toISOString()}\n`); } catch { return "write_failed"; }
+    }
     if (loaded.unknownKinds > 0 || loaded.staleAliases > 0) {
       say([{ event: "heliopause.problem.watch", what: "state_pruned", unknownKinds: loaded.unknownKinds, staleAliases: loaded.staleAliases }]);
     }
@@ -293,8 +308,8 @@ export function startProblemWatch(deps: ProblemWatchDeps): ProblemWatch {
         let got: boolean;
         try {
           got = acquire();
-        } catch {
-          say([watch("lock_error")]);
+        } catch (e) {
+          say([{ event: "heliopause.problem.watch", what: "lock_error", errno: (e as ProblemWatchLockError).errno ?? "other" }]);
           return;
         }
         if (!got) {

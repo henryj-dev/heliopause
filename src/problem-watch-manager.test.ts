@@ -6,7 +6,7 @@ import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { generateKeyPairSync } from "node:crypto";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { request } from "node:https";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -51,7 +51,7 @@ const body = (evaluated: Record<string, Record<string, string>>): ReadonlyMap<st
 })]]);
 
 /** A manager with the watch on, every watch boundary but the files replaced. */
-async function manager(stateFile: string, poll: () => Promise<ReadonlyMap<string, RelayRead>>) {
+async function manager(stateFile: string, poll?: () => Promise<ReadonlyMap<string, RelayRead>>) {
   const lines: Record<string, unknown>[] = [];
   const timers: { fn: () => void }[] = [];
   const cleared: unknown[] = [];
@@ -63,16 +63,18 @@ async function manager(stateFile: string, poll: () => Promise<ReadonlyMap<string
     operatorCNs: ["ops-alice"], timeoutMs: 200,
     problemWatch: {
       stateFile, aliases: ALIASES, intervalMs: 30_000, allowEmptyState: true,
-      poll: async () => { polls += 1; return poll(); },
+      ...(poll ? { poll: async () => { polls += 1; return poll(); } } : {}),
       emit: (l) => lines.push(JSON.parse(l) as Record<string, unknown>),
       setInterval: (fn) => { const h = { fn }; timers.push(h); return h; },
       clearInterval: (h) => cleared.push(h),
     },
   });
   const port = (started.server.address() as { port: number }).port;
-  /** What the interval does, then a few turns so the poll and the cycle finish. */
+  /** What the interval does, then wait until the watch writes a line or two seconds pass. */
   const fire = async () => {
+    const before = lines.length;
     for (const t of timers) t.fn();
+    for (let i = 0; i < 200 && lines.length === before; i++) await new Promise((r) => setTimeout(r, 10));
     for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
   };
   const whats = () => lines.filter((l) => l.event === "heliopause.problem.watch").map((l) => l.what);
@@ -94,7 +96,7 @@ describe("problem watch in the manager", () => {
       assert.deepEqual(m.whats(), ["lock_held", "lock_held"]);
       assert.equal(m.polls(), 0);
     } finally {
-      m.started.server.close();
+      await new Promise<void>((resolve) => m.started.server.close(() => resolve()));
       holder.stop();
     }
   });
@@ -110,7 +112,42 @@ describe("problem watch in the manager", () => {
       assert.equal(existsSync(`${stateFile}.lock`), false);
       assert.equal(await healthz(m.port), 200);
     } finally {
-      m.started.server.close();
+      await new Promise<void>((resolve) => m.started.server.close(() => resolve()));
+    }
+  });
+
+  it("the default poll reads the relays through pollRelays, and an unreachable relay opens relay-unobservable after two cycles", async () => {
+    const stateFile = join(dir, "default-poll.json");
+    const m = await manager(stateFile);
+    try {
+      await m.fire();
+      const opened = () => m.lines.filter((l) => l.transition === "opened").map((l) => `${String(l.relay)}/${String(l.host)}/${String(l.kind)}`);
+      assert.deepEqual(opened(), []);
+      const firstCycle = m.lines.find((l) => l.event === "heliopause.problem.cycle") as { relays: { reason: unknown }[] } | undefined;
+      assert.deepEqual(firstCycle?.relays.map((r) => r.reason), ["unreachable"]);
+      await m.fire();
+      assert.deepEqual(opened(), ["za/_relay/relay-unobservable"]);
+    } finally {
+      await new Promise<void>((resolve) => m.started.server.close(() => resolve()));
+    }
+  });
+
+  it("a manager without problemWatch creates no state file and no lock", async () => {
+    const offDir = mkdtempSync(join(tmpdir(), "hp-watch-off-"));
+    const started = await startManager({
+      port: 0, hostname: "127.0.0.1",
+      relays: [{ name: RELAY, url: "https://127.0.0.1:1/", pkiDir: offDir }],
+      tls: { certFile: join(dir, "server.pem"), keyFile: join(dir, "server.key"), caFile: join(dir, "ca.pem") },
+      operatorCNs: ["ops-alice"], timeoutMs: 200,
+    });
+    try {
+      assert.equal(await healthz((started.server.address() as { port: number }).port), 200);
+      assert.doesNotThrow(() => started.stopProblemWatch());
+      // The relay's PKI directory is the only directory of its own this manager is given; nothing appears in it.
+      assert.deepEqual(readdirSync(offDir), []);
+    } finally {
+      await new Promise<void>((resolve) => started.server.close(() => resolve()));
+      rmSync(offDir, { recursive: true, force: true });
     }
   });
 

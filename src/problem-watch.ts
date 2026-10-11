@@ -287,9 +287,13 @@ export interface WatchLine {
   holderAgeSec?: number | null;
   /** `state_pruned` only: loaded keys dropped for a kind this build does not know. */
   unknownKinds?: number;
-  /** `state_pruned` only: loaded keys dropped for a relay or host alias the alias file no longer has. */
+  /** `state_pruned` only: loaded keys whose relay or host alias the alias file no longer has; kept, and taken out of scope next cycle. */
   staleAliases?: number;
+  /** `lock_error` only: the error code, or `other`. */
+  errno?: LockErrno;
 }
+export type LockErrno = "EACCES" | "ENOENT" | "EROFS" | "EPERM" | "EIO" | "other";
+export const LOCK_ERRNOS = new Set<string>(["EACCES", "ENOENT", "EROFS", "EPERM", "EIO"]);
 export type WatchEvent = StateLine | TransitionLine | CycleLine | WatchLine;
 
 export interface StepResult {
@@ -463,6 +467,7 @@ export function stepWatch(prev: WatchState, input: WatchCycle): StepResult {
 // ## Output
 
 const TRANSITIONS = new Set<string>(["opened", "resolved", "scope_removed"]);
+const LOCK_ERRNO_VALUES = new Set<string>([...LOCK_ERRNOS, "other"]);
 const REASONS = new Set<string>(["unreachable", "schema", "no-manifest", "not-configured"]);
 const WHATS = new Set<string>([
   "started", "stopped", "state_initialized", "state_unreadable", "state_write_failed",
@@ -542,6 +547,9 @@ export function emitLines(events: readonly WatchEvent[]): string[] {
         if (what === "lock_held") {
           return JSON.stringify({ event, v: 1, what, holderAgeSec: w.holderAgeSec === null ? null : count(w.holderAgeSec, event) });
         }
+        if (what === "lock_error") {
+          return JSON.stringify({ event, v: 1, what, errno: oneOf(w.errno, LOCK_ERRNO_VALUES, event) });
+        }
         if (what === "state_pruned") {
           return JSON.stringify({
             event, v: 1, what, unknownKinds: count(w.unknownKinds, event), staleAliases: count(w.staleAliases, event),
@@ -572,9 +580,12 @@ const bounded = (v: unknown, max: number): boolean => Number.isSafeInteger(v) &&
 
 /**
  * Read a state file's text against the current alias file. Text that is not this shape is
- * `ok: false`. A well-formed key whose kind this build does not know, or whose relay or host alias the
- * current alias file does not have, is dropped and counted.
- * @see "state loader drops unknown kinds and stale aliases and says how many" in problem-watch-runner.test.ts
+ * `ok: false`. A key whose relay or host alias the current alias file does not have is kept and
+ * counted: `stepWatch` takes it out of scope on the next cycle, with `scope_removed` and the zero tail.
+ * A key whose kind this build does not know is dropped and counted — kept, it would be held forever
+ * and `emitLines` would refuse the cycle — so its resolution, after a downgrade, rests on the series
+ * disappearing.
+ * @see "state loader drops unknown kinds and keeps stale aliases for scope removal" in problem-watch-runner.test.ts
  */
 export function loadWatchState(text: string, aliases: WatchAliases): LoadedWatchState {
   let doc: unknown;
@@ -595,12 +606,10 @@ export function loadWatchState(text: string, aliases: WatchAliases): LoadedWatch
       unknownKinds += 1;
       continue;
     }
+    if (!ALIAS_RE.test(r.relay) || !(ALIAS_RE.test(r.host) || RESERVED_HOSTS.has(r.host))) return { ok: false };
     const relayName = relayByAlias.get(r.relay);
     const hostAliases = relayName === undefined ? null : new Set(aliases.hosts.get(relayName)?.values() ?? []);
-    if (!hostAliases || !(RESERVED_HOSTS.has(r.host) || hostAliases.has(r.host))) {
-      staleAliases += 1;
-      continue;
-    }
+    if (!hostAliases || !(RESERVED_HOSTS.has(r.host) || hostAliases.has(r.host))) staleAliases += 1;
     state.keys[k] = {
       relay: r.relay, host: r.host, kind: r.kind as WatchKind, active: r.active,
       openStreak: r.openStreak as number, resolveStreak: r.resolveStreak as number,

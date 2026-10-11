@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { EnvSpecError } from "./env-spec.ts";
@@ -245,32 +245,67 @@ describe("problem watch runner: state file", () => {
     assert.equal(existsSync(again.stateFile), false);
   });
 
-  it("state loader drops unknown kinds and stale aliases and says how many", async () => {
-    const rec = (relay: string, host: string, kind: string) => ({
-      relay, host, kind, active: true, openStreak: 2, resolveStreak: 0, count: 1, tail: 0,
-    });
-    const text = JSON.stringify({ v: 1, seq: 4, keys: [
-      rec("za", "web", "silent"), rec("za", "_fleet", "unaliased-hosts"),
-      rec("za", "web", "drifted"), rec("gone", "web", "silent"), rec("za", "olddb", "silent"),
-    ] });
-    const loaded = loadWatchState(text, ALIASES);
+  const rec = (relay: string, host: string, kind: string) => ({
+    relay, host, kind, active: true, openStreak: 2, resolveStreak: 0, count: 1, tail: 0,
+  });
+  const PRUNABLE = JSON.stringify({ v: 1, seq: 4, keys: [
+    rec("za", "web", "silent"), rec("za", "_fleet", "unaliased-hosts"),
+    rec("za", "web", "drifted"), rec("gone", "web", "silent"), rec("za", "olddb", "silent"),
+  ] });
+
+  it("state loader drops unknown kinds and keeps stale aliases for scope removal", async () => {
+    const loaded = loadWatchState(PRUNABLE, ALIASES);
     assert.ok(loaded.ok);
     assert.deepEqual([loaded.unknownKinds, loaded.staleAliases], [1, 2]);
-    assert.deepEqual(Object.keys(loaded.state.keys).sort(),
-      [keyOf("za", "_fleet", "unaliased-hosts"), keyOf("za", "web", "silent")].sort());
+    assert.deepEqual(Object.keys(loaded.state.keys).sort(), [
+      keyOf("za", "_fleet", "unaliased-hosts"), keyOf("za", "web", "silent"), keyOf("gone", "web", "silent"), keyOf("za", "olddb", "silent"),
+    ].sort());
     assert.equal(loaded.state.seq, 4);
     // A text in the serialized shape round-trips.
-    assert.deepEqual(loadWatchState(serializeWatchState(loaded.state), ALIASES), { ok: true, state: loaded.state, unknownKinds: 0, staleAliases: 0 });
+    assert.deepEqual(loadWatchState(serializeWatchState(loaded.state), ALIASES), { ok: true, state: loaded.state, unknownKinds: 0, staleAliases: 2 });
+    // An alias the output schema would refuse is not a stale alias but a broken file.
+    assert.deepEqual(loadWatchState(JSON.stringify({ v: 1, seq: 0, keys: [rec("ZA", "web", "silent")] }), ALIASES), { ok: false });
 
-    writeFileSync(join(dir, "state.json"), text);
+    writeFileSync(join(dir, "state.json"), PRUNABLE);
     const h = start({ poll: async () => SILENT_H1, allowEmptyState: false });
     const pruned = h.lines.find((l) => l.what === "state_pruned");
     assert.deepEqual(pruned, { event: "heliopause.problem.watch", v: 1, what: "state_pruned", unknownKinds: 1, staleAliases: 2 });
     await h.watch.tick();
-    // Known positive: the kept key is held and the cycle's lines were written (an unknown kind would have thrown them away).
-    assert.ok(h.lines.some((l) => l.event === "heliopause.problem.cycle"));
-    assert.ok(h.lines.some((l) => l.event === "heliopause.problem.state" && l.host === "web" && l.active === 1));
+    // The first cycle takes both stale keys out of scope, by name.
+    const removed = h.lines.filter((l) => l.transition === "scope_removed").map((l) => `${String(l.relay)}/${String(l.host)}/${String(l.kind)}`);
+    assert.deepEqual(removed.sort(), ["gone/web/silent", "za/olddb/silent"]);
+    const stale = (l: Line) => l.event === "heliopause.problem.state" && (l.relay === "gone" || l.host === "olddb");
+    for (let i = 0; i < 25; i++) await h.watch.tick();
+    const zeros = h.lines.filter(stale);
+    assert.ok(zeros.every((l) => l.active === 0));
+    assert.equal(zeros.length, 2 * 20);
+    const saved = JSON.parse(readFileSync(h.stateFile, "utf8")) as { keys: { relay: string; host: string }[] };
+    assert.deepEqual(saved.keys.filter((k) => k.relay === "gone" || k.host === "olddb"), []);
+    // Known positive: the kept, current key is held, and no cycle was refused.
+    assert.ok(h.lines.some((l) => l.event === "heliopause.problem.state" && l.host === "web" && l.kind === "silent" && l.active === 1));
     assert.ok(!whats(h).includes("cycle_failed"));
+  });
+
+  it("a stale alias leaves scope even on a cycle where its relay is unobservable", async () => {
+    writeFileSync(join(dir, "state.json"), PRUNABLE);
+    const h = start({ poll: async () => new Map([[RELAY, { ok: false, reason: "unreachable" } as RelayRead]]), allowEmptyState: false });
+    await h.watch.tick();
+    const removed = h.lines.filter((l) => l.transition === "scope_removed").map((l) => `${String(l.relay)}/${String(l.host)}`);
+    assert.deepEqual(removed.sort(), ["gone/web", "za/olddb"]);
+    // Known positive: the current key is held, not removed, on that cycle.
+    assert.ok(h.lines.some((l) => l.event === "heliopause.problem.state" && l.host === "web" && l.active === 1 && l.observed === false));
+  });
+
+  it("a loaded state without the initialized marker gets one", () => {
+    writeFileSync(join(dir, "state.json"), serializeWatchState(emptyWatchState()));
+    const h = start({ allowEmptyState: false });
+    assert.deepEqual(whats(h), ["lock_acquired", "started"]);
+    assert.ok(h.calls.includes("writeFileAtomic state.json.initialized"));
+    assert.ok(existsSync(`${h.stateFile}.initialized`));
+    h.watch.stop();
+    // So losing the state file now keeps the watch off, even with the first-start switch on.
+    unlinkSync(h.stateFile);
+    assert.deepEqual(whats(start({ allowEmptyState: true })), ["lock_acquired", "state_unreadable"]);
   });
 
   it("lock_held and state_pruned lines need their own counts, and an empty state serializes to no keys", () => {
@@ -347,6 +382,28 @@ describe("problem watch runner: lock", () => {
     // Known positive: the default writer leaves the record.
     openLockFile(path, "{\"pid\":1}");
     assert.equal(readFileSync(path, "utf8"), "{\"pid\":1}");
+  });
+
+  it("a lock error after start says lock_error with its code and keeps retrying", async () => {
+    const codes = ["EEXIST", "EACCES", "EIO", "EXDEV", "EEXIST"];
+    const h = start({ fs: { openLock: () => { throw Object.assign(new Error("x"), { code: codes.shift() }); } } });
+    for (let i = 0; i < 4; i++) await h.watch.tick();
+    assert.deepEqual(h.lines.map((l) => [l.what, l.errno ?? null]), [
+      ["lock_held", null], ["lock_error", "EACCES"], ["lock_error", "EIO"], ["lock_error", "other"], ["lock_held", null],
+    ]);
+    assert.ok(!whats(h).includes("cycle_failed"));
+    assert.equal(h.polls(), 0);
+    assert.throws(() => emitLines([{ event: "heliopause.problem.watch", what: "lock_error" }]));
+    assert.throws(() => emitLines([{ event: "heliopause.problem.watch", what: "lock_error", errno: "ENOSPC" as "other" }]));
+  });
+
+  it("a lock whose close fails is not left behind", () => {
+    const path = join(dir, "y.lock");
+    assert.throws(() => openLockFile(path, "{\"pid\":2}", undefined, (fd) => { closeSync(fd); throw new Error("EIO on close"); }), /EIO on close/);
+    assert.equal(existsSync(path), false);
+    // Known positive: with a close that succeeds the lock stays, holding the record.
+    openLockFile(path, "{\"pid\":2}");
+    assert.equal(readFileSync(path, "utf8"), "{\"pid\":2}");
   });
 
   it("a lock error other than EEXIST refuses to start", () => {
@@ -438,5 +495,6 @@ describe("problem watch runner: env", () => {
     assert.equal(at("10", 10_000)?.intervalMs, 10_000);
     assert.throws(() => problemWatchFromEnv({ ...on, HELIOPAUSE_PROBLEM_WATCH_ALLOW_EMPTY_STATE: "yes" }, [RELAY], 5_000, r.read), EnvSpecError);
     assert.equal(problemWatchFromEnv({ ...on, HELIOPAUSE_PROBLEM_WATCH_ALLOW_EMPTY_STATE: "1" }, [RELAY], 5_000, r.read)?.allowEmptyState, true);
+    assert.equal(problemWatchFromEnv({ ...on, HELIOPAUSE_PROBLEM_WATCH_ALLOW_EMPTY_STATE: "0" }, [RELAY], 5_000, r.read)?.allowEmptyState, false);
   });
 });
