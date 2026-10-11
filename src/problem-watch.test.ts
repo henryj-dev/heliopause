@@ -558,10 +558,34 @@ describe("problem watch: event-shaped contradictions (#148 PR 4)", () => {
     assert.deepEqual(r.transitions.map(brief), ["opened za/web/silent"]);
     assert.deepEqual(r.events, []);
     assert.deepEqual(r.state.eventRelays, {});
+    // The cycle line says the event path was off for that relay.
+    const eventsOn = (b: unknown) => {
+      const [line] = emitLines([run([b]).steps[0]!.snapshot.cycle]);
+      return (JSON.parse(line!) as { relays: { events: unknown }[] }).relays.map((x) => x.events);
+    };
+    assert.deepEqual(eventsOn(old), [false]);
     // A relay that could not say when it started counts nothing either.
-    assert.equal((readRelayStatus(body({ events: [], processStartedAt: null })) as { eventCounts: unknown }).eventCounts, null);
-    // Known positive: the same relay with events is read.
+    const unstarted = body({ events: [], processStartedAt: null });
+    assert.equal((readRelayStatus(unstarted) as { eventCounts: unknown }).eventCounts, null);
+    assert.deepEqual(eventsOn(unstarted), [false]);
+    // Known positive: the same relay with events is read, and the cycle line says so.
     assert.ok((readRelayStatus(counted(1)) as { eventCounts: unknown }).eventCounts);
+    assert.deepEqual(eventsOn(counted(1)), [true]);
+  });
+
+  it("a count that falls under the same process is ignored; only a rise above the stored count raises", () => {
+    const run10 = repeat(EVENT_QUIET_CYCLES, counted(3));
+    // Back up to the stored count is not an increase; past it is.
+    assert.deepEqual(run([counted(0), counted(3), ...run10, counted(1), counted(3)]).events.map(briefEvent), [`za/web/${HASH} +3`]);
+    assert.deepEqual(run([counted(0), counted(3), ...run10, counted(1), counted(4)]).events.map(briefEvent),
+      [`za/web/${HASH} +3`, `za/web/${HASH} +1`]);
+    // The cycle with the lower count is not a quiet one: nine quiet cycles after it are still one short.
+    assert.deepEqual(run([counted(0), counted(3), counted(1), ...repeat(EVENT_QUIET_CYCLES - 1, counted(3)), counted(4)]).events.length, 1);
+  });
+
+  it("a relay restart in the middle of a run raises no second event", () => {
+    const r = run([counted(0), counted(1), counted(2), counted(1, { started: P2 }), counted(2, { started: P2 }), counted(3, { started: P2 })]);
+    assert.deepEqual(r.events.map(briefEvent), [`za/web/${HASH} +1`]);
   });
 
   it("a malformed event field is schema; an event kind this build does not know is skipped and counted", () => {
@@ -569,6 +593,7 @@ describe("problem watch: event-shaped contradictions (#148 PR 4)", () => {
       { events: [{ host: H1, kind: HASH, count: -1 }] },
       { events: [{ host: 7, kind: HASH, count: 1 }] },
       { events: [], hostObservable: { [H1]: "yes" } },
+      { events: [{ host: H1, kind: HASH, count: 1 }, { host: H1, kind: HASH, count: 2 }] },
     ]) {
       const b = body({ events: [] }) as Record<string, unknown>;
       assert.deepEqual(readRelayStatus({ ...b, ...bad }), { ok: false, reason: "schema" }, JSON.stringify(bad));

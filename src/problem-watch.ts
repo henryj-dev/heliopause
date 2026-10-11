@@ -281,6 +281,7 @@ function readEventCounts(body: Record<string, unknown>, unknown: Set<string>): R
     }
     if (!Number.isSafeInteger(count) || (count as number) < 0) return "schema";
     const byKind = counts.get(host) ?? new Map<EventKind, number>();
+    if (byKind.has(kind as EventKind)) return "schema";
     byKind.set(kind as EventKind, count as number);
     counts.set(host, byKind);
   }
@@ -351,7 +352,8 @@ export interface EventLine {
 export interface CycleLine {
   event: "heliopause.problem.cycle";
   cycle: number;
-  relays: { relay: string; observed: boolean; reason: CycleReason | null; active: number }[];
+  /** `events`: whether this relay's answer carried event counts this cycle — false turns the event path off for it. */
+  relays: { relay: string; observed: boolean; reason: CycleReason | null; active: number; events: boolean }[];
   unaliasedHosts: number;
   /** Summed over relays: distinct kind names each relay sent that this build does not know. */
   unknownKinds: number;
@@ -367,7 +369,11 @@ export interface WatchLine {
   holderAgeSec?: number | null;
   /** `state_pruned` only: loaded keys dropped for a kind this build does not know. */
   unknownKinds?: number;
-  /** `state_pruned` only: loaded keys whose relay or host alias the alias file no longer has; kept, and taken out of scope next cycle. */
+  /**
+   * `state_pruned` only: loaded problem keys, event keys and `eventRelays` entries whose relay or host
+   * alias the alias file no longer has. Kept; a problem key is taken out of scope next cycle with
+   * `scope_removed`, an event key or entry is deleted without a line.
+   */
   staleAliases?: number;
   /** `lock_error` only: the error code, or `other`. */
   errno?: LockErrno;
@@ -481,7 +487,7 @@ export function stepWatch(prev: WatchState, input: WatchCycle): StepResult {
       apply({ relay, host: RELAY_HOST, kind: "relay-not-configured", present: !poll, count: poll ? 0 : 1, ev: "yes" });
       if (poll) apply({ relay, host: RELAY_HOST, kind: "relay-unobservable", present: true, count: 1, ev: "yes" });
       inScope = new Set(hostAliases.values());
-      cycleRelays.push({ relay, observed: false, reason: poll ? poll.reason : "not-configured", active: 0 });
+      cycleRelays.push({ relay, observed: false, reason: poll ? poll.reason : "not-configured", active: 0, events: false });
     } else {
       apply({ relay, host: RELAY_HOST, kind: "relay-not-configured", present: false, count: 0, ev: "yes" });
       apply({ relay, host: RELAY_HOST, kind: "relay-unobservable", present: false, count: 0, ev: "yes" });
@@ -506,7 +512,7 @@ export function stepWatch(prev: WatchState, input: WatchCycle): StepResult {
       apply({ relay, host: FLEET_HOST, kind: "unaliased-hosts", present: unaliased > 0, count: unaliased, ev: "yes" });
       unaliasedTotal += unaliased;
       unknownKindsTotal += poll.unknownKinds;
-      cycleRelays.push({ relay, observed: true, reason: null, active: 0 });
+      cycleRelays.push({ relay, observed: true, reason: null, active: 0, events: poll.eventCounts !== null });
     }
     for (const [k, rec] of Object.entries(next.keys)) {
       if (rec.relay !== relay || handled.has(k)) continue;
@@ -553,8 +559,12 @@ export function stepWatch(prev: WatchState, input: WatchCycle): StepResult {
  * stored ones under the same relay `processStartedAt`; under a different one — a relay restart, or
  * this watch's first look at the relay — they are only stored, so beats between the last read and the
  * restart are missed. A key seen for the first time is stored the same way. On a host the relay does
- * not currently hear, an increase is stored and not raised. Mutates `next`.
+ * not currently hear, an increase is stored and not raised, and that cycle counts as a quiet one. A
+ * count lower than the stored one under the same process is ignored: the stored count and the quiet
+ * run stay, so only a rise above the stored count is an increase. Mutates `next`.
  *
+ * @see "a count that falls under the same process is ignored; only a rise above the stored count raises" in problem-watch.test.ts
+ * @see "a relay restart in the middle of a run raises no second event" in problem-watch.test.ts
  * @see "an increase raises one event, and a run of increases raises one" in problem-watch.test.ts
  * @see "an increase after EVENT_QUIET_CYCLES quiet cycles raises a new event" in problem-watch.test.ts
  * @see "a relay restart re-baselines the counts and raises nothing, and the next increase raises" in problem-watch.test.ts
@@ -584,6 +594,8 @@ function stepEvents(next: WatchState, input: WatchCycle, expectedAliases: Readon
           next.events[k] = { relay, host, kind, count: now, quiet: EVENT_QUIET_CYCLES };
           continue;
         }
+        // A lower count under the same process is no reading to compare with: keep the stored one and the quiet run.
+        if (sameProcess && now < rec.count) continue;
         const increase = sameProcess && hostObservable && now > rec.count ? now - rec.count : 0;
         rec.count = now;
         if (increase === 0) {
@@ -681,6 +693,7 @@ export function emitLines(events: readonly WatchEvent[]): string[] {
           relays: c.relays.map((r) => ({
             relay: relayAlias(r.relay, event), observed: bool(r.observed, event),
             reason: r.reason === null ? null : oneOf(r.reason, REASONS, event), active: count(r.active, event),
+            events: bool(r.events, event),
           })),
           unaliasedHosts: count(c.unaliasedHosts, event), unknownKinds: count(c.unknownKinds, event),
           skippedTicks: count(c.skippedTicks, event),
@@ -710,8 +723,16 @@ export function emitLines(events: readonly WatchEvent[]): string[] {
 
 // ## Persisted state
 
-// Version 2 adds `eventRelays` and `events`. A version 1 file loads with neither; a manager older than
-// version 2 refuses a version 2 file as unreadable.
+// Version 2 adds `eventRelays` and `events`. A version 1 file loads with neither.
+//
+// Rolling back: the #173 manager (a308ebf) reads only version 1 with exactly its three fields, so it
+// moves a version 2 file to `.corrupt-<ms>` and turns the watch off. To run the watch on that manager
+// again, delete the state file and `<state>.initialized` and start it once with
+// HELIOPAUSE_PROBLEM_WATCH_ALLOW_EMPTY_STATE=1.
+//
+// From version 2 on, a top-level field this loader does not know is ignored, so a later version that
+// only adds fields does not lock this one out; a `v` above `STATE_VERSION` is still refused, since its
+// fields may mean something else.
 const STATE_VERSION = 2;
 
 /** The state file's text: every key as a record, so the loader re-derives each key from its fields. */
@@ -741,7 +762,7 @@ export function loadWatchState(text: string, aliases: WatchAliases): LoadedWatch
   let doc: unknown;
   try { doc = JSON.parse(text); } catch { return { ok: false }; }
   if (!isObject(doc) || (doc.v !== 1 && doc.v !== STATE_VERSION) || !Number.isSafeInteger(doc.seq) || (doc.seq as number) < 0
-    || !Array.isArray(doc.keys) || Object.keys(doc).length !== (doc.v === 1 ? 3 : 5)) return { ok: false };
+    || !Array.isArray(doc.keys) || (doc.v === 1 && Object.keys(doc).length !== 3)) return { ok: false };
   const relayByAlias = new Map([...aliases.relays].map(([name, alias]) => [alias, name]));
   const state: WatchState = { seq: doc.seq as number, keys: {}, eventRelays: {}, events: {} };
   let unknownKinds = 0;

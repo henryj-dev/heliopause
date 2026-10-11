@@ -152,11 +152,13 @@ export type EventKind =
   | "contradiction-artifact-hash-changed"
   | "contradiction-unknown-generation"
   | "contradiction-kernel-unchanged";
-export const EVENT_KINDS: readonly EventKind[] = [
-  "contradiction-artifact-hash-changed",
-  "contradiction-unknown-generation",
-  "contradiction-kernel-unchanged",
-];
+/** A `Record` so the compiler refuses one missing from or added to `EventKind`. */
+const EVENT_KIND_RECORD: Record<EventKind, true> = {
+  "contradiction-artifact-hash-changed": true,
+  "contradiction-unknown-generation": true,
+  "contradiction-kernel-unchanged": true,
+};
+export const EVENT_KINDS = Object.keys(EVENT_KIND_RECORD) as readonly EventKind[];
 
 /** One host's count of one event kind since this relay process started. Only counts above 0 are listed. */
 export interface ProblemEventCount {
@@ -509,7 +511,7 @@ export function fleetView(
   const evaluated: Record<string, Partial<Record<ProblemKind, ProblemEvaluation>>> = {};
   const hostObservable: Record<string, boolean> = {};
   const events: ProblemEventCount[] = [];
-  const relayAgeSec =startedAt ? (now.getTime() - startedAt.getTime()) / 1000 : Infinity;
+  const relayAgeSec = startedAt ? (now.getTime() - startedAt.getTime()) / 1000 : Infinity;
   /** Seconds since `host` last beat, or null if never seen. The one rounding both silence checks use. */
   const ageOf = (host: string): number | null => {
     const seen = state.lastSeen[host];

@@ -372,6 +372,12 @@ describe("problem watch runner: state file", () => {
       text([], { za: 1 }),
       JSON.stringify({ v: 2, seq: 0, keys: [] }),
     ]) assert.deepEqual(loadWatchState(broken, ALIASES), { ok: false }, broken);
+    // A version 2 file with a top-level field this loader does not know is read; a higher version is not.
+    const added = JSON.parse(text([ev("za", "web", "contradiction-artifact-hash-changed")])) as Record<string, unknown>;
+    const withExtra = loadWatchState(JSON.stringify({ ...added, laterField: { anything: 1 } }), ALIASES);
+    assert.ok(withExtra.ok);
+    assert.deepEqual(Object.keys(withExtra.state.events), [keyOf("za", "web", "contradiction-artifact-hash-changed")]);
+    assert.deepEqual(loadWatchState(JSON.stringify({ ...added, v: 3 }), ALIASES), { ok: false });
     // A version 1 file loads with no event state.
     const v1 = loadWatchState(JSON.stringify({ v: 1, seq: 4, keys: [] }), ALIASES);
     assert.deepEqual(v1, { ok: true, state: { seq: 4, keys: {}, eventRelays: {}, events: {} }, unknownKinds: 0, staleAliases: 0 });
