@@ -22,7 +22,7 @@
 // be missed.
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { spawn, type ChildProcessByStdio } from "node:child_process";
+import { execFileSync, spawn, type ChildProcessByStdio } from "node:child_process";
 // `fetch` will not send a malformed request target, so one test speaks HTTP directly.
 import { connect } from "node:net";
 import type { Readable } from "node:stream";
@@ -1848,6 +1848,72 @@ export const site = {
       }
     },
   );
+
+  it("reads an excluded helper's new marker when only its commit changes HEAD", { timeout: 30_000 }, async () => {
+    const { dir, sites, alpha, beta } = twoSites();
+    const helper = join(dir, ".generated", "helper.ts");
+    const gitEnv = {
+      PATH: process.env.PATH ?? "",
+      GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_CONFIG_NOSYSTEM: "1",
+    };
+    const git = (...args: string[]) => execFileSync("git", ["-c", "core.hooksPath=/dev/null", "-C", dir, ...args], {
+      env: gitEnv, encoding: "utf8", stdio: "pipe", timeout: 5_000,
+    });
+    let started: Started | undefined;
+    try {
+      mkdirSync(join(dir, ".generated"));
+      writeFileSync(helper, 'export const mark = "first";\n');
+      writeFileSync(beta, `import { mark } from "./.generated/helper.ts";
+export const site = {
+  cfg: { hookPolicy: { input: "drop", output: "accept" } },
+  hosts: [{ id: "gw-01.beta", stage: "canary", items: [] }],
+  objects: [{ id: "ao-beta", kind: "address", name: mark,
+              members: [{ kind: "cidr", value: "10.0.0.0/8" }] }],
+};
+`);
+      const pinned = 1_700_000_000;
+      const scanned = [alpha, beta, join(dir, "policies.json"), join(dir, "coverage-a.json")];
+      for (const file of [...scanned, helper]) utimesSync(file, pinned, pinned);
+      const mtimes = scanned.map((file) => statSync(file).mtimeMs);
+      git("init", "-q", "--template=");
+      git("add", ".");
+      git("-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false", "commit", "-qm", "first marker");
+      const firstHead = git("rev-parse", "HEAD").trim();
+      assert.equal(git("status", "--porcelain").trim(), "");
+      // The helper is excluded from the neighbour scan and from the explicit allowlist.
+      started = await start(dir, {
+        ...MULTI(sites), HELIOPAUSE_POLICY_ALLOW_PATHS: "policies.json",
+        GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1",
+      });
+      const marker = async () => {
+        const res = await fetchAt(started!.port, "/source?site=beta", { signal: AbortSignal.timeout(5_000) });
+        assert.equal(res.status, 200);
+        const source = parsePolicySource(await res.json());
+        assert.equal(source.site.hosts?.[0]?.id, "gw-01.beta");
+        return (source.site as { objects?: { name: string }[] }).objects?.[0]?.name;
+      };
+      assert.equal(await marker(), "first", "the excluded helper's import was not reached");
+
+      writeFileSync(helper, 'export const mark = "second";\n');
+      assert.equal(git("rev-parse", "HEAD").trim(), firstHead);
+      assert.equal(git("diff", "--name-only").trim(), ".generated/helper.ts");
+      git("add", ".generated/helper.ts");
+      git("-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false", "commit", "-qm", "second marker");
+      assert.notEqual(git("rev-parse", "HEAD").trim(), firstHead, "the helper commit did not move HEAD");
+      assert.equal(git("status", "--porcelain").trim(), "", "the second answer must also use a clean tree");
+      assert.equal(git("diff", "--name-only", firstHead, "HEAD").trim(), ".generated/helper.ts");
+      assert.deepEqual(scanned.map((file) => statSync(file).mtimeMs), mtimes, "a scanned file moved the stamp");
+      assert.equal(statSync(beta).mtimeMs, pinned * 1_000, "the entry mtime changed");
+      assert.equal(await marker(), "second", "HEAD changed but the excluded helper stayed cached");
+    } finally {
+      if (started && started.proc.exitCode === null && started.proc.signalCode === null) {
+        const exited = new Promise<void>((done) => started!.proc.once("exit", () => done()));
+        started.stop();
+        await exited;
+      }
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
 
   it("stops serving a cached answer when a file the module imports breaks", { timeout: 30_000 }, async () => {
     // ## The stamp read the entry module, not what the entry module imports
