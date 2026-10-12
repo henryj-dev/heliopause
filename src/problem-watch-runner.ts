@@ -282,7 +282,7 @@ export function startProblemWatch(deps: ProblemWatchDeps): ProblemWatch {
       return;
     }
     const step = stepWatch(state, { cycle: cycle + 1, aliases: deps.aliases, relays: reads, skippedTicks: skipped });
-    const lines = emitLines([...step.transitions, ...step.snapshot.states, step.snapshot.cycle]);
+    const lines = emitLines([...step.transitions, ...step.events, ...step.snapshot.states, step.snapshot.cycle]);
     try {
       fs.writeFileAtomic(deps.stateFile, serializeWatchState(step.next));
     } catch {

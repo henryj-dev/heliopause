@@ -313,7 +313,74 @@ describe("problem watch runner: state file", () => {
       ['{"event":"heliopause.problem.watch","v":1,"what":"lock_held","holderAgeSec":null}']);
     assert.throws(() => emitLines([{ event: "heliopause.problem.watch", what: "lock_held" }]));
     assert.throws(() => emitLines([{ event: "heliopause.problem.watch", what: "state_pruned", unknownKinds: 1 }]));
-    assert.deepEqual(serializeWatchState(emptyWatchState()), '{"v":1,"seq":0,"keys":[]}\n');
+    assert.deepEqual(serializeWatchState(emptyWatchState()), '{"v":2,"seq":0,"keys":[],"eventRelays":{},"events":[]}\n');
+  });
+
+  /** A body with H1's `artifact-hash-changed` count at `n`, and a silent H2 so transitions take seq too. */
+  const eventBody = (n: number) => {
+    const b = body([{ kind: "silent", host: H2 }]) as Record<string, unknown>;
+    return reads({
+      ...b,
+      events: n > 0 ? [{ host: H1, kind: "contradiction-artifact-hash-changed", count: n, lastAt: NOW.toISOString() }] : [],
+      processStartedAt: "2026-10-11T00:00:00.000Z",
+      hostObservable: { [H1]: true, [H2]: true },
+    });
+  };
+  const seqs = (h: Harness) => h.lines.filter((l) => typeof l.seq === "number").map((l) => `${String(l.event).replace("heliopause.problem.", "")} ${String(l.seq)}`);
+
+  it("a watch restarted from its state file does not raise the same increase again, and seq keeps rising", async () => {
+    let n = 0;
+    const first = start({ poll: async () => eventBody(n) });
+    await first.watch.tick();
+    n = 1;
+    for (let i = 0; i < 11; i++) await first.watch.tick();
+    assert.deepEqual(seqs(first), ["transition 1", "event 2"]);
+    first.watch.stop();
+
+    // The count it last saved is the count it reads: nothing to raise.
+    const same = start({ poll: async () => eventBody(n), allowEmptyState: false });
+    for (let i = 0; i < 3; i++) await same.watch.tick();
+    assert.deepEqual(seqs(same), []);
+    same.watch.stop();
+
+    // An increase while no watch ran is measured against the saved count, not taken as a first look.
+    n = 2;
+    const later = start({ poll: async () => eventBody(n), allowEmptyState: false });
+    await later.watch.tick();
+    assert.deepEqual(seqs(later), ["event 3"]);
+  });
+
+  it("state loader reads event keys under the same rules: unknown kinds dropped, stale aliases kept", () => {
+    const ev = (relay: string, host: string, kind: string, extra: object = {}) =>
+      ({ relay, host, kind, count: 3, quiet: 10, ...extra });
+    const text = (events: object[], eventRelays: object = { za: "2026-10-11T00:00:00.000Z" }) =>
+      JSON.stringify({ v: 2, seq: 7, keys: [], eventRelays, events });
+    const loaded = loadWatchState(text([
+      ev("za", "web", "contradiction-artifact-hash-changed"), ev("za", "web", "contradiction-new-one"),
+      ev("za", "olddb", "contradiction-kernel-unchanged"),
+    ], { za: "2026-10-11T00:00:00.000Z", gone: "2026-10-10T00:00:00.000Z" }), ALIASES);
+    assert.ok(loaded.ok);
+    assert.deepEqual([loaded.unknownKinds, loaded.staleAliases], [1, 2]);
+    assert.deepEqual(Object.keys(loaded.state.events).sort(), [
+      keyOf("za", "web", "contradiction-artifact-hash-changed"), keyOf("za", "olddb", "contradiction-kernel-unchanged"),
+    ].sort());
+    assert.deepEqual(loadWatchState(serializeWatchState(loaded.state), ALIASES), { ok: true, state: loaded.state, unknownKinds: 0, staleAliases: 2 });
+    for (const broken of [
+      text([ev("za", "web", "contradiction-artifact-hash-changed", { quiet: 11 })]),
+      text([ev("za", "web", "contradiction-artifact-hash-changed", { detail: "x" })]),
+      text([ev("za", "_fleet", "contradiction-artifact-hash-changed")]),
+      text([], { za: 1 }),
+      JSON.stringify({ v: 2, seq: 0, keys: [] }),
+    ]) assert.deepEqual(loadWatchState(broken, ALIASES), { ok: false }, broken);
+    // A version 2 file with a top-level field this loader does not know is read; a higher version is not.
+    const added = JSON.parse(text([ev("za", "web", "contradiction-artifact-hash-changed")])) as Record<string, unknown>;
+    const withExtra = loadWatchState(JSON.stringify({ ...added, laterField: { anything: 1 } }), ALIASES);
+    assert.ok(withExtra.ok);
+    assert.deepEqual(Object.keys(withExtra.state.events), [keyOf("za", "web", "contradiction-artifact-hash-changed")]);
+    assert.deepEqual(loadWatchState(JSON.stringify({ ...added, v: 3 }), ALIASES), { ok: false });
+    // A version 1 file loads with no event state.
+    const v1 = loadWatchState(JSON.stringify({ v: 1, seq: 4, keys: [] }), ALIASES);
+    assert.deepEqual(v1, { ok: true, state: { seq: 4, keys: {}, eventRelays: {}, events: {} }, unknownKinds: 0, staleAliases: 0 });
   });
 });
 

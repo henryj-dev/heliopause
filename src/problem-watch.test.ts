@@ -1,11 +1,12 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { EnvSpecError } from "./env-spec.ts";
-import { emptyState, fleetView } from "./relay.ts";
-import { SCHEMA_VERSION } from "./protocol.ts";
+import { emptyState, fleetView, handleHeartbeat } from "./relay.ts";
+import { SCHEMA_VERSION, type Heartbeat } from "./protocol.ts";
 import {
-  CONFIRM_CYCLES, ZERO_TAIL_CYCLES, emitLines, emptyWatchState, parseWatchAliases, readRelayStatus, stepWatch,
-  type RelayRead, type StateLine, type StepResult, type TransitionLine, type WatchAliases, type WatchState,
+  CONFIRM_CYCLES, EVENT_QUIET_CYCLES, ZERO_TAIL_CYCLES, emitLines, emptyWatchState, parseWatchAliases, readRelayStatus,
+  stepWatch, type EventLine, type RelayRead, type StateLine, type StepResult, type TransitionLine, type WatchAliases,
+  type WatchState,
 } from "./problem-watch.ts";
 
 // Fixture names are RFC 2606 / RFC 5737: self-evidently not a site.
@@ -25,6 +26,10 @@ interface BodyOpts {
   evaluated?: Record<string, Record<string, Ev>>;
   fleetEvaluated?: Record<string, Ev>;
   manifest?: boolean;
+  /** With these, the body also carries `processStartedAt` and `hostObservable`, as `fleetView` does. */
+  events?: { host: string; kind: string; count: number }[];
+  processStartedAt?: string | null;
+  hostObservable?: Record<string, boolean>;
 }
 
 /** A `/status` body in the shape `fleetView` returns, through a JSON round trip. */
@@ -35,6 +40,11 @@ function body(o: BodyOpts = {}): unknown {
     evaluated: o.evaluated ?? { [H1]: { silent: "yes" }, [H2]: { silent: "yes" } },
     fleetEvaluated: o.fleetEvaluated ?? { "trust-ring-split": "yes" },
     observability: { manifest: o.manifest ?? true, graceActive: false },
+    ...(o.events ? {
+      events: o.events.map((e) => ({ lastAt: "2026-10-12T00:00:00.000Z", ...e })),
+      processStartedAt: o.processStartedAt === undefined ? "2026-10-12T00:00:00.000Z" : o.processStartedAt,
+      hostObservable: o.hostObservable ?? { [H1]: true, [H2]: true },
+    } : {}),
   }));
 }
 
@@ -43,7 +53,7 @@ const UNREACHABLE: RelayRead = { ok: false, reason: "unreachable" };
 const NOT_CONFIGURED = Symbol("not configured");
 type Poll = unknown | typeof NOT_CONFIGURED;
 
-interface Run { state: WatchState; steps: StepResult[]; transitions: TransitionLine[]; states: StateLine[][] }
+interface Run { state: WatchState; steps: StepResult[]; transitions: TransitionLine[]; events: EventLine[]; states: StateLine[][] }
 
 /** Feed `polls` to one relay, cycle by cycle. A `RelayRead` is passed as is; anything else is a body. */
 function run(polls: Poll[], aliases: WatchAliases = ALIASES, start: WatchState = emptyWatchState(), relay = RELAY): Run {
@@ -59,7 +69,10 @@ function run(polls: Poll[], aliases: WatchAliases = ALIASES, start: WatchState =
     state = r.next;
     steps.push(r);
   });
-  return { state, steps, transitions: steps.flatMap((s) => s.transitions), states: steps.map((s) => s.snapshot.states) };
+  return {
+    state, steps, transitions: steps.flatMap((s) => s.transitions), events: steps.flatMap((s) => s.events),
+    states: steps.map((s) => s.snapshot.states),
+  };
 }
 
 const brief = (t: TransitionLine) => `${t.transition} ${t.relay}/${t.host}/${t.kind}`;
@@ -468,5 +481,181 @@ describe("problem watch: against fleetView", () => {
     // After the grace window the host is never-reported, and silent is still not resolved.
     const after = run(repeat(5, viewOf(restarted, LONG_AGO)), ALIASES, grace.state);
     assert.deepEqual(after.transitions.map(brief), ["opened za/web/never-reported"]);
+  });
+});
+
+describe("problem watch: event-shaped contradictions (#148 PR 4)", () => {
+  const HASH = "contradiction-artifact-hash-changed";
+  const P1 = "2026-10-12T00:00:00.000Z";
+  const P2 = "2026-10-12T01:00:00.000Z";
+  /** A body whose only event count is H1's `artifact-hash-changed`; 0 is no entry, as `fleetView` sends it. */
+  const counted = (n: number, o: { started?: string; h1Observable?: boolean } = {}) => body({
+    events: n > 0 ? [{ host: H1, kind: HASH, count: n }] : [],
+    processStartedAt: o.started ?? P1,
+    hostObservable: { [H1]: o.h1Observable ?? true, [H2]: true },
+  });
+  const briefEvent = (e: EventLine) => `${e.relay}/${e.host}/${e.kind} +${e.count}`;
+
+  it("an increase raises one event, and a run of increases raises one", () => {
+    // The first look takes the counts as they are; the increase after it is the event.
+    assert.deepEqual(run([counted(0), counted(1)]).events.map(briefEvent), [`za/web/${HASH} +1`]);
+    // `artifact-hash-changed` goes up on every beat while a host keeps reporting the other artifact.
+    assert.deepEqual(run([counted(0), counted(2), counted(4), counted(6), counted(8)]).events.map(briefEvent), [`za/web/${HASH} +2`]);
+  });
+
+  it("the first look at a relay raises nothing, whatever its counts", () => {
+    assert.deepEqual(run([counted(5), counted(5)]).events, []);
+    // Known positive: the same counts, then one more, raise.
+    assert.equal(run([counted(5), counted(6)]).events.length, 1);
+  });
+
+  it("an event-shaped finding opens no problem and resolves none", () => {
+    // What `fleetView` sends for these kinds: a finding, evaluated `no`.
+    const withFinding = (n: number) => body({
+      findings: [{ kind: HASH, host: H1, count: 1 }], evaluated: { [H1]: { [HASH]: "no" }, [H2]: {} },
+      events: [{ host: H1, kind: HASH, count: n }],
+    });
+    const r = run([withFinding(1), withFinding(2), withFinding(3), body({ events: [] })]);
+    assert.deepEqual(r.transitions, []);
+    assert.equal(r.events.length, 1);
+  });
+
+  it("an increase after EVENT_QUIET_CYCLES quiet cycles raises a new event", () => {
+    assert.equal(EVENT_QUIET_CYCLES, 10);
+    const quiet = (n: number) => repeat(n, counted(1));
+    assert.deepEqual(run([counted(0), counted(1), ...quiet(EVENT_QUIET_CYCLES), counted(2)]).events.map(briefEvent),
+      [`za/web/${HASH} +1`, `za/web/${HASH} +1`]);
+    // One quiet cycle short, the increase belongs to the same run.
+    assert.deepEqual(run([counted(0), counted(1), ...quiet(EVENT_QUIET_CYCLES - 1), counted(2)]).events.map(briefEvent),
+      [`za/web/${HASH} +1`]);
+  });
+
+  it("a relay restart re-baselines the counts and raises nothing, and the next increase raises", () => {
+    const before = [counted(0), counted(3), ...repeat(EVENT_QUIET_CYCLES, counted(3))];
+    // A restart starts counting at 0, so its counts can be lower — or, a while later, higher — than the last read.
+    for (const after of [1, 5]) {
+      const r = run([...before, counted(after, { started: P2 })]);
+      assert.equal(r.events.length, 1, `restart to ${after}`);
+      // Beats between the last read before the restart and the restart are not seen: this is the baseline.
+      const next = run([counted(after + 1, { started: P2 })], ALIASES, r.state);
+      assert.deepEqual(next.events.map(briefEvent), [`za/web/${HASH} +1`], `restart to ${after}`);
+    }
+  });
+
+  it("an increase on a cycle where the host is unobservable is stored, not raised", () => {
+    const r = run([counted(0), counted(1, { h1Observable: false }), counted(1)]);
+    assert.deepEqual(r.events, []);
+    // Known positive: the next increase on an observable cycle raises.
+    assert.deepEqual(run([counted(2)], ALIASES, r.state).events.map(briefEvent), [`za/web/${HASH} +1`]);
+  });
+
+  it("a relay without events turns only the event path off", () => {
+    const old = body({ findings: [silentOn(H1)] });
+    const read = readRelayStatus(old);
+    assert.ok(read.ok);
+    assert.equal(read.eventCounts, null);
+    const r = run([old, old]);
+    assert.deepEqual(r.transitions.map(brief), ["opened za/web/silent"]);
+    assert.deepEqual(r.events, []);
+    assert.deepEqual(r.state.eventRelays, {});
+    // The cycle line says the event path was off for that relay.
+    const eventsOn = (b: unknown) => {
+      const [line] = emitLines([run([b]).steps[0]!.snapshot.cycle]);
+      return (JSON.parse(line!) as { relays: { events: unknown }[] }).relays.map((x) => x.events);
+    };
+    assert.deepEqual(eventsOn(old), [false]);
+    // A relay that could not say when it started counts nothing either.
+    const unstarted = body({ events: [], processStartedAt: null });
+    assert.equal((readRelayStatus(unstarted) as { eventCounts: unknown }).eventCounts, null);
+    assert.deepEqual(eventsOn(unstarted), [false]);
+    // Known positive: the same relay with events is read, and the cycle line says so.
+    assert.ok((readRelayStatus(counted(1)) as { eventCounts: unknown }).eventCounts);
+    assert.deepEqual(eventsOn(counted(1)), [true]);
+  });
+
+  it("a count that falls under the same process is ignored; only a rise above the stored count raises", () => {
+    const run10 = repeat(EVENT_QUIET_CYCLES, counted(3));
+    // Back up to the stored count is not an increase; past it is.
+    assert.deepEqual(run([counted(0), counted(3), ...run10, counted(1), counted(3)]).events.map(briefEvent), [`za/web/${HASH} +3`]);
+    assert.deepEqual(run([counted(0), counted(3), ...run10, counted(1), counted(4)]).events.map(briefEvent),
+      [`za/web/${HASH} +3`, `za/web/${HASH} +1`]);
+    // The cycle with the lower count is not a quiet one: nine quiet cycles after it are still one short.
+    assert.deepEqual(run([counted(0), counted(3), counted(1), ...repeat(EVENT_QUIET_CYCLES - 1, counted(3)), counted(4)]).events.length, 1);
+  });
+
+  it("a relay restart in the middle of a run raises no second event", () => {
+    const r = run([counted(0), counted(1), counted(2), counted(1, { started: P2 }), counted(2, { started: P2 }), counted(3, { started: P2 })]);
+    assert.deepEqual(r.events.map(briefEvent), [`za/web/${HASH} +1`]);
+  });
+
+  it("a malformed event field is schema; an event kind this build does not know is skipped and counted", () => {
+    for (const bad of [
+      { events: [{ host: H1, kind: HASH, count: -1 }] },
+      { events: [{ host: 7, kind: HASH, count: 1 }] },
+      { events: [], hostObservable: { [H1]: "yes" } },
+      { events: [{ host: H1, kind: HASH, count: 1 }, { host: H1, kind: HASH, count: 2 }] },
+    ]) {
+      const b = body({ events: [] }) as Record<string, unknown>;
+      assert.deepEqual(readRelayStatus({ ...b, ...bad }), { ok: false, reason: "schema" }, JSON.stringify(bad));
+    }
+    const read = readRelayStatus(body({ events: [{ host: H1, kind: "contradiction-new-one", count: 3 }] }));
+    assert.ok(read.ok);
+    assert.equal(read.unknownKinds, 1);
+    assert.equal(read.eventCounts?.counts.size, 0);
+  });
+
+  it("a host without an alias raises no event", () => {
+    const b = (n: number) => body({
+      events: [{ host: H3, kind: HASH, count: n }], hostObservable: { [H1]: true, [H2]: true, [H3]: true },
+    });
+    assert.deepEqual(run([b(0), b(1), b(2)]).events, []);
+    // Known positive: the same counts on an aliased host raise.
+    const a = (n: number) => body({ events: [{ host: H2, kind: HASH, count: n }] });
+    assert.equal(run([a(0), a(1), a(2)]).events.length, 1);
+  });
+
+  it("transition and event lines share one rising seq, transitions first", () => {
+    const both = (n: number) => body({ findings: [silentOn(H1)], events: [{ host: H2, kind: HASH, count: n }] });
+    const r = run([both(0), both(1)]);
+    assert.deepEqual(r.transitions.map((t) => t.seq), [1]);
+    assert.deepEqual(r.events.map((e) => e.seq), [2]);
+  });
+
+  it("an event line carries only its fields and refuses a host id", () => {
+    const [line] = emitLines(run([counted(0), counted(1)]).events);
+    assert.equal(line, `{"event":"heliopause.problem.event","v":1,"seq":1,"relay":"za","host":"web","kind":"${HASH}","count":1}`);
+    const e: EventLine = { event: "heliopause.problem.event", seq: 1, relay: "za", host: "web", kind: HASH, count: 1 };
+    for (const bad of [{ host: H1 }, { host: "_fleet" }, { relay: RELAY }, { kind: "silent" }, { count: -1 }]) {
+      assert.throws(() => emitLines([{ ...e, ...bad } as EventLine]),
+        (err: Error) => !err.message.includes(H1) && !err.message.includes(RELAY), JSON.stringify(bad));
+    }
+    const extra = { ...e, lastAt: "2026-10-12T00:00:00.000Z", detail: H1 } as EventLine;
+    assert.deepEqual(Object.keys(JSON.parse(emitLines([extra])[0]!) as object), ["event", "v", "seq", "relay", "host", "kind", "count"]);
+  });
+
+  it("one contradiction fleetView counted becomes one event line, end to end", () => {
+    const started = new Date("2026-07-30T00:00:00Z");
+    const now = new Date("2026-07-30T00:01:00Z");
+    const s = emptyState();
+    s.manifest = {
+      generation: "g1", issuedAt: "2026-07-30T00:00:00Z", schemaVersion: SCHEMA_VERSION,
+      hosts: { [H1]: { stage: "general", rulesetHash: "sha256:1", confirmTimeoutSec: 60, mustContain: [] } },
+    };
+    const beat = (artifactHash: string): Heartbeat => ({
+      host: H1, agentVersion: "0.6.0", schemaVersion: SCHEMA_VERSION,
+      applied: { generation: "g1", state: "confirmed", artifactHash, observedHash: "dump:1" },
+    });
+    const view = () => JSON.parse(JSON.stringify(fleetView(s, now, 90, started))) as unknown;
+    handleHeartbeat(s, H1, beat("sha256:1"), now.toISOString());
+    const polls = [view()];
+    // Known negative: another beat reporting the same artifact counts nothing.
+    handleHeartbeat(s, H1, beat("sha256:1"), now.toISOString());
+    polls.push(view());
+    handleHeartbeat(s, H1, beat("sha256:other"), now.toISOString());
+    polls.push(view());
+    const r = run(polls);
+    assert.deepEqual(emitLines(r.events),
+      [`{"event":"heliopause.problem.event","v":1,"seq":1,"relay":"za","host":"web","kind":"${HASH}","count":1}`]);
+    assert.deepEqual(r.steps.map((st) => st.events.length), [0, 0, 1]);
   });
 });
