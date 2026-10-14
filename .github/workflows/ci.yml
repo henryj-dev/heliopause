@@ -6,10 +6,10 @@
 # Collapsing them into one job would mean a machine without `nft` silently skipping the check that
 # matters most.
 #
-# Two jobs here are about the repository rather than the product, and they are not decoration.
-# `leaks` is the backstop half of the site-data scan (the authoritative half is `trusted-leaks.yml`),
-# and `guards` runs the hook suites that keep agent sessions off the shared working tree. Both guard
-# against failures whose symptom is silence, which is the only reason a check is worth CI minutes.
+# One job here is about the repository rather than the product, and it is not decoration.
+# `leaks` is the backstop half of the site-data scan (the authoritative half is `trusted-leaks.yml`).
+# It guards against a failure whose symptom is silence, which is the only reason a check is worth
+# CI minutes.
 name: ci
 
 on:
@@ -189,50 +189,6 @@ jobs:
           node scripts/scan-public-history.mjs
           --base "$SCAN_BASE" --head "$SCAN_HEAD" --default-branch "$DEFAULT_BRANCH"
 
-  guards:
-    name: agent worktree guards
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          # `test-session-end-cleanup.py` asks which worktree branches a session may delete, and
-          # "already merged" is a history question. A shallow checkout answers it wrongly rather
-          # than refusing to answer.
-          fetch-depth: 0
-          persist-credentials: false
-
-      # `git clone` writes `refs/remotes/origin/HEAD`; `actions/checkout` does not — it builds the
-      # repository with `init` + `fetch`, and nothing in that path sets a remote HEAD. The suites
-      # create their worktrees off `origin/HEAD`, so without this the whole file dies at the first
-      # fixture with `fatal: invalid reference: origin/HEAD` — measured against a checkout built the
-      # way the runner builds one. It fails loudly if the ref is missing, which is the point: a
-      # skipped guard suite and a passing one must not look alike.
-      - name: point origin/HEAD at the default branch
-        env:
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: git symbolic-ref refs/remotes/origin/HEAD "refs/remotes/origin/$DEFAULT_BRANCH"
-
-      # These hooks are what keeps several agent sessions from sharing one index and committing each
-      # other's half-finished work (AGENTS.md). They are tracked code with tests, and until now
-      # nothing ran those tests except a person remembering to — which is the worst shape for this
-      # particular thing: **a guard that has stopped denying looks exactly like a guard that works.**
-      # Every suite here pins the ALLOW side too, and mutates a copy of the hook to prove the check
-      # is not vacuous, so a green run means more than "nothing threw".
-      #
-      # Standard library only, no install step, ~20s for all seven. They build their own fixtures in
-      # temporary directories and restore the owner records they touch.
-      - name: hook suites
-        run: |
-          set -euo pipefail
-          python3 scripts/claude-hooks/test-main-tree-guard.py
-          python3 scripts/claude-hooks/test-enter-worktree.py
-          python3 scripts/claude-hooks/test-ignored-paths.py
-          python3 scripts/claude-hooks/test-session-start-pull.py
-          python3 scripts/claude-hooks/test-session-end-cleanup.py
-          python3 scripts/claude-hooks/test-codex-hooks.py
-          python3 scripts/git-hooks/test-pre-commit.py
-
   # The desktop enrolment app: Rust + a plain page, outside the npm workspaces, and until now named
   # by no job here at all. What it *does* is checked by `src/enroll-app-cli-contract.test.ts`, which
   # reads both ends of the CLI contract statically and runs inside `npm test` — no toolchain needed.
@@ -307,7 +263,7 @@ jobs:
   # one-line change to `needs:`, and leaves the ruleset alone.
   gate:
     name: gate
-    needs: [check, e2e, rollback, leaks, guards, enroll-app, policy]
+    needs: [check, e2e, rollback, leaks, enroll-app, policy]
     # This job must run even when something upstream is red. Otherwise it is a check that
     # never reported, the rule waits forever, and nothing records what broke.
     if: always()

@@ -130,8 +130,6 @@ heliopause는 nftables를 관리하는 host firewall 제어 시스템이다. 코
 - CI/CD 파이프라인(`.github/workflows`)은 별도 감사 대상. 단, 워크플로가 **주장하는**
   보안 속성(예: `trusted-leaks.yml` 이 후보 코드를 실행하지 않는다)이 이 리포의 문서에
   적혀 있다면 그 주장의 사실 여부는 범위 안이다.
-- 워크트리 가드(`scripts/claude-hooks`, `scripts/git-hooks`)는 개발 위생이지 제품
-  보안 경계가 아니다 — 명시적으로 fail-open 이라고 문서화되어 있다.
 
 ## 결과 형식
 각 발견 사항마다:
