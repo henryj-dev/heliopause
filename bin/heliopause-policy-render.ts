@@ -44,6 +44,7 @@
 import { createServer, type IncomingMessage } from "node:http";
 import { Worker } from "node:worker_threads";
 import { evaluateWithLifecycle } from "../src/policy-eval-lifecycle.ts";
+import { currentPolicyWire, type SourceStamp } from "../src/policy-eval-cache.ts";
 import { existsSync, opendirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -471,7 +472,8 @@ if (!token) {
 }
 
 /**
- * Evaluated once per commit, not once per request.
+ * Clean/nogit evaluations reuse matching stamps; dirty calls evaluate independently.
+ * @see src/policy-eval-cache.test.ts "starts one clean evaluation and four dirty evaluations for four concurrent calls"
  *
  * ⚠ **This was keyed on the site module's mtime alone, and that was wrong for eleven hours on
  * 2026-08-16.** The comment here asserted that mtime "is what git-sync changes when it lands a new
@@ -512,21 +514,26 @@ if (!token) {
 //
 // @see src/policy-render-service.test.ts "answers the same payload on a cache miss and a cache hit"
 const cached = new Map<string, { stamp: string; wire: string }>();
+// Dirty metadata is not part of these values. currentPolicyWire reads reuseAllowed before touching
+// either map, so a dirty evaluation neither reads nor writes them. @see policy-eval-cache.test.ts
 
 /**
  * The evaluation in progress for each site, keyed like `cached` and holding the stamp it started on.
  *
  * Concurrent cache misses on one stamp used to start one worker each — measured on `d8615ca`: 64
  * concurrent requests after a stamp move ran 64 workers, and a failing site, which is never cached,
- * ran one per request (#117). A miss now joins the evaluation already running for the same stamp.
+ * ran one per request (#117). Clean/nogit misses join an evaluation running on the same stamp;
+ * dirty calls start their own evaluation.
  *
- * Only the **running** evaluation is shared. A failure is not remembered once it settles, so the next
- * request after it evaluates again, as before; what changes is that everyone waiting on that one
- * evaluation receives its answer, success or failure, instead of starting their own.
+ * For clean/nogit, only the **running** evaluation is shared. A failure is not remembered once it
+ * settles, so the next call evaluates again. Calls sharing that evaluation receive its answer,
+ * success or failure.
  *
- * @see src/policy-render-service.test.ts "concurrent requests share one evaluation"
+ * @see src/policy-eval-cache.test.ts "starts one clean evaluation and four dirty evaluations for four concurrent calls"
  */
 const inFlight = new Map<string, { stamp: string; answer: Promise<string> }>();
+// The stamp match and self-entry cleanup live in currentPolicyWire. An older clean completion can
+// still replace the completed value for the same site; this change does not alter that race.
 
 /**
  * What can change what `/source` should answer, in one string — as much of it as this can see.
@@ -582,7 +589,7 @@ const STAMP_SCAN_CAP = 2_000;
  * Returning a placeholder instead froze the key; evaluating without caching leaked the module
  * registry. Both were tried, in that order, and both are recorded there.
  */
-function sourceStamp(sitePath: string): string | ScanFailure {
+function sourceStamp(sitePath: string): SourceStamp | ScanFailure {
   const head = policyHead(sitePath);
   const dir = dirname(resolve(sitePath));
   const mtime = (p: string): string => {
@@ -719,7 +726,10 @@ function sourceStamp(sitePath: string): string | ScanFailure {
   // stamp for `alpha.ts` and `beta.ts` can be byte-identical, and then a cache that keys on the
   // stamp alone answers one site's request with the other's policy. Belt and braces on purpose: the
   // bucket and the stamp each encode the site, so a mistake in either is caught by the other.
-  return `${sitePath}:${head.sha ?? "nogit"}:${head.dirty ? "dirty" : "clean"}:${files}:${scanned}`;
+  return {
+    stamp: `${sitePath}:${head.sha ?? "nogit"}:${head.dirty ? "dirty" : "clean"}:${files}:${scanned}`,
+    reuseAllowed: !head.dirty,
+  };
 }
 
 /** The host ids a rendered site declares, for the zone check. */
@@ -752,50 +762,32 @@ async function currentSource(site: { name: string | null; path: string }): Promi
   // directory, so every site whose module sits in it reaches the same verdict — and in the fleet all
   // three do. An overflow is therefore every console, not one. That is the price of refusing, and it is
   // why the cap sits far above a measured checkout rather than near it.
-  const stamped = sourceStamp(sitePath);
-  if (typeof stamped !== "string") {
-    throw new Error(
-      `${sitePath}: ${scanFailureReason(stamped)} — so this site is refused rather than served from a ` +
-        "key that cannot move",
-    );
-  }
-  const stamp = stamped;
-  const hit = cached.get(sitePath);
-  if (hit && hit.stamp === stamp) return hit.wire;
-  // ## The module is evaluated in a worker, and what comes back is text
-  //
-  // Everything the module can reach now lives in a thread that is terminated after one evaluation:
-  // the globals it replaces, the prototypes it poisons, a top-level `while (true) {}`, and the module
-  // graph itself, which is what #89 is about. `docs/policy-evaluation-realm-design.md` §4-a has the
-  // measurement that chose a worker over `vm`.
-  //
-  // `src/policy-eval-worker.ts` holds the three lines §3-b measured — a dedicated port, taken before
-  // the module is imported, and a captured `postMessage` — and the reasons they are not
-  // interchangeable with the obvious alternatives.
-  const running = inFlight.get(sitePath);
-  // The stamp is part of the match: a request that sees a newer stamp than the running evaluation
-  // started on must not be answered from the older one.
-  if (running && running.stamp === stamp) return running.answer;
-  const answer = (async () => {
-    const moduleWire = await evaluateInWorker({ sitePath, label: name ?? label });
-    return accepted({ moduleWire, name, sitePath, stamp });
-  })();
-  const entry = { stamp, answer };
-  inFlight.set(sitePath, entry);
-  // Removes only its own entry: a newer evaluation may have replaced it. Both handlers, so this chain
-  // is never an unhandled rejection; each caller handles the rejection it receives.
-  const forget = () => { if (inFlight.get(sitePath) === entry) inFlight.delete(sitePath); };
-  answer.then(forget, forget);
-  return answer;
+  return currentPolicyWire({
+    sitePath,
+    cached,
+    inFlight,
+    readStamp: () => {
+      const stamped = sourceStamp(sitePath);
+      if ("kind" in stamped) {
+        throw new Error(
+          `${sitePath}: ${scanFailureReason(stamped)} — so this site is refused rather than served from a ` +
+            "key that cannot move",
+        );
+      }
+      return stamped;
+    },
+    evaluate: () => evaluateInWorker({ sitePath, label: name ?? label }),
+    accepted: (moduleWire) => accepted({ moduleWire, name, sitePath }),
+  });
 }
 
 /** The half of `currentSource` that runs in the parent on what the worker sent: read the module's
- *  half, add everything the renderer reads itself, validate, zone-check, cache. Separated because
+ *  half, add everything the renderer reads itself, validate and zone-check. Separated because
  *  every one of those steps can refuse, and the caller turns a refusal into that site's 503. */
 function accepted(
-  input: { moduleWire: string; name: string | null; sitePath: string; stamp: string },
+  input: { moduleWire: string; name: string | null; sitePath: string },
 ): string {
-  const { moduleWire, name, sitePath, stamp } = input;
+  const { moduleWire, name, sitePath } = input;
   // ## 🔑 Two keys are taken from the worker's message; this side reads the rest
   //
   // A module controls what its worker sends — measured twice: once by replacing
@@ -865,7 +857,6 @@ function accepted(
     ? null
     : zoneMismatch({ target: name, hostIds: hostIdsOf(parsed.site as ScreenSite) });
   if (wrongZone) throw ownZoneMismatch(wrongZone);
-  cached.set(sitePath, { stamp, wire });
   log(`evaluated ${name ?? label} at ${parsed.head.sha ?? "unknown"}${parsed.head.dirty ? " (dirty)" : ""}`);
   // ## Serialised here, and the caller receives bytes
   //
@@ -1001,10 +992,11 @@ function evalExecArgv(sitePath: string): string[] | undefined {
  * into production without a measurement.
  *
  * ⚠️ **Until then there is no cap.** Startup evaluates every site at once (four today). On the request
- * path, concurrent cache misses on one stamp share one evaluation (`inFlight`), so a burst no longer
- * spawns one worker per request — but a site that keeps failing still evaluates again on each request
- * after the shared one settles, and a moved stamp starts a new evaluation while the old one may still
- * be inside its grace. @see #117
+ * path, clean/nogit concurrent misses on one stamp share one evaluation (`inFlight`); dirty calls
+ * evaluate independently. A clean/nogit failure evaluates again on the next call after the shared
+ * evaluation settles, and a moved stamp starts a new evaluation while the old one may still be inside
+ * its grace. @see #117; src/policy-eval-cache.test.ts
+ * "starts one clean evaluation and four dirty evaluations for four concurrent calls"
  */
 let workersAlive = 0;
 /**
