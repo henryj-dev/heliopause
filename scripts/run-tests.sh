@@ -65,7 +65,7 @@ run() {
 # ⚠️ Pointing it at a directory is not a promise that the tests there pass — it decides **which**
 # tests run. Read the count, as the paragraph above says.
 run "src + examples + policy" \
-  node --test "src/*.test.ts" "examples/*.test.ts" "${HELIOPAUSE_POLICY_DIR:-policy}/*.test.ts"
+  node --test --test-concurrency=4 "src/*.test.ts" "examples/*.test.ts" "${HELIOPAUSE_POLICY_DIR:-policy}/*.test.ts"
 
 # `--if-present` is kept: a workspace may legitimately have no suite. It is also why the workspace
 # list is spelled out here — see `scripts/check-workspace-suites.sh`, which fails when a workspace

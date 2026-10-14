@@ -11,7 +11,7 @@
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "prepare": "svelte-kit sync",
-    "test": "node --test \"src/**/*.test.ts\""
+    "test": "node --test --test-concurrency=4 \"src/**/*.test.ts\""
   },
   "dependencies": {
     "@heliopause/i18n": "file:../i18n"
