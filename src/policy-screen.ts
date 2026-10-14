@@ -203,6 +203,20 @@ export function policyHead(sitePath: string): { sha: string | null; dirty: boole
   return { sha, dirty: Boolean(git(dir, ["status", "--porcelain"])) };
 }
 
+/**
+ * `policyHead` for the renderer's reuse decision: a `git status` that fails is `"unknown"`, not clean.
+ * The same two git calls; a failed `rev-parse` still answers `{ sha: null, dirty: false }`.
+ *
+ * @see src/policy-render-service.test.ts "does not reuse an answer when git status fails on a tree whose HEAD resolves"
+ */
+export function policyHeadForReuse(sitePath: string): { sha: string | null; dirty: boolean | "unknown" } {
+  const dir = resolve(sitePath, "..");
+  const sha = git(dir, ["rev-parse", "--short", "HEAD"]);
+  if (sha === null) return { sha: null, dirty: false };
+  const status = git(dir, ["status", "--porcelain"]);
+  return { sha, dirty: status === null ? "unknown" : status !== "" };
+}
+
 const SEP = "";
 
 /** The policy repository's commit log — the only history that exists. */

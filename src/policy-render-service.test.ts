@@ -1915,6 +1915,85 @@ export const site = {
     }
   });
 
+  it("does not reuse an answer when git status fails on a tree whose HEAD resolves", { timeout: 30_000 }, async () => {
+    // The helper is git-ignored and outside the stamp, so changing it moves neither HEAD, status nor
+    // the stamp. A clean tree therefore reuses the old answer; a tree whose status fails must not.
+    const { dir, sites, alpha, beta } = twoSites();
+    const helper = join(dir, ".generated", "helper.ts");
+    const gitEnv = {
+      PATH: process.env.PATH ?? "",
+      GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_CONFIG_NOSYSTEM: "1",
+    };
+    const git = (...args: string[]) => execFileSync("git", ["-c", "core.hooksPath=/dev/null", "-C", dir, ...args], {
+      env: gitEnv, encoding: "utf8", stdio: "pipe", timeout: 5_000,
+    });
+    let started: Started | undefined;
+    try {
+      mkdirSync(join(dir, ".generated"));
+      writeFileSync(join(dir, ".gitignore"), ".generated/\n");
+      writeFileSync(helper, 'export const mark = "first";\n');
+      writeFileSync(beta, `import { mark } from "./.generated/helper.ts";
+export const site = {
+  cfg: { hookPolicy: { input: "drop", output: "accept" } },
+  hosts: [{ id: "gw-01.beta", stage: "canary", items: [] }],
+  objects: [{ id: "ao-beta", kind: "address", name: mark,
+              members: [{ kind: "cidr", value: "10.0.0.0/8" }] }],
+};
+`);
+      const pinned = 1_700_000_000;
+      const scanned = [alpha, beta, join(dir, "policies.json"), join(dir, "coverage-a.json")];
+      for (const file of [...scanned, helper]) utimesSync(file, pinned, pinned);
+      const mtimes = scanned.map((file) => statSync(file).mtimeMs);
+      git("init", "-q", "--template=");
+      git("add", ".");
+      git("-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false", "commit", "-qm", "first");
+      const head = git("rev-parse", "--short", "HEAD").trim();
+      assert.equal(git("status", "--porcelain").trim(), "");
+      started = await start(dir, {
+        ...MULTI(sites), HELIOPAUSE_POLICY_ALLOW_PATHS: "policies.json",
+        GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1",
+      });
+      const marker = async () => {
+        const res = await fetchAt(started!.port, "/source?site=beta", { signal: AbortSignal.timeout(5_000) });
+        assert.equal(res.status, 200);
+        const source = parsePolicySource(await res.json());
+        assert.equal(source.site.hosts?.[0]?.id, "gw-01.beta");
+        return (source.site as { objects?: { name: string }[] }).objects?.[0]?.name;
+      };
+      assert.equal(await marker(), "first", "the ignored helper's import was not reached");
+
+      // Known positive: on a clean tree the unchanged stamp reuses the first answer.
+      writeFileSync(helper, 'export const mark = "second";\n');
+      assert.equal(git("status", "--porcelain").trim(), "", "the ignored helper made the tree dirty");
+      assert.deepEqual(scanned.map((file) => statSync(file).mtimeMs), mtimes, "a scanned file moved the stamp");
+      assert.equal(await marker(), "first", "a clean tree with an unchanged stamp was not reused");
+
+      // A short index makes `git status` fail while `rev-parse` still resolves HEAD.
+      writeFileSync(join(dir, ".git", "index"), "garbage");
+      assert.equal(git("rev-parse", "--short", "HEAD").trim(), head, "rev-parse no longer resolves HEAD");
+      assert.throws(
+        () => git("status", "--porcelain"),
+        (e: { status?: unknown; stderr?: unknown }) =>
+          e.status === 128 && /index file smaller than expected/.test(String(e.stderr)),
+        "git status did not fail on the short index",
+      );
+      assert.deepEqual(scanned.map((file) => statSync(file).mtimeMs), mtimes, "a scanned file moved the stamp");
+      // The first request after the failure misses because the stamp now says `unknown`; the second
+      // has the same stamp, so only `reuseAllowed` separates a fresh answer from a cached one.
+      assert.equal(await marker(), "second", "a tree whose status failed was served the cached answer");
+      writeFileSync(helper, 'export const mark = "third";\n');
+      assert.deepEqual(scanned.map((file) => statSync(file).mtimeMs), mtimes, "a scanned file moved the stamp");
+      assert.equal(await marker(), "third", "an unknown status reused the answer cached under the same stamp");
+    } finally {
+      if (started && started.proc.exitCode === null && started.proc.signalCode === null) {
+        const exited = new Promise<void>((done) => started!.proc.once("exit", () => done()));
+        started.stop();
+        await exited;
+      }
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
   it("stops serving a cached answer when a file the module imports breaks", { timeout: 30_000 }, async () => {
     // ## The stamp read the entry module, not what the entry module imports
     //
