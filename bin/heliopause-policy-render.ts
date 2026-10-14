@@ -54,7 +54,7 @@ import { boundedInteger, ENV_BOUNDS, parsePolicySites } from "../src/env-spec.ts
 import { zoneMismatch, ZoneMismatchError } from "../src/site-zone.ts";
 import { armedReasons } from "../src/policy-render-guard.ts";
 import { assemblePolicySource, parsePolicySource, type PolicySource } from "../src/policy-source.ts";
-import { policyHead, type ScreenSite } from "../src/policy-screen.ts";
+import { policyHeadForReuse, type ScreenSite } from "../src/policy-screen.ts";
 import { installCliLanguage } from "../src/operator-i18n.ts";
 import { makePreviewCopy, MAX_PREVIEW_BYTES, PreviewRefused } from "../src/policy-preview.ts";
 import { diffRules, siteRules } from "../src/preview-diff.ts";
@@ -590,7 +590,7 @@ const STAMP_SCAN_CAP = 2_000;
  * registry. Both were tried, in that order, and both are recorded there.
  */
 function sourceStamp(sitePath: string): SourceStamp | ScanFailure {
-  const head = policyHead(sitePath);
+  const head = policyHeadForReuse(sitePath);
   const dir = dirname(resolve(sitePath));
   const mtime = (p: string): string => {
     try {
@@ -727,8 +727,10 @@ function sourceStamp(sitePath: string): SourceStamp | ScanFailure {
   // stamp alone answers one site's request with the other's policy. Belt and braces on purpose: the
   // bucket and the stamp each encode the site, so a mistake in either is caught by the other.
   return {
-    stamp: `${sitePath}:${head.sha ?? "nogit"}:${head.dirty ? "dirty" : "clean"}:${files}:${scanned}`,
-    reuseAllowed: !head.dirty,
+    stamp: `${sitePath}:${head.sha ?? "nogit"}:${head.dirty === "unknown" ? "unknown" : head.dirty ? "dirty" : "clean"}:${files}:${scanned}`,
+    // An unknown status reuses nothing, like dirty.
+    // @see src/policy-render-service.test.ts "does not reuse an answer when git status fails on a tree whose HEAD resolves"
+    reuseAllowed: head.dirty === false,
   };
 }
 
@@ -1412,7 +1414,7 @@ const server = createServer((req, res) => {
   // 🔴 **This endpoint's cheapness is load-bearing, and it is why `/readyz` is gated and memoised.**
   // Everything here shares one event loop. A route that does synchronous work holds this one up, and
   // holding it up past `timeoutSeconds` is a liveness failure — so any expensive route is a lever on
-  // this pod's life. `/readyz` reached for `currentSource`, which calls `sourceStamp` → `policyHead`
+  // this pod's life. `/readyz` reached for `currentSource`, which calls `sourceStamp` → `policyHeadForReuse`
   // → two synchronous `execFileSync("git", …)` per site **before** the cache is consulted, and a
   // review measured 42.7 ms each: thirty concurrent unauthenticated requests held `/healthz` over a
   // second and would have had kubelet kill the container on demand. The fix this comment is pointing
