@@ -41,8 +41,12 @@ const flag = (name: string): string | undefined => {
 
 const siteArg = args[0]?.startsWith("--") ? undefined : args[0];
 const from = flag("--from");
+const familiesIndex = args.indexOf("--families");
+const familiesArg = familiesIndex >= 0 ? args[familiesIndex + 1] : "v4,v6";
+const familyTokens = (familiesArg ?? "").split(",").map((s) => s.trim());
+const invalidFamilies = familyTokens.some((s) => s !== "v4" && s !== "v6");
 
-if (!siteArg || !from || args.includes("--help")) {
+if (!siteArg || !from || args.includes("--help") || invalidFamilies) {
   console.error(
     "usage: heliopause-coverage <site.ts> --from <label> [--out <file>] [--families v4,v6] [--timeout-ms N]\n" +
       "\n" +
@@ -97,7 +101,7 @@ if (!checks.length) {
   process.exit(64);
 }
 
-const families = (flag("--families") ?? "v4,v6").split(",").map((s) => s.trim()) as Family[];
+const families = familyTokens as Family[];
 const timeoutMs = Number(flag("--timeout-ms") ?? "5000");
 
 const probes = await probeAll(checks, { observedFrom: from, families, timeoutMs });
