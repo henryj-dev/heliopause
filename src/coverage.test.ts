@@ -192,10 +192,21 @@ describe("coverageRows", () => {
 
   // Two missed slots, not one. The window is derived from the cron, so this is the statement that
   // breaks if somebody changes one without the other.
-  it("tolerates one missed slot of the four-a-day cadence and not two", () => {
-    const slotSec = 6 * 3600;
+  it("tolerates one missed slot of the twice-a-day cadence and not two", () => {
+    const slotSec = 12 * 3600;
     assert.ok(COVERAGE_STALE_SEC > 2 * slotSec, "one missed slot peaks at two intervals — not stale");
     assert.ok(COVERAGE_STALE_SEC < 3 * slotSec, "two missed slots reach three intervals — stale");
+  });
+
+  it("treats 24h as current, the 25h window as the edge, and 36h as stale", () => {
+    const stale = (hours: number, extraSec = 0): boolean | undefined => {
+      const at = new Date(Date.parse(NOW) - (hours * 3600 + extraSec) * 1000).toISOString();
+      return coverageRows([check()], [probe({ at })], { now: NOW })[0]!.v4.stale;
+    };
+    assert.equal(stale(24), false, "24h old is current");
+    assert.equal(stale(25), false, "exactly 25h is not yet stale");
+    assert.equal(stale(25, 1), true, "one second past 25h is stale");
+    assert.equal(stale(36), true, "36h old is stale");
   });
 
   it("carries the vantage point onto the cell", () => {
@@ -209,6 +220,10 @@ describe("coverageSummary staleness", () => {
     check({ expect: "reach", ...over });
   const connected = (over: Partial<Probe> = {}): Probe =>
     probe({ outcome: "connected", ...over });
+  // One second past the window, derived rather than written as a date: "a day before NOW" was stale
+  // under the four-a-day window and is current under the twice-a-day one, and the cases below are
+  // about a stale probe, not about any particular age.
+  const old = new Date(Date.parse(NOW) - (COVERAGE_STALE_SEC + 1) * 1000).toISOString();
 
   it("counts a current pass in passing and not in stale", () => {
     const s = coverageSummary(
@@ -221,7 +236,6 @@ describe("coverageSummary staleness", () => {
   // The defect this field exists for: the cell drew `△ stale` while the banner above it said the
   // check was passing. A reader skims the banner.
   it("counts a stale pass in stale and not in passing", () => {
-    const old = "2026-08-11T12:00:00Z"; // a day before NOW
     const s = coverageSummary(
       coverageRows(
         [reach()],
@@ -234,7 +248,6 @@ describe("coverageSummary staleness", () => {
   });
 
   it("keeps a failure a failure however old it is", () => {
-    const old = "2026-08-11T12:00:00Z";
     // `expect: "blocked"` with `connected` is a fail — the rule did not drop the packet.
     const s = coverageSummary(coverageRows([check()], [connected({ at: old })], { now: NOW }));
     assert.equal(s.failing, 1);
@@ -252,7 +265,7 @@ describe("coverageSummary staleness", () => {
     const s = coverageSummary(
       coverageRows(
         [reach()],
-        [connected({ at: "2026-08-11T12:00:00Z" }), connected({ family: "v6", addr: "2001:db8::1" })],
+        [connected({ at: old }), connected({ family: "v6", addr: "2001:db8::1" })],
         { now: NOW },
       ),
     );
