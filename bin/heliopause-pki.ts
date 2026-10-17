@@ -275,7 +275,7 @@ function issued(): Issued[] {
 /** Reconstruct a plan from a certificate that already exists, so renewal keeps its role and SANs. */
 function planFromExisting(i: Issued): CertPlan {
   const days = Number(flags.get("days") ?? LEAF_DAYS);
-  if (i.role !== "relay") return planCert({ name: i.name, role: "agent", days });
+  if (i.role !== "relay") return planCert({ name: i.name, role: i.role, days });
   const sans = (i.cert.subjectAltName ?? "")
     .split(",")
     .map((s) => s.trim().replace(/^(DNS|IP Address|IP):/, ""))
