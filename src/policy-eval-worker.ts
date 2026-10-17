@@ -29,10 +29,12 @@
 // anything below. They are this repository's modules, and the capture only has to precede the
 // **dynamic** import of the policy module, which it does. Saying it the loose way invites someone to
 // "fix" the order and break ②.
+import { registerHooks } from "node:module";
 import { parentPort, workerData, MessagePort } from "node:worker_threads";
 import { pathToFileURL } from "node:url";
 import { collectModuleFacts } from "./policy-source.ts";
 import type { ScreenSite } from "./policy-screen.ts";
+import type { ImportReport } from "./policy-import-scope.ts";
 
 // ③ — captured here, at the top of this module's body, which is after this file's static imports and
 // before the dynamic import below.
@@ -68,8 +70,70 @@ const apply = Reflect.apply;
 // more (see above); the parent reads only those two keys from it. Exported so the test and the parent
 // describe one thing.
 export type EvalReply =
-  | { ok: true; wire: string }
+  | { ok: true; wire: string; imports: ImportReport }
   | { ok: false; message: string };
+
+/**
+ * How many resolved URLs one evaluation records before it stops and reports the record incomplete.
+ *
+ * Past this the report cannot name every file the module read, so caching against it could miss one —
+ * the same shape as the stamp's own scan cap, which refuses rather than guess. A policy module's graph
+ * is a handful of files; this bounds a module that imports in a loop.
+ */
+const IMPORT_RECORD_CAP = 1_024;
+
+/** How much of one URL is kept. A longer one is not a path the parent can check, so the record ends. */
+const IMPORT_URL_CAP = 4_096;
+
+/**
+ * Records what the module resolves, from here until the import below returns.
+ *
+ * Registered **after** the captures above and **before** the dynamic import: the hook runs in this
+ * thread, so a module can replace `module.registerHooks` the moment its own top level runs, and
+ * registering any later would miss the imports that top level makes. The hook calls `nextResolve`
+ * unchanged and keeps only the URL it returned — it does not choose what the module loads.
+ *
+ * A throw from `nextResolve` propagates, which is what an unresolvable import did before this hook
+ * existed. A throw from the recording itself ends the record: the import still resolves, and the
+ * report says it is incomplete.
+ *
+ * `urls` holds the resolved `file:` URLs only. A `node:` builtin names nothing on disk, and the parent
+ * allows those without a record (`src/policy-import-scope.ts`). Anything else the hook saw — an
+ * `http:` URL, a `data:` URL — is not a file the stamp reads, so it is counted in `other` and the
+ * report says `complete: false`: the parent then serves the answer and does not cache it.
+ *
+ * ⚠️ **Not a boundary.** This thread is the module's realm, so the module can omit a URL from what is
+ * sent or invent one. The parent uses the report to notice an honest policy importing something the
+ * stamp cannot see (#158), not to stop a policy written to hide an import.
+ */
+function recordImports(): ImportReport {
+  const urls: string[] = [];
+  let other = 0;
+  let overflowed = false;
+  let failed = false;
+  const note = (resolved: string): void => {
+    try {
+      if (overflowed || failed) return;
+      if (typeof resolved !== "string" || resolved.length > IMPORT_URL_CAP) { overflowed = true; return; }
+      if (!resolved.startsWith("file:")) { if (!resolved.startsWith("node:")) other += 1; return; }
+      if (urls.length >= IMPORT_RECORD_CAP) { overflowed = true; return; }
+      urls.push(resolved);
+    } catch {
+      failed = true;
+    }
+  };
+  registerHooks({
+    resolve: (specifier, context, nextResolve) => {
+      const resolved = nextResolve(specifier, context);
+      note(resolved.url);
+      return resolved;
+    },
+  });
+  return {
+    get complete() { return !overflowed && !failed && other === 0; },
+    urls,
+  } as ImportReport;
+}
 
 // ## The failure text, without trusting the module for it
 //
@@ -144,6 +208,10 @@ if (!(reply instanceof MessagePort)) {
 // Everything above runs before the module. Everything below is in its reach.
 const task = workerData as { sitePath: string };
 
+// Before the import, like the captures above: the module's own top level is the first thing that
+// resolves, and a hook registered from inside the import would not see it.
+const imports = recordImports();
+
 try {
   // ## No `?v=` and no child-version hook
   //
@@ -167,7 +235,14 @@ try {
   // `build` are filled in by the parent. This sends the module's half; the parent keeps only that
   // half from whatever actually arrives.
   // @see bin/heliopause-policy-render.ts, and the decision note in docs/policy-eval-worker-notes.md
-  apply(send, reply, [{ ok: true, wire: JSON.stringify(collectModuleFacts(mod.site)) } satisfies EvalReply]);
+  apply(send, reply, [{
+    ok: true,
+    wire: JSON.stringify(collectModuleFacts(mod.site)),
+    // Read through the getters above, which close over the counters. A module that rewrote `urls`
+    // after the import — this thread is its realm — sends whatever it wrote; see the note on
+    // `ImportReport`.
+    imports: { complete: imports.complete, urls: imports.urls },
+  } satisfies EvalReply]);
 } catch (thrown) {
   apply(send, reply, [{ ok: false, message: failureText(thrown) } satisfies EvalReply]);
 }

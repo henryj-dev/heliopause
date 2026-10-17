@@ -87,7 +87,7 @@ describe("an evaluation settles once, on the right signal", () => {
   it("reads a successful reply still queued when the thread's exit arrives first", async () => {
     const { thread } = fakeThread({ ok: true, wire: '{"site":{}}' }, (t) => t.emit("exit", 0));
     const { opts, late } = options(thread);
-    assert.equal(await evaluateWithLifecycle(opts), '{"site":{}}');
+    assert.equal((await evaluateWithLifecycle(opts)).wire, '{"site":{}}');
     assert.deepEqual(late, [], "a clean exit after an answer was counted as a fault");
   });
 
@@ -96,7 +96,7 @@ describe("an evaluation settles once, on the right signal", () => {
     // the answer stands.
     const { thread } = fakeThread({ ok: true, wire: '{"site":{}}' }, (t) => t.emit("error", new Error("late")));
     const { opts, late } = options(thread);
-    assert.equal(await evaluateWithLifecycle(opts), '{"site":{}}');
+    assert.equal((await evaluateWithLifecycle(opts)).wire, '{"site":{}}');
     assert.equal(late.length, 1, "the error after the answer was not counted");
   });
 
@@ -127,7 +127,7 @@ describe("an evaluation settles once, on the right signal", () => {
       terminate: () => Promise.resolve(1),
     } as unknown as EvalThread;
     const { opts, logs } = options(thread);
-    assert.equal(await evaluateWithLifecycle(opts), "first");
+    assert.equal((await evaluateWithLifecycle(opts)).wire, "first");
     assert.ok(logs.some((l) => /ignoring a second message/.test(l)), "the second answer was not logged");
   });
 
@@ -138,14 +138,14 @@ describe("an evaluation settles once, on the right signal", () => {
     // long so the thread is still ours when both events arrive.
     const { thread, t } = fakeThread({ ok: true, wire: "x" });
     const { opts, late } = options(thread, { graceMs: 60_000 });
-    assert.equal(await evaluateWithLifecycle(opts), "x");
+    assert.equal((await evaluateWithLifecycle(opts)).wire, "x");
     t.emit("error", new Error("late"));
     t.emit("exit", 1);
     assert.equal(late.length, 1, "one late throw was counted more than once");
     // The known positive: an abnormal exit with no error before it is still a fault.
     const second = fakeThread({ ok: true, wire: "x" });
     const o2 = options(second.thread, { graceMs: 60_000 });
-    assert.equal(await evaluateWithLifecycle(o2.opts), "x");
+    assert.equal((await evaluateWithLifecycle(o2.opts)).wire, "x");
     second.t.emit("exit", 2);
     assert.equal(o2.late.length, 1, "an abnormal exit after the answer was not counted at all");
   });
@@ -169,13 +169,13 @@ describe("an evaluation settles once, on the right signal", () => {
       terminate() { t.emit("exit", 2); return Promise.resolve(2); },
     } as unknown as EvalThread;
     const { opts, late } = options(thread, { graceMs: 1 });
-    assert.equal(await evaluateWithLifecycle(opts), "x");
+    assert.equal((await evaluateWithLifecycle(opts)).wire, "x");
     await new Promise((r) => setTimeout(r, 20));
     assert.equal(late.length, 1, "the module's own exit 2 was taken for our termination");
     // And the known negative: our own termination (exit 1) is still not a fault.
     const ours = fakeThread({ ok: true, wire: "x" });
     const o2 = options(ours.thread, { graceMs: 1 });
-    assert.equal(await evaluateWithLifecycle(o2.opts), "x");
+    assert.equal((await evaluateWithLifecycle(o2.opts)).wire, "x");
     await new Promise((r) => setTimeout(r, 20));
     assert.equal(ours.terminated(), 1);
     assert.equal(o2.late.length, 0, "our own terminate was counted as the module's fault");
@@ -188,7 +188,7 @@ describe("an evaluation settles once, on the right signal", () => {
     // only thing that can bring the count to zero is the exit itself.
     const { thread, t } = fakeThread({ ok: true, wire: "x" });
     const { opts, alive } = options(thread, { graceMs: 60_000 });
-    assert.equal(await evaluateWithLifecycle(opts), "x");
+    assert.equal((await evaluateWithLifecycle(opts)).wire, "x");
     assert.equal(alive(), 1, "the thread should still be counted while it is alive inside its grace");
     t.emit("exit", 0);
     assert.equal(alive(), 0, "a thread that exited is still counted");
