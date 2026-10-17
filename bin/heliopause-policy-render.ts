@@ -44,7 +44,14 @@
 import { createServer, type IncomingMessage } from "node:http";
 import { Worker } from "node:worker_threads";
 import { evaluateWithLifecycle } from "../src/policy-eval-lifecycle.ts";
-import { currentPolicyWire, type SourceStamp } from "../src/policy-eval-cache.ts";
+import { currentPolicyWire, type SourceStamp, type UnreusableMark } from "../src/policy-eval-cache.ts";
+import {
+  stampRootOf,
+  stampSkipsDirectory,
+  STAMPED_EXTENSIONS,
+  type ImportReport,
+  type ImportScope,
+} from "../src/policy-import-scope.ts";
 import { existsSync, opendirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -532,6 +539,16 @@ const cached = new Map<string, { stamp: string; wire: string }>();
  * @see src/policy-eval-cache.test.ts "starts one clean evaluation and four dirty evaluations for four concurrent calls"
  */
 const inFlight = new Map<string, { stamp: string; answer: Promise<string> }>();
+/**
+ * Stamps whose evaluation imported something the stamp cannot see, so the next request on that stamp
+ * evaluates again instead of being served the stored answer.
+ *
+ * One entry per site, naming the stamp and when its evaluation started. A moved stamp is judged on its
+ * own evaluation, and `currentPolicyWire` lets the later-started evaluation's mark stand.
+ *
+ * @see src/policy-eval-cache.test.ts "an answer whose imports the stamp cannot see is served and not cached"
+ */
+const unreusable = new Map<string, UnreusableMark>();
 // The stamp match and self-entry cleanup live in currentPolicyWire. An older clean completion can
 // still replace the completed value for the same site; this change does not alter that race.
 
@@ -591,7 +608,7 @@ const STAMP_SCAN_CAP = 2_000;
  */
 function sourceStamp(sitePath: string): SourceStamp | ScanFailure {
   const head = policyHeadForReuse(sitePath);
-  const dir = dirname(resolve(sitePath));
+  const dir = stampRootOf(sitePath);
   const mtime = (p: string): string => {
     try {
       return String(statSync(p).mtimeMs);
@@ -609,9 +626,18 @@ function sourceStamp(sitePath: string): SourceStamp | ScanFailure {
   // `heliopause-policy-render.ts` and found no `readdirSync` — the stamp there is the entry module,
   // the allowlisted files and the sha, and nothing else.
   //
-  // The whole directory rather than a dependency graph: Node exposes no import graph for an evaluated
-  // module, and policy modules keep their helpers beside them. A helper **outside** this directory is
-  // still invisible to the stamp — the known remaining gap, not an oversight.
+  // The whole directory rather than a dependency graph. A helper **outside** this directory, or inside
+  // a directory this walk skips, is still invisible to the stamp — and since the worker records the
+  // URLs an evaluation resolved (`src/policy-import-scope.ts`), an answer that imported one is served
+  // and not cached, so the next request evaluates again. The gap is now "not cached" rather than
+  // "served stale". The walk's root is `stampRootOf`, and what it records below that root is
+  // `stampSkipsDirectory` and `STAMPED_EXTENSIONS` — the import check reads all three from the same
+  // module, so it cannot accept a file this walk does not record. It may refuse one the walk does: a
+  // symlinked site file's target directory is not walked, so its neighbours are refused, which costs a
+  // re-evaluation and never a stale answer. Two kinds of file are accepted without the walk: this
+  // renderer's own code, and the site file itself by its real path, which the stamp stats through the
+  // link (`files` below). @see src/policy-render-service.test.ts
+  // "does not cache an answer whose symlinked site file imports a neighbour of its target"
   //
   // ## Two things the first version of this got wrong, both found by an audit
   //
@@ -637,8 +663,9 @@ function sourceStamp(sitePath: string): SourceStamp | ScanFailure {
   // entries in an actual checkout instead of reasoning about a plausible one.
   //
   // What is skipped is **dot-directories and `node_modules`**, and a module importing out of one of
-  // those is invisible to the stamp — the same class of gap as a helper outside the directory, stated in
-  // the same breath. This did say the skipped paths are "not part of any module graph", which is not
+  // those resolves a URL the stamp cannot see — the same class as a helper outside the directory. The
+  // import check (`importsAreReusable`) reads `stampSkipsDirectory`, so such an answer is served and not
+  // cached. This did say the skipped paths are "not part of any module graph", which is not
   // true of `.generated/` or a vendored directory and was never true of a dot-**file**: the first
   // version of the predicate ran before the directory check and hid `./.helper.ts` too, which is a legal
   // import the resolve hook versions. Directories only, for that reason.
@@ -699,12 +726,12 @@ function sourceStamp(sitePath: string): SourceStamp | ScanFailure {
         // versions and this stamp could not see change. Inside the scanned directory, which made it a
         // new defect rather than the stated gap about helpers outside it.
         if (entry.isDirectory()) {
-          if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
+          if (stampSkipsDirectory(entry.name)) continue;
           stack.push(join(here, entry.name));
           continue;
         }
         if (!entry.isFile()) continue;
-        if (!/\.(ts|mts|cts|js|mjs|cjs|json)$/.test(entry.name)) continue;
+        if (!STAMPED_EXTENSIONS.test(entry.name)) continue;
         neighbours.push(join(here, entry.name));
       }
     } finally {
@@ -768,6 +795,8 @@ async function currentSource(site: { name: string | null; path: string }): Promi
     sitePath,
     cached,
     inFlight,
+    unreusable,
+    importScope: importScopeFor(sitePath),
     readStamp: () => {
       const stamped = sourceStamp(sitePath);
       if ("kind" in stamped) {
@@ -779,6 +808,15 @@ async function currentSource(site: { name: string | null; path: string }): Promi
       return stamped;
     },
     evaluate: () => evaluateInWorker({ sitePath, label: name ?? label }),
+    // Served either way. The coordinator stores the answer only when every recorded import is somewhere
+    // this stamp can see, and reports here when it did not, so the next request evaluates again.
+    //
+    // Logged on every such evaluation, not once. It runs at the rate of evaluations, which already print
+    // an `evaluated` line each, and it is the only line that says why this site evaluates on every
+    // request. Logging only the first would need a per-site flag and would go quiet on a condition that
+    // persists.
+    // @see src/policy-render-service.test.ts "serves the new marker when only an unscanned helper changes"
+    onUnreusable: () => log(`${name ?? label}: an import is outside what the stamp scans, so this answer is not cached`),
     accepted: (moduleWire) => accepted({ moduleWire, name, sitePath }),
   });
 }
@@ -952,6 +990,25 @@ const WORKER_GRACE_MS = 1_000;
 const WORKER_ENTRY = new URL("../src/policy-eval-worker.ts", import.meta.url);
 
 /**
+ * This renderer's own `src` and `bin`, by real path — the roots an import report may name without the
+ * stamp having scanned them, because they are this binary's code and not the policy's.
+ *
+ * Resolved once, from this file. `realpath` follows the checkout: a symlinked `src` and the `../src` a
+ * policy module imports are the same directory afterwards, which is the comparison the check makes.
+ */
+const OWN_SOURCE_ROOTS = [new URL("../src", import.meta.url), new URL(".", import.meta.url)]
+  .map((u) => realpathSync(fileURLToPath(u)));
+
+/**
+ * The site module plus this renderer's own code, for one import-scope check. Nothing is resolved here:
+ * a site file that is gone must fail with the stamp's or the evaluation's reason, not this one's.
+ * @see src/policy-render-service.test.ts "keeps the evaluation's reason when the site file is removed after startup"
+ */
+function importScopeFor(sitePath: string): ImportScope {
+  return { sitePath, ownRoots: OWN_SOURCE_ROOTS };
+}
+
+/**
  * The worker's `execArgv` under `HELIOPAUSE_POLICY_EVAL_PERMISSION=on`, or `undefined` when it is off.
  *
  * `--permission` with read access to the site module's directory and the `src` beside it — the one its
@@ -994,11 +1051,13 @@ function evalExecArgv(sitePath: string): string[] | undefined {
  * into production without a measurement.
  *
  * ⚠️ **Until then there is no cap.** Startup evaluates every site at once (four today). On the request
- * path, clean/nogit concurrent misses on one stamp share one evaluation (`inFlight`); dirty calls
- * evaluate independently. A clean/nogit failure evaluates again on the next call after the shared
- * evaluation settles, and a moved stamp starts a new evaluation while the old one may still be inside
- * its grace. @see #117; src/policy-eval-cache.test.ts
- * "starts one clean evaluation and four dirty evaluations for four concurrent calls"
+ * path, clean/nogit concurrent misses on one stamp share one evaluation (`inFlight`) — unless that
+ * stamp is marked unreusable (an import outside what it scans), after which each call evaluates on its
+ * own; dirty calls evaluate independently. A clean/nogit failure evaluates again on the next call after
+ * the shared evaluation settles, and a moved stamp starts a new evaluation while the old one may still
+ * be inside its grace. @see #117; src/policy-eval-cache.test.ts
+ * "starts one clean evaluation and four dirty evaluations for four concurrent calls";
+ * src/policy-eval-cache.test.ts "marks a moved stamp that also imports outside, so its next concurrent calls do not join"
  */
 let workersAlive = 0;
 /**
@@ -1011,7 +1070,9 @@ let workersAlive = 0;
  *
  * @see src/policy-render-service.test.ts "a module that spins forever fails only its own site"
  */
-function evaluateInWorker(task: { sitePath: string; label: string }): Promise<string> {
+function evaluateInWorker(
+  task: { sitePath: string; label: string },
+): Promise<{ wire: string; imports?: ImportReport }> {
   return evaluateWithLifecycle({
     // The port is **not** in `workerData` — a module reads `workerData` and posts on the port itself,
     // which §3-b ② measured arriving at the parent. The path and nothing else goes in it; the label,
@@ -1612,7 +1673,7 @@ async function runPreview(req: IncomingMessage, site: { name: string | null; pat
   log(`preview: copied ${copy.files} files, ${Math.round(copy.bytes / 1024)} KiB in ${Math.round(copy.ms)} ms`);
   let edited: { site: ScreenSite; services: Record<string, unknown> };
   try {
-    edited = JSON.parse(await evaluateInWorker({ sitePath: copy.sitePath, label: `${site.name ?? label} (preview)` })) as typeof edited;
+    edited = JSON.parse((await evaluateInWorker({ sitePath: copy.sitePath, label: `${site.name ?? label} (preview)` })).wire) as typeof edited;
   } finally {
     copy.remove();
   }

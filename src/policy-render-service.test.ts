@@ -32,7 +32,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { parsePolicySource } from "./policy-source.ts";
 // Imported so the budget assertions derive both sides from the same table the renderer reads, rather
 // than restating numbers that would then have to be kept in step by hand.
@@ -1916,10 +1916,13 @@ export const site = {
   });
 
   it("does not reuse an answer when git status fails on a tree whose HEAD resolves", { timeout: 30_000 }, async () => {
-    // The helper is git-ignored and outside the stamp, so changing it moves neither HEAD, status nor
-    // the stamp. A clean tree therefore reuses the old answer; a tree whose status fails must not.
+    // The helper is git-ignored and its mtime is put back after every write, so changing it moves
+    // neither HEAD, status nor the stamp. It sits beside the module, where the stamp scans and the
+    // import check accepts, so a clean tree reuses the old answer; a tree whose status fails must not.
+    // (It was in `.generated/`, which the import check now refuses: the first answer would not be
+    // cached, and the reuse this test separates from would never happen.)
     const { dir, sites, alpha, beta } = twoSites();
-    const helper = join(dir, ".generated", "helper.ts");
+    const helper = join(dir, "helper.ts");
     const gitEnv = {
       PATH: process.env.PATH ?? "",
       GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_CONFIG_NOSYSTEM: "1",
@@ -1929,10 +1932,9 @@ export const site = {
     });
     let started: Started | undefined;
     try {
-      mkdirSync(join(dir, ".generated"));
-      writeFileSync(join(dir, ".gitignore"), ".generated/\n");
+      writeFileSync(join(dir, ".gitignore"), "helper.ts\n");
       writeFileSync(helper, 'export const mark = "first";\n');
-      writeFileSync(beta, `import { mark } from "./.generated/helper.ts";
+      writeFileSync(beta, `import { mark } from "./helper.ts";
 export const site = {
   cfg: { hookPolicy: { input: "drop", output: "accept" } },
   hosts: [{ id: "gw-01.beta", stage: "canary", items: [] }],
@@ -1941,12 +1943,17 @@ export const site = {
 };
 `);
       const pinned = 1_700_000_000;
-      const scanned = [alpha, beta, join(dir, "policies.json"), join(dir, "coverage-a.json")];
-      for (const file of [...scanned, helper]) utimesSync(file, pinned, pinned);
+      const scanned = [alpha, beta, helper, join(dir, "policies.json"), join(dir, "coverage-a.json")];
+      for (const file of scanned) utimesSync(file, pinned, pinned);
       const mtimes = scanned.map((file) => statSync(file).mtimeMs);
+      const rewrite = (mark: string) => {
+        writeFileSync(helper, `export const mark = "${mark}";\n`);
+        utimesSync(helper, pinned, pinned);
+      };
       git("init", "-q", "--template=");
       git("add", ".");
       git("-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false", "commit", "-qm", "first");
+      assert.equal(git("ls-files", "helper.ts").trim(), "", "the helper is tracked, so its rewrite would dirty the tree");
       const head = git("rev-parse", "--short", "HEAD").trim();
       assert.equal(git("status", "--porcelain").trim(), "");
       started = await start(dir, {
@@ -1963,7 +1970,7 @@ export const site = {
       assert.equal(await marker(), "first", "the ignored helper's import was not reached");
 
       // Known positive: on a clean tree the unchanged stamp reuses the first answer.
-      writeFileSync(helper, 'export const mark = "second";\n');
+      rewrite("second");
       assert.equal(git("status", "--porcelain").trim(), "", "the ignored helper made the tree dirty");
       assert.deepEqual(scanned.map((file) => statSync(file).mtimeMs), mtimes, "a scanned file moved the stamp");
       assert.equal(await marker(), "first", "a clean tree with an unchanged stamp was not reused");
@@ -1981,9 +1988,318 @@ export const site = {
       // The first request after the failure misses because the stamp now says `unknown`; the second
       // has the same stamp, so only `reuseAllowed` separates a fresh answer from a cached one.
       assert.equal(await marker(), "second", "a tree whose status failed was served the cached answer");
-      writeFileSync(helper, 'export const mark = "third";\n');
+      rewrite("third");
       assert.deepEqual(scanned.map((file) => statSync(file).mtimeMs), mtimes, "a scanned file moved the stamp");
       assert.equal(await marker(), "third", "an unknown status reused the answer cached under the same stamp");
+    } finally {
+      if (started && started.proc.exitCode === null && started.proc.signalCode === null) {
+        const exited = new Promise<void>((done) => started!.proc.once("exit", () => done()));
+        started.stop();
+        await exited;
+      }
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("serves the new marker when only an unscanned helper changes", { timeout: 60_000 }, async () => {
+    // ## The stamp walks the module's directory; an import can reach past it (#158)
+    //
+    // `sourceStamp` does not leave the module's directory and does not descend into a dot-directory.
+    // A helper in either place is read by the module and by nothing the stamp records, so changing it
+    // left the stamp where it was and the cache answered 200 with the old payload. Each placement
+    // below pins every scanned mtime, rewrites only the helper and puts its mtime back, so the stamp
+    // cannot move: only the import check separates the new answer from the cached one.
+    //
+    // The tree is not a git checkout, so the stamp is clean and reuse is allowed — the path that used
+    // to serve the stale answer.
+    const placements = [
+      { name: "outside the module's directory", rel: ["..", "shared", "helper.ts"], spec: "../shared/helper.ts" },
+      { name: "inside a dot-directory", rel: [".generated", "helper.ts"], spec: "./.generated/helper.ts" },
+    ];
+    for (const placement of placements) {
+      const { dir, sites, alpha, beta } = twoSites();
+      const helper = join(dir, ...placement.rel);
+      let started: Started | undefined;
+      try {
+        mkdirSync(join(helper, ".."), { recursive: true });
+        writeFileSync(helper, 'export const mark = "first";\n');
+        writeFileSync(beta, `import { mark } from "${placement.spec}";
+export const site = {
+  cfg: { hookPolicy: { input: "drop", output: "accept" } },
+  hosts: [{ id: "gw-01.beta", stage: "canary", items: [] }],
+  objects: [{ id: "ao-beta", kind: "address", name: mark,
+              members: [{ kind: "cidr", value: "10.0.0.0/8" }] }],
+};
+`);
+        const pinned = 1_700_000_000;
+        const scanned = [alpha, beta, join(dir, "policies.json"), join(dir, "coverage-a.json")];
+        for (const file of [...scanned, helper]) utimesSync(file, pinned, pinned);
+        const mtimes = scanned.map((file) => statSync(file).mtimeMs);
+        started = await start(dir, MULTI(sites));
+        const marker = async () => {
+          const res = await fetchAt(started!.port, "/source?site=beta", { signal: AbortSignal.timeout(5_000) });
+          assert.equal(res.status, 200, placement.name);
+          const source = parsePolicySource(await res.json());
+          assert.equal(source.site.hosts?.[0]?.id, "gw-01.beta", placement.name);
+          return (source.site as { objects?: { name: string }[] }).objects?.[0]?.name;
+        };
+        assert.equal(await marker(), "first", `${placement.name}: the helper's import was not reached`);
+
+        writeFileSync(helper, 'export const mark = "second";\n');
+        utimesSync(helper, pinned, pinned);
+        assert.deepEqual(
+          scanned.map((file) => statSync(file).mtimeMs), mtimes,
+          `${placement.name}: a scanned file moved the stamp, so this would pass without the import check`,
+        );
+        assert.equal(await marker(), "second", `${placement.name}: the cached answer was served after its helper changed`);
+        assert.match(
+          started.output(), /\[policy-render\] beta: an import is outside what the stamp scans, so this answer is not cached/,
+          `${placement.name}: the uncached answer was not logged`,
+        );
+      } finally {
+        if (started && started.proc.exitCode === null && started.proc.signalCode === null) {
+          const exited = new Promise<void>((done) => started!.proc.once("exit", () => done()));
+          started.stop();
+          await exited;
+        }
+        rmSync(join(dir, ".."), { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("still reuses an answer whose module imports this renderer's own src", { timeout: 30_000 }, async () => {
+    // A site module importing the renderer's own code is the ordinary case: `../src/*.ts` is how the
+    // policy files reach the model. That code is this binary's, not the policy's, so the import check
+    // accepts it and the answer stays cached. The import is by absolute URL to this checkout's `src`,
+    // which is the directory the renderer under test resolves as its own.
+    const { dir, sites, beta } = twoSites();
+    const own = pathToFileURL(fileURLToPath(new URL("./policy-import-scope.ts", import.meta.url))).href;
+    let started: Started | undefined;
+    try {
+      writeFileSync(beta, `import { importsAreReusable } from ${JSON.stringify(own)};
+export const site = {
+  cfg: { hookPolicy: { input: "drop", output: "accept" } },
+  hosts: [{ id: "gw-01.beta", stage: "canary", items: [] }],
+  objects: [{ id: "ao-beta", kind: "address", name: typeof importsAreReusable === "function" ? "own" : "missing",
+              members: [{ kind: "cidr", value: "10.0.0.0/8" }] }],
+};
+`);
+      started = await start(dir, MULTI(sites));
+      const evaluations = () => (started!.output().match(/evaluated beta /g) ?? []).length;
+      // Known positive for the count: the startup verification evaluates every site once.
+      assert.ok(evaluations() >= 1, "the startup evaluation of beta was not logged, so the count below says nothing");
+      const before = evaluations();
+      for (let i = 0; i < 2; i++) {
+        const res = await fetchAt(started.port, "/source?site=beta", { signal: AbortSignal.timeout(5_000) });
+        assert.equal(res.status, 200);
+        const source = parsePolicySource(await res.json());
+        assert.equal((source.site as { objects?: { name: string }[] }).objects?.[0]?.name, "own", "the own import was not reached");
+      }
+      await new Promise((r) => setTimeout(r, 200)); // let the last line reach the pipe
+      assert.equal(evaluations(), before, "an answer importing only the renderer's own src was evaluated again");
+      assert.doesNotMatch(started.output(), /not cached/, "an import of the renderer's own src was judged outside the stamp");
+    } finally {
+      if (started && started.proc.exitCode === null && started.proc.signalCode === null) {
+        const exited = new Promise<void>((done) => started!.proc.once("exit", () => done()));
+        started.stop();
+        await exited;
+      }
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("does not cache an answer whose module imports a data: URL", { timeout: 30_000 }, async () => {
+    // A `data:` module has no file the stamp could watch. The worker does not list such a URL among the
+    // files it reports, so what keeps this answer out of the cache is the report saying it is incomplete.
+    const { dir, sites, beta } = twoSites();
+    const data = `data:text/javascript,${encodeURIComponent('export const mark = "data";')}`;
+    let started: Started | undefined;
+    try {
+      writeFileSync(beta, `import { mark } from ${JSON.stringify(data)};
+export const site = {
+  cfg: { hookPolicy: { input: "drop", output: "accept" } },
+  hosts: [{ id: "gw-01.beta", stage: "canary", items: [] }],
+  objects: [{ id: "ao-beta", kind: "address", name: mark,
+              members: [{ kind: "cidr", value: "10.0.0.0/8" }] }],
+};
+`);
+      started = await start(dir, MULTI(sites));
+      const evaluations = () => (started!.output().match(/evaluated beta /g) ?? []).length;
+      assert.ok(evaluations() >= 1, "the startup evaluation of beta was not logged, so the count below says nothing");
+      const before = evaluations();
+      for (let i = 0; i < 2; i++) {
+        const res = await fetchAt(started.port, "/source?site=beta", { signal: AbortSignal.timeout(5_000) });
+        assert.equal(res.status, 200);
+        const source = parsePolicySource(await res.json());
+        assert.equal((source.site as { objects?: { name: string }[] }).objects?.[0]?.name, "data", "the data: import was not reached");
+      }
+      await new Promise((r) => setTimeout(r, 200)); // let the last line reach the pipe
+      assert.equal(evaluations(), before + 2, "an answer importing a data: URL was served from the cache");
+      assert.match(started.output(), /beta: an import is outside what the stamp scans, so this answer is not cached/);
+    } finally {
+      if (started && started.proc.exitCode === null && started.proc.signalCode === null) {
+        const exited = new Promise<void>((done) => started!.proc.once("exit", () => done()));
+        started.stop();
+        await exited;
+      }
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("does not cache an answer whose symlinked site file imports a neighbour of its target", { timeout: 30_000 }, async () => {
+    // `policy/beta.ts → real/beta.ts`, and the target imports `./helper.ts` beside it. The worker
+    // evaluates the target, so the helper resolves to `real/helper.ts`; the stamp walks `policy/` and
+    // never sees it. The import check used to judge against the target's directory, which accepted the
+    // helper and kept serving the cached marker after it changed — the false 200 of #158 again.
+    const { dir, sites, alpha, beta } = twoSites();
+    const real = join(dir, "..", "real");
+    const helper = join(real, "helper.ts");
+    let started: Started | undefined;
+    try {
+      mkdirSync(real);
+      writeFileSync(helper, 'export const mark = "first";\n');
+      writeFileSync(join(real, "beta.ts"), `import { mark } from "./helper.ts";
+export const site = {
+  cfg: { hookPolicy: { input: "drop", output: "accept" } },
+  hosts: [{ id: "gw-01.beta", stage: "canary", items: [] }],
+  objects: [{ id: "ao-beta", kind: "address", name: mark,
+              members: [{ kind: "cidr", value: "10.0.0.0/8" }] }],
+};
+`);
+      rmSync(beta);
+      symlinkSync(join(real, "beta.ts"), beta);
+      const pinned = 1_700_000_000;
+      const scanned = [alpha, join(real, "beta.ts"), join(dir, "policies.json"), join(dir, "coverage-a.json")];
+      for (const file of [...scanned, helper]) utimesSync(file, pinned, pinned);
+      const mtimes = scanned.map((file) => statSync(file).mtimeMs);
+      started = await start(dir, MULTI(sites));
+      const marker = async () => {
+        const res = await fetchAt(started!.port, "/source?site=beta", { signal: AbortSignal.timeout(5_000) });
+        assert.equal(res.status, 200);
+        const source = parsePolicySource(await res.json());
+        return (source.site as { objects?: { name: string }[] }).objects?.[0]?.name;
+      };
+      assert.equal(await marker(), "first", "the target's helper was not reached");
+
+      writeFileSync(helper, 'export const mark = "second";\n');
+      utimesSync(helper, pinned, pinned);
+      assert.deepEqual(
+        scanned.map((file) => statSync(file).mtimeMs), mtimes,
+        "a scanned file moved the stamp, so this would pass without the import check",
+      );
+      assert.equal(await marker(), "second", "the cached answer was served after the target's helper changed");
+      assert.match(started.output(), /\[policy-render\] beta: an import is outside what the stamp scans, so this answer is not cached/);
+    } finally {
+      if (started && started.proc.exitCode === null && started.proc.signalCode === null) {
+        const exited = new Promise<void>((done) => started!.proc.once("exit", () => done()));
+        started.stop();
+        await exited;
+      }
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("still reuses an answer whose symlinked site file imports nothing else", { timeout: 30_000 }, async () => {
+    // The known positive for the case above. The entry is in the stamp through the link (`statSync`
+    // follows it), so an answer whose only file import is the link's target is cached as before.
+    const { dir, sites, beta } = twoSites();
+    const real = join(dir, "..", "real");
+    let started: Started | undefined;
+    try {
+      mkdirSync(real);
+      writeFileSync(join(real, "beta.ts"), `export const site = {
+  cfg: { hookPolicy: { input: "drop", output: "accept" } },
+  hosts: [{ id: "gw-01.beta", stage: "canary", items: [] }],
+  objects: [{ id: "ao-beta", kind: "address", name: "linked",
+              members: [{ kind: "cidr", value: "10.0.0.0/8" }] }],
+};
+`);
+      rmSync(beta);
+      symlinkSync(join(real, "beta.ts"), beta);
+      started = await start(dir, MULTI(sites));
+      const evaluations = () => (started!.output().match(/evaluated beta /g) ?? []).length;
+      assert.ok(evaluations() >= 1, "the startup evaluation of beta was not logged, so the count below says nothing");
+      const before = evaluations();
+      for (let i = 0; i < 2; i++) {
+        const res = await fetchAt(started.port, "/source?site=beta", { signal: AbortSignal.timeout(5_000) });
+        assert.equal(res.status, 200);
+        const source = parsePolicySource(await res.json());
+        assert.equal((source.site as { objects?: { name: string }[] }).objects?.[0]?.name, "linked", "the link's target was not evaluated");
+      }
+      await new Promise((r) => setTimeout(r, 200)); // let the last line reach the pipe
+      assert.equal(evaluations(), before, "an answer importing only the link's target was evaluated again");
+      assert.doesNotMatch(started.output(), /not cached/, "the link's target was judged outside the stamp");
+    } finally {
+      if (started && started.proc.exitCode === null && started.proc.signalCode === null) {
+        const exited = new Promise<void>((done) => started!.proc.once("exit", () => done()));
+        started.stop();
+        await exited;
+      }
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the evaluation's reason when the site file is removed after startup", { timeout: 30_000 }, async () => {
+    // The import check resolves the site path when it judges a report, not when the request starts.
+    // Resolving it up front turned a removed site file into that `realpath`'s ENOENT, ahead of the
+    // stamp and the evaluation that already said what was wrong.
+    const { dir, sites, beta } = twoSites();
+    let started: Started | undefined;
+    try {
+      started = await start(dir, MULTI(sites));
+      assert.equal((await fetchAt(started.port, "/source?site=beta")).status, 200, "beta did not serve before removal");
+      rmSync(beta);
+      const res = await fetchAt(started.port, "/source?site=beta", { signal: AbortSignal.timeout(5_000) });
+      const error = String(((await res.json()) as { error?: string }).error);
+      console.log("PROBE-REASON", res.status, JSON.stringify(error));
+      assert.equal(res.status, 503);
+      assert.equal((await fetchAt(started.port, "/source?site=alpha")).status, 200);
+    } finally {
+      if (started && started.proc.exitCode === null && started.proc.signalCode === null) {
+        const exited = new Promise<void>((done) => started!.proc.once("exit", () => done()));
+        started.stop();
+        await exited;
+      }
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
+  it("treats a dot-file helper the way the stamp does", { timeout: 30_000 }, async () => {
+    // The stamp skips dot-directories and not dot-files, and the import check shares that predicate.
+    // A `.helper.ts` beside the module is therefore scanned: a change to it moves the stamp, and the
+    // answer it produced is cached. Either half diverging fails here — a check stricter than the stamp
+    // logs "not cached" and evaluates again, a stamp stricter than the check serves the old marker.
+    const { dir, sites, beta } = twoSites();
+    const helper = join(dir, ".helper.ts");
+    let started: Started | undefined;
+    try {
+      writeFileSync(helper, 'export const mark = "first";\n');
+      writeFileSync(beta, `import { mark } from "./.helper.ts";
+export const site = {
+  cfg: { hookPolicy: { input: "drop", output: "accept" } },
+  hosts: [{ id: "gw-01.beta", stage: "canary", items: [] }],
+  objects: [{ id: "ao-beta", kind: "address", name: mark,
+              members: [{ kind: "cidr", value: "10.0.0.0/8" }] }],
+};
+`);
+      started = await start(dir, MULTI(sites));
+      const marker = async () => {
+        const res = await fetchAt(started!.port, "/source?site=beta", { signal: AbortSignal.timeout(5_000) });
+        assert.equal(res.status, 200);
+        return (parsePolicySource(await res.json()).site as { objects?: { name: string }[] }).objects?.[0]?.name;
+      };
+      const evaluations = () => (started!.output().match(/evaluated beta /g) ?? []).length;
+      assert.equal(await marker(), "first", "the dot-file's import was not reached");
+      writeFileSync(helper, 'export const mark = "second";\n');
+      const later = new Date(Date.now() + 5_000);
+      utimesSync(helper, later, later);
+      assert.equal(await marker(), "second", "a change to a scanned dot-file did not move the stamp");
+      await new Promise((r) => setTimeout(r, 200)); // let the last line reach the pipe
+      const after = evaluations();
+      assert.equal(await marker(), "second");
+      await new Promise((r) => setTimeout(r, 200));
+      assert.equal(evaluations(), after, "an answer importing a scanned dot-file was evaluated again");
+      assert.doesNotMatch(started.output(), /not cached/, "a scanned dot-file was judged outside the stamp");
     } finally {
       if (started && started.proc.exitCode === null && started.proc.signalCode === null) {
         const exited = new Promise<void>((done) => started!.proc.once("exit", () => done()));
@@ -2003,8 +2319,8 @@ export const site = {
     // what is deployed, which is what the comment above `cached` says must never happen. Measured here,
     // and confirmed in the running image by the cluster's operator, who found no `readdirSync` in it.
     //
-    // A helper *outside* the module's directory is still invisible to the stamp. That is a stated gap,
-    // not a claim this test covers.
+    // A helper *outside* the module's directory is still invisible to the stamp; an answer that imports
+    // one is not cached instead. @see "serves the new marker when only an unscanned helper changes"
     const { dir, sites, beta } = twoSites();
     const helper = join(dir, "helper.ts");
     writeFileSync(helper, 'export const mark = "first";\n');

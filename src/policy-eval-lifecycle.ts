@@ -16,6 +16,38 @@
 // @see src/policy-eval-lifecycle.test.ts
 
 import { MessageChannel, receiveMessageOnPort, type MessagePort } from "node:worker_threads";
+import type { ImportReport } from "./policy-import-scope.ts";
+
+/**
+ * One evaluation's answer: the module's wire, and the imports the worker recorded beside it.
+ *
+ * `imports` is absent when the worker sent a wire without one — a worker from before this field, or a
+ * message that dropped it. The caller treats that the same as `complete: false`: the answer is served
+ * and not cached. The wire stays valid either way; a missing report is not a failed evaluation.
+ */
+export interface Evaluation {
+  wire: string;
+  imports?: ImportReport;
+}
+
+/**
+ * The report, when the message carried one of the shape this file expects, and `undefined` otherwise.
+ *
+ * A present-but-wrong field is `complete: false` rather than absent: the worker sent something and it
+ * cannot be read, which is a reason not to cache, and dropping it would let a caller that only checks
+ * `complete` treat "unreadable" as "not reported".
+ */
+function importsOf(reply: object): ImportReport | undefined {
+  if (!("imports" in reply)) return undefined;
+  const given = (reply as { imports?: unknown }).imports;
+  if (typeof given !== "object" || given === null) return { complete: false, urls: [] };
+  const complete = (given as { complete?: unknown }).complete;
+  const urls = (given as { urls?: unknown }).urls;
+  if (typeof complete !== "boolean" || !Array.isArray(urls) || urls.some((u) => typeof u !== "string")) {
+    return { complete: false, urls: [] };
+  }
+  return { complete, urls };
+}
 
 /** The part of `Worker` this lifecycle uses. A real `Worker` satisfies it. */
 export interface EvalThread {
@@ -45,8 +77,8 @@ export interface EvalLifecycleOptions {
 }
 
 /**
- * Evaluate once and settle exactly once: with the worker's `wire` on a valid answer, or with an
- * `Error` naming the reason otherwise.
+ * Evaluate once and settle exactly once: with the worker's `wire` and its import report on a valid
+ * answer, or with an `Error` naming the reason otherwise.
  *
  * The rules this file holds, each with the test that pins it:
  *
@@ -62,8 +94,8 @@ export interface EvalLifecycleOptions {
  *
  * Unprefixed names are in `src/policy-eval-lifecycle.test.ts`.
  */
-export function evaluateWithLifecycle(opts: EvalLifecycleOptions): Promise<string> {
-  return new Promise<string>((resolve, reject) => {
+export function evaluateWithLifecycle(opts: EvalLifecycleOptions): Promise<Evaluation> {
+  return new Promise<Evaluation>((resolve, reject) => {
     const { port1, port2 } = new MessageChannel();
     const thread = opts.spawn();
     opts.onAlive(1);
@@ -148,7 +180,7 @@ export function evaluateWithLifecycle(opts: EvalLifecycleOptions): Promise<strin
         const wire = (reply as { wire?: unknown }).wire;
         if (typeof wire === "string") {
           settled = true;
-          resolve(wire);
+          resolve({ wire, imports: importsOf(reply) });
           reclaim(opts.graceMs);
           return;
         }
