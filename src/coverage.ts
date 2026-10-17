@@ -182,22 +182,17 @@ function worst(cells: CoverageCell[]): CoverageCell {
 }
 
 /**
- * Age at which a probe stops counting as current.
+ * Age at which a probe stops counting as current: 25 hours.
  *
- * **Tied to the publishing cadence, not picked.** `coverage` runs four times a day, six hours apart
- * (`17 2,8,14,20 * * *` in the policy repository). One missed slot plus the scheduler's delivery
- * jitter tops out at a twelve-hour-old probe and is ordinary; two missed slots reaches eighteen and is
- * not. Thirteen hours sits between them, so this trips when **more than one** slot was lost.
+ * `coverage` is scheduled twice a day, twelve hours apart (`17 8,20 * * *` in the policy repository).
+ * With one slot missed a probe ages to 24 hours and stays current; with two missed it ages to 36 hours
+ * and is stale. 25 hours is a threshold chosen between those two — it is not a bound on how late the
+ * scheduler can deliver a run, and nothing here promises the deployed schedule matches this cron.
  *
- * It was `24 * 3600` written inline, and the link to the cron lived only in somebody's head. That
- * mattered more than it looks: while the cron claimed hourly, twenty-four hours was twenty-four
- * missed slots, and the screen called a day-old probe current. Measured 2026-10-01, that cron
- * actually delivered 22% of its slots — so the window was lax against the claim *and* against the
- * reality, in different directions.
- *
- * Change this with the cron, never alone.
+ * Change this with the cron, never alone. The 24 h / 25 h / 36 h behaviour is pinned in
+ * `coverage.test.ts` ("treats 24h as current, the 25h window as the edge, and 36h as stale").
  */
-export const COVERAGE_STALE_SEC = 13 * 3600;
+export const COVERAGE_STALE_SEC = 25 * 3600;
 
 export interface RowOptions {
   /** Instant to measure staleness against. Passed in so rendering is deterministic in tests. */
