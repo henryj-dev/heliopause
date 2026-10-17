@@ -1552,6 +1552,27 @@ class TestWorkloadValidation(unittest.TestCase):
         self.assertIsNone(doc)
         self.assertIn("exactly one", reason)
 
+    def test_peer_entities_are_the_renderer_set(self):
+        # The fixture is an ingress allow. An egress allow carries only that direction and
+        # `enableDefaultDeny: {egress: false}` — the shape the validator requires of it.
+        def one_direction(doc, direction, rules):
+            if direction == "egress":
+                del doc["spec"]["ingress"]
+                doc["spec"]["enableDefaultDeny"] = {"egress": False}
+            doc["spec"][direction] = rules
+            return doc
+
+        for direction, field in (("ingress", "fromEntities"), ("egress", "toEntities")):
+            for entity in ("all", "world", "host", "remote-node"):
+                ok = one_direction(cnp(), direction, [{field: [entity]}])
+                self.assertIsNotNone(validate_wl(wl(ok))[0], (direction, entity))
+
+            for entity in ("cluster", "kube-apiserver", "remote-nodes", "Remote-Node"):
+                bad = one_direction(cnp(), direction, [{field: [entity]}])
+                doc, reason = validate_wl(wl(bad))
+                self.assertIsNone(doc, (direction, entity))
+                self.assertIn("unsupported entity", reason)
+
     def test_port_zero_is_only_the_renderer_protocol_wildcard(self):
         valid = cnp()
         valid["spec"]["ingress"] = [{

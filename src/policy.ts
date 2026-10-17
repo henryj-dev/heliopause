@@ -53,10 +53,13 @@ export type EndpointKind =
   /**
    * A Cilium reserved identity used as the non-workload side of a workload policy.
    *
-   * Deliberately limited to `host`: kubelet probes originate with Cilium's reserved host identity,
-   * not a CIDR identity, so a fromCIDR rule for the node address does not reliably preserve probes
-   * when an ingress allow turns the selected pod into default-deny. Other Cilium entities stay
-   * unavailable until a concrete policy needs them.
+   * Limited to `host` and `remote-node`. `host` is the node the pod runs on: kubelet probes
+   * originate with that reserved identity, not a CIDR identity, so a fromCIDR rule for the node
+   * address does not reliably preserve probes when an ingress allow turns the selected pod into
+   * default-deny. `remote-node` is Cilium's reserved identity for nodes other than the local one,
+   * added for host-network callers on another node; which nodes Cilium puts in it depends on the
+   * Cilium configuration and is not checked here. Other Cilium entities stay unavailable until a
+   * concrete policy needs them.
    */
   | "k8s-entity"
   /**
@@ -334,8 +337,8 @@ function normalizeEndpoint(e: unknown, label: "src" | "dst"): Endpoint {
   if (kind === "cidr" && !/^[0-9a-fA-F.:]+\/\d{1,3}$/.test(value)) {
     throw bad(`${label}.value must be a CIDR, e.g. 10.0.0.0/8`);
   }
-  if (kind === "k8s-entity" && value !== "host") {
-    throw bad(`${label}.value for kind=k8s-entity must be host`);
+  if (kind === "k8s-entity" && value !== "host" && value !== "remote-node") {
+    throw bad(`${label}.value for kind=k8s-entity must be host or remote-node`);
   }
 
   // A Service is a receiving concept — a stable name plus a selector for the pods behind it.

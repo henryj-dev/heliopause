@@ -644,10 +644,10 @@ function otherSide(
   if (e.kind === "any") return { cidr: [], entities: ["all"], v6: [] };
   if (e.kind === "internet") return { cidr: [], entities: ["world"], v6: [] };
   if (e.kind === "k8s-entity") {
-    if (e.value !== "host") {
+    if (e.value !== "host" && e.value !== "remote-node") {
       throw new CiliumRenderError(`${at}: unsupported Cilium entity ${JSON.stringify(e.value)}`);
     }
-    return { cidr: [], entities: ["host"], v6: [] };
+    return { cidr: [], entities: [e.value], v6: [] };
   }
 
   if (cidrs.length === 0) {

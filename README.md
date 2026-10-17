@@ -318,7 +318,7 @@ every deny before every allow, each in the order the site wires them. `denyMode`
 <tr><td><code>k8s-service</code></td><td><code>namespace/name</code> — the stable unit; pod addresses die in hours</td><td>🎯 <b>dst only</b></td></tr>
 <tr><td><code>k8s-namespace</code></td><td>every pod in a namespace — covers workloads that only <i>send</i>, such as CI runners</td><td>either</td></tr>
 <tr><td><code>k8s-label</code></td><td>a pod label selector, several ANDed with commas</td><td>either</td></tr>
-<tr><td><code>k8s-entity</code></td><td>Cilium's reserved <code>host</code> identity — keeps kubelet probes alive under a default-deny ingress</td><td>either</td></tr>
+<tr><td><code>k8s-entity</code></td><td>Cilium's reserved <code>host</code> identity (keeps kubelet probes alive under a default-deny ingress) or <code>remote-node</code> (Cilium's reserved identity for nodes other than the local one — which nodes it covers depends on the Cilium configuration)</td><td>either</td></tr>
 <tr><td><code>geofeed</code></td><td><code>&lt;feed&gt;:&lt;selector&gt;</code>, e.g. <code>cloudflare:KR</code>, from a hashed snapshot</td><td>📍 <b>src only</b></td></tr>
 <tr><td><code>cf-device</code></td><td>one approved WARP device, by <b>device id</b> — never by name, which its owner can rename</td><td>either</td></tr>
 <tr><td><code>cf-user</code></td><td>one approved person — the union of their registered devices</td><td>either</td></tr>
