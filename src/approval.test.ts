@@ -443,3 +443,29 @@ describe("approve — two names, one human", () => {
     assert.equal(plan.approval?.solo, undefined);
   });
 });
+
+describe("one-time-code identity", () => {
+  it("two names with one OTP identity are one human", () => {
+    const st = emptyApprovals();
+    propose(st, { hash: H, generation: "abc1234", summary: SUMMARY, by: "henry", byOtp: "ks-1", now: T0 });
+    const e = refusal(() => approve(st, { hash: H, by: "ops-henry", byOtp: "ks-1", now: at(1) }));
+    assert.equal(e.status, 403);
+    assert.match(e.message, /same person as henry/);
+    // Another identity, or none, is still a second person.
+    approve(st, { hash: H, by: "ops-other", byOtp: "ks-2", now: at(2) });
+    assert.equal(st.plans.get(H)!.approval?.by, "ops-other");
+  });
+
+  it("keeps the first proposer's OTP identity on re-propose", () => {
+    const st = emptyApprovals();
+    propose(st, { hash: H, generation: "abc1234", summary: SUMMARY, by: "henry", byOtp: "ks-1", now: T0 });
+    propose(st, { hash: H, generation: "abc1234", summary: SUMMARY, by: "ops-other", byOtp: "ks-2", now: at(1) });
+    assert.equal(st.plans.get(H)!.proposedByOtp, "ks-1");
+  });
+
+  it("soloApproveAndPublishRefusal treats an equal OTP identity as the proposer", () => {
+    const st = emptyApprovals();
+    propose(st, { hash: H, generation: "abc1234", summary: SUMMARY, by: "henry", byOtp: "ks-1", now: T0 });
+    assert.equal(soloApproveAndPublishRefusal(st, { hash: H, by: "ops-henry", byOtp: "ks-1", now: at(1), mayApproveOwn: true }), null);
+  });
+});

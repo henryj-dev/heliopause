@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { after, describe, it } from "node:test";
-import { createMember, deleteMember, loadMemberDocument, withMemberTransaction } from "./member-store.ts";
+import { confirmOtp, createMember, deleteMember, loadMemberDocument, withMemberTransaction } from "./member-store.ts";
 import { verifyPassword } from "./password.ts";
 
 const cli = resolve(import.meta.dirname, "../bin/heliopause-members.ts");
@@ -67,6 +67,32 @@ describe("heliopause-members CLI", () => {
     const again = run(["unsuspend", "--store", store, "--username", "second"]);
     assert.equal(again.status, 2);
     assert.match(again.stderr, /not suspended/);
+  });
+
+  it("--break-glass passes the sign-in-capable admin rule, records it, and never the last active admin rule", () => {
+    const store = freshStore();
+    assert.equal(run(["create-admin", "--store", store, "--username", "first", "--email", "f@example.com", "--otp-user-id", "ks-first"], `${PASSWORD}\n`).status, 0);
+    assert.equal(run(["create-admin", "--store", store, "--username", "second", "--email", "s@example.com"], `${PASSWORD}\n`).status, 0);
+    withMemberTransaction(store, (d) => confirmOtp(d, d.members[0]!.id, "ks-first", { actor: "cli" }));
+    // `second` is an active admin, but cannot sign in (no confirmed code): `first` is the last who can.
+    const refused = run(["suspend", "--store", store, "--username", "first"]);
+    assert.equal(refused.status, 2);
+    assert.match(refused.stderr, /no admin who can sign in/);
+    const glass = run(["suspend", "--store", store, "--username", "first", "--break-glass"]);
+    assert.equal(glass.status, 0, glass.stderr);
+    const after = loadMemberDocument(store);
+    assert.equal(after.members[0]!.status, "suspended");
+    assert.deepEqual(after.audit.filter((a) => a.action === "member.break-glass").map((a) => a.target), [`suspend:${after.members[0]!.id}`]);
+    for (const command of ["unsuspend", "reset-password"]) {
+      const r = run([command, "--store", store, "--username", "first", "--break-glass"], "another long passphrase\n");
+      assert.equal(r.status, 0, r.stderr);
+    }
+    assert.equal(loadMemberDocument(store).audit.filter((a) => a.action === "member.break-glass").length, 3);
+    const last = freshStore();
+    assert.equal(run(["create-admin", "--store", last, "--username", "only", "--email", "o@example.com"], `${PASSWORD}\n`).status, 0);
+    const lastGlass = run(["suspend", "--store", last, "--username", "only", "--break-glass"]);
+    assert.equal(lastGlass.status, 2);
+    assert.match(lastGlass.stderr, /no active admin/);
   });
 
   it("create-admin refuses a password the policy refuses and writes nothing", () => {

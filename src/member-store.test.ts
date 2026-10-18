@@ -5,9 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import {
-  activeMember, bindCertCN, consumeToken, createMember, deleteMember, emptyMemberDocument, findByCertCN, findByEmail,
+  activeMember, bindCertCN, confirmOtp, consumeToken, createMember, deleteMember, emptyMemberDocument, findByCertCN, findByEmail,
   findByIdentity, findByUsername, initializeMemberDocument, issueToken, linkIdentity, loadMemberDocument, MEMBER_TOKEN_PREFIX,
-  MemberError, saveMemberDocument, setPassword, setRoles, suspendMember, unbindCertCN, unlinkIdentity, unsuspendMember,
+  MemberError, saveMemberDocument, setOtpUserId, setPassword, setRoles, suspendMember, unbindCertCN, unlinkIdentity, unsuspendMember,
   withMemberTransaction, type MemberDocument,
 } from "./member-store.ts";
 
@@ -303,6 +303,89 @@ describe("soft delete", () => {
     raw.members[1].email = "a@example.com";
     writeFileSync(path, JSON.stringify(raw));
     refuses(() => loadMemberDocument(path), 400, /deleted member/);
+  });
+});
+
+describe("otpUserId confirmation", () => {
+  it("starts unconfirmed, is confirmed once, and resets when otpUserId changes or is cleared", () => {
+    const { document } = withAdmin();
+    const m = createMember(document, { username: "wade", status: "active", roles: ["writer"], otpUserId: "ks-1" }, ctx);
+    assert.equal(m.otpConfirmedAt, null);
+    confirmOtp(document, m.id, "ks-1", { ...ctx, now: new Date("2026-10-18T00:00:00.000Z") });
+    confirmOtp(document, m.id, "ks-1", { ...ctx, now: new Date("2026-10-19T00:00:00.000Z") });
+    assert.equal(m.otpConfirmedAt, "2026-10-18T00:00:00.000Z");
+    assert.equal(document.audit.filter((a) => a.action === "member.otp.confirmed").length, 1);
+    refuses(() => confirmOtp(document, m.id, "ks-other", ctx), 409, /changed/);
+    setOtpUserId(document, m.id, "ks-1", ctx);
+    assert.notEqual(m.otpConfirmedAt, null, "the same value keeps the confirmation");
+    setOtpUserId(document, m.id, "ks-2", ctx);
+    assert.equal(m.otpConfirmedAt, null);
+    confirmOtp(document, m.id, "ks-2", ctx);
+    setOtpUserId(document, m.id, null, ctx);
+    assert.equal(m.otpConfirmedAt, null);
+  });
+
+  it("load refuses otpConfirmedAt without otpUserId, a deleted member carrying it, and a mistyped value", () => {
+    const path = storePath();
+    const { document } = withAdmin();
+    const m = createMember(document, { username: "wade", status: "active", roles: ["writer"], otpUserId: "ks-1" }, ctx);
+    confirmOtp(document, m.id, "ks-1", ctx);
+    deleteMember(document, m.id, ctx);
+    assert.equal(m.otpConfirmedAt, null);
+    saveMemberDocument(path, document);
+    const raw = JSON.parse(readFileSync(path, "utf8"));
+    raw.members[1].otpConfirmedAt = "2026-10-18T00:00:00.000Z";
+    writeFileSync(path, JSON.stringify(raw));
+    refuses(() => loadMemberDocument(path), 400, /otpConfirmedAt without an otpUserId/);
+    raw.members[1].otpUserId = "ks-1";
+    writeFileSync(path, JSON.stringify(raw));
+    refuses(() => loadMemberDocument(path), 400, /deleted member/);
+    raw.members[1].otpUserId = null; raw.members[1].otpConfirmedAt = null;
+    raw.members[0].otpConfirmedAt = 7;
+    writeFileSync(path, JSON.stringify(raw));
+    refuses(() => loadMemberDocument(path), 400, /otpConfirmedAt is not an ISO timestamp/);
+  });
+
+  it("reads a phase-A member without otpConfirmedAt as unconfirmed", () => {
+    const path = storePath();
+    const { document } = withAdmin();
+    saveMemberDocument(path, document);
+    const raw = JSON.parse(readFileSync(path, "utf8"));
+    delete raw.members[0].otpConfirmedAt;
+    writeFileSync(path, JSON.stringify(raw));
+    assert.equal(loadMemberDocument(path).members[0]!.otpConfirmedAt, null);
+  });
+
+  it("refuses two members with one otpUserId, in a mutation and on load", () => {
+    const path = storePath();
+    const { document } = withAdmin();
+    const a = createMember(document, { username: "anna", status: "active", roles: ["writer"], otpUserId: "ks-1" }, ctx);
+    const b = createMember(document, { username: "bert", status: "active", roles: ["writer"] }, ctx);
+    refuses(() => createMember(document, { username: "carl", status: "active", roles: ["writer"], otpUserId: "ks-1" }, ctx), 409, /otpUserId/);
+    refuses(() => setOtpUserId(document, b.id, "ks-1", ctx), 409, /otpUserId/);
+    saveMemberDocument(path, document);
+    const raw = JSON.parse(readFileSync(path, "utf8"));
+    raw.members.find((m: { id: string }) => m.id === b.id).otpUserId = "ks-1";
+    writeFileSync(path, JSON.stringify(raw));
+    refuses(() => loadMemberDocument(path), 409, /otpUserId is not unique/);
+    deleteMember(document, a.id, ctx);
+    setOtpUserId(document, b.id, "ks-1", ctx);
+    assert.equal(b.otpUserId, "ks-1", "a deleted member's id is free again");
+  });
+
+  it("refuses to leave no admin who can sign in", () => {
+    const { document, adminId } = withAdmin();
+    setOtpUserId(document, adminId, "ks-root", ctx);
+    confirmOtp(document, adminId, "ks-root", ctx);
+    const other = createMember(document, { username: "second", status: "active", roles: ["admin"] }, ctx);
+    // Another active admin exists, but cannot sign in: it has no confirmed code.
+    refuses(() => setOtpUserId(document, adminId, null, ctx), 409, /no admin who can sign in/);
+    refuses(() => setOtpUserId(document, adminId, "ks-new", ctx), 409, /no admin who can sign in/);
+    refuses(() => suspendMember(document, adminId, ctx), 409, /no admin who can sign in/);
+    setOtpUserId(document, other.id, "ks-second", ctx);
+    confirmOtp(document, other.id, "ks-second", ctx);
+    setOtpUserId(document, adminId, null, ctx);
+    assert.equal(document.members.find((m) => m.id === adminId)!.otpUserId, null);
   });
 });
 

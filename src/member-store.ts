@@ -45,7 +45,10 @@ export type MemberTokenKind = typeof MEMBER_TOKEN_KINDS[number];
 
 export interface Member {
   id: string; username: string; principalName: string; email: string | null; emailVerifiedAt: string | null;
-  status: MemberStatus; roles: MemberRole[]; soloApprove: boolean; otpUserId: string | null; certCNs: string[];
+  status: MemberStatus; roles: MemberRole[]; soloApprove: boolean; otpUserId: string | null;
+  /** When the member first signed in with a code from `otpUserId`. Null until then, and after it changes. */
+  otpConfirmedAt: string | null;
+  certCNs: string[];
   createdAt: string; createdBy: string; updatedAt: string;
 }
 export interface PasswordCredential { memberId: string; kind: "password"; hash: string; changedAt: string; mustChange: boolean; }
@@ -62,7 +65,14 @@ export interface MemberDocument {
   tokens: MemberToken[]; audit: MemberAuditEvent[];
 }
 /** Who is making a change. CLI callers pass `actor: "cli"`. */
-export interface MemberContext { actor: string; sourceIp?: string | null; now?: Date; }
+export interface MemberContext {
+  actor: string; sourceIp?: string | null; now?: Date;
+  /**
+   * CLI break-glass only: skip the "last admin who can sign in" rule (the "last active admin" rule
+   * still holds). The HTTP routes never set it.
+   */
+  breakGlass?: boolean;
+}
 
 export class MemberError extends Error {
   readonly statusCode: number;
@@ -159,9 +169,11 @@ const MEMBER_FIELDS = [
   "id", "username", "principalName", "email", "emailVerifiedAt", "status", "roles", "soloApprove",
   "otpUserId", "certCNs", "createdAt", "createdBy", "updatedAt",
 ] as const;
+/** Added after phase A; a store written before it has no such field and reads it as null. */
+const MEMBER_OPTIONAL_FIELDS = ["otpConfirmedAt"] as const;
 
 function parseMember(raw: unknown): Member {
-  exactObject(raw, MEMBER_FIELDS, [], "member");
+  exactObject(raw, MEMBER_FIELDS, MEMBER_OPTIONAL_FIELDS, "member");
   if (typeof raw.id !== "string" || !UUID.test(raw.id)) throw new MemberError("member id is invalid");
   const username = normalizeMemberName(raw.username);
   const principalName = normalizeMemberName(raw.principalName, "principalName");
@@ -176,10 +188,12 @@ function parseMember(raw: unknown): Member {
     id: raw.id, username, principalName, email,
     emailVerifiedAt: isoOrNull(raw.emailVerifiedAt, "emailVerifiedAt"),
     status, roles, soloApprove: bool(raw.soloApprove, "soloApprove"), otpUserId: otpUserId(raw.otpUserId),
+    otpConfirmedAt: raw.otpConfirmedAt === undefined ? null : isoOrNull(raw.otpConfirmedAt, "otpConfirmedAt"),
     certCNs: raw.certCNs.map(certCN),
     createdAt: isoTime(raw.createdAt, "createdAt"), createdBy: actorName(raw.createdBy), updatedAt: isoTime(raw.updatedAt, "updatedAt"),
   };
   if (member.email === null && member.emailVerifiedAt !== null) throw new MemberError("emailVerifiedAt without an email");
+  if (member.otpUserId === null && member.otpConfirmedAt !== null) throw new MemberError("otpConfirmedAt without an otpUserId");
   if (status === "active" && roles.length === 0) throw new MemberError(`active member ${username} has no roles`);
   if (status === "deleted" && (email !== null || member.certCNs.length > 0 || roles.length > 0 || member.otpUserId !== null || member.soloApprove)) {
     throw new MemberError(`deleted member ${username} still carries personal data or authority`);
@@ -276,6 +290,8 @@ function checkCrossRecord(document: MemberDocument): void {
   unique(members.map((m) => m.principalName), "principalName");
   unique(members.flatMap((m) => (m.email === null ? [] : [m.email])), "email");
   unique(members.flatMap((m) => m.certCNs), "certificate CN");
+  // Approval treats one KeyStone user as one human, so two members may not share one.
+  unique(members.flatMap((m) => (m.status === "deleted" || m.otpUserId === null ? [] : [m.otpUserId])), "otpUserId");
   // Approval compares principal names and certificate CNs as plain strings, so one member's CN
   // may not be another member's principalName. A member's own pair may match.
   for (const member of members) {
@@ -394,6 +410,10 @@ export function passwordCredential(document: MemberDocument, memberId: string): 
 function audit(document: MemberDocument, ctx: MemberContext, action: string, target: string): void {
   document.audit.push({ at: nowIso(ctx.now), actor: actorName(ctx.actor), action, target, sourceIp: ctx.sourceIp ?? null });
 }
+/** Append one audit row for an action that has no mutation function of its own (a sign-in, say). */
+export function recordAudit(document: MemberDocument, ctx: MemberContext, action: string, target: string): void {
+  audit(document, ctx, action, target);
+}
 function requireMember(document: MemberDocument, id: string): Member {
   const member = document.members.find((m) => m.id === id);
   if (!member) throw new MemberError("member not found", 404);
@@ -405,15 +425,30 @@ function requireNotDeleted(document: MemberDocument, id: string): Member {
   return member;
 }
 const isActiveAdmin = (status: MemberStatus, roles: readonly MemberRole[]): boolean => status === "active" && roles.includes("admin");
+/** An active admin who can sign in to the console: admin sign-in needs a confirmed one-time code. */
+const isUsableAdmin = (m: { status: MemberStatus; roles: readonly MemberRole[]; otpUserId: string | null; otpConfirmedAt: string | null }): boolean =>
+  isActiveAdmin(m.status, m.roles) && m.otpUserId !== null && m.otpConfirmedAt !== null;
 
 /**
  * Refuse a change that turns the last active admin into anything else.
  * @see member-store.test.ts "last-admin protection"
  */
-function assertAdminRemains(document: MemberDocument, member: Member, next: { status: MemberStatus; roles: readonly MemberRole[] }): void {
-  if (!isActiveAdmin(member.status, member.roles) || isActiveAdmin(next.status, next.roles)) return;
-  const others = document.members.filter((m) => m.id !== member.id && isActiveAdmin(m.status, m.roles));
-  if (others.length === 0) throw new MemberError("refusing to leave no active admin", 409);
+function assertAdminRemains(
+  document: MemberDocument, member: Member,
+  next: { status: MemberStatus; roles: readonly MemberRole[]; otpUserId?: string | null; otpConfirmedAt?: string | null },
+  breakGlass = false,
+): void {
+  const after = { otpUserId: member.otpUserId, otpConfirmedAt: member.otpConfirmedAt, ...next };
+  const others = document.members.filter((m) => m.id !== member.id);
+  if (isActiveAdmin(member.status, member.roles) && !isActiveAdmin(after.status, after.roles)
+    && !others.some((m) => isActiveAdmin(m.status, m.roles))) {
+    throw new MemberError("refusing to leave no active admin", 409);
+  }
+  // The same rule for the admins who can actually sign in.
+  // @see member-store.test.ts "refuses to leave no admin who can sign in"
+  if (!breakGlass && isUsableAdmin(member) && !isUsableAdmin(after) && !others.some(isUsableAdmin)) {
+    throw new MemberError("refusing to leave no admin who can sign in", 409);
+  }
 }
 
 export function createMember(document: MemberDocument, input: {
@@ -432,6 +467,8 @@ export function createMember(document: MemberDocument, input: {
   if (email !== null && document.members.some((m) => m.email === email)) throw new MemberError("email is already in use", 409);
   const cns = (input.certCNs ?? []).map(certCN);
   for (const cn of cns) if (findByCertCN(document, cn)) throw new MemberError(`certificate CN ${cn} is bound to another member`, 409);
+  const otp = otpUserId(input.otpUserId);
+  if (otp !== null && otpUserTaken(document, otp, null)) throw new MemberError("otpUserId is already used by another member", 409);
   if (findByCertCN(document, principalName)) throw new MemberError(`principalName ${principalName} is another member's certificate CN`, 409);
   for (const cn of cns) {
     if (cn !== principalName && document.members.some((m) => m.principalName === cn)) {
@@ -441,7 +478,7 @@ export function createMember(document: MemberDocument, input: {
   const member: Member = {
     id: randomUUID(), username, principalName, email,
     emailVerifiedAt: email !== null && input.emailVerified === true ? at : null,
-    status, roles, soloApprove: input.soloApprove === true, otpUserId: otpUserId(input.otpUserId),
+    status, roles, soloApprove: input.soloApprove === true, otpUserId: otpUserId(input.otpUserId), otpConfirmedAt: null,
     certCNs: [...new Set(cns)], createdAt: at, createdBy: actorName(ctx.actor), updatedAt: at,
   };
   if (status === "active" && roles.length === 0) throw new MemberError("an active member needs at least one role");
@@ -464,7 +501,7 @@ export function setPassword(document: MemberDocument, memberId: string, hash: st
 export function suspendMember(document: MemberDocument, memberId: string, ctx: MemberContext): Member {
   const member = requireNotDeleted(document, memberId);
   if (member.status === "suspended") return member;
-  assertAdminRemains(document, member, { status: "suspended", roles: member.roles });
+  assertAdminRemains(document, member, { status: "suspended", roles: member.roles }, ctx.breakGlass === true);
   member.status = "suspended"; member.updatedAt = nowIso(ctx.now);
   audit(document, ctx, "member.suspend", memberId);
   return member;
@@ -486,10 +523,10 @@ export function unsuspendMember(document: MemberDocument, memberId: string, ctx:
  */
 export function deleteMember(document: MemberDocument, memberId: string, ctx: MemberContext): Member {
   const member = requireNotDeleted(document, memberId);
-  assertAdminRemains(document, member, { status: "deleted", roles: [] });
+  assertAdminRemains(document, member, { status: "deleted", roles: [] }, ctx.breakGlass === true);
   const email = member.email;
   Object.assign(member, {
-    status: "deleted", email: null, emailVerifiedAt: null, certCNs: [], roles: [], soloApprove: false, otpUserId: null,
+    status: "deleted", email: null, emailVerifiedAt: null, certCNs: [], roles: [], soloApprove: false, otpUserId: null, otpConfirmedAt: null,
     updatedAt: nowIso(ctx.now),
   });
   document.credentials = document.credentials.filter((c) => c.memberId !== memberId);
@@ -503,7 +540,7 @@ export function setRoles(document: MemberDocument, memberId: string, roles: read
   const member = requireNotDeleted(document, memberId);
   const next = roleList(roles);
   if (member.status === "active" && next.length === 0) throw new MemberError("an active member needs at least one role");
-  assertAdminRemains(document, member, { status: member.status, roles: next });
+  assertAdminRemains(document, member, { status: member.status, roles: next }, ctx.breakGlass === true);
   member.roles = next; member.updatedAt = nowIso(ctx.now);
   audit(document, ctx, "member.roles", memberId);
   return member;
@@ -528,6 +565,50 @@ export function unbindCertCN(document: MemberDocument, memberId: string, cn: str
   if (!member.certCNs.includes(cn)) throw new MemberError("certificate CN is not bound to this member", 404);
   member.certCNs = member.certCNs.filter((c) => c !== cn); member.updatedAt = nowIso(ctx.now);
   audit(document, ctx, "member.cert-unbind", memberId);
+  return member;
+}
+
+/**
+ * Set or clear the KeyStone user id one-time codes are checked against. A different value (or
+ * clearing it) resets `otpConfirmedAt`; the member confirms by signing in with a code from it.
+ */
+export function setOtpUserId(document: MemberDocument, memberId: string, value: string | null, ctx: MemberContext): Member {
+  const member = requireNotDeleted(document, memberId);
+  const next = otpUserId(value);
+  if (next !== null && otpUserTaken(document, next, memberId)) throw new MemberError("otpUserId is already used by another member", 409);
+  if (next !== member.otpUserId) {
+    assertAdminRemains(document, member, { status: member.status, roles: member.roles, otpUserId: next, otpConfirmedAt: null }, ctx.breakGlass === true);
+    member.otpConfirmedAt = null;
+  }
+  member.otpUserId = next; member.updatedAt = nowIso(ctx.now);
+  audit(document, ctx, "member.otp-user", memberId);
+  return member;
+}
+
+function otpUserTaken(document: MemberDocument, value: string, exceptId: string | null): boolean {
+  return document.members.some((m) => m.id !== exceptId && m.status !== "deleted" && m.otpUserId === value);
+}
+
+/** Newest `member.login` rows kept in the audit; older ones are dropped, every other row is kept. */
+export const MEMBER_LOGIN_AUDIT_MAX = 5_000;
+/**
+ * Drop the oldest `member.login` rows beyond `max`. Sign-ins are the one audit action whose rate is
+ * set by users rather than admins, so they are the one that is bounded.
+ * @see member-auth-server.test.ts "keeps only the newest sign-in audit rows"
+ */
+export function trimLoginAudit(document: MemberDocument, max = MEMBER_LOGIN_AUDIT_MAX): void {
+  let excess = document.audit.filter((a) => a.action === "member.login").length - max;
+  if (excess <= 0) return;
+  document.audit = document.audit.filter((a) => a.action !== "member.login" || excess-- <= 0);
+}
+
+/** Record that a code from `expectedOtpUserId` was verified for this member. No-op once confirmed. */
+export function confirmOtp(document: MemberDocument, memberId: string, expectedOtpUserId: string, ctx: MemberContext): Member {
+  const member = requireNotDeleted(document, memberId);
+  if (member.otpUserId !== expectedOtpUserId) throw new MemberError("otpUserId changed during sign-in", 409);
+  if (member.otpConfirmedAt !== null) return member;
+  member.otpConfirmedAt = nowIso(ctx.now); member.updatedAt = member.otpConfirmedAt;
+  audit(document, ctx, "member.otp.confirmed", memberId);
   return member;
 }
 
@@ -597,6 +678,17 @@ export function issueToken(document: MemberDocument, input: {
  * member is suspended, or an invite bound to a member who is no longer invited.
  */
 export function consumeToken(document: MemberDocument, input: { kind: MemberTokenKind; token: string }, ctx: MemberContext): MemberToken {
+  const row = peekToken(document, input, ctx.now);
+  row.usedAt = nowIso(ctx.now ?? new Date());
+  audit(document, ctx, `token.consume.${row.kind}`, row.id);
+  return row;
+}
+
+/**
+ * The checks `consumeToken` makes, without marking the token used or writing an audit row. For a
+ * caller that must learn which member a token names before the transaction that consumes it.
+ */
+export function peekToken(document: MemberDocument, input: { kind: MemberTokenKind; token: string }, at?: Date): MemberToken {
   const refuse = (): MemberError => new MemberError("token is invalid, used, or expired");
   if (typeof input.token !== "string" || !TOKEN_RE.test(input.token)) throw refuse();
   const digest = Buffer.from(sha256(input.token), "hex");
@@ -605,14 +697,12 @@ export function consumeToken(document: MemberDocument, input: { kind: MemberToke
     if (candidate.kind !== input.kind) continue;
     if (timingSafeEqual(Buffer.from(candidate.digest, "hex"), digest)) row = candidate;
   }
-  const now = ctx.now ?? new Date();
+  const now = at ?? new Date();
   if (!row || row.usedAt !== null || Date.parse(row.expiresAt) <= now.getTime()) throw refuse();
   if (row.memberId !== null) {
     const member = requireMember(document, row.memberId);
     const allowed: MemberStatus[] = row.kind === "invite" ? ["invited"] : ["active", "invited"];
     if (!allowed.includes(member.status)) throw refuse();
   }
-  row.usedAt = nowIso(now);
-  audit(document, ctx, `token.consume.${row.kind}`, row.id);
   return row;
 }

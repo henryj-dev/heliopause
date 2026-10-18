@@ -455,8 +455,15 @@ const started = await startManager({
     : {}),
   operatorCNs,
   writerCNs,
-  // Local member accounts by stage; unset is `off`. `shadow` stops browsers signing in by certificate.
-  members: { mode: membersMode },
+  // Local member accounts by stage; unset is `off`. `shadow` stops browsers signing in by certificate
+  // and serves member password sign-in from HELIOPAUSE_MEMBER_STORE, which must already exist.
+  members: {
+    mode: membersMode,
+    ...(process.env.HELIOPAUSE_MEMBER_STORE ? { storeFile: process.env.HELIOPAUSE_MEMBER_STORE } : {}),
+    sessionIdleSec: number("HELIOPAUSE_MEMBER_SESSION_IDLE_SEC"),
+    // Invite and reset links are built on this when no OIDC redirect URI gives an origin.
+    ...(process.env.HELIOPAUSE_PUBLIC_ORIGIN ? { publicOrigin: process.env.HELIOPAUSE_PUBLIC_ORIGIN } : {}),
+  },
   ...(problemWatch ? { problemWatch } : {}),
   timeoutMs: relayTimeoutMs,
   publishTimeoutMs: number("HELIOPAUSE_PUBLISH_TIMEOUT_MS"),
