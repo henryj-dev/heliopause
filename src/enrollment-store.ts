@@ -1,11 +1,9 @@
 import { execFileSync } from "node:child_process";
 import { createHash, createPublicKey, randomBytes, X509Certificate } from "node:crypto";
-import {
-  chmodSync, closeSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync,
-  writeFileSync,
-} from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { isMainThread, parentPort, Worker, workerData } from "node:worker_threads";
+import { atomicWriteFile, createExclusiveFile, withFileLock } from "./json-store.ts";
 import {
   MAX_REVOCATION_ROWS, parseRevocationSnapshot, planRevocationCompaction, serializeRevocationSnapshot,
 } from "./revocation-snapshot.ts";
@@ -64,7 +62,6 @@ const CSR_WORKER_TIMEOUT_MS = 10_000;
 const MAX_CSR_VALIDATION_WORKERS = 2;
 const MAX_QUEUED_CSR_VALIDATIONS = 16;
 const ENROLLMENT_LOCK_WAIT_MS = 10_000;
-const LOCK_SLEEP = new Int32Array(new SharedArrayBuffer(4));
 const HOSTNAME = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const CSR_PEM = /^-----BEGIN CERTIFICATE REQUEST-----\r?\n[A-Za-z0-9+/=\r\n]+-----END CERTIFICATE REQUEST-----\r?\n?$/;
@@ -708,73 +705,23 @@ export function requireEnrollmentDocument(path: string): EnrollmentDocument {
 }
 export function saveEnrollmentDocument(path: string, document: EnrollmentDocument): EnrollmentDocument {
   const full = resolve(path); const valid = parse(document, full); mkdirSync(dirname(full), { recursive: true, mode: 0o700 });
-  const tmp = `${full}.tmp-${process.pid}-${randomHex(4)}`;
-  try {
-    writeFileSync(tmp, JSON.stringify(valid, null, 2) + "\n", { mode: 0o600, flag: "wx" });
-    chmodSync(tmp, 0o600);
-    const fd = openSync(tmp, "r");
-    try { fsyncSync(fd); } finally { closeSync(fd); }
-    renameSync(tmp, full);
-    const directory = openSync(dirname(full), "r");
-    try { fsyncSync(directory); } finally { closeSync(directory); }
-  } catch (error) {
-    try { unlinkSync(tmp); } catch { /* the rename may already have installed it */ }
-    throw error;
-  }
+  atomicWriteFile(full, JSON.stringify(valid, null, 2) + "\n");
   return valid;
 }
 
-/** Unlink `path` only if it is still the inode `fd` opened, then close `fd`. */
-export function discardOwnedPath(path: string, fd: number): void {
-  try {
-    const owned = fstatSync(fd);
-    const current = lstatSync(path);
-    if (owned.dev === current.dev && owned.ino === current.ino) unlinkSync(path);
-  } catch {
-    // If creation failed before the pathname was installed, or another process already removed it,
-    // there is no owned lock left to clean up.
-  } finally {
-    closeSync(fd);
-  }
-}
+
+const enrollmentFailure = (message: string, statusCode?: number): Error => new EnrollmentError(message, statusCode);
 
 /** Explicit one-time provisioning. Runtime transactions never create a missing durable store. */
 export function initializeEnrollmentDocument(path: string): EnrollmentDocument {
-  const full = resolve(path);
   const document = emptyEnrollmentDocument();
-  mkdirSync(dirname(full), { recursive: true, mode: 0o700 });
-  let fd: number;
-  try {
-    fd = openSync(full, "wx", 0o600);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-      throw new EnrollmentError(`refusing to overwrite existing enrollment store: ${full}`);
-    }
-    throw new EnrollmentError(`${full}: cannot initialize enrollment store`);
-  }
-  try {
-    writeFileSync(fd, JSON.stringify(document, null, 2) + "\n", "utf8");
-    chmodSync(full, 0o600);
-    fsyncSync(fd);
-  } catch {
-    discardOwnedPath(full, fd);
-    throw new EnrollmentError(`${full}: cannot initialize enrollment store`);
-  }
-  closeSync(fd);
-  const directory = openSync(dirname(full), "r");
-  try { fsyncSync(directory); } finally { closeSync(directory); }
+  createExclusiveFile(path, JSON.stringify(document, null, 2) + "\n", "enrollment store", enrollmentFailure);
   return document;
 }
 
 /**
- * Cross-process transaction for the file-backed enrollment store.
- *
- * Atomic rename protects readers from partial JSON, but it does not protect two writers that both
- * loaded the same old document. The adjacent `O_EXCL` lock covers load → mutate → save as one unit.
- * An existing owner always makes the caller wait and then fail closed. Automatically unlinking a
- * supposedly stale pathname has no compare-and-delete primitive in portable Node: two reclaimers
- * can otherwise delete a newly acquired lock and reintroduce lost updates. After a confirmed crash,
- * an operator must stop every writer and explicitly remove the adjacent `.lock` file.
+ * Cross-process transaction for the file-backed enrollment store. The lock discipline lives in
+ * `withFileLock` (`json-store.ts`); this wrapper bounds `waitMs` and runs load → mutate → save.
  */
 export function withEnrollmentTransaction<T>(
   path: string,
@@ -782,53 +729,16 @@ export function withEnrollmentTransaction<T>(
   options: { waitMs?: number } = {},
 ): T {
   const full = resolve(path);
-  const lockPath = `${full}.lock`;
-  mkdirSync(dirname(full), { recursive: true, mode: 0o700 });
-  const owner = JSON.stringify({ pid: process.pid, nonce: randomHex(16), createdAt: Date.now() });
   const waitMs = options.waitMs ?? ENROLLMENT_LOCK_WAIT_MS;
   if (!Number.isSafeInteger(waitMs) || waitMs < 0 || waitMs > ENROLLMENT_LOCK_WAIT_MS) {
     throw new EnrollmentError("enrollment lock waitMs is invalid");
   }
-  const deadline = Date.now() + waitMs;
-  let fd: number | null = null;
-
-  while (fd === null) {
-    let opened: number;
-    try {
-      opened = openSync(lockPath, "wx", 0o600);
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code !== "EEXIST") throw new EnrollmentError(`${full}: cannot lock enrollment store`);
-      if (Date.now() >= deadline) throw new EnrollmentError(`${full}: enrollment store is busy`, 503);
-      Atomics.wait(LOCK_SLEEP, 0, 0, 20);
-      continue;
-    }
-
-    try {
-      writeFileSync(opened, owner, "utf8");
-      fd = opened;
-    } catch {
-      // `open("wx")` has already made the pathname visible. If writing the owner record fails,
-      // release both the descriptor and that exact inode so restart cannot inherit a poison lock.
-      discardOwnedPath(lockPath, opened);
-      throw new EnrollmentError(`${full}: cannot initialize enrollment store lock`);
-    }
-  }
-
-  try {
+  return withFileLock(full, waitMs, "enrollment store", enrollmentFailure, () => {
     const document = requireEnrollmentDocument(full);
     const result = mutate(document);
     saveEnrollmentDocument(full, document);
     return result;
-  } finally {
-    closeSync(fd);
-    try {
-      if (readFileSync(lockPath, "utf8") === owner) unlinkSync(lockPath);
-    } catch {
-      // A missing lock cannot make a committed mutation unsafe. A mismatched lock belongs to a
-      // later owner and must never be removed here.
-    }
-  }
+  });
 }
 function audit(document: EnrollmentDocument, event: Omit<EnrollmentAuditEvent, "at">, now?: Date): void {
   document.audit.push({ at: nowIso(now), ...event });

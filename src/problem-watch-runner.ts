@@ -13,9 +13,8 @@
  * @see "a lock left by a dead owner is not reclaimed and the watch stays off" in problem-watch-runner.test.ts
  */
 import { randomBytes } from "node:crypto";
-import { chmodSync, closeSync, fsyncSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
-import { discardOwnedPath } from "./enrollment-store.ts";
+import { closeSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { atomicWriteFile, discardOwnedPath } from "./json-store.ts";
 import { boundedInteger, ENV_BOUNDS, EnvSpecError } from "./env-spec.ts";
 import {
   emitLines, emptyWatchState, loadWatchState, manifestAliasCollision, parseWatchAliases, serializeWatchState, stepWatch,
@@ -102,26 +101,9 @@ export function openLockFile(
   try { close(fd); } catch { /* the record is written; the lock is ours */ }
 }
 
-/** tmp file with `wx` and 0600, fsync, rename over `path`, fsync the directory. */
-function writeFileAtomic(path: string, text: string): void {
-  const tmp = `${path}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
-  try {
-    writeFileSync(tmp, text, { mode: 0o600, flag: "wx" });
-    chmodSync(tmp, 0o600);
-    const fd = openSync(tmp, "r");
-    try { fsyncSync(fd); } finally { closeSync(fd); }
-    renameSync(tmp, path);
-    const directory = openSync(dirname(path), "r");
-    try { fsyncSync(directory); } finally { closeSync(directory); }
-  } catch (error) {
-    try { unlinkSync(tmp); } catch { /* the rename may already have installed it */ }
-    throw error;
-  }
-}
-
 export const defaultProblemWatchFs: ProblemWatchFs = {
   readFile: (path) => readFileSync(path, "utf8"),
-  writeFileAtomic,
+  writeFileAtomic: atomicWriteFile,
   openLock: (path, owner) => openLockFile(path, owner),
   unlink: (path) => unlinkSync(path),
   rename: (from, to) => renameSync(from, to),
