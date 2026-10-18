@@ -145,7 +145,7 @@ export class SessionStore {
    * derived from the session id would be recoverable by anything that ever saw the id — including a
    * proxy log, if the id ever ended up in a URL.
    */
-  create(principal: Principal, options: { idleSec?: number; perMemberMax?: number } = {}): Session {
+  create(principal: Principal, options: { idleSec?: number; ttlSec?: number; perMemberMax?: number } = {}): Session {
     this.sweep();
     // A member over its own cap loses its oldest session; that is not a table eviction.
     // @see member-auth-server.test.ts "a sixth sign-in ends the member's oldest session"
@@ -180,7 +180,8 @@ export class SessionStore {
       principal,
       csrf: randomBytes(32).toString("base64url"),
       createdAt: at,
-      expiresAt: new Date(at.getTime() + this.limits.ttlSec * 1000),
+      // `ttlSec` overrides the store's absolute lifetime for this session (member password sessions).
+      expiresAt: new Date(at.getTime() + (options.ttlSec ?? this.limits.ttlSec) * 1000),
       lastSeenAt: at,
       ...(options.idleSec !== undefined ? { idleSec: options.idleSec } : {}),
     };

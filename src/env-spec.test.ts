@@ -441,3 +441,16 @@ describe("HELIOPAUSE_MEMBERS", () => {
     assert.throws(() => membersModeFromEnv({ HELIOPAUSE_MEMBERS: "true" }), EnvSpecError);
   });
 });
+
+describe("member password session limits", () => {
+  test("idle 30 minutes and absolute 12 hours by default, each bounded", () => {
+    const idle = ENV_BOUNDS.HELIOPAUSE_MEMBER_SESSION_IDLE_SEC;
+    const ttl = ENV_BOUNDS.HELIOPAUSE_MEMBER_SESSION_TTL_SEC;
+    assert.equal(boundedInteger("HELIOPAUSE_MEMBER_SESSION_IDLE_SEC", undefined, idle), 1800);
+    assert.equal(boundedInteger("HELIOPAUSE_MEMBER_SESSION_TTL_SEC", undefined, ttl), 43_200);
+    assert.equal(boundedInteger("HELIOPAUSE_MEMBER_SESSION_TTL_SEC", "300", ttl), 300);
+    assert.equal(boundedInteger("HELIOPAUSE_MEMBER_SESSION_TTL_SEC", "86400", ttl), 86_400);
+    assert.throws(() => boundedInteger("HELIOPAUSE_MEMBER_SESSION_TTL_SEC", "299", ttl), EnvSpecError);
+    assert.throws(() => boundedInteger("HELIOPAUSE_MEMBER_SESSION_TTL_SEC", "86401", ttl), EnvSpecError);
+  });
+});

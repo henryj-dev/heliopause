@@ -164,7 +164,9 @@ export const ENV_BOUNDS = {
   HELIOPAUSE_PUBLIC_RETRY_SEC: { min: 0.001, max: 3600, fallback: 5 },
   HELIOPAUSE_OIDC_SESSION_TTL_SEC: { min: 60, max: 30 * 86_400, fallback: 8 * 3600 },
   /** Idle limit for member password sessions only; OIDC sessions have none. */
-  HELIOPAUSE_MEMBER_SESSION_IDLE_SEC: { min: 60, max: 86_400, fallback: 3600 },
+  HELIOPAUSE_MEMBER_SESSION_IDLE_SEC: { min: 60, max: 86_400, fallback: 1800 },
+  /** Absolute lifetime of member password sessions only; OIDC sessions keep `HELIOPAUSE_OIDC_SESSION_TTL_SEC`. */
+  HELIOPAUSE_MEMBER_SESSION_TTL_SEC: { min: 300, max: 86_400, fallback: 12 * 3600 },
   HELIOPAUSE_RELAY_TIMEOUT_MS: { min: 100, max: 120_000, fallback: 5_000 },
   HELIOPAUSE_PUBLISH_TIMEOUT_MS: { min: 1_000, max: 600_000, fallback: 30_000 },
   HELIOPAUSE_PLAN_TTL_SEC: { min: 60, max: 86_400, fallback: 600 },

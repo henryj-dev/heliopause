@@ -10,7 +10,7 @@ import { verifyPassword } from "./password.ts";
 const cli = resolve(import.meta.dirname, "../bin/heliopause-members.ts");
 const root = mkdtempSync(join(tmpdir(), "heliopause-members-cli-"));
 after(() => rmSync(root, { recursive: true, force: true }));
-const PASSWORD = "a long enough passphrase";
+const PASSWORD = "A long enough passphrase";
 let counter = 0;
 const freshStore = (): string => {
   const store = join(root, `s${++counter}`, "members.json");
@@ -48,7 +48,7 @@ describe("heliopause-members CLI", () => {
     assert.equal(suspended.status, 2);
     assert.match(suspended.stderr, /no active admin/);
 
-    const reset = run(["reset-password", "--store", store, "--username", "henry"], "another long passphrase\n");
+    const reset = run(["reset-password", "--store", store, "--username", "henry"], "Another long passphrase\n");
     assert.equal(reset.status, 0, reset.stderr);
     assert.equal(loadMemberDocument(store).credentials[0]!.mustChange, true);
   });
@@ -84,7 +84,7 @@ describe("heliopause-members CLI", () => {
     assert.equal(after.members[0]!.status, "suspended");
     assert.deepEqual(after.audit.filter((a) => a.action === "member.break-glass").map((a) => a.target), [`suspend:${after.members[0]!.id}`]);
     for (const command of ["unsuspend", "reset-password"]) {
-      const r = run([command, "--store", store, "--username", "first", "--break-glass"], "another long passphrase\n");
+      const r = run([command, "--store", store, "--username", "first", "--break-glass"], "Another long passphrase\n");
       assert.equal(r.status, 0, r.stderr);
     }
     assert.equal(loadMemberDocument(store).audit.filter((a) => a.action === "member.break-glass").length, 3);
@@ -100,9 +100,10 @@ describe("heliopause-members CLI", () => {
     const before = readFileSync(store, "utf8");
     const short = run(["create-admin", "--store", store, "--username", "henry", "--email", "h@example.com"], "short\n");
     assert.equal(short.status, 2);
-    assert.match(short.stderr, /at least 12/);
-    const containing = run(["create-admin", "--store", store, "--username", "henry", "--email", "h@example.com"], "henry-is-my-password\n");
-    assert.match(containing.stderr, /username/);
+    assert.match(short.stderr, /at least 8/);
+    const twoClasses = run(["create-admin", "--store", store, "--username", "henry", "--email", "h@example.com"], "only lowercase words\n");
+    assert.equal(twoClasses.status, 2);
+    assert.match(twoClasses.stderr, /at least 3 of/);
     assert.equal(readFileSync(store, "utf8"), before);
   });
 
@@ -233,11 +234,11 @@ async function viaTerminal(argv: string[], answers: string[]): Promise<{ code: n
 describe("heliopause-members on a terminal", { skip: noScript, timeout: 30_000 }, () => {
   it("reads the password from a terminal, without echo, with UTF-8 backspace", async () => {
     const store = freshStore();
-    const typed = "a long enough passé";
+    const typed = "A long enough passé";
     // "X" and the two-byte "é" are erased, then "é" is typed again.
     const result = await viaTerminal(
       ["create-admin", "--store", store, "--username", "henry", "--email", "h@example.com"],
-      [`a long enough passéX\x7f\x7fé\r`, `${typed}\r`],
+      [`A long enough passéX\x7f\x7fé\r`, `${typed}\r`],
     );
     assert.equal(result.code, 0, result.output);
     assert.match(result.output, /created admin henry/);
@@ -250,18 +251,18 @@ describe("heliopause-members on a terminal", { skip: noScript, timeout: 30_000 }
     const store = freshStore();
     const result = await viaTerminal(
       ["create-admin", "--store", store, "--username", "henry", "--email", "h@example.com"],
-      ["a long enough pa\x1b[Ass\x1bOB\x1b[1;5C\r", "a long enough pass\r"],
+      ["A long enough pa\x1b[Ass\x1bOB\x1b[1;5C\r", "A long enough pass\r"],
     );
     assert.equal(result.code, 0, result.output);
     const hash = loadMemberDocument(store).credentials[0]!.hash;
-    assert.equal((await verifyPassword("a long enough pass", hash)).ok, true);
+    assert.equal((await verifyPassword("A long enough pass", hash)).ok, true);
   });
 
   it("Ctrl-C aborts instead of submitting what was typed", async () => {
     const store = freshStore();
     const result = await viaTerminal(
       ["create-admin", "--store", store, "--username", "henry", "--email", "h@example.com"],
-      ["a long enough pass\x03"],
+      ["A long enough pass\x03"],
     );
     assert.equal(result.code, 2, result.output);
     assert.match(result.output, /interrupted/);
@@ -272,7 +273,7 @@ describe("heliopause-members on a terminal", { skip: noScript, timeout: 30_000 }
     const store = freshStore();
     const result = await viaTerminal(
       ["create-admin", "--store", store, "--username", "henry", "--email", "h@example.com"],
-      ["a long enough pass\x04"],
+      ["A long enough pass\x04"],
     );
     assert.equal(result.code, 2, result.output);
     assert.match(result.output, /input ended/);

@@ -149,11 +149,11 @@ function readTerminal(prompt: string): string {
   return new TextDecoder("utf-8", { fatal: true }).decode(Uint8Array.from(bytes));
 }
 
-async function newPasswordHash(context: { username: string; email: string | null }): Promise<string> {
+async function newPasswordHash(): Promise<string> {
   const terminal = isatty(0);
   const password = terminal ? readTerminal("new password: ") : readPipe();
   if (terminal && readTerminal("repeat: ") !== password) throw new Error("passwords do not match");
-  const problems = checkPasswordPolicy(password, context);
+  const problems = checkPasswordPolicy(password);
   if (problems.length > 0) throw new Error(`password refused: ${problems.join("; ")}`);
   return hashPassword(password);
 }
@@ -222,7 +222,7 @@ try {
         };
         // Run the same creation on a copy first, so a taken name or email is refused before the prompt.
         const preview = createMember(loadMemberDocument(store), input, ctx);
-        const hash = await newPasswordHash({ username: preview.username, email: preview.email });
+        const hash = await newPasswordHash();
         const member = withMemberTransaction(store, (document) => {
           const created = createMember(document, input, ctx);
           setPassword(document, created.id, hash, { mustChange: false }, ctx);
@@ -241,7 +241,7 @@ try {
       } else if (command === "reset-password") {
         const member = memberFor(store, required("username"));
         if (member.status === "deleted") throw new Error(`member ${member.username} is deleted`);
-        const hash = await newPasswordHash({ username: member.username, email: member.email });
+        const hash = await newPasswordHash();
         withMemberTransaction(store, (document) => {
           breakGlass(document, member.id);
           setPassword(document, member.id, hash, { mustChange: !flags.has("no-must-change") }, glassCtx());
