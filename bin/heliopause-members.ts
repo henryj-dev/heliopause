@@ -9,7 +9,7 @@ import { isatty } from "node:tty";
 import { parsePairs } from "../src/env-spec.ts";
 import {
   createMember, findByUsername, initializeMemberDocument, loadMemberDocument, normalizeEmail, normalizeMemberName,
-  passwordCredential, setPassword, suspendMember, unsuspendMember, withMemberTransaction, type MemberContext,
+  passwordCredential, recordAudit, setPassword, suspendMember, unsuspendMember, withMemberTransaction, type MemberContext,
 } from "../src/member-store.ts";
 import { installCliLanguage } from "../src/operator-i18n.ts";
 import { checkPasswordPolicy, hashPassword } from "../src/password.ts";
@@ -18,28 +18,32 @@ installCliLanguage();
 
 const usage = `usage:
   heliopause-members init --store <members.json>
-  heliopause-members create-admin --store <members.json> --username NAME --email ADDRESS [--principal-name NAME]
+  heliopause-members create-admin --store <members.json> --username NAME --email ADDRESS [--principal-name NAME] [--otp-user-id ID]
   heliopause-members list --store <members.json> [--json]
-  heliopause-members reset-password --store <members.json> --username NAME [--no-must-change]
-  heliopause-members suspend --store <members.json> --username NAME
-  heliopause-members unsuspend --store <members.json> --username NAME
+  heliopause-members reset-password --store <members.json> --username NAME [--no-must-change] [--break-glass]
+  heliopause-members suspend --store <members.json> --username NAME [--break-glass]
+  heliopause-members unsuspend --store <members.json> --username NAME [--break-glass]
   heliopause-members import --dry-run
 
 Passwords are read from the terminal without echo, or from stdin when it is not a terminal.
 import reads HELIOPAUSE_OPERATOR_CNS, HELIOPAUSE_WRITER_CNS, HELIOPAUSE_OIDC_ALIASES and
-HELIOPAUSE_OTP_USERS and prints a draft; it never writes a file.`;
+HELIOPAUSE_OTP_USERS and prints a draft; it never writes a file.
+A writer or admin signs in to the console with a one-time code checked against --otp-user-id
+(the KeyStone user id); without one the manager refuses that member's sign-in.
+--break-glass skips the "last admin who can sign in" rule (never the "last active admin" rule) and
+records a member.break-glass audit row.`;
 
 /** The flags each command accepts; anything else is refused. */
 const COMMAND_FLAGS: Record<string, readonly string[]> = {
   "init": ["store"],
-  "create-admin": ["store", "username", "email", "principal-name"],
+  "create-admin": ["store", "username", "email", "principal-name", "otp-user-id"],
   "list": ["store", "json"],
-  "reset-password": ["store", "username", "no-must-change"],
-  "suspend": ["store", "username"],
-  "unsuspend": ["store", "username"],
+  "reset-password": ["store", "username", "no-must-change", "break-glass"],
+  "suspend": ["store", "username", "break-glass"],
+  "unsuspend": ["store", "username", "break-glass"],
   "import": ["dry-run"],
 };
-const BOOLEAN_FLAGS = new Set(["json", "dry-run", "no-must-change", "help"]);
+const BOOLEAN_FLAGS = new Set(["json", "dry-run", "no-must-change", "break-glass", "help"]);
 const [command, ...rest] = process.argv.slice(2);
 const flags = new Map<string, string>();
 function usageError(message: string): Error { return Object.assign(new Error(`${message}\n${usage}`), { exitCode: 64 }); }
@@ -63,6 +67,12 @@ function required(name: string): string {
   return value;
 }
 const ctx: MemberContext = { actor: "cli" };
+/** `ctx`, with the break-glass bypass when the flag was given. */
+const glassCtx = (): MemberContext => (flags.has("break-glass") ? { ...ctx, breakGlass: true } : ctx);
+/** With --break-glass, the audit row that says so, in the same transaction as the change. */
+function breakGlass(document: Parameters<typeof recordAudit>[0], memberId: string): void {
+  if (flags.has("break-glass")) recordAudit(document, ctx, "member.break-glass", `${command}:${memberId}`);
+}
 const WAIT = new Int32Array(new SharedArrayBuffer(4));
 
 /** All of non-terminal stdin, minus one trailing newline. Retries EAGAIN on a non-blocking fd. */
@@ -208,6 +218,7 @@ try {
         const input = {
           username: required("username"), principalName: flags.get("principal-name") ?? required("username"),
           email: required("email"), emailVerified: true, status: "active" as const, roles: ["reader", "writer", "admin"],
+          otpUserId: flags.get("otp-user-id") ?? null,
         };
         // Run the same creation on a copy first, so a taken name or email is refused before the prompt.
         const preview = createMember(loadMemberDocument(store), input, ctx);
@@ -231,11 +242,17 @@ try {
         const member = memberFor(store, required("username"));
         if (member.status === "deleted") throw new Error(`member ${member.username} is deleted`);
         const hash = await newPasswordHash({ username: member.username, email: member.email });
-        withMemberTransaction(store, (document) => setPassword(document, member.id, hash, { mustChange: !flags.has("no-must-change") }, ctx));
+        withMemberTransaction(store, (document) => {
+          breakGlass(document, member.id);
+          setPassword(document, member.id, hash, { mustChange: !flags.has("no-must-change") }, glassCtx());
+        });
         console.log(`password reset for ${member.username}`);
       } else {
         const id = memberFor(store, required("username")).id;
-        const member = withMemberTransaction(store, (document) => (command === "suspend" ? suspendMember : unsuspendMember)(document, id, ctx));
+        const member = withMemberTransaction(store, (document) => {
+          breakGlass(document, id);
+          return (command === "suspend" ? suspendMember : unsuspendMember)(document, id, glassCtx());
+        });
         console.log(`${member.username} is ${member.status}`);
       }
     }

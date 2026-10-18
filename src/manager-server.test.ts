@@ -32,6 +32,7 @@ import {
   trimPendingOidcLogins,
 } from "./manager-server.ts";
 import type { CertBundle } from "./cert-api.ts";
+import { initializeMemberDocument } from "./member-store.ts";
 
 /** The `events` key this test's issuer uses. Not a constant in `set.ts` any more — it is a fact
  * about a deployment's IdP, so every caller declares it and the type checker enforces that. */
@@ -2931,7 +2932,9 @@ describe("a browser request never signs in by certificate when members are on", 
     off: { port: 0, close: () => {} }, shadow: { port: 0, close: () => {} },
   };
 
+  const membersStore = join(dir, "members-shadow.json");
   before(async () => {
+    initializeMemberDocument(membersStore);
     for (const mode of ["off", "shadow"] as const) {
       const started = await startManager({
         port: 0, hostname: "127.0.0.1",
@@ -2946,7 +2949,8 @@ describe("a browser request never signs in by certificate when members are on", 
           operatorGroups: ["heliopause-operators"], writerGroups: ["heliopause-writers"],
           aliases: new Map(), fetchImpl: idpFetch,
         },
-        members: { mode },
+        // Shadow also serves member sign-in and so needs an existing store; an empty one is enough.
+        members: mode === "shadow" ? { mode, storeFile: membersStore } : { mode },
       });
       servers[mode] = { port: (started.server.address() as { port: number }).port, close: () => started.server.close() };
     }

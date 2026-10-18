@@ -67,7 +67,24 @@ export interface Principal {
   /** Group and role claims as they arrived. Authorisation reads these; nothing else does. */
   groups: readonly string[];
   /** How this identity was proved. Recorded so a log line can say which door was used. */
-  via: "certificate" | "oidc";
+  via: "certificate" | "oidc" | "password";
+  /**
+   * For `via: "password"`: the member this session belongs to. The manager re-reads the member from
+   * the store on every request and rebuilds `name`, `canWrite` and the fields below from it.
+   */
+  memberId?: string;
+  /** For `via: "password"`: a one-time code was verified when this session was created. */
+  loginMfa?: boolean;
+  /** For `via: "password"`: the credential's `changedAt` this session was issued against. Another value ends it. */
+  credentialChangedAt?: string;
+  /** For `via: "password"`, per request: the member's credential says the password must change. */
+  mustChange?: boolean;
+  /** For `via: "password"`, per request: the member holds the admin role (and `loginMfa` is true). */
+  isAdmin?: boolean;
+  /** For `via: "password"`, per request: the KeyStone user id `requireOtp` checks codes against. */
+  otpUserId?: string | null;
+  /** For `via: "password"`, per request: `otpUserId` has been confirmed by a sign-in code. */
+  otpConfirmed?: boolean;
   /**
    * Whether this principal may propose, approve and publish.
    *
@@ -87,12 +104,16 @@ export interface Session {
   csrf: string;
   createdAt: Date;
   expiresAt: Date;
+  /** Updated by every successful `get`. */
+  lastSeenAt: Date;
+  /** Set only for sessions created with an idle limit: `get` ends the session after this many idle seconds. */
+  idleSec?: number;
 }
 
 export interface SessionLimits {
   /** Absolute lifetime. A session does not extend past this however active it is. */
   ttlSec: number;
-  /** Ceiling on concurrent sessions, so a login loop cannot grow this map without bound. */
+  /** Ceiling on concurrent sessions per kind (password; everything else), so a login loop cannot grow this map without bound. */
   max: number;
 }
 
@@ -124,9 +145,20 @@ export class SessionStore {
    * derived from the session id would be recoverable by anything that ever saw the id — including a
    * proxy log, if the id ever ended up in a URL.
    */
-  create(principal: Principal): Session {
+  create(principal: Principal, options: { idleSec?: number; perMemberMax?: number } = {}): Session {
     this.sweep();
-    if (this.sessions.size >= this.limits.max) {
+    // A member over its own cap loses its oldest session; that is not a table eviction.
+    // @see member-auth-server.test.ts "a sixth sign-in ends the member's oldest session"
+    if (principal.memberId !== undefined && options.perMemberMax !== undefined) {
+      const own = [...this.sessions.values()]
+        .filter((x) => x.principal.memberId === principal.memberId)
+        .sort((a, b) => +a.createdAt - +b.createdAt);
+      while (own.length >= options.perMemberMax) this.sessions.delete(own.shift()!.id);
+    }
+    // Password sessions and the rest have a cap each, so one kind cannot push the other out.
+    // @see member-auth-server.test.ts "password sign-ins cannot evict an OIDC session"
+    const pool = [...this.sessions.values()].filter((x) => poolOf(x.principal) === poolOf(principal));
+    if (pool.length >= this.limits.max) {
       // Oldest first. Refusing the new login instead would let anyone lock out the operator by
       // filling the table, and the failure would look like a broken IdP.
       //
@@ -135,7 +167,7 @@ export class SessionStore {
       // eviction is reported — `evicted` counts them, and the manager logs it. A bound that is being
       // hit is a fact about the deployment, and the version of this that said nothing made a
       // deliberate flood indistinguishable from an ordinary expiry.
-      const oldest = [...this.sessions.values()].sort((a, b) => +a.createdAt - +b.createdAt)[0];
+      const oldest = pool.sort((a, b) => +a.createdAt - +b.createdAt)[0];
       if (oldest) {
         this.sessions.delete(oldest.id);
         this.evictions += 1;
@@ -149,21 +181,47 @@ export class SessionStore {
       csrf: randomBytes(32).toString("base64url"),
       createdAt: at,
       expiresAt: new Date(at.getTime() + this.limits.ttlSec * 1000),
+      lastSeenAt: at,
+      ...(options.idleSec !== undefined ? { idleSec: options.idleSec } : {}),
     };
     this.sessions.set(s.id, s);
     return s;
   }
 
-  /** The live session for a cookie value, or null. Expiry is checked here, not by a sweep. */
+  /**
+   * The live session for a cookie value, or null. Expiry — absolute, and idle for a session that has
+   * an idle limit — is checked here, not by a sweep. A session that is returned has its
+   * `lastSeenAt` moved to now.
+   */
   get(id: string | null): Session | null {
     if (!id) return null;
     const s = this.sessions.get(id);
     if (!s) return null;
-    if (s.expiresAt <= this.now()) {
+    const t = this.now();
+    if (s.expiresAt <= t || idleExpired(s, t)) {
       this.sessions.delete(id);
       return null;
     }
+    s.lastSeenAt = t;
     return s;
+  }
+
+  /** Live sessions whose principal is this member, without touching `lastSeenAt`. */
+  forMember(memberId: string): Session[] {
+    const t = this.now();
+    return [...this.sessions.values()].filter((s) =>
+      s.principal.memberId === memberId && s.expiresAt > t && !idleExpired(s, t));
+  }
+
+  /** End every session of one member except `keep`. Returns how many ended. */
+  endMember(memberId: string, keep: string | null = null): number {
+    let ended = 0;
+    for (const [id, s] of this.sessions) {
+      if (s.principal.memberId !== memberId || id === keep) continue;
+      this.sessions.delete(id);
+      ended++;
+    }
+    return ended;
   }
 
   /** End one session. Idempotent — logging out twice is not an error worth reporting. */
@@ -193,7 +251,8 @@ export class SessionStore {
     let updated = 0;
     let ended = 0;
     for (const [id, s] of this.sessions) {
-      if (s.principal.sub !== sub) continue;
+      // An IdP event names an IdP subject. A password session is not one, whatever its `sub` says.
+      if (s.principal.via !== "oidc" || s.principal.sub !== sub) continue;
       const next = decide(s.principal);
       if (next === null) {
         this.sessions.delete(id);
@@ -223,8 +282,14 @@ export class SessionStore {
 
   private sweep(): void {
     const t = this.now();
-    for (const [id, s] of this.sessions) if (s.expiresAt <= t) this.sessions.delete(id);
+    for (const [id, s] of this.sessions) if (s.expiresAt <= t || idleExpired(s, t)) this.sessions.delete(id);
   }
+}
+
+const poolOf = (p: Principal): "password" | "other" => (p.via === "password" ? "password" : "other");
+
+function idleExpired(s: Session, t: Date): boolean {
+  return s.idleSec !== undefined && s.lastSeenAt.getTime() + s.idleSec * 1000 <= t.getTime();
 }
 
 // ── Cookies ───────────────────────────────────────────────────────────────────

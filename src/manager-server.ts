@@ -155,6 +155,7 @@ import { certFactsFromPeer, certFactsFromPem, pemCertificateCount, type CertFact
 import { certificateInventory, certificateProblems, prose, type CertificateReport, type FileReading } from "./cert-inventory.ts";
 import type { CertificateRevocation } from "./enrollment-store.ts";
 import type { MembersMode } from "./env-spec.ts";
+import { createMemberAuth } from "./member-auth.ts";
 
 /**
  * Body limit for `POST /plan`, well above the relay's.
@@ -471,12 +472,28 @@ export interface ManagerOptions {
   /**
    * Local member accounts, by stage. Absent or `off` is the behaviour before they existed.
    *
-   * `shadow` today changes one thing: a request a browser marks as its own (see "A certificate is
-   * not a browser login" in `handle` for which marks, and what they miss) does not authenticate by
-   * client certificate. It requires `oidc`,
-   * because until password sign-in exists a session is the only other way into the console.
+   * `shadow` does two things. A request a browser marks as its own (see "A certificate is not a
+   * browser login" in `handle` for which marks, and what they miss) does not authenticate by client
+   * certificate; and member password sign-in is served (`member-auth.ts`). It requires `oidc` until
+   * the console has a sign-in page of its own, and `storeFile`, which must already exist.
    */
-  members?: { mode: MembersMode };
+  members?: {
+    mode: MembersMode;
+    /** `members.json`, created by `heliopause-members init`. Read at startup and on every member request. */
+    storeFile?: string;
+    /**
+     * Idle limit for password sessions, in seconds. Default 3600. The environment variable is bounded
+     * to 60..86400 (`ENV_BOUNDS`); this option accepts 1..86400 so a test need not wait a minute.
+     */
+    sessionIdleSec?: number;
+    /**
+     * `https://<host>` that invite and reset links are built on, when `oidc` is not configured (with
+     * it, the origin of `oidc.redirectUri` is used). Neither means the link routes answer 503.
+     */
+    publicOrigin?: string;
+    /** Test seam: the source address member sign-in limits count. See `MemberAuthDeps.sourceOf`. */
+    sourceOf?: (req: IncomingMessage) => string;
+  };
   /** Enrollment store or standalone JSON denylist, reloaded on every authenticated request. */
   revocationFile?: string;
   /**
@@ -1194,6 +1211,20 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
   if (membersOn && !opts.oidc) {
     throw new Error(`members.mode=${opts.members?.mode} requires oidc — without it a browser has no way into the console once certificates stop signing it in`);
   }
+  if (membersOn && !opts.members?.storeFile) {
+    throw new Error(`members.mode=${opts.members?.mode} requires members.storeFile (HELIOPAUSE_MEMBER_STORE)`);
+  }
+  // Only with members on: `off` must start exactly as before, whatever the redirect URI looks like.
+  // @see "off ignores the members' public origin" in member-auth-server.test.ts
+  const memberPublicOrigin = !membersOn ? null
+    : opts.oidc ? new URL(opts.oidc.redirectUri).origin : opts.members?.publicOrigin ?? null;
+  if (memberPublicOrigin !== null && !/^https:\/\/[^/]+$/.test(memberPublicOrigin)) {
+    throw new Error(`the members' public origin must be https://<host>, not ${memberPublicOrigin}`);
+  }
+  const memberIdleSec = opts.members?.sessionIdleSec ?? 3600;
+  if (!Number.isSafeInteger(memberIdleSec) || memberIdleSec < 1 || memberIdleSec > 86_400) {
+    throw new Error("members.sessionIdleSec must be an integer between 1 and 86400");
+  }
   if (opts.enrollment) {
     // Initialization is an explicit operator action. Treating a missing store as first boot here
     // cannot be distinguished from deletion of a populated revocation ledger after a crash.
@@ -1329,16 +1360,22 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     return results;
   };
 
-  // Only built when OIDC is configured, so a certificate-only deployment carries no session table and
-  // no outbound dependency on an IdP.
+  // One table for every cookie session, OIDC and member password alike, so the cap and the
+  // eviction report cover both. Only built when a session can exist, so a certificate-only
+  // deployment carries no session table.
+  const sessions = opts.oidc || membersOn
+    ? new SessionStore({
+        ttlSec: opts.oidc?.sessionTtlSec ?? DEFAULT_SESSION_LIMITS.ttlSec,
+        max: DEFAULT_SESSION_LIMITS.max,
+      })
+    : null;
+  // Only built when OIDC is configured, so a certificate-only deployment carries no outbound
+  // dependency on an IdP.
   const oidc = opts.oidc
     ? {
         conf: opts.oidc,
         provider: new Provider(opts.oidc.issuer, opts.oidc.fetchImpl ?? fetch),
-        sessions: new SessionStore({
-          ttlSec: opts.oidc.sessionTtlSec ?? DEFAULT_SESSION_LIMITS.ttlSec,
-          max: DEFAULT_SESSION_LIMITS.max,
-        }),
+        sessions: sessions!,
         /**
          * In-flight logins, keyed by `state`.
          *
@@ -1376,6 +1413,53 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
   const limits = opts.limits ?? DEFAULT_LIMITS;
   const now = opts.now ?? (() => new Date());
   const authorizationTimestamps = new AuthorizationTimestampIssuer();
+  // Built after the checks above; constructing it reads the store, so a missing store or a member
+  // name that clashes with a certificate CN or an alias target refuses to start.
+  const memberAuth = membersOn
+    ? createMemberAuth({
+        storeFile: opts.members!.storeFile!,
+        sessions: sessions!,
+        idleSec: memberIdleSec,
+        ...(opts.otp ? { otp: opts.otp } : {}),
+        certificateNames: new Set([...operators, ...writers]),
+        otpUsers: opts.otp?.users ?? new Map(),
+        publicOrigin: memberPublicOrigin,
+        ...(opts.members?.sourceOf ? { sourceOf: opts.members.sourceOf } : {}),
+        aliasNames: new Set(opts.oidc?.aliases.values() ?? []),
+        now,
+        log,
+        rateLimited,
+        requireOtp: (p, body, res, path) => requireOtp(p, body, res, path),
+      })
+    : null;
+
+  /** The KeyStone user that answers for this principal's one-time codes, if any. */
+  const otpIdentityOf = (p: Principal): string | null =>
+    p.via === "oidc" ? p.sub : p.via === "password" ? (p.otpUserId ?? null) : (opts.otp?.users.get(p.name) ?? null);
+
+  /**
+   * Every other name that is the same human as `p`: writer CNs sharing its KeyStone user
+   * (`sameHumanAs`), any certificate CN mapped to that user, and a member's principalName and
+   * certificate CNs — for the member whose names include `p.name` and for the member bound to the
+   * same KeyStone user. Null when the member store cannot be read; the caller refuses.
+   * @see "a member and their own certificate are one approver" in member-auth-server.test.ts
+   */
+  function alsoKnownAsFor(p: Principal): string[] | null {
+    const names = new Set(sameHumanAs.get(p.name) ?? []);
+    const otpId = otpIdentityOf(p);
+    if (otpId) for (const [cn, uid] of opts.otp?.users ?? []) if (uid === otpId) names.add(cn);
+    if (memberAuth) {
+      let members;
+      try { members = memberAuth.document().members; } catch { return null; }
+      for (const m of members) {
+        if (m.status === "deleted") continue;
+        const own = [m.principalName, ...m.certCNs];
+        if (own.includes(p.name) || (otpId !== null && m.otpUserId === otpId)) for (const n of own) names.add(n);
+      }
+    }
+    names.delete(p.name);
+    return [...names];
+  }
 
   /**
    * Per-source counters for the two enrollment routes a caller reaches without a certificate.
@@ -1980,6 +2064,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     // individually harmless to an anonymous caller — `/auth/login` hands out a redirect to the IdP,
     // `/auth/callback` fails without a `state` this server issued, and `/auth/logout` ends a session
     // the caller must already hold.
+    if (memberAuth && (await memberAuth.handleAuthRoute(url, req, res))) return;
     if (oidc && url.pathname.startsWith("/auth/")) {
       return await handleAuth(oidc, url, req, res);
     }
@@ -2019,7 +2104,22 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       || typeof req.headers["sec-fetch-site"] === "string"
       || typeof req.headers["origin"] === "string";
     const certIsAcceptable = membersOn ? !fromBrowser : !(oidc && wantsHtml);
-    const session = oidc ? oidc.sessions.get(readCookie(req.headers["cookie"], COOKIE)) : null;
+    const session = sessions ? sessions.get(readCookie(req.headers["cookie"], COOKIE)) : null;
+    // A password session's authority is the member record as it is now, not as it was at sign-in.
+    // @see "suspension takes effect on the next request" in member-auth-server.test.ts
+    let memberPrincipal: Principal | null = null;
+    if (session && session.principal.via === "password") {
+      if (!memberAuth) {
+        sessions!.destroy(session.id);
+        return send(res, 401, { error: "this session has ended — sign in again" }, { "set-cookie": clearCookieHeader() });
+      }
+      const resolved = memberAuth.resolve(session);
+      if (!resolved.ok) {
+        return send(res, resolved.status, { error: resolved.error },
+          resolved.status === 401 ? { "set-cookie": clearCookieHeader() } : {});
+      }
+      memberPrincipal = resolved.principal;
+    }
 
     // ## The session wins, and the `Accept` rule above is not enough on its own
     //
@@ -2038,7 +2138,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     // So the order is session first. A CLI never carries a cookie, which is what makes this safe to
     // state so bluntly: presenting both is a browser, and a browser that has signed in has already
     // said who it is with claims a certificate cannot carry.
-    const principal: Principal | null = session?.principal
+    const principal: Principal | null = memberPrincipal ?? session?.principal
       ?? (cn && certIsAcceptable
         ? { name: cn, sub: cn, groups: [], via: "certificate", canWrite: writers.has(cn) }
         : null);
@@ -2081,7 +2181,10 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     // it to cross-site requests in ways it does not attach a certificate, and because this site chose
     // full write parity for sessions. `session.ts` explains the three layers; this is where the third
     // one — a token in a header no cross-origin form can set — is enforced.
-    if (req.method === "POST" && session && principal.via === "oidc") {
+    //
+    // POST, PUT and DELETE, for every session — OIDC or member password.
+    // @see "CSRF is required on POST, PUT and DELETE for a member session" in member-auth-server.test.ts
+    if ((req.method === "POST" || req.method === "PUT" || req.method === "DELETE") && session) {
       const refusal = checkCsrf(
         session,
         {
@@ -2101,6 +2204,12 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         });
       }
     }
+
+    // A password that must change answers nothing else; `/auth/logout` ran before this.
+    if (memberAuth && memberAuth.mustChangeRefuses(principal, req.method, url.pathname)) {
+      return send(res, 403, { error: "password change required" });
+    }
+    if (memberAuth && (await memberAuth.handleApiRoute(principal, session, url, req, res))) return;
 
     // Kept so the existing certificate-path code below reads unchanged. Every use of `cn` from here
     // on means "the authenticated principal's name", which is what it always meant.
@@ -2946,7 +3055,8 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         const status = await pullRequestStatus(creds, target, call, nowSec, number);
         const { checks, checksUnavailable } = await readChecks(creds, target, call, nowSec, status);
         const proposedBy = proposerFromBody(status.body);
-        const alsoKnownAs = sameHumanAs.get(who) ?? [];
+        const alsoKnownAs = alsoKnownAsFor(principal);
+        if (!alsoKnownAs) return send(res, 503, { error: "the member store is unavailable" });
         const why = mergeRefusal({
           status, checks, who, proposer: proposedBy, checksUnavailable,
           alsoKnownAs, maySolo: maySoloApprove,
@@ -2997,7 +3107,8 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         const status = await pullRequestStatus(creds, target, call, nowSec, number);
         const { checks, checksUnavailable } = await readChecks(creds, target, call, nowSec, status);
         const proposedBy = proposerFromBody(status.body);
-        const alsoKnownAs = sameHumanAs.get(who) ?? [];
+        const alsoKnownAs = alsoKnownAsFor(principal);
+        if (!alsoKnownAs) return send(res, 503, { error: "the member store is unavailable" });
         const why = mergeRefusal({
           status,
           checks,
@@ -3133,7 +3244,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         // a broken store is what stops the sidenav claiming there are no CSRs.
         pendingCsrs: pendingCsrCount(opts.enrollment?.storeFile),
         // Same rule as `/plans`: only for a session, and only ever to the caller holding it.
-        ...(session && principal.via === "oidc" ? { csrf: session.csrf } : {}),
+        ...(session ? { csrf: session.csrf } : {}),
         certificate: {
           operators: [...operators],
           writers: [...writers],
@@ -3423,7 +3534,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         //
         // Safe to return: it is readable only by a caller that already holds the session cookie, and
         // its whole purpose is to be echoed back by that caller's own script.
-        ...(session && principal.via === "oidc" ? { csrf: session.csrf } : {}),
+        ...(session ? { csrf: session.csrf } : {}),
       });
     }
 
@@ -3486,7 +3597,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       try {
         const plan = propose(
           approvals,
-          { hash, generation: bundle.manifest.generation, summary: summarise(bundle), by, now: now() },
+          { hash, generation: bundle.manifest.generation, summary: summarise(bundle), by, byOtp: otpIdentityOf(principal), now: now() },
           limits,
         );
         // The bundle is held beside the plan rather than inside it: `Plan` is what gets serialised to
@@ -3696,6 +3807,8 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         return send(res, 400, { error: `bad request body: ${(e as Error).message}` });
       }
       if ((await requireOtp(principal, body, res, url.pathname)) === "answered") return;
+      const approverAka = alsoKnownAsFor(principal);
+      if (!approverAka) return send(res, 503, { error: "the member store is unavailable" });
       try {
         // `alsoKnownAs` is what turns "the same name" into "the same person". An OIDC principal
         // arrives already collapsed onto one certificate name by its alias, and that name's other
@@ -3707,7 +3820,8 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
             by: who,
             now: now(),
             mayApproveOwn: maySoloApprove,
-            alsoKnownAs: sameHumanAs.get(who) ?? [],
+            alsoKnownAs: approverAka,
+            byOtp: otpIdentityOf(principal),
           },
           limits,
         );
@@ -3734,10 +3848,12 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         return send(res, 400, { error: `bad request body: ${(e as Error).message}` });
       }
       const hash = String(body.hash ?? "");
-      const alsoKnownAs = sameHumanAs.get(who) ?? [];
+      const alsoKnownAs = alsoKnownAsFor(principal);
+      if (!alsoKnownAs) return send(res, 503, { error: "the member store is unavailable" });
+      const byOtp = otpIdentityOf(principal);
       const refusal = (at: Date) => soloApproveAndPublishRefusal(
         approvals,
-        { hash, by: who, now: at, mayApproveOwn: maySoloApprove, alsoKnownAs },
+        { hash, by: who, now: at, mayApproveOwn: maySoloApprove, alsoKnownAs, byOtp },
         limits,
       );
       // Before the code: a refusal decided from state must not spend it.
@@ -3755,7 +3871,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       if (late) return sendApprovalError(res, late);
       let plan;
       try {
-        plan = approve(approvals, { hash, by: who, now: at, mayApproveOwn: maySoloApprove, alsoKnownAs }, limits);
+        plan = approve(approvals, { hash, by: who, now: at, mayApproveOwn: maySoloApprove, alsoKnownAs, byOtp }, limits);
       } catch (e) {
         return sendApprovalError(res, e);
       }
@@ -4208,6 +4324,21 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       }
       const id = readCookie(req.headers["cookie"], COOKIE);
       const s = o.sessions.get(id);
+      // A member password session also needs its CSRF token to end. An OIDC session keeps the
+      // Origin-only rule above, which is what the console's sign-out button sends today.
+      // @see "logout of a member session needs the CSRF token" in member-auth-server.test.ts
+      if (s && s.principal.via === "password") {
+        const refusal = checkCsrf(s, {
+          origin: typeof origin === "string" ? origin : undefined,
+          referer: typeof req.headers["referer"] === "string" ? req.headers["referer"] : undefined,
+          csrf: typeof req.headers[CSRF_HEADER] === "string" ? (req.headers[CSRF_HEADER] as string) : undefined,
+        }, selfOrigin);
+        if (refusal) return send(res, 403, { error: "missing or invalid CSRF token — reload the console" });
+        log(`session for ${s.principal.name} ended`, `${s.principal.name}의 세션 종료`);
+        o.sessions.destroy(id);
+        res.writeHead(200, { "content-type": "application/json", "set-cookie": clearCookieHeader(), "cache-control": "no-store" });
+        return void res.end(JSON.stringify({ endSession: null }));
+      }
       if (s) log(`session for ${s.principal.name} ended`, `${s.principal.name}의 세션 종료`);
       o.sessions.destroy(id);
 
@@ -4601,7 +4732,14 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     const otp = opts.otp;
     if (!otp) return "ok";
 
-    const userId = p.via === "oidc" ? p.sub : otp.users.get(p.name);
+    const userId = p.via === "oidc" ? p.sub : p.via === "password" ? (p.otpUserId ?? undefined) : otp.users.get(p.name);
+    // A password session whose otpUserId is not (or no longer) confirmed by a sign-in code. Admin
+    // changes end the member's sessions; a store edit outside the API does not, and lands here.
+    // @see "an unconfirmed otpUserId refuses the approval code" in member-auth-server.test.ts
+    if (p.via === "password" && userId && !p.otpConfirmed) {
+      log(`${path} REFUSED for ${p.name}: otpUserId not confirmed`, `${p.name}의 ${path} 거부: otpUserId 미확인`);
+      return answered(res, 403, "confirm your one-time code by signing in again");
+    }
     if (!userId) {
       // Refused rather than waved through. A writer this deployment cannot identify to the IdP is a
       // writer whose second factor cannot be checked, and the safe reading of that is "not yet".

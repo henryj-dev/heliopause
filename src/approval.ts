@@ -40,6 +40,11 @@ export interface Plan {
   generation: string;
   /** Certificate CN of whoever submitted it. */
   proposedBy: string;
+  /**
+   * The proposer's one-time-code identity (a KeyStone user id), when they have one. Two principals
+   * with the same value are one human whatever their names. Kept on re-propose, like `proposedBy`.
+   */
+  proposedByOtp?: string;
   proposedAt: string;
   /** One line per host, for a reviewer who has to decide without re-rendering anything. */
   summary: PlanSummary;
@@ -160,9 +165,18 @@ function inFlight(p: Plan, now: Date): boolean {
   return p.inFlightUntil !== undefined && now.getTime() < new Date(p.inFlightUntil).getTime();
 }
 
+/**
+ * One human by name (`by`, or a name in `alsoKnownAs`) or by one-time-code identity.
+ * @see approval.test.ts "two names with one OTP identity are one human"
+ */
+function sameHumanAsProposer(plan: Plan, input: { by: string; alsoKnownAs?: readonly string[]; byOtp?: string | null }): boolean {
+  if (plan.proposedBy === input.by || (input.alsoKnownAs ?? []).includes(plan.proposedBy)) return true;
+  return plan.proposedByOtp !== undefined && !!input.byOtp && plan.proposedByOtp === input.byOtp;
+}
+
 export function propose(
   state: ApprovalState,
-  input: { hash: string; generation: string; summary: PlanSummary; by: string; now: Date },
+  input: { hash: string; generation: string; summary: PlanSummary; by: string; byOtp?: string | null; now: Date },
   limits = DEFAULT_LIMITS,
 ): Plan {
   sweep(state, input.now, limits);
@@ -193,6 +207,7 @@ export function propose(
     hash: input.hash,
     generation: input.generation,
     proposedBy: input.by,
+    ...(input.byOtp ? { proposedByOtp: input.byOtp } : {}),
     proposedAt: input.now.toISOString(),
     summary: input.summary,
     approval: null,
@@ -252,6 +267,8 @@ export function approve(
      * which is what every caller without an OTP user map gets.
      */
     alsoKnownAs?: readonly string[];
+    /** The approver's one-time-code identity; equal to `plan.proposedByOtp` means the same human. */
+    byOtp?: string | null;
   },
   limits = DEFAULT_LIMITS,
 ): Plan {
@@ -268,7 +285,7 @@ export function approve(
   // The same *person*, not the same string. `alsoKnownAs` carries the other certificate names the
   // deployment declares to be this human — see its comment for the live configuration where two
   // writer names shared one identity-provider account.
-  const sameHuman = plan.proposedBy === input.by || (input.alsoKnownAs ?? []).includes(plan.proposedBy);
+  const sameHuman = sameHumanAsProposer(plan, input);
   if (sameHuman && !input.mayApproveOwn) {
     // The rule this whole module exists for. Checked against the stored proposer, so it cannot be
     // sidestepped by anything in this request.
@@ -314,7 +331,7 @@ export function approve(
  */
 export function soloApproveAndPublishRefusal(
   state: ApprovalState,
-  input: { hash: string; by: string; now: Date; mayApproveOwn: boolean; alsoKnownAs?: readonly string[] },
+  input: { hash: string; by: string; now: Date; mayApproveOwn: boolean; alsoKnownAs?: readonly string[]; byOtp?: string | null },
   limits = DEFAULT_LIMITS,
 ): ApprovalError | null {
   if (!input.by) return new ApprovalError("no operator identity on the request", 401);
@@ -328,7 +345,7 @@ export function soloApproveAndPublishRefusal(
   if (expired(plan, input.now, limits)) {
     return new ApprovalError(`plan ${input.hash} expired after ${limits.ttlSec}s — re-propose it`, 410);
   }
-  const sameHuman = plan.proposedBy === input.by || (input.alsoKnownAs ?? []).includes(plan.proposedBy);
+  const sameHuman = sameHumanAsProposer(plan, input);
   if (!sameHuman) {
     return new ApprovalError(
       `plan ${input.hash} was proposed by ${plan.proposedBy} — approving and publishing in one step is ` +
