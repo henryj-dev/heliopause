@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   boundedInteger, boundedNumber, ENV_BOUNDS, parsePairs, parseRelays, parsePolicySites, EnvSpecError,
   planLimitsFromEnv, startupLimitSources, type BoundedEnvName,
+  membersModeFromEnv,
 } from "./env-spec.ts";
 import { DEFAULT_LIMITS } from "./approval.ts";
 
@@ -422,5 +423,21 @@ describe("the manager's plan limits from the environment (#161)", () => {
     assert.deepEqual(planLimitsFromEnv({ HELIOPAUSE_PLAN_TTL_SEC: " ", HELIOPAUSE_MAX_PENDING_PLANS: "" }), DEFAULT_LIMITS);
     assert.throws(() => planLimitsFromEnv({ HELIOPAUSE_MAX_PENDING_PLANS: "0" }), EnvSpecError);
     assert.throws(() => planLimitsFromEnv({ HELIOPAUSE_PLAN_TTL_SEC: "soon" }), EnvSpecError);
+  });
+});
+
+describe("HELIOPAUSE_MEMBERS", () => {
+  test("is off when unset, blank or off", () => {
+    assert.equal(membersModeFromEnv({}), "off");
+    assert.equal(membersModeFromEnv({ HELIOPAUSE_MEMBERS: " " }), "off");
+    assert.equal(membersModeFromEnv({ HELIOPAUSE_MEMBERS: "off" }), "off");
+  });
+  test("accepts shadow", () => {
+    assert.equal(membersModeFromEnv({ HELIOPAUSE_MEMBERS: "shadow" }), "shadow");
+  });
+  test("refuses on until member sign-in exists, and anything else", () => {
+    assert.throws(() => membersModeFromEnv({ HELIOPAUSE_MEMBERS: "on" }), (e: Error) => e instanceof EnvSpecError && /not available yet/.test(e.message));
+    assert.throws(() => membersModeFromEnv({ HELIOPAUSE_MEMBERS: "Shadow" }), EnvSpecError);
+    assert.throws(() => membersModeFromEnv({ HELIOPAUSE_MEMBERS: "true" }), EnvSpecError);
   });
 });

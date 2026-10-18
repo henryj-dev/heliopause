@@ -154,6 +154,7 @@ import type { CertBundle } from "./cert-api.ts";
 import { certFactsFromPeer, certFactsFromPem, pemCertificateCount, type CertFacts } from "./cert-watch.ts";
 import { certificateInventory, certificateProblems, prose, type CertificateReport, type FileReading } from "./cert-inventory.ts";
 import type { CertificateRevocation } from "./enrollment-store.ts";
+import type { MembersMode } from "./env-spec.ts";
 
 /**
  * Body limit for `POST /plan`, well above the relay's.
@@ -467,6 +468,15 @@ export interface ManagerOptions {
   trafficReader?: { url: string; fetch?: Fetcher };
   /** Optional standalone enrollment database. Unset leaves all enrollment routes disabled. */
   enrollment?: { storeFile: string; trustedCaFiles?: ReadonlyMap<string, string> };
+  /**
+   * Local member accounts, by stage. Absent or `off` is the behaviour before they existed.
+   *
+   * `shadow` today changes one thing: a request a browser marks as its own (see "A certificate is
+   * not a browser login" in `handle` for which marks, and what they miss) does not authenticate by
+   * client certificate. It requires `oidc`,
+   * because until password sign-in exists a session is the only other way into the console.
+   */
+  members?: { mode: MembersMode };
   /** Enrollment store or standalone JSON denylist, reloaded on every authenticated request. */
   revocationFile?: string;
   /**
@@ -1179,6 +1189,10 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
   const log = (en: string, ko: string) => writeLog(`[manager] ${formatOperatorEvent(opts.logLang ?? "en", { en, ko })}`);
   if ((opts.oidc?.soloApprovalRoles?.length ?? 0) > 0 && !opts.otp) {
     throw new Error("oidc.soloApprovalRoles requires otp — solo approval may not run without a second factor");
+  }
+  const membersOn = (opts.members?.mode ?? "off") !== "off";
+  if (membersOn && !opts.oidc) {
+    throw new Error(`members.mode=${opts.members?.mode} requires oidc — without it a browser has no way into the console once certificates stop signing it in`);
   }
   if (opts.enrollment) {
     // Initialization is an explicit operator action. Treating a missing store as first boot here
@@ -1988,7 +2002,23 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     //
     // **Guarded on `oidc` being configured.** With no IdP there is no other way to reach the console,
     // and disabling the one that works would lock the operator out of their own firewall.
-    const certIsAcceptable = !(oidc && wantsHtml);
+    //
+    // **With member accounts switched on (`members.mode` not `off`) the rule covers requests a
+    // browser marks, not just pages.** The marks: `Sec-Fetch-Site`, which current browsers send on
+    // every request (Chrome 76+, Firefox 90+, Safari 16.4+), and `Origin`, which browsers send on
+    // every POST and cross-origin request. The CLI's client (`api-client.ts`, `node:https`) sends
+    // neither. `Sec-Fetch-Mode` is not used — Node's own `fetch` sends it (measured on Node 26), so
+    // it does not separate a browser from a script.
+    //
+    // **What this misses:** a browser that sends no `Sec-Fetch-Site` (older, or behind something
+    // that strips it) still authenticates a same-origin GET by certificate, because that GET carries
+    // no `Origin` either. Its writes are POSTs and carry `Origin`, so they are refused. Closing the
+    // read side for those browsers needs the console and the mTLS API on separate listeners.
+    // @see "a browser request never signs in by certificate when members are on" in manager-server.test.ts
+    const fromBrowser = wantsHtml
+      || typeof req.headers["sec-fetch-site"] === "string"
+      || typeof req.headers["origin"] === "string";
+    const certIsAcceptable = membersOn ? !fromBrowser : !(oidc && wantsHtml);
     const session = oidc ? oidc.sessions.get(readCookie(req.headers["cookie"], COOKIE)) : null;
 
     // ## The session wins, and the `Accept` rule above is not enough on its own
@@ -2025,6 +2055,9 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         const to = safeReturnTo(next) ? `/auth/login?next=${encodeURIComponent(next)}` : "/auth/login";
         res.writeHead(302, { location: to, "cache-control": "no-store" });
         return void res.end();
+      }
+      if (membersOn && cn && fromBrowser) {
+        return send(res, 401, { error: "a client certificate does not sign in to the console — sign in at /auth/login, or use the CLI" });
       }
       return send(res, 401, {
         error: oidc

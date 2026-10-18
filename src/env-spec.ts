@@ -271,6 +271,27 @@ export function startupLimitSources(env: NodeJS.ProcessEnv): {
   };
 }
 
+/** `HELIOPAUSE_MEMBERS`: which stage of local member accounts this manager runs. */
+export type MembersMode = "off" | "shadow";
+
+/**
+ * Unset or blank is `off`, which is the behaviour before member accounts existed.
+ *
+ * `on` is refused rather than accepted early: it means "only members may use the console", and the
+ * pieces that make that reachable (password sign-in, SSO linking) are later phases. Accepting the
+ * word now would let a deployment set it and get a console nobody can enter.
+ * @see "HELIOPAUSE_MEMBERS" in env-spec.test.ts
+ */
+export function membersModeFromEnv(env: NodeJS.ProcessEnv): MembersMode {
+  const raw = (env.HELIOPAUSE_MEMBERS ?? "").trim();
+  if (raw === "" || raw === "off") return "off";
+  if (raw === "shadow") return "shadow";
+  if (raw === "on") {
+    throw new EnvSpecError("HELIOPAUSE_MEMBERS=on is not available yet — it needs member sign-in; use off or shadow");
+  }
+  throw new EnvSpecError(`HELIOPAUSE_MEMBERS must be off or shadow, not ${JSON.stringify(raw)}`);
+}
+
 /**
  * `dev=https://192.0.2.1:8443=./pki,prod=https://192.0.2.2:8443=./pki-prod`
  *

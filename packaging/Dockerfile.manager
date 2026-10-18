@@ -87,6 +87,7 @@ COPY --chown=heliopause:heliopause packages/i18n/ ./packages/i18n/
 COPY --chown=heliopause:heliopause \
   bin/heliopause-manager.ts \
   bin/heliopause-enrollment.ts \
+  bin/heliopause-members.ts \
   bin/heliopause-policy-render.ts \
   ./bin/
 COPY --from=web --chown=heliopause:heliopause /src/packages/web/build ./packages/web/build
