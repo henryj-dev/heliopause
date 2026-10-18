@@ -351,16 +351,31 @@ export type PendingOidcLogin = {
  * value is stored under a state this server minted and is unreachable to anyone who did not start
  * the login.
  *
- * Same-origin paths only, and that is three separate refusals rather than one: anything with a
- * scheme, anything starting `//` (protocol-relative, a host in disguise), and anything not starting
- * `/`. A backslash is refused too — some browsers normalise `/\evil.com` to `//evil.com`.
+ * Same-origin paths only, in two steps:
+ *
+ *   1. It must start with `/` and not `//` (protocol-relative, a host in disguise), and hold only
+ *      printable ASCII other than a backslash. The WHATWG URL parser drops tab, CR and LF and reads
+ *      a backslash as `/`, so `/` + tab + `/evil.example`, and `/` + backslash + `evil.example`, are
+ *      both `//evil.example` once a browser reads them. Anything outside ASCII would also make the
+ *      `Location` header throw (`ERR_INVALID_CHAR`), a 500 at the callback.
+ *   2. Not a login route (they would loop, and a POST-only route reached by redirect becomes a GET),
+ *      and not the console's own sign-in, invitation or reset page.
+ *
+ * The console's `safeNext` (`packages/web/src/lib/domains/members/login.ts`) applies the same rule.
+ * @see "refuses to be turned into an open redirect" in manager-server.test.ts
  */
+const RETURN_TO_PLACEHOLDER = "https://return-to.invalid";
 export function safeReturnTo(raw: string | null): string | null {
-  if (!raw || !raw.startsWith("/")) return null;
-  if (raw.startsWith("//") || raw.startsWith("/\\")) return null;
-  if (/^[a-z][a-z0-9+.-]*:/i.test(raw)) return null;
-  // The login routes themselves would loop, and a POST-only route reached by redirect becomes a GET.
-  if (raw.startsWith("/auth/")) return null;
+  if (!raw || !raw.startsWith("/") || raw.startsWith("//")) return null;
+  if (/[^\x21-\x7e]/.test(raw) || raw.includes("\\")) return null;
+  // No origin check follows: a value that starts with a single `/` and holds only printable ASCII
+  // other than a backslash always resolves to this origin.
+  // @see "safeReturnTo refuses control characters, whitespace and backslashes, and the one-time-link pages" in manager-server.test.ts
+  const path = new URL(raw, RETURN_TO_PLACEHOLDER).pathname;
+  if (path.startsWith("/auth/")) return null;
+  for (const page of ["/login", "/invite", "/reset", "/app/login", "/app/invite", "/app/reset"]) {
+    if (path === page || path.startsWith(`${page}/`)) return null;
+  }
   return raw;
 }
 
@@ -474,8 +489,10 @@ export interface ManagerOptions {
    *
    * `shadow` does two things. A request a browser marks as its own (see "A certificate is not a
    * browser login" in `handle` for which marks, and what they miss) does not authenticate by client
-   * certificate; and member password sign-in is served (`member-auth.ts`). It requires `oidc` until
-   * the console has a sign-in page of its own, and `storeFile`, which must already exist.
+   * certificate; and member password sign-in is served (`member-auth.ts`), which the console's
+   * `/app/login` page uses. It requires `storeFile`, which must already exist, and a public origin
+   * for invite and reset links: `oidc.redirectUri`'s when OIDC is configured, else `publicOrigin`.
+   * Without either it refuses to start. `oidc` itself is optional.
    */
   members?: {
     mode: MembersMode;
@@ -1213,9 +1230,6 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     throw new Error("oidc.soloApprovalRoles requires otp — solo approval may not run without a second factor");
   }
   const membersOn = (opts.members?.mode ?? "off") !== "off";
-  if (membersOn && !opts.oidc) {
-    throw new Error(`members.mode=${opts.members?.mode} requires oidc — without it a browser has no way into the console once certificates stop signing it in`);
-  }
   if (membersOn && !opts.members?.storeFile) {
     throw new Error(`members.mode=${opts.members?.mode} requires members.storeFile (HELIOPAUSE_MEMBER_STORE)`);
   }
@@ -1223,6 +1237,10 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
   // @see "off ignores the members' public origin" in member-auth-server.test.ts
   const memberPublicOrigin = !membersOn ? null
     : opts.oidc ? new URL(opts.oidc.redirectUri).origin : opts.members?.publicOrigin ?? null;
+  // @see "refuses to start in shadow without a public origin" in manager-server.test.ts
+  if (membersOn && memberPublicOrigin === null) {
+    throw new Error(`members.mode=${opts.members?.mode} needs a public origin — set oidc.redirectUri or HELIOPAUSE_PUBLIC_ORIGIN`);
+  }
   if (memberPublicOrigin !== null && !/^https:\/\/[^/]+$/.test(memberPublicOrigin)) {
     throw new Error(`the members' public origin must be https://<host>, not ${memberPublicOrigin}`);
   }
@@ -1433,7 +1451,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         ...(opts.otp ? { otp: opts.otp } : {}),
         certificateNames: new Set([...operators, ...writers]),
         otpUsers: opts.otp?.users ?? new Map(),
-        publicOrigin: memberPublicOrigin,
+        publicOrigin: memberPublicOrigin!,
         ...(opts.members?.sourceOf ? { sourceOf: opts.members.sourceOf } : {}),
         aliasNames: new Set(opts.oidc?.aliases.values() ?? []),
         now,
@@ -2074,6 +2092,13 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     // individually harmless to an anonymous caller — `/auth/login` hands out a redirect to the IdP,
     // `/auth/callback` fails without a `state` this server issued, and `/auth/logout` ends a session
     // the caller must already hold.
+    //
+    // `/auth/methods` says which of the two sign-ins this manager offers, so the console's sign-in
+    // page can draw the password form, the SSO link, or both. It names no account and no setting.
+    // @see "says which sign-ins it offers" in member-auth-server.test.ts
+    if (req.method === "GET" && url.pathname === "/auth/methods") {
+      return send(res, 200, { password: membersOn, sso: oidc !== null });
+    }
     if (memberAuth && (await memberAuth.handleAuthRoute(url, req, res))) return;
     if (oidc && url.pathname.startsWith("/auth/")) {
       return await handleAuth(oidc, url, req, res);
@@ -2160,18 +2185,24 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       // `next` carries them back afterwards; `safeReturnTo` is what keeps that from being an open
       // redirect. GET only — a 302 turns a POST into a GET, so a form would arrive stripped of its
       // body and look like it had been submitted.
-      if (oidc && wantsHtml && req.method === "GET") {
+      //
+      // With members on, the page is the console's own sign-in (`/app/login`), which offers SSO
+      // beside the password form when OIDC is configured.
+      // @see "sends a page request to the console's own sign-in" in member-auth-server.test.ts
+      if ((oidc || membersOn) && wantsHtml && req.method === "GET") {
         const next = `${url.pathname}${url.search}`;
-        const to = safeReturnTo(next) ? `/auth/login?next=${encodeURIComponent(next)}` : "/auth/login";
+        const login = membersOn ? `${CONSOLE_ENTRY}/login` : "/auth/login";
+        const to = safeReturnTo(next) ? `${login}?next=${encodeURIComponent(next)}` : login;
         res.writeHead(302, { location: to, "cache-control": "no-store" });
         return void res.end();
       }
+      const signInAt = membersOn ? `${CONSOLE_ENTRY}/login` : "/auth/login";
       if (membersOn && cn && fromBrowser) {
-        return send(res, 401, { error: "a client certificate does not sign in to the console — sign in at /auth/login, or use the CLI" });
+        return send(res, 401, { error: `a client certificate does not sign in to the console — sign in at ${signInAt}, or use the CLI` });
       }
       return send(res, 401, {
-        error: oidc
-          ? "no client certificate and no session — sign in at /auth/login"
+        error: oidc || membersOn
+          ? `no client certificate and no session — sign in at ${signInAt}`
           : "client certificate carries no subject CN",
       });
     }
@@ -2217,7 +2248,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
 
     // A password that must change answers nothing else; `/auth/logout` ran before this.
     if (memberAuth && memberAuth.mustChangeRefuses(principal, req.method, url.pathname)) {
-      return send(res, 403, { error: "password change required" });
+      return send(res, 403, { error: "password change required", mustChange: true });
     }
     if (memberAuth && (await memberAuth.handleApiRoute(principal, session, url, req, res))) return;
 
@@ -3247,6 +3278,11 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         // there being a plan listing.
         you: who,
         canWrite: mayWrite,
+        // Which door, and whether the member screens apply. `isAdmin` is only ever true for a
+        // member password session that passed its sign-in code; the console hides `/members` otherwise.
+        // @see "authz says how the caller signed in and whether they administer members" in member-auth-server.test.ts
+        via: principal.via,
+        isAdmin: principal.isAdmin === true,
         // A count, not the plans. The sidenav badge has to exist on every screen, and
         // hanging the chrome on `/plans` is the coupling `/authz` was added to avoid.
         pendingPlans: listPlans(approvals, now(), limits).filter((p) => !p.publishedAt).length,
@@ -4334,21 +4370,8 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       }
       const id = readCookie(req.headers["cookie"], COOKIE);
       const s = o.sessions.get(id);
-      // A member password session also needs its CSRF token to end. An OIDC session keeps the
-      // Origin-only rule above, which is what the console's sign-out button sends today.
-      // @see "logout of a member session needs the CSRF token" in member-auth-server.test.ts
-      if (s && s.principal.via === "password") {
-        const refusal = checkCsrf(s, {
-          origin: typeof origin === "string" ? origin : undefined,
-          referer: typeof req.headers["referer"] === "string" ? req.headers["referer"] : undefined,
-          csrf: typeof req.headers[CSRF_HEADER] === "string" ? (req.headers[CSRF_HEADER] as string) : undefined,
-        }, selfOrigin);
-        if (refusal) return send(res, 403, { error: "missing or invalid CSRF token — reload the console" });
-        log(`session for ${s.principal.name} ended`, `${s.principal.name}의 세션 종료`);
-        o.sessions.destroy(id);
-        res.writeHead(200, { "content-type": "application/json", "set-cookie": clearCookieHeader(), "cache-control": "no-store" });
-        return void res.end(JSON.stringify({ endSession: null }));
-      }
+      // A member password session never reaches here: `member-auth.ts` ends it, with its CSRF token,
+      // before this handler runs — with or without OIDC configured.
       if (s) log(`session for ${s.principal.name} ended`, `${s.principal.name}의 세션 종료`);
       o.sessions.destroy(id);
 

@@ -27,6 +27,7 @@ import {
   API_ROUTE_PATTERNS,
   rateLimited,
   republishRefusal,
+  safeReturnTo,
   startManager,
   targetGeneration,
   trimPendingOidcLogins,
@@ -1148,13 +1149,32 @@ describe("a real OIDC session, end to end", () => {
     // minted — but it is validated on the way in and again on the way out, because a redirect target
     // is worth checking where it becomes a `Location` header.
     mintGroups = ["heliopause-operators"];
-    for (const evil of ["//evil.example", "https://evil.example", "/\\evil.example", "/auth/login"]) {
+    // The second row is what the WHATWG URL parser turns into `//evil.example`: it drops tab, LF and
+    // CR, and reads a backslash as `/`. Then the console's own one-time-link pages.
+    for (const evil of ["//evil.example", "https://evil.example", "/\\evil.example", "/auth/login",
+                        "/\t/evil.example", "/\n/evil.example", "/\r\\evil.example", "/ /evil.example",
+                        "/app/invite", "/app/reset/x",
+                        // Outside ASCII: a Location header carrying these throws ERR_INVALID_CHAR,
+                        // which answered 500 here before `safeReturnTo` refused them.
+                        "/a\u200b", "/\u2215evil", "/\uff0fevil"]) {
       const login = await call(`/auth/login?next=${encodeURIComponent(evil)}`);
       const q = new URL(String(login.headers.location as string)).searchParams;
       mintNonce = q.get("nonce")!;
       const cb = await call(`/auth/callback?code=any&state=${encodeURIComponent(q.get("state")!)}`, "GET", { cookie: cookiesFrom(login) });
+      assert.equal(cb.status, 302, `the callback answered ${cb.status} for ${JSON.stringify(evil)}`);
       assert.equal(cb.headers.location, "/", `login followed ${evil}`);
     }
+  });
+
+  it("safeReturnTo refuses control characters, whitespace and backslashes, and the one-time-link pages", () => {
+    for (const evil of ["/\t/evil.example", "/\n/evil.example", "/\r\\evil.example", "/ /evil.example",
+                        "/\u0085/evil.example", "/\u00a0/evil.example", "/\\evil.example", "//evil.example",
+                        "/a\u200b", "/\u2215evil", "/\uff0fevil",
+                        "/auth/login", "/invite", "/reset/x", "/app/invite", "/app/reset", "/app/login?next=/x", "/login"]) {
+      assert.equal(safeReturnTo(evil), null, JSON.stringify(evil));
+    }
+    // The known positives: a plain path, a query, and a name that only starts like a refused page.
+    for (const ok of ["/policy", "/app/changes?x=1", "/app/invitex", "/fleet#top"]) assert.equal(safeReturnTo(ok), ok);
   });
 
   it("signs a group member in and lets them read — the known positive", async () => {
@@ -2597,6 +2617,7 @@ describe("the data routes answer under /api/ as well", () => {
       "/auth/login": "a browser navigation to the identity provider",
       "/auth/callback": "the identity provider redirects the browser here",
       "/auth/logout": "a browser navigation",
+      "/auth/methods": "read by the sign-in page before anyone is signed in; names no account",
       "/auth/backchannel-logout": "the identity provider posts here; not a caller of ours",
       // Found by this test, not by the hand-written list above it — which is the argument for
       // having it. The IdP posts a signed Security Event Token here and the signature is the
@@ -2923,7 +2944,7 @@ describe("the startup line names the limits this process uses (#154)", () => {
 
 describe("a browser request never signs in by certificate when members are on", () => {
   // Two managers, identical except `members.mode`, so the difference each case shows is that switch
-  // and nothing else. The IdP is configured (shadow requires it) but never reached: these requests
+  // and nothing else. The IdP is configured but never reached: these requests
   // carry no cookie, and no route below starts a login.
   const idpFetch = (async (u: string | URL) => {
     throw new Error(`the IdP should not be called here: ${String(u)}`);
@@ -3002,9 +3023,11 @@ describe("a browser request never signs in by certificate when members are on", 
     assert.equal(r.status, 200, r.body);
   });
 
-  it("refuses to start in shadow without an IdP", async () => {
-    // If it starts anyway, close what it opened: a listening server left behind keeps the runner
-    // alive, and a hang reads as an infrastructure fault rather than this test failing.
+  it("refuses to start in shadow without a public origin", async () => {
+    // Invite and reset links are built on it. With no IdP, `oidc.redirectUri` cannot supply one.
+    // If it starts anyway, close what it opened: a listener left behind keeps the runner alive.
+    const store = join(dir, "members-no-origin.json");
+    initializeMemberDocument(store);
     let started: Awaited<ReturnType<typeof startManager>> | null = null;
     let refusal: unknown = null;
     try {
@@ -3013,13 +3036,48 @@ describe("a browser request never signs in by certificate when members are on", 
         relays: [{ name: "dev", url: "https://127.0.0.1:1/", pkiDir: dir }],
         tls: { certFile: join(dir, "server.pem"), keyFile: join(dir, "server.key"), caFile: join(dir, "ca.pem") },
         operatorCNs: ["ops-alice"], writerCNs: ["ops-alice"], timeoutMs: 200,
-        members: { mode: "shadow" },
+        members: { mode: "shadow", storeFile: store },
+        log: () => {},
       });
     } catch (error) {
       refusal = error;
     } finally {
       if (started) { started.stopProblemWatch(); started.server.close(); }
     }
-    assert.match(String((refusal as Error | null)?.message), /members\.mode=shadow requires oidc/);
+    assert.equal((refusal as Error | null)?.message,
+      "members.mode=shadow needs a public origin — set oidc.redirectUri or HELIOPAUSE_PUBLIC_ORIGIN");
+  });
+
+  it("starts in shadow without an IdP, and sends a page to the console's own sign-in", async () => {
+    // Shadow used to require OIDC, because a session was the only way into the console once
+    // certificates stopped signing browsers in. The console now has a password sign-in page.
+    // Started and closed in this test: a listening server left behind keeps the runner alive.
+    const noIdpStore = join(dir, "members-no-idp.json");
+    initializeMemberDocument(noIdpStore);
+    const started = await startManager({
+      port: 0, hostname: "127.0.0.1",
+      relays: [{ name: "dev", url: "https://127.0.0.1:1/", pkiDir: dir }],
+      tls: { certFile: join(dir, "server.pem"), keyFile: join(dir, "server.key"), caFile: join(dir, "ca.pem") },
+      operatorCNs: ["ops-alice"], writerCNs: ["ops-alice"], timeoutMs: 200,
+      members: { mode: "shadow", storeFile: noIdpStore, publicOrigin: "https://heliopause.example.invalid" },
+      log: () => {},
+    });
+    try {
+      const port = (started.server.address() as { port: number }).port;
+      const page = await new Promise<{ status: number; location: string | undefined }>((resolve, reject) => {
+        const r = request({
+          host: "127.0.0.1", port, path: "/changes?x=1", method: "GET", ca: [readCa()],
+          headers: { accept: "text/html", "sec-fetch-site": "none" }, signal: AbortSignal.timeout(10_000),
+        }, (res) => { res.resume(); res.on("end", () => resolve({ status: res.statusCode ?? 0, location: res.headers.location })); });
+        r.on("error", reject);
+        r.end();
+      });
+      assert.equal(page.status, 302);
+      assert.equal(page.location, `/app/login?next=${encodeURIComponent("/changes?x=1")}`);
+    } finally {
+      started.stopProblemWatch();
+      started.server.closeAllConnections();
+      started.server.close();
+    }
   });
 });

@@ -1,9 +1,10 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { goto } from "$app/navigation";
   import { base } from "$app/paths";
   import { page } from "$app/state";
   import { crumbLabel, t } from "../i18n.ts";
-  import { GROUP_I18N, NAV_I18N, activeKey, crumbsFor, navGroups } from "./nav";
+  import { GROUP_I18N, NAV_I18N, activeKey, crumbsFor, mustChangeRedirect, navGroups } from "./nav";
   import { ageLabel } from "../age.ts";
   import { chromeFreshness } from "./freshness.svelte";
   import { chromePrefs } from "./prefs.svelte";
@@ -15,7 +16,6 @@
 
   let { children } = $props();
 
-  const groups = navGroups();
   const prefs = chromePrefs();
   const who = whoQuery();
   const fresh = chromeFreshness();
@@ -26,8 +26,17 @@
     fresh.snap ? ageLabel(Math.max(0, Math.floor((fresh.now - fresh.snap.lastOkAt) / 1000))) : "",
   );
 
+  // Account and members show only to the callers they are for; until `/api/authz` is read, neither.
+  const groups = $derived(navGroups(who.state.kind === "ok" ? who.state.view : null));
   const pendingPlans = $derived(who.state.kind === "ok" ? who.state.view.pendingPlans : 0);
   const pendingCsrs = $derived(who.state.kind === "ok" ? who.state.view.pendingCsrs : 0);
+
+  // A password that must change answers nothing but `/account`, so every other screen would only
+  // show refusals. Go there instead.
+  $effect(() => {
+    const to = mustChangeRedirect(who.state.kind, key, base);
+    if (to) void goto(to, { replaceState: true });
+  });
 
   onMount(() => {
     void who.refresh();

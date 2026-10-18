@@ -23,7 +23,9 @@ import {
   checkPasswordPolicy, dummyVerify, hashPassword, PasswordBusyError, verifyPassword,
 } from "./password.ts";
 import { statusFor, verifyOtp } from "./otp.ts";
-import { clearCookieHeader, cookieHeader, COOKIE, readCookie, type Principal, type Session, type SessionStore } from "./session.ts";
+import {
+  checkCsrf, clearCookieHeader, cookieHeader, COOKIE, CSRF_HEADER, readCookie, type Principal, type Session, type SessionStore,
+} from "./session.ts";
 
 /** Lock wait for a transaction taken on the request path; see `ENROLLMENT_HTTP_LOCK_WAIT_MS`. */
 const MEMBER_HTTP_LOCK_WAIT_MS = 100;
@@ -78,8 +80,8 @@ export interface MemberAuthDeps {
   aliasNames: ReadonlySet<string>;
   /** `HELIOPAUSE_OTP_USERS`: certificate CN → KeyStone user id. */
   otpUsers: ReadonlyMap<string, string>;
-  /** `https://<host>` that invite and reset links are built on; null refuses to build them. */
-  publicOrigin: string | null;
+  /** `https://<host>` that invite and reset links are built on. `startManager` refuses to start without one. */
+  publicOrigin: string;
   now: () => Date;
   log: (en: string, ko: string) => void;
   rateLimited: (seen: Hits, key: string, nowMs: number, limit: number, windowMs: number, maxKeys: number) => boolean;
@@ -283,12 +285,12 @@ export function createMemberAuth(deps: MemberAuthDeps) {
     return f && f.until > nowMs ? Math.ceil((f.until - nowMs) / 1000) : 0;
   }
   const recordFailure = (key: string, nowMs: number): void => recordFailureIn(failures, key, nowMs);
-  /** Links are built on the configured public origin, never on the request's `Host`. Checked before a token is issued. */
-  const requirePublicOrigin = (): string => {
-    if (!deps.publicOrigin) throw new MemberError("no public origin is configured to build links on (HELIOPAUSE_PUBLIC_ORIGIN)", 503);
-    return deps.publicOrigin;
-  };
-  const linkTo = (kind: "invite" | "reset", token: string): string => `${requirePublicOrigin()}/${kind}/${token}`;
+  // The token is in the fragment, which a browser never sends to any server, so it stays out of this
+  // server's and any front proxy's access log. The page reads it and clears it from the address bar
+  // and the current history entry; the browser's own history and autocomplete may still keep it.
+  // What protects the link is that it works once and expires.
+  // Links are built on the configured public origin, never on the request's `Host`.
+  const linkTo = (kind: "invite" | "reset", token: string): string => `${deps.publicOrigin}/app/${kind}#${token}`;
 
   function storeUnavailable(res: ServerResponse, e: unknown): void {
     log(`member store unavailable: ${(e as Error).message}`, `회원 저장소를 읽을 수 없음: ${(e as Error).message}`);
@@ -530,8 +532,35 @@ export function createMemberAuth(deps: MemberAuthDeps) {
     reply(res, 200, { ok: true });
   }
 
-  /** `/auth/password/login`, `/auth/password/reset`, `/auth/invite/accept`. False for any other path. */
+  /**
+   * `POST /auth/logout` for a member password session: it needs its CSRF token to end, and works
+   * whether or not OIDC is configured. False for any other session, which the OIDC handler ends.
+   * @see member-auth-server.test.ts "logout of a member session needs the CSRF token"
+   * @see member-auth-server.test.ts "signs a member out without OIDC configured"
+   */
+  function logout(req: IncomingMessage, res: ServerResponse): boolean {
+    const id = readCookie(req.headers["cookie"], COOKIE);
+    const s = sessions.get(id);
+    if (!s || s.principal.via !== "password") return false;
+    const origin = req.headers["origin"];
+    const refusal = checkCsrf(s, {
+      origin: typeof origin === "string" ? origin : undefined,
+      referer: typeof req.headers["referer"] === "string" ? req.headers["referer"] : undefined,
+      csrf: typeof req.headers[CSRF_HEADER] === "string" ? (req.headers[CSRF_HEADER] as string) : undefined,
+    }, selfOrigin(req));
+    if (refusal) {
+      reply(res, 403, { error: "missing or invalid CSRF token — reload the console" });
+      return true;
+    }
+    log(`session for ${s.principal.name} ended`, `${s.principal.name}의 세션 종료`);
+    sessions.destroy(s.id);
+    reply(res, 200, { endSession: null }, { "set-cookie": clearCookieHeader() });
+    return true;
+  }
+
+  /** `/auth/password/login`, `/auth/password/reset`, `/auth/invite/accept`, and a password session's `/auth/logout`. False for any other path. */
   async function handleAuthRoute(url: URL, req: IncomingMessage, res: ServerResponse): Promise<boolean> {
+    if (req.method === "POST" && url.pathname === "/auth/logout") return logout(req, res);
     const route = req.method === "POST" ? ({
       "/auth/password/login": { run: login, hits: loginHits },
       "/auth/password/reset": { run: resetPassword, hits: tokenHits },
@@ -572,6 +601,9 @@ export function createMemberAuth(deps: MemberAuthDeps) {
       return reply(res, 200, {
         id: m.id, username: m.username, principalName: m.principalName, email: m.email, roles: m.roles,
         status: m.status, mustChange: principal.mustChange === true, via: principal.via, otpConfirmedAt: m.otpConfirmedAt,
+        // The session's own token, for the one caller holding its cookie. `/api/authz` carries it
+        // too, but answers nothing while the password must change, and sign-out still needs it then.
+        csrf: session.csrf,
       });
     }
     if (req.method === "POST" && url.pathname === "/api/me/password") {
@@ -643,7 +675,6 @@ export function createMemberAuth(deps: MemberAuthDeps) {
       fields(body, ["email", "roles", "otp"]);
       const email = str(body, "email", 254);
       const roles = stringList(body, "roles");
-      requirePublicOrigin();
       if ((await deps.requireOtp(principal, body, res, url.pathname)) === "answered") return;
       const issued = write((d) => {
         if (findByEmail(d, email)) throw new MemberError("email is already in use", 409);
@@ -671,7 +702,6 @@ export function createMemberAuth(deps: MemberAuthDeps) {
     if (id === actor && (action === "roles" || action === "otp-user")) {
       return reply(res, 403, { error: "an admin cannot change their own roles or one-time code — another admin must" });
     }
-    if (action === "password-reset") requirePublicOrigin();
     if ((await deps.requireOtp(principal, body, res, url.pathname)) === "answered") return;
     const ctx = { actor, sourceIp: source(req), now: deps.now() };
     const { endSessions, resetToken } = write((d): { endSessions: boolean; resetToken: string | null } => {

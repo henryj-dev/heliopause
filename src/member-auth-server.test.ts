@@ -182,7 +182,7 @@ describe("signing in", () => {
     assert.equal(me.status, 200);
     assert.deepEqual(me.body, {
       id: ids.rita, username: "rita", principalName: "rita", email: "rita@example.com", roles: ["reader"],
-      status: "active", mustChange: false, via: "password", otpConfirmedAt: null,
+      status: "active", mustChange: false, via: "password", otpConfirmedAt: null, csrf: s.csrf,
     });
   });
 
@@ -458,11 +458,11 @@ describe("a password that must change", () => {
     assert.equal(s.body.mustChange, true);
     const site = await call(main.port, "GET", "/site", { cookie: s.cookie });
     assert.equal(site.status, 403);
-    assert.deepEqual(site.body, { error: "password change required" });
+    assert.deepEqual(site.body, { error: "password change required", mustChange: true });
     assert.equal((await call(main.port, "GET", "/api/me/sessions", { cookie: s.cookie })).status, 403);
     assert.equal((await call(main.port, "GET", "/api/site", { cookie: s.cookie })).status, 403);
     const plan = await call(main.port, "POST", "/api/plan", { cookie: s.cookie, csrf: s.csrf, body: {} });
-    assert.deepEqual([plan.status, plan.body], [403, { error: "password change required" }]);
+    assert.deepEqual([plan.status, plan.body], [403, { error: "password change required", mustChange: true }]);
     assert.equal((await call(main.port, "GET", "/api/me", { cookie: s.cookie })).body.mustChange, true);
     const change = await call(main.port, "POST", "/api/me/password", { cookie: s.cookie, csrf: s.csrf, body: { current: PASSWORD, next: NEW_PASSWORD } });
     assert.equal(change.status, 200, JSON.stringify(change.body));
@@ -528,7 +528,7 @@ describe("invitations and resets", () => {
   it("refuses a password with fewer than three character classes at invite, reset and change", async () => {
     const admin = await adminLogin();
     const inv = await call(main.port, "POST", "/api/members/invites", { cookie: admin.cookie, csrf: admin.csrf, body: { email: "weak@example.com", roles: ["reader"], otp: GOOD_OTP } });
-    const token = String(inv.body.inviteUrl).split("/invite/")[1]!;
+    const token = String(inv.body.inviteUrl).split("/app/invite#")[1]!;
     const weak = await call(main.port, "POST", "/auth/invite/accept", { body: { token, username: "weak", password: "all lowercase words" } });
     assert.equal(weak.status, 400);
     assert.match(JSON.stringify(weak.body.problems), /at least 3 of/);
@@ -544,9 +544,9 @@ describe("invitations and resets", () => {
     const admin = await adminLogin();
     const inv = await call(main.port, "POST", "/api/members/invites", { cookie: admin.cookie, csrf: admin.csrf, body: { email: "ivy@example.com", roles: ["reader"], otp: GOOD_OTP } });
     assert.equal(inv.status, 201, JSON.stringify(inv.body));
-    const token = String(inv.body.inviteUrl).split("/invite/")[1]!;
+    const token = String(inv.body.inviteUrl).split("/app/invite#")[1]!;
     // Built on the configured origin (the OIDC redirect URI's), not on the request's Host.
-    assert.match(String(inv.body.inviteUrl), /^https:\/\/heliopause\.example\.invalid\/invite\/hpmem_/);
+    assert.match(String(inv.body.inviteUrl), /^https:\/\/heliopause\.example\.invalid\/app\/invite#hpmem_[0-9a-f]{64}$/);
     const clash = await call(main.port, "POST", "/auth/invite/accept", { body: { token, username: "ops-alice", password: PASSWORD } });
     assert.equal(clash.status, 409);
     assert.deepEqual(clash.body, { error: "username is not available" });
@@ -569,7 +569,8 @@ describe("invitations and resets", () => {
     const admin = await adminLogin();
     const issued = await call(main.port, "POST", `/api/members/${id}/password-reset`, { cookie: admin.cookie, csrf: admin.csrf, body: { otp: GOOD_OTP } });
     assert.equal(issued.status, 200, JSON.stringify(issued.body));
-    const token = String(issued.body.resetUrl).split("/reset/")[1]!;
+    assert.match(String(issued.body.resetUrl), /^https:\/\/heliopause\.example\.invalid\/app\/reset#hpmem_[0-9a-f]{64}$/);
+    const token = String(issued.body.resetUrl).split("/app/reset#")[1]!;
     const r = await call(main.port, "POST", "/auth/password/reset", { body: { token, password: NEW_PASSWORD } });
     assert.equal(r.status, 200, JSON.stringify(r.body));
     const fresh = await login(main.port, "rhea", NEW_PASSWORD);
@@ -586,7 +587,7 @@ describe("invitations and resets", () => {
     await login(main.port, "wren", PASSWORD, GOOD_OTP); // confirms ks-wren
     const admin = await adminLogin();
     const issued = await call(main.port, "POST", `/api/members/${id}/password-reset`, { cookie: admin.cookie, csrf: admin.csrf, body: { otp: GOOD_OTP } });
-    const token = String(issued.body.resetUrl).split("/reset/")[1]!;
+    const token = String(issued.body.resetUrl).split("/app/reset#")[1]!;
     const without = await call(main.port, "POST", "/auth/password/reset", { body: { token, password: NEW_PASSWORD } });
     assert.equal(without.status, 401);
     assert.equal(without.body.needOtp, true);
@@ -758,7 +759,7 @@ describe("state that changes while a check is in flight", () => {
     await login(main.port, "tita", PASSWORD, GOOD_OTP);
     const admin = await adminLogin();
     const issued = await call(main.port, "POST", `/api/members/${id}/password-reset`, { cookie: admin.cookie, csrf: admin.csrf, body: { otp: GOOD_OTP } });
-    const token = String(issued.body.resetUrl).split("/reset/")[1]!;
+    const token = String(issued.body.resetUrl).split("/app/reset#")[1]!;
     duringOtp["ks-tita"] = () => withMemberTransaction(store, (d) => setOtpUserId(d, id, "ks-tita-2", { actor: "cli" }));
     try {
       const r = await call(main.port, "POST", "/auth/password/reset", { body: { token, password: NEW_PASSWORD, otp: GOOD_OTP } });
@@ -772,7 +773,7 @@ describe("state that changes while a check is in flight", () => {
     const id = await seed(store, "uma", ["reader", "writer"], { otpUserId: "ks-uma" });
     const admin = await adminLogin();
     const issued = await call(main.port, "POST", `/api/members/${id}/password-reset`, { cookie: admin.cookie, csrf: admin.csrf, body: { otp: GOOD_OTP } });
-    const token = String(issued.body.resetUrl).split("/reset/")[1]!;
+    const token = String(issued.body.resetUrl).split("/app/reset#")[1]!;
     const r = await call(main.port, "POST", "/auth/password/reset", { body: { token, password: NEW_PASSWORD, otp: GOOD_OTP } });
     assert.equal(r.status, 403);
     assert.match(String(r.body.error), /not confirmed/);
@@ -1142,5 +1143,70 @@ describe("approval compares people, not names", () => {
     const oidc = await oidcSession();
     for (let i = 0; i < 13; i++) for (let j = 0; j < 5; j++) await login(server.port, `crowd-${i}`);
     assert.equal((await call(server.port, "GET", "/authz", { origin: null, cookie: oidc.cookie })).status, 200);
+  });
+});
+
+describe("what the console's own pages read", () => {
+  it("says which sign-ins it offers", async () => {
+    skewMs += 61_000;
+    assert.deepEqual((await call(main.port, "GET", "/auth/methods", { origin: null })).body, { password: true, sso: true });
+    const off = await start(store, {}, "off");
+    const noIdp = await start(store, { oidc: undefined, members: { mode: "shadow", storeFile: store, publicOrigin: "https://heliopause.example.invalid" } });
+    try {
+      assert.deepEqual((await call(off.port, "GET", "/auth/methods", { origin: null })).body, { password: false, sso: true });
+      assert.deepEqual((await call(noIdp.port, "GET", "/auth/methods", { origin: null })).body, { password: true, sso: false });
+    } finally { off.close(); noIdp.close(); }
+  });
+
+  it("sends a page request to the console's own sign-in", async () => {
+    const r = await new Promise<{ status: number; location: string | undefined }>((resolve, reject) => {
+      const q = request({
+        host: "127.0.0.1", port: main.port, path: "/fleet", method: "GET", ca: [read("ca.pem")], agent: false,
+        headers: { accept: "text/html" }, signal: AbortSignal.timeout(10_000),
+      }, (res) => { res.resume(); res.on("end", () => resolve({ status: res.statusCode ?? 0, location: res.headers.location })); });
+      q.on("error", reject);
+      q.end();
+    });
+    assert.deepEqual(r, { status: 302, location: "/app/login?next=%2Ffleet" });
+  });
+
+  it("points a signed-out request at the console's sign-in page", async () => {
+    const r = await call(main.port, "GET", "/site", { origin: null });
+    assert.equal(r.status, 401);
+    assert.match(String(r.body.error), /sign in at \/app\/login$/);
+  });
+
+  it("authz says how the caller signed in and whether they administer members", async () => {
+    const admin = await adminLogin();
+    const a = await call(main.port, "GET", "/api/authz", { cookie: admin.cookie });
+    assert.deepEqual([a.status, a.body.via, a.body.isAdmin], [200, "password", true]);
+    const reader = await login(main.port, "rita");
+    const r = await call(main.port, "GET", "/api/authz", { cookie: reader.cookie });
+    assert.deepEqual([r.status, r.body.via, r.body.isAdmin], [200, "password", false]);
+    const cert = await call(main.port, "GET", "/api/authz", { cert: true, origin: null });
+    assert.deepEqual([cert.status, cert.body.via, cert.body.isAdmin], [200, "certificate", false]);
+  });
+
+  it("a password that must change says so, and /api/me still hands out the CSRF token for sign-out", async () => {
+    await seed(store, "mona", ["reader"], { mustChange: true });
+    const s = await login(main.port, "mona");
+    const authz = await call(main.port, "GET", "/api/authz", { cookie: s.cookie });
+    assert.deepEqual([authz.status, authz.body.mustChange], [403, true]);
+    const me = await call(main.port, "GET", "/api/me", { cookie: s.cookie });
+    assert.equal(me.body.csrf, s.csrf);
+    const out = await call(main.port, "POST", "/auth/logout", { cookie: s.cookie, csrf: String(me.body.csrf) });
+    assert.equal(out.status, 200, JSON.stringify(out.body));
+  });
+
+  it("signs a member out without OIDC configured", async () => {
+    const noIdp = await start(store, { oidc: undefined, members: { mode: "shadow", storeFile: store, publicOrigin: "https://heliopause.example.invalid" } });
+    try {
+      const s = await login(noIdp.port, "rita");
+      assert.equal((await call(noIdp.port, "POST", "/auth/logout", { cookie: s.cookie })).status, 403);
+      const out = await call(noIdp.port, "POST", "/auth/logout", { cookie: s.cookie, csrf: s.csrf });
+      assert.deepEqual([out.status, out.body], [200, { endSession: null }]);
+      assert.ok(out.setCookie.some((c) => c.startsWith("__Host-heliopause-session=;")), JSON.stringify(out.setCookie));
+      assert.equal((await call(noIdp.port, "GET", "/api/me", { cookie: s.cookie })).status, 401);
+    } finally { noIdp.close(); }
   });
 });

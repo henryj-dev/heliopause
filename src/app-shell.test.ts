@@ -145,7 +145,10 @@ describe("the side nav", () => {
 
   it("carries every route, so a screen cannot fall out of the menu by being forgotten", () => {
     const hrefs = consoleNav("en", "fleet").flatMap((g) => g.items).map((i) => i.href);
-    assert.deepEqual(hrefs.sort(), CONSOLE_ROUTES.map((r) => r.path).sort());
+    assert.deepEqual(hrefs.sort(), CONSOLE_ROUTES.filter((r) => r.nav).map((r) => r.path).sort());
+    // The routes left out are named here, outside the list, so marking another one `nav: false`
+    // fails this instead of quietly shrinking both sides of the comparison above.
+    assert.deepEqual(CONSOLE_ROUTES.filter((r) => !r.nav).map((r) => r.path).sort(), ["/account", "/login", "/members"]);
   });
 
   it("maps the old ?s= query onto /app/policy and refuses a free-form path", () => {
@@ -172,6 +175,9 @@ describe("the side nav", () => {
     assert.equal(consoleAppPath("/lookup"), "/app/lookup");
     assert.equal(consoleAppPath("/traffic"), "/app/traffic");
     assert.equal(consoleAppPath("/routing"), "/app/routing");
+    assert.equal(consoleAppPath("/login"), "/app/login");
+    assert.equal(consoleAppPath("/account"), "/app/account");
+    assert.equal(consoleAppPath("/members"), "/app/members");
     // `/policy` has its own mapper — `?s=` is a slug, not a screen key.
     assert.equal(consoleAppPath("/policy"), null);
     assert.equal(consoleAppPath("/enrollment/tokens"), null);
