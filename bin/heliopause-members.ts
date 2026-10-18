@@ -222,11 +222,11 @@ try {
         const document = loadMemberDocument(store);
         const rows = document.members.map((m) => ({
           id: m.id, username: m.username, principalName: m.principalName, status: m.status, roles: m.roles,
-          hasPassword: passwordCredential(document, m.id) !== null,
+          hasCredential: passwordCredential(document, m.id) !== null,
           identities: document.identities.filter((i) => i.memberId === m.id).length,
         }));
         if (flags.has("json")) console.log(JSON.stringify({ members: rows }, null, 2));
-        else for (const r of rows) console.log(`${r.id}\t${r.username}\t${r.principalName}\t${r.status}\t${r.roles.join(",")}\tpassword=${r.hasPassword}\tidentities=${r.identities}`);
+        else for (const r of rows) console.log(`${r.id}\t${r.username}\t${r.principalName}\t${r.status}\t${r.roles.join(",")}\tcredential=${r.hasCredential}\tidentities=${r.identities}`);
       } else if (command === "reset-password") {
         const member = memberFor(store, required("username"));
         if (member.status === "deleted") throw new Error(`member ${member.username} is deleted`);

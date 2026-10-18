@@ -41,8 +41,8 @@ describe("heliopause-members CLI", () => {
 
     const listed = run(["list", "--store", store, "--json"]);
     const rows = JSON.parse(listed.stdout).members;
-    assert.deepEqual(Object.keys(rows[0]).sort(), ["hasPassword", "id", "identities", "principalName", "roles", "status", "username"]);
-    assert.equal(rows[0].hasPassword, true);
+    assert.deepEqual(Object.keys(rows[0]).sort(), ["hasCredential", "id", "identities", "principalName", "roles", "status", "username"]);
+    assert.equal(rows[0].hasCredential, true);
 
     const suspended = run(["suspend", "--store", store, "--username", "henry"]);
     assert.equal(suspended.status, 2);
@@ -153,9 +153,13 @@ describe("heliopause-members CLI", () => {
  */
 const scriptArgs = (argv: string[]): string[] | null => {
   if (spawnSync("sh", ["-c", "command -v script"]).status !== 0) return null;
-  const quoted = argv.map((a) => `'${a.replaceAll("'", "'\\''")}'`).join(" ");
+  const shellQuote = (a: string): string => `'${a.replaceAll("'", "'\\''")}'`;
+  const quoted = argv.map(shellQuote).join(" ");
   if (process.platform === "darwin") return ["-c", `cat | script -q /dev/null ${quoted}`];
-  if (process.platform === "linux") return ["-c", `cat | script -qec ${JSON.stringify(quoted)} /dev/null`];
+  // util-linux `script -c` takes one command string, which the outer `sh` must pass through
+  // untouched: single-quoted, so `$0` and `$@` inside it reach the inner shell. (Double quotes let
+  // the outer shell expand them to nothing — CI failed with `exec: : Permission denied`.)
+  if (process.platform === "linux") return ["-c", `cat | script -qec ${shellQuote(quoted)} /dev/null`];
   return null;
 };
 const noScript = scriptArgs(["true"]) === null ? "needs script(1) on macOS or Linux" : false;
