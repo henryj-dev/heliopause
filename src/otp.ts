@@ -32,6 +32,11 @@ export type OtpFailure =
   | "wrong-code"
   /** This user has no TOTP credential. They must enrol before they can approve anything. */
   | "not-enrolled"
+  /**
+   * The IdP says this user is not active (disabled, locked, pending deletion) and refuses to verify.
+   * A refusal about the person, not an outage: the code is not accepted, and retrying will not help.
+   */
+  | "account-inactive"
   /** Too many attempts for this user. Enforced by the IdP, not here. */
   | "rate-limited"
   /** The manager's own credential was refused. Nothing the operator types will help. */
@@ -140,6 +145,11 @@ export async function verifyOtp(o: OtpOptions, fetchImpl: typeof fetch = fetch):
       : { ok: false, reason: "service-token", detail: "the IdP refused this manager's service token" };
   }
 
+  // KeyStone answers 403 for a user who is not active (lodestar #157). Before that change a 403 fell
+  // through to `unavailable` — still refused, but reported as an outage.
+  if (res.status === 403) {
+    return { ok: false, reason: "account-inactive", detail: "the IdP refused this account: it is not active there" };
+  }
   if (res.status === 404) {
     return { ok: false, reason: "not-enrolled", detail: "this account has no one-time code enrolled at the IdP" };
   }
@@ -155,6 +165,7 @@ export function statusFor(reason: OtpFailure): number {
     case "wrong-code":
       return 401;
     case "not-enrolled":
+    case "account-inactive":
       return 403;
     case "rate-limited":
       return 429;

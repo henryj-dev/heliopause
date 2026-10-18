@@ -42,7 +42,8 @@ function pki() {
 }
 
 /**
- * KeyStone's verify endpoint: GOOD_OTP is right for every user except `ks-broken`, which answers 500.
+ * KeyStone's verify endpoint: GOOD_OTP is right for every user except `ks-broken`, which answers 500,
+ * and `ks-inactive`, which answers 403 the way KeyStone does for a user who is not active there.
  * `duringOtp[userId]`, when set, runs before the verdict — the window between the check and the write.
  */
 const otpCalls: Array<{ userId: string; code: string }> = [];
@@ -52,6 +53,7 @@ const otpFetch = (async (_u: string | URL, init?: { body?: string }) => {
   otpCalls.push(body);
   duringOtp[body.userId]?.();
   if (body.userId === "ks-broken") return new Response("boom", { status: 500 });
+  if (body.userId === "ks-inactive") return new Response(JSON.stringify({ error: "user is not active" }), { status: 403 });
   return body.code === GOOD_OTP
     ? new Response(JSON.stringify({ ok: true }), { status: 200 })
     : new Response(JSON.stringify({ ok: false }), { status: 401 });
@@ -156,6 +158,7 @@ before(async () => {
   ids.wade = await seed(store, "wade", ["reader", "writer"], { otpUserId: "ks-wade" });
   ids.nora = await seed(store, "nora", ["reader", "writer"]);
   ids.brok = await seed(store, "brok", ["reader", "writer"], { otpUserId: "ks-broken" });
+  ids.inac = await seed(store, "inac", ["reader", "writer"], { otpUserId: "ks-inactive" });
   ids.mia = await seed(store, "mia", ["reader"], { mustChange: true });
   ids.sam = await seed(store, "sam", ["reader"]);
   withMemberTransaction(store, (d) => suspendMember(d, ids.sam!, { actor: "cli" }));
@@ -267,6 +270,14 @@ describe("writer and admin sign-in needs a one-time code", () => {
     skewMs += 61_000;
     const r = await call(main.port, "POST", "/auth/password/login", { body: { username: "brok", password: PASSWORD, otp: GOOD_OTP } });
     assert.equal(r.status, 503);
+    assert.deepEqual(r.setCookie, []);
+  });
+
+  it("refuses a writer KeyStone reports as not active: 403, not an outage and not a pass", async () => {
+    skewMs += 61_000;
+    const r = await call(main.port, "POST", "/auth/password/login", { body: { username: "inac", password: PASSWORD, otp: GOOD_OTP } });
+    assert.equal(r.status, 403);
+    assert.equal(r.body.needOtp, undefined);
     assert.deepEqual(r.setCookie, []);
   });
 
