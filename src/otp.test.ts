@@ -106,6 +106,9 @@ describe("verifying a one-time code", () => {
   it("reports an unenrolled account as its own failure", async () => {
     // Not a wrong code: no amount of retyping fixes it. The person has to enrol at the IdP.
     assert.equal(fail(await verifyOtp(OPTS, idp(404, "TOTP not enrolled").impl)).reason, "not-enrolled");
+    // lodestar #157: an account that is not active at the IdP is refused with 403. That is a refusal
+    // of the person, never an outage and never a pass.
+    assert.equal(fail(await verifyOtp(OPTS, idp(403, "user is not active").impl)).reason, "account-inactive");
   });
 
   it("reports the IdP's rate limit rather than calling it a wrong code", async () => {
@@ -153,6 +156,7 @@ describe("mapping a failure to a status", () => {
   it("blames the caller only when it is the caller", () => {
     assert.equal(statusFor("wrong-code"), 401);
     assert.equal(statusFor("not-enrolled"), 403);
+    assert.equal(statusFor("account-inactive"), 403);
     assert.equal(statusFor("rate-limited"), 429);
   });
 
