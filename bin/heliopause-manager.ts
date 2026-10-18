@@ -19,8 +19,8 @@ import { artifactSigningKeyId, privateKeyFileModeError, privateKeyFileOwnerError
 import { fetchCert } from "../src/cert-api.ts";
 import { measureNamespaces } from "../src/kube-read.ts";
 import {
-  boundedInteger, boundedNumber, ENV_BOUNDS, EnvSpecError, parsePairs, parseRelays,
-  planLimitsFromEnv, startupLimitSources, type BoundedEnvName,
+  boundedInteger, boundedNumber, ENV_BOUNDS, EnvSpecError, membersModeFromEnv, parsePairs, parseRelays,
+  planLimitsFromEnv, startupLimitSources, type BoundedEnvName, type MembersMode,
 } from "../src/env-spec.ts";
 import { shutdownManager, startManager } from "../src/manager-server.ts";
 import { problemWatchFromEnv, ProblemWatchLockError } from "../src/problem-watch-runner.ts";
@@ -105,6 +105,14 @@ const pairs = (spec: string, name: string): Map<string, string> => {
     return refuse(error);
   }
 };
+
+const membersMode = ((): MembersMode => {
+  try {
+    return membersModeFromEnv(process.env);
+  } catch (error) {
+    return refuse(error);
+  }
+})();
 
 const relays = relaysFrom(env("HELIOPAUSE_RELAYS")).map((r) => ({
   ...r,
@@ -447,6 +455,8 @@ const started = await startManager({
     : {}),
   operatorCNs,
   writerCNs,
+  // Local member accounts by stage; unset is `off`. `shadow` stops browsers signing in by certificate.
+  members: { mode: membersMode },
   ...(problemWatch ? { problemWatch } : {}),
   timeoutMs: relayTimeoutMs,
   publishTimeoutMs: number("HELIOPAUSE_PUBLISH_TIMEOUT_MS"),

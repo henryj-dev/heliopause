@@ -108,6 +108,9 @@ describe("the manager image contains the entry points its deployment starts", ()
     // Its own pod, holding no credential, so that a commit to the policy repository executes
     // somewhere with nothing to steal (audit C1). Absent from the image for one rollout.
     "heliopause-policy-render.ts",
+    // Break-glass and bootstrap for the member store, run with `kubectl exec` next to the file it
+    // writes. It reads no private keys or PKI directory.
+    "heliopause-members.ts",
   ];
 
   /**

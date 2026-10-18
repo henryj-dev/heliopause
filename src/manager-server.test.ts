@@ -2919,3 +2919,103 @@ describe("the startup line names the limits this process uses (#154)", () => {
     assert.match(line, /한도: 아티팩트 인가 TTL 24h, 프로토콜 상한 168h; 플랜 유효기간 10m; 대기 플랜 최대 32개$/);
   });
 });
+
+describe("a browser request never signs in by certificate when members are on", () => {
+  // Two managers, identical except `members.mode`, so the difference each case shows is that switch
+  // and nothing else. The IdP is configured (shadow requires it) but never reached: these requests
+  // carry no cookie, and no route below starts a login.
+  const idpFetch = (async (u: string | URL) => {
+    throw new Error(`the IdP should not be called here: ${String(u)}`);
+  }) as unknown as typeof fetch;
+  const servers: Record<"off" | "shadow", { port: number; close: () => void }> = {
+    off: { port: 0, close: () => {} }, shadow: { port: 0, close: () => {} },
+  };
+
+  before(async () => {
+    for (const mode of ["off", "shadow"] as const) {
+      const started = await startManager({
+        port: 0, hostname: "127.0.0.1",
+        relays: [{ name: "dev", url: "https://127.0.0.1:1/", pkiDir: dir }],
+        tls: { certFile: join(dir, "server.pem"), keyFile: join(dir, "server.key"), caFile: join(dir, "ca.pem") },
+        operatorCNs: ["ops-alice"], writerCNs: ["ops-alice"],
+        timeoutMs: 200,
+        oidc: {
+          issuer: "https://idp.example.invalid", clientId: "heliopause-manager",
+          redirectUri: "https://heliopause.example.invalid/auth/callback",
+          roleChangeEvent: ROLE_CHANGE_EVENT,
+          operatorGroups: ["heliopause-operators"], writerGroups: ["heliopause-writers"],
+          aliases: new Map(), fetchImpl: idpFetch,
+        },
+        members: { mode },
+      });
+      servers[mode] = { port: (started.server.address() as { port: number }).port, close: () => started.server.close() };
+    }
+  });
+  after(() => { servers.off.close(); servers.shadow.close(); });
+
+  /** GET with the operator's client certificate and exactly the headers given. */
+  function withCert(mode: "off" | "shadow", path: string, headers: Record<string, string>) {
+    return new Promise<{ status: number; body: string }>((resolve, reject) => {
+      const r = request({
+        host: "127.0.0.1", port: servers[mode].port, path, method: "GET", ca: [readCa()],
+        cert: read("ops.pem"), key: read("ops.key"), headers,
+      }, (res) => {
+        let b = ""; res.on("data", (d) => (b += d));
+        res.on("end", () => resolve({ status: res.statusCode ?? 0, body: b }));
+      });
+      r.on("error", reject);
+      r.end();
+    });
+  }
+
+  it("refuses a certificate on a request carrying Sec-Fetch-Site", async () => {
+    const r = await withCert("shadow", "/site", { "sec-fetch-site": "same-origin", accept: "*/*" });
+    assert.equal(r.status, 401, r.body);
+    assert.match(r.body, /does not sign in to the console/);
+  });
+
+  it("refuses a certificate on a request carrying Origin", async () => {
+    const r = await withCert("shadow", "/site", { origin: "https://127.0.0.1" });
+    assert.equal(r.status, 401, r.body);
+    assert.match(r.body, /does not sign in to the console/);
+  });
+
+  it("still sends a page request to sign in rather than answering JSON", async () => {
+    // The redirect comes first: a browser opening a page must land on the login, not a 401 body.
+    const r = await withCert("shadow", "/", { accept: "text/html", "sec-fetch-site": "none" });
+    assert.equal(r.status, 302, r.body);
+  });
+
+  it("still lets the CLI in: no browser marker, certificate accepted", async () => {
+    // Sec-Fetch-Mode alone is what Node's own fetch sends; it must not count as a browser.
+    const r = await withCert("shadow", "/site", { "sec-fetch-mode": "cors" });
+    assert.equal(r.status, 200, r.body);
+  });
+
+  it("leaves off exactly as it was: the same browser-marked request is accepted", async () => {
+    // The known positive for the cases above — without it, a 401 could come from anything.
+    const r = await withCert("off", "/site", { "sec-fetch-site": "same-origin", accept: "*/*" });
+    assert.equal(r.status, 200, r.body);
+  });
+
+  it("refuses to start in shadow without an IdP", async () => {
+    // If it starts anyway, close what it opened: a listening server left behind keeps the runner
+    // alive, and a hang reads as an infrastructure fault rather than this test failing.
+    let started: Awaited<ReturnType<typeof startManager>> | null = null;
+    let refusal: unknown = null;
+    try {
+      started = await startManager({
+        port: 0, hostname: "127.0.0.1",
+        relays: [{ name: "dev", url: "https://127.0.0.1:1/", pkiDir: dir }],
+        tls: { certFile: join(dir, "server.pem"), keyFile: join(dir, "server.key"), caFile: join(dir, "ca.pem") },
+        operatorCNs: ["ops-alice"], writerCNs: ["ops-alice"], timeoutMs: 200,
+        members: { mode: "shadow" },
+      });
+    } catch (error) {
+      refusal = error;
+    } finally {
+      if (started) { started.stopProblemWatch(); started.server.close(); }
+    }
+    assert.match(String((refusal as Error | null)?.message), /members\.mode=shadow requires oidc/);
+  });
+});

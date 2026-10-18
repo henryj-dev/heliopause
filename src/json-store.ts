@@ -2,8 +2,8 @@
  * Durable-file primitives: atomic replace, one-time exclusive creation, and an adjacent `O_EXCL`
  * lock around a caller's body.
  *
- * Callers today: the enrollment store (all three) and the problem-watch runner (atomic replace and
- * `discardOwnedPath`). Errors come from the caller's `fail` factory and messages are built from the
+ * Callers today: the enrollment store and the member store (all three), and the problem-watch
+ * runner (atomic replace and `discardOwnedPath`). Errors come from the caller's `fail` factory and messages are built from the
  * caller's `name`, so each store keeps its own error class and wording.
  */
 import { randomBytes } from "node:crypto";
