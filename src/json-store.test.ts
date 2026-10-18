@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, mkdtempSync, openSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { atomicWriteFile, createExclusiveFile, withFileLock } from "./json-store.ts";
@@ -11,17 +11,26 @@ class StoreError extends Error {
 }
 const fail = (message: string, statusCode?: number): Error => new StoreError(message, statusCode);
 const scratch = (): string => mkdtempSync(join(tmpdir(), "hp-json-store-"));
+/** Read text, inode and mode through one descriptor, so all three describe the same file. */
+function snapshot(path: string): { text: string; ino: number; mode: number } {
+  const fd = openSync(path, "r");
+  try {
+    const st = fstatSync(fd);
+    return { text: readFileSync(fd, "utf8"), ino: st.ino, mode: st.mode & 0o777 };
+  } finally { closeSync(fd); }
+}
 
 describe("json-store", () => {
   it("replaces a file by rename (new inode) with mode 0600 and leaves no temp file behind", () => {
     const dir = scratch();
     const path = join(dir, "doc.json");
     writeFileSync(path, "old\n");
-    const before = statSync(path).ino;
+    const before = snapshot(path).ino;
     atomicWriteFile(path, "new\n");
-    assert.notEqual(statSync(path).ino, before, "the file was rewritten in place, not replaced");
-    assert.equal(readFileSync(path, "utf8"), "new\n");
-    assert.equal(statSync(path).mode & 0o777, 0o600);
+    const after = snapshot(path);
+    assert.notEqual(after.ino, before, "the file was rewritten in place, not replaced");
+    assert.equal(after.text, "new\n");
+    assert.equal(after.mode, 0o600);
     assert.deepEqual(readdirSync(dir), ["doc.json"]);
   });
 
@@ -33,13 +42,14 @@ describe("json-store", () => {
   it("creates a store once and refuses to overwrite it, naming the store", () => {
     const path = join(scratch(), "members.json");
     createExclusiveFile(path, "{}\n", "member store", fail);
-    assert.equal(readFileSync(path, "utf8"), "{}\n");
-    assert.equal(statSync(path).mode & 0o777, 0o600);
+    const created = snapshot(path);
+    assert.equal(created.text, "{}\n");
+    assert.equal(created.mode, 0o600);
     assert.throws(
       () => createExclusiveFile(path, "{\"x\":1}\n", "member store", fail),
       (e: StoreError) => e instanceof StoreError && e.message === `refusing to overwrite existing member store: ${path}`,
     );
-    assert.equal(readFileSync(path, "utf8"), "{}\n");
+    assert.equal(snapshot(path).text, "{}\n");
   });
 
   it("fails closed with 503 while another owner holds the lock", () => {
