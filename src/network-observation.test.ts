@@ -131,3 +131,108 @@ test("contended telemetry writes fail immediately without sleeping the heartbeat
     } finally { wait.mock.restore(); }
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("clock and replay admission preserves evidence across updates and recovery", async t => {
+  const dir = mkdtempSync(join(tmpdir(), "hp-observation-clock-"));
+  let now = Date.parse(at);
+  let store = new NetworkObservationStore(dir, { now: () => now });
+  const make = (id: number, offset = 0) => {
+    const value = report(); value.collectionId = id.toString(16).padStart(32, "0");
+    const time = new Date(now + offset).toISOString();
+    value.startedAt = value.completedAt = time;
+    value.observations.links.startedAt = value.observations.links.completedAt = time;
+    return value;
+  };
+  try {
+    let current = store.put("host", make(1));
+    await t.test("normal update advances current", () => { now += 1000; current = store.put("host", make(2)); assert.equal(current.report.collectionId, make(2).collectionId); });
+    await t.test("same ID cannot renew receipt", () => { now += 1000; assert.deepEqual(store.put("host", make(2)), current); });
+    await t.test("previous ID cannot return with changed timestamp", () => { assert.deepEqual(store.put("host", make(1)), current); });
+    await t.test("excessive future timestamp cannot poison current", () => { assert.throws(() => store.put("host", make(3, 30_001)), /future skew/); assert.deepEqual(store.get("host"), current); });
+    await t.test("allowed skew remains usable", () => { current = store.put("host", make(3, 30_000)); assert.equal(observationFreshness(current, now), "fresh"); });
+    await t.test("agent clock recovery requires explicit audited CAS", () => {
+      now -= 60_000;
+      assert.equal(store.put("host", make(4)).report.collectionId, current.report.collectionId);
+      assert.throws(() => store.recover("host", make(4), { expectedCollectionId: "wrong", actor: "operator", reason: "clock corrected" }));
+      current = store.recover("host", make(4), { expectedCollectionId: current.report.collectionId, actor: "operator", reason: "clock corrected" });
+      assert.equal(current.recovery?.actor, "operator"); assert.equal(current.report.collectionId, make(4).collectionId);
+      assert.deepEqual(store.put("host", make(3)), current);
+    });
+    await t.test("relay receipt has independent clock tolerance", () => {
+      now += 1000;
+      assert.throws(() => store.put("host", make(5), { relayReceivedAt: new Date(now + 30_001).toISOString() }), /future skew/);
+      current = store.put("host", make(5), { relayReceivedAt: new Date(now + 20_000).toISOString() });
+      assert.equal(observationFreshness(current, now), "fresh");
+    });
+    await t.test("old collection stays stale despite new manager receipt", () => {
+      now += 20 * 60_000;
+      current = store.put("host", make(6, -15 * 60_000));
+      assert.equal(observationFreshness(current, now), "stale");
+    });
+    await t.test("collector error then success advances without treating error as data", () => {
+      const failed: any = make(7); failed.observations.links.status = "error"; delete failed.observations.links.data;
+      failed.capabilities.links = { available: false, status: "error" };
+      assert.equal(store.put("host", failed).report.observations.links!.status, "error");
+      now += 1000; current = store.put("host", make(8)); assert.equal(current.report.observations.links!.status, "success");
+    });
+    await t.test("restart preserves replay history and receipt", () => {
+      store = new NetworkObservationStore(dir, { now: () => now });
+      assert.deepEqual(store.get("host"), current);
+      assert.deepEqual(store.put("host", make(1)), current);
+    });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("legacy future-poisoned disk state is recovered with archived evidence, not deleted", () => {
+  const dir = mkdtempSync(join(tmpdir(), "hp-observation-legacy-"));
+  const now = Date.parse(at);
+  const path = join(dir, createHash("sha256").update(JSON.stringify(["", "host"])).digest("hex") + ".json");
+  const poisoned = report(); poisoned.startedAt = poisoned.completedAt = "2099-01-01T00:00:00Z";
+  poisoned.observations.links.startedAt = poisoned.observations.links.completedAt = poisoned.completedAt;
+  const previous = { host: "host", receivedAt: poisoned.completedAt, report: poisoned };
+  writeFileSync(path, JSON.stringify(previous));
+  try {
+    const store = new NetworkObservationStore(dir, { now: () => now });
+    const replacement = report(); replacement.collectionId = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+    assert.deepEqual(store.put("host", replacement), previous);
+    const recovered = store.recover("host", replacement, { expectedCollectionId: poisoned.collectionId, actor: "operator", reason: "verified clock repair" });
+    const digest = createHash("sha256").update(JSON.stringify(previous)).digest("hex");
+    assert.deepEqual(JSON.parse(readFileSync(join(dir, `recovery-${createHash("sha256").update(JSON.stringify(["", "host"])).digest("hex")}-${digest}.json`), "utf8")), previous);
+    assert.equal(store.list().length, 1); assert.equal(observationFreshness(recovered, now), "fresh");
+    assert.throws(() => store.recover("host", { ...replacement, collectionId: "cccccccc-cccc-cccc-cccc-cccccccccccc" }, { expectedCollectionId: replacement.collectionId, actor: "operator", reason: "unnecessary" }), /future-poisoned/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+
+test("freshness fails closed for missing receipts and invalid clock policies", () => {
+  const valid = { host: "host", receivedAt: at, report: report() };
+  for (const receivedAt of [undefined, null, ""]) assert.equal(observationFreshness({ ...valid, receivedAt } as any, Date.parse(at)), "stale");
+  assert.equal(observationFreshness({ ...valid, source: "relay-a" }, Date.parse(at)), "stale");
+  for (const age of [-1, Infinity, NaN, 600001]) assert.equal(observationFreshness(valid, Date.parse(at), age), "stale");
+  assert.equal(observationFreshness(valid, NaN), "stale");
+});
+
+test("metadata cannot override identity or report and duplicate recovery cannot bypass CAS", () => {
+  const dir = mkdtempSync(join(tmpdir(), "hp-observation-projection-"));
+  let now = Date.parse(at);
+  try {
+    const store = new NetworkObservationStore(dir, { now: () => now });
+    const first = store.put("host", report(), { host: "other", report: { invalid: true }, receivedAt: "2099-01-01T00:00:00Z" } as any);
+    assert.equal(first.host, "host"); assert.equal(first.receivedAt, new Date(now).toISOString()); assert.equal(first.report.schemaVersion, 1);
+    now -= 60000;
+    const corrected = report();
+    corrected.startedAt = corrected.completedAt = new Date(now).toISOString();
+    corrected.observations.links.startedAt = corrected.observations.links.completedAt = corrected.completedAt;
+    assert.throws(() => store.recover("host", corrected, { expectedCollectionId: "wrong", actor: "operator", reason: "repair" }), /matching/);
+    assert.throws(() => store.recover("host", corrected, { expectedCollectionId: first.report.collectionId, actor: "operator", reason: "repair" }), /new collection ID/);
+    assert.throws(() => store.recover("host", corrected, { expectedCollectionId: first.report.collectionId, actor: "operator", reason: null } as any), /invalid recovery/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+
+test("calendar-invalid timestamps are rejected without normalization", () => {
+  const invalid = report(); invalid.startedAt = "2026-02-30T00:00:00Z"; invalid.completedAt = invalid.startedAt;
+  invalid.observations.links.startedAt = invalid.observations.links.completedAt = invalid.startedAt;
+  assert.throws(() => validateNetworkObservation(invalid), /envelope/);
+  assert.equal(observationFreshness({ host: "host", receivedAt: invalid.startedAt, report: report() }, Date.parse("2026-03-02T00:00:00Z")), "stale");
+});
