@@ -482,10 +482,15 @@ export interface ManagerOptions {
     /** `members.json`, created by `heliopause-members init`. Read at startup and on every member request. */
     storeFile?: string;
     /**
-     * Idle limit for password sessions, in seconds. Default 3600. The environment variable is bounded
+     * Idle limit for password sessions, in seconds. Default 1800. The environment variable is bounded
      * to 60..86400 (`ENV_BOUNDS`); this option accepts 1..86400 so a test need not wait a minute.
      */
     sessionIdleSec?: number;
+    /**
+     * Absolute lifetime of password sessions, in seconds. Default 43200 (12 h). OIDC sessions keep
+     * `oidc.sessionTtlSec`. The environment variable is bounded to 300..86400; this option accepts 1..86400.
+     */
+    sessionTtlSec?: number;
     /**
      * `https://<host>` that invite and reset links are built on, when `oidc` is not configured (with
      * it, the origin of `oidc.redirectUri` is used). Neither means the link routes answer 503.
@@ -1221,9 +1226,13 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
   if (memberPublicOrigin !== null && !/^https:\/\/[^/]+$/.test(memberPublicOrigin)) {
     throw new Error(`the members' public origin must be https://<host>, not ${memberPublicOrigin}`);
   }
-  const memberIdleSec = opts.members?.sessionIdleSec ?? 3600;
+  const memberIdleSec = opts.members?.sessionIdleSec ?? 1800;
   if (!Number.isSafeInteger(memberIdleSec) || memberIdleSec < 1 || memberIdleSec > 86_400) {
     throw new Error("members.sessionIdleSec must be an integer between 1 and 86400");
+  }
+  const memberTtlSec = opts.members?.sessionTtlSec ?? 12 * 3600;
+  if (!Number.isSafeInteger(memberTtlSec) || memberTtlSec < 1 || memberTtlSec > 86_400) {
+    throw new Error("members.sessionTtlSec must be an integer between 1 and 86400");
   }
   if (opts.enrollment) {
     // Initialization is an explicit operator action. Treating a missing store as first boot here
@@ -1420,6 +1429,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         storeFile: opts.members!.storeFile!,
         sessions: sessions!,
         idleSec: memberIdleSec,
+        ttlSec: memberTtlSec,
         ...(opts.otp ? { otp: opts.otp } : {}),
         certificateNames: new Set([...operators, ...writers]),
         otpUsers: opts.otp?.users ?? new Map(),

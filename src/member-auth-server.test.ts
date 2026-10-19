@@ -13,10 +13,10 @@ import { request } from "node:https";
 import { execFileSync } from "node:child_process";
 import { createSign, generateKeyPairSync, createHash } from "node:crypto";
 import { startManager } from "./manager-server.ts";
-import { normalizeSource, recordFailureIn } from "./member-auth.ts";
+import { MEMBER_MAX_DELAY_SEC, normalizeSource, PASSWORD_BODY_MAX_BYTES, recordFailureIn } from "./member-auth.ts";
 import { SCHEMA_VERSION } from "./protocol.ts";
 import {
-  confirmOtp, createMember, initializeMemberDocument, loadMemberDocument, MEMBER_LOGIN_AUDIT_MAX, saveMemberDocument, setOtpUserId,
+  confirmOtp, createMember, initializeMemberDocument, loadMemberDocument, saveMemberDocument, setOtpUserId,
   setPassword, setRoles, suspendMember, withMemberTransaction,
   type MemberRole,
 } from "./member-store.ts";
@@ -24,8 +24,8 @@ import { hashPassword } from "./password.ts";
 import { CSRF_HEADER } from "./session.ts";
 
 const ROLE_CHANGE_EVENT = "https://idp.example.invalid/event/role-change";
-const PASSWORD = "correct horse battery staple";
-const NEW_PASSWORD = "an entirely different passphrase";
+const PASSWORD = "Correct horse battery staple";
+const NEW_PASSWORD = "An entirely different passphrase";
 const GOOD_OTP = "123456";
 
 const dir = mkdtempSync(join(tmpdir(), "hp-member-auth-"));
@@ -226,11 +226,36 @@ describe("signing in", () => {
     assert.equal((await call(main.port, "POST", "/auth/password/login", { body, headers: { "sec-fetch-site": "cross-site" } })).status, 403);
   });
 
-  it("refuses badly typed or oversized fields before hashing", async () => {
+  it("refuses badly typed fields and a body over 64 KiB before hashing", async () => {
     skewMs += 61_000;
-    const tooLong = await call(main.port, "POST", "/auth/password/login", { body: { username: "rita", password: "x".repeat(1025) } });
+    // A body of exactly 64 KiB reaches the password check; one byte more is refused before parsing.
+    const frame = JSON.stringify({ username: "rita", password: "" }).length;
+    const atCap = await call(main.port, "POST", "/auth/password/login", { body: { username: "rita", password: "x".repeat(PASSWORD_BODY_MAX_BYTES - frame) } });
+    assert.equal(atCap.status, 401, JSON.stringify(atCap.body));
+    const tooLong = await call(main.port, "POST", "/auth/password/login", { body: { username: "rita", password: "x".repeat(PASSWORD_BODY_MAX_BYTES - frame + 1) } });
     assert.equal(tooLong.status, 400);
-    assert.match(String(tooLong.body.error), /password is too long/);
+    assert.match(String(tooLong.body.error), /request body too large/);
+    assert.equal(PASSWORD_BODY_MAX_BYTES, 64 * 1024);
+  });
+
+  it("invite accept, reset and password change also read bodies up to 64 KiB, and no further", async () => {
+    skewMs += 61_000;
+    const s = await login(main.port, "rita");
+    const token = `hpmem_${"0".repeat(64)}`;
+    const routes: Array<[string, (pad: string) => Record<string, unknown>, Record<string, string>]> = [
+      ["/auth/invite/accept", (pad) => ({ token, username: "nobody-new", password: pad }), {}],
+      ["/auth/password/reset", (pad) => ({ token, password: pad }), {}],
+      ["/api/me/password", (pad) => ({ current: pad, next: NEW_PASSWORD }), { cookie: s.cookie, csrf: s.csrf }],
+    ];
+    for (const [path, body, auth] of routes) {
+      const frame = JSON.stringify(body("")).length;
+      const at = await call(main.port, "POST", path, { ...auth, body: body("x".repeat(PASSWORD_BODY_MAX_BYTES - frame)) });
+      // Past the body read: an unknown token is 400 with the token message, a wrong current password 403.
+      const expected = path === "/api/me/password" ? [403, "the current password is not correct"] : [400, "token is invalid, used, or expired"];
+      assert.deepEqual([path, at.status, at.body.error], [path, ...expected]);
+      const over = await call(main.port, "POST", path, { ...auth, body: body("x".repeat(PASSWORD_BODY_MAX_BYTES - frame + 1)) });
+      assert.deepEqual([path, over.status, over.body.error], [path, 400, "request body too large"]);
+    }
     assert.equal((await call(main.port, "POST", "/auth/password/login", { body: { username: 7, password: PASSWORD } })).status, 400);
     assert.equal((await call(main.port, "POST", "/auth/password/login", { body: { username: "rita", password: PASSWORD, extra: 1 } })).status, 400);
   });
@@ -389,6 +414,31 @@ describe("authority is re-read on every request", () => {
     assert.equal((await call(main.port, "GET", "/api/me", { cookie: s.cookie })).status, 200);
   });
 
+  it("a password session lives 12 hours by default", async () => {
+    skewMs += 61_000;
+    const r = await call(main.port, "POST", "/auth/password/login", { body: { username: "rita", password: PASSWORD } });
+    assert.equal(r.status, 200);
+    const maxAge = Number(/Max-Age=(\d+)/.exec(r.setCookie.join(";"))?.[1]);
+    assert.ok(maxAge > 43_190 && maxAge <= 43_200, `Max-Age ${maxAge}`);
+  });
+
+  it("ends a password session at its absolute lifetime however active it is", async () => {
+    // Real time, 5 s: the session store keeps the wall clock (cookie Max-Age is computed from it too).
+    const short = await start(store, { members: { mode: "shadow", storeFile: store, sessionTtlSec: 5, sessionIdleSec: 3600 } });
+    try {
+      skewMs += 61_000;
+      const r = await call(short.port, "POST", "/auth/password/login", { body: { username: "rita", password: PASSWORD } });
+      const cookie = cookieOf(r);
+      const started = Date.now();
+      for (let i = 0; i < 3; i++) {
+        assert.equal((await call(short.port, "GET", "/api/me", { cookie })).status, 200);
+        await new Promise((resolve) => setTimeout(resolve, 1_000));
+      }
+      await new Promise((resolve) => setTimeout(resolve, Math.max(0, 5_600 - (Date.now() - started))));
+      assert.equal((await call(short.port, "GET", "/api/me", { cookie })).status, 401);
+    } finally { short.close(); }
+  });
+
   it("ends an idle session", async () => {
     const idle = await start(store, { members: { mode: "shadow", storeFile: store, sessionIdleSec: 1 } });
     try {
@@ -475,6 +525,21 @@ describe("own sessions", () => {
 });
 
 describe("invitations and resets", () => {
+  it("refuses a password with fewer than three character classes at invite, reset and change", async () => {
+    const admin = await adminLogin();
+    const inv = await call(main.port, "POST", "/api/members/invites", { cookie: admin.cookie, csrf: admin.csrf, body: { email: "weak@example.com", roles: ["reader"], otp: GOOD_OTP } });
+    const token = String(inv.body.inviteUrl).split("/invite/")[1]!;
+    const weak = await call(main.port, "POST", "/auth/invite/accept", { body: { token, username: "weak", password: "all lowercase words" } });
+    assert.equal(weak.status, 400);
+    assert.match(JSON.stringify(weak.body.problems), /at least 3 of/);
+    // A password containing the username is fine now.
+    const ok = await call(main.port, "POST", "/auth/invite/accept", { body: { token, username: "weak", password: "Weak-but-3-classes" } });
+    assert.equal(ok.status, 201, JSON.stringify(ok.body));
+    const s = await login(main.port, "weak", "Weak-but-3-classes");
+    const change = await call(main.port, "POST", "/api/me/password", { cookie: s.cookie, csrf: s.csrf, body: { current: "Weak-but-3-classes", next: "short1A" } });
+    assert.deepEqual([change.status, change.body.problems], [400, ["must be at least 8 characters"]]);
+  });
+
   it("an invitation is accepted once and creates an active member", async () => {
     const admin = await adminLogin();
     const inv = await call(main.port, "POST", "/api/members/invites", { cookie: admin.cookie, csrf: admin.csrf, body: { email: "ivy@example.com", roles: ["reader"], otp: GOOD_OTP } });
@@ -746,11 +811,48 @@ describe("addresses", () => {
   });
 
   it("a flood of new names does not evict an account that is waiting", () => {
-    const failures = new Map<string, { count: number; until: number }>();
+    const failures = new Map<string, { count: number; until: number; last: number }>();
     for (let i = 0; i < 5; i++) recordFailureIn(failures, "target", 1_000, 8);
     for (let i = 0; i < 50; i++) recordFailureIn(failures, `noise-${i}`, 2_000, 8);
     assert.equal(failures.size, 8);
     assert.ok((failures.get("target")?.until ?? 0) > 1_000, "the waiting entry survived the flood");
+  });
+
+  it("eviction takes an expired record before one below the threshold", () => {
+    const failures = new Map<string, { count: number; until: number; last: number }>();
+    for (let i = 0; i < 5; i++) recordFailureIn(failures, "expired-waiting", 0, 3);
+    recordFailureIn(failures, "fresh-below", 15 * 60_000, 3);
+    recordFailureIn(failures, "fresh-below-2", 15 * 60_000, 3);
+    // A fourth key: the expired record goes, though it is the only one at the threshold.
+    recordFailureIn(failures, "newest", 15 * 60_000, 3);
+    assert.deepEqual([...failures.keys()].sort(), ["fresh-below", "fresh-below-2", "newest"]);
+  });
+
+  it("the wait starts at 1 s after five failures, doubles, and stops at 15 minutes", () => {
+    const failures = new Map<string, { count: number; until: number; last: number }>();
+    const waits: number[] = [];
+    for (let i = 0; i < 20; i++) {
+      recordFailureIn(failures, "k", 1_000_000);
+      waits.push(Math.max(0, failures.get("k")!.until - 1_000_000) / 1000);
+    }
+    assert.deepEqual(waits.slice(0, 4), [0, 0, 0, 0]);
+    assert.deepEqual(waits.slice(4, 9), [1, 2, 4, 8, 16]);
+    assert.equal(MEMBER_MAX_DELAY_SEC, 900);
+    assert.equal(Math.max(...waits), 900);
+    assert.deepEqual(waits.slice(-3), [900, 900, 900]);
+  });
+
+  it("a failure record is forgotten 15 minutes after its last failure", () => {
+    const failures = new Map<string, { count: number; until: number; last: number }>();
+    for (let i = 0; i < 5; i++) recordFailureIn(failures, "k", 0);
+    // Just inside the window the count carries on; the window runs from the last failure.
+    recordFailureIn(failures, "k", 15 * 60_000 - 1);
+    assert.equal(failures.get("k")!.count, 6);
+    recordFailureIn(failures, "k", 2 * 15 * 60_000 - 2);
+    assert.equal(failures.get("k")!.count, 7);
+    // Fifteen minutes after the last failure, the next one starts again at one, with no wait.
+    recordFailureIn(failures, "k", 3 * 15 * 60_000 - 2);
+    assert.deepEqual([failures.get("k")!.count, failures.get("k")!.until], [1, 0]);
   });
 
   it("another address's failures do not make the owner wait", async () => {
@@ -792,24 +894,28 @@ describe("addresses", () => {
 });
 
 describe("the sign-in audit", () => {
-  it("keeps only the newest sign-in audit rows", async () => {
+  it("a sign-in drops audit rows older than a year and keeps the rest", async () => {
     const audited = join(dir, "audited.json");
     initializeMemberDocument(audited);
     await seed(audited, "aud", ["reader"]);
     const d = loadMemberDocument(audited);
-    for (let i = 0; i < MEMBER_LOGIN_AUDIT_MAX; i++) {
-      d.audit.push({ at: new Date(Date.UTC(2026, 0, 1, 0, 0, i % 60)).toISOString(), actor: "old", action: "member.login", target: "old", sourceIp: null });
-    }
+    const day = 86_400_000;
+    const at = (ageMs: number) => new Date(clock().getTime() - ageMs).toISOString();
+    d.audit.push(
+      { at: at(400 * day), actor: "old", action: "member.login", target: "old", sourceIp: null },
+      { at: at(400 * day), actor: "old", action: "member.suspend", target: "old", sourceIp: null },
+      { at: at(300 * day), actor: "recent", action: "member.login", target: "recent", sourceIp: null },
+    );
     saveMemberDocument(audited, d);
     const server = await start(audited);
     try {
       skewMs += 61_000;
       assert.equal((await call(server.port, "POST", "/auth/password/login", { body: { username: "aud", password: PASSWORD } })).status, 200);
       const after = loadMemberDocument(audited).audit;
-      const logins = after.filter((a) => a.action === "member.login");
-      assert.equal(logins.length, MEMBER_LOGIN_AUDIT_MAX);
-      assert.notEqual(logins.at(-1)!.actor, "old");
+      assert.equal(after.some((a) => a.actor === "old"), false, "rows over a year old are gone, of every kind");
+      assert.ok(after.some((a) => a.actor === "recent"), "a row under a year old is kept");
       assert.ok(after.some((a) => a.action === "member.create"), "other rows are kept");
+      assert.equal(after.at(-1)!.action, "member.login");
     } finally { server.close(); }
   });
 

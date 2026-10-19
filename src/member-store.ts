@@ -306,7 +306,11 @@ function checkCrossRecord(document: MemberDocument): void {
   };
   for (const credential of document.credentials) live(credential.memberId, "credential");
   unique(document.credentials.map((c) => c.memberId), "credential per member");
-  for (const identity of document.identities) live(identity.memberId, "identity");
+  // An identity may name a deleted member: deletion keeps it as a tombstone so it is never linked again.
+  // @see member-store.test.ts "keeps a deleted member's identities as tombstones that cannot be linked again"
+  for (const identity of document.identities) {
+    if (!byId.has(identity.memberId)) throw new MemberError("identity names an unknown member");
+  }
   unique(document.identities.map((i) => JSON.stringify([i.issuer, i.subject])), "identity (issuer, subject)");
   unique(document.tokens.map((t) => t.id), "token id");
   unique(document.tokens.map((t) => t.digest), "token digest");
@@ -349,13 +353,18 @@ export function initializeMemberDocument(path: string): MemberDocument {
 const activeAdmins = (document: MemberDocument): number =>
   document.members.filter((m) => m.status === "active" && m.roles.includes("admin")).length;
 
+/** Audit rows of every kind older than this are dropped by each transaction. */
+export const MEMBER_AUDIT_RETENTION_DAYS = 365;
+
 /**
  * Load → mutate → validate → save under `<path>.lock`, waiting at most `waitMs` (≤ 10 s).
  * Nothing is saved when `mutate` returns a thenable (it must be synchronous), or when the store had
- * an active admin before `mutate` and has none after it.
+ * an active admin before `mutate` and has none after it. Before saving, audit rows older than
+ * `MEMBER_AUDIT_RETENTION_DAYS` before `now` (default: the current time) are dropped.
  * @see member-store.test.ts "a transaction that removes the last active admin is not saved"
+ * @see member-store.test.ts "a transaction drops audit rows older than a year, of every kind"
  */
-export function withMemberTransaction<T>(path: string, mutate: (document: MemberDocument) => T, options: { waitMs?: number } = {}): T {
+export function withMemberTransaction<T>(path: string, mutate: (document: MemberDocument) => T, options: { waitMs?: number; now?: Date } = {}): T {
   const full = resolve(path);
   const waitMs = options.waitMs ?? MEMBER_LOCK_WAIT_MS;
   if (!Number.isSafeInteger(waitMs) || waitMs < 0 || waitMs > MEMBER_LOCK_WAIT_MS) throw new MemberError("member lock waitMs is invalid");
@@ -370,6 +379,8 @@ export function withMemberTransaction<T>(path: string, mutate: (document: Member
       throw new MemberError("member transaction mutate must be synchronous", 500);
     }
     if (adminsBefore > 0 && activeAdmins(document) === 0) throw new MemberError("refusing to leave no active admin", 409);
+    const cutoff = (options.now ?? new Date()).getTime() - MEMBER_AUDIT_RETENTION_DAYS * 86_400_000;
+    document.audit = document.audit.filter((a) => Date.parse(a.at) >= cutoff);
     saveMemberDocument(full, document);
     return result;
   });
@@ -380,7 +391,7 @@ export function withMemberTransaction<T>(path: string, mutate: (document: Member
 function tryName(value: string): string | null { try { return normalizeMemberName(value); } catch { return null; } }
 function tryEmail(value: string): string | null { try { return normalizeEmail(value); } catch { return null; } }
 
-/** These four return the member in any status; callers check `status` (or use `activeMember`). */
+/** These return the member in any status (`findByIdentity` excepts deleted); callers check `status` (or use `activeMember`). */
 export function findByUsername(document: MemberDocument, username: string): Member | null {
   const name = tryName(username);
   return name === null ? null : document.members.find((m) => m.username === name) ?? null;
@@ -389,10 +400,15 @@ export function findByEmail(document: MemberDocument, email: string): Member | n
   const normalized = tryEmail(email);
   return normalized === null ? null : document.members.find((m) => m.email === normalized) ?? null;
 }
-/** Exact string match on issuer and subject; no URL normalization. */
+/**
+ * Exact string match on issuer and subject; no URL normalization. Returns only a member that is not
+ * deleted: a deleted member's identities are tombstones that block linking and identify no one.
+ * @see member-store.test.ts "keeps a deleted member's identities as tombstones that cannot be linked again"
+ */
 export function findByIdentity(document: MemberDocument, issuer: string, subject: string): Member | null {
   const identity = document.identities.find((i) => i.issuer === issuer && i.subject === subject);
-  return identity ? document.members.find((m) => m.id === identity.memberId) ?? null : null;
+  const member = identity ? document.members.find((m) => m.id === identity.memberId) ?? null : null;
+  return member && member.status !== "deleted" ? member : null;
 }
 export function findByCertCN(document: MemberDocument, cn: string): Member | null {
   return document.members.find((m) => m.certCNs.includes(cn)) ?? null;
@@ -517,9 +533,10 @@ export function unsuspendMember(document: MemberDocument, memberId: string, ctx:
 }
 
 /**
- * Soft delete. Keeps `id`, `username`, `principalName` (so they stay taken), clears email,
- * certificate CNs, roles, solo approval, OTP binding, the password credential, linked identities,
- * the member's tokens, and any token addressed to the member's email.
+ * Soft delete. Keeps `id`, `username`, `principalName` (so they stay taken) and the linked identities
+ * (issuer + subject, as tombstones that `linkIdentity` refuses), and clears email, certificate CNs,
+ * roles, solo approval, OTP binding, the password credential, the member's tokens, and any token
+ * addressed to the member's email.
  */
 export function deleteMember(document: MemberDocument, memberId: string, ctx: MemberContext): Member {
   const member = requireNotDeleted(document, memberId);
@@ -530,7 +547,6 @@ export function deleteMember(document: MemberDocument, memberId: string, ctx: Me
     updatedAt: nowIso(ctx.now),
   });
   document.credentials = document.credentials.filter((c) => c.memberId !== memberId);
-  document.identities = document.identities.filter((i) => i.memberId !== memberId);
   document.tokens = document.tokens.filter((t) => t.memberId !== memberId && (email === null || t.email !== email));
   audit(document, ctx, "member.delete", memberId);
   return member;
@@ -589,12 +605,16 @@ function otpUserTaken(document: MemberDocument, value: string, exceptId: string 
   return document.members.some((m) => m.id !== exceptId && m.status !== "deleted" && m.otpUserId === value);
 }
 
-/** Newest `member.login` rows kept in the audit; older ones are dropped, every other row is kept. */
-export const MEMBER_LOGIN_AUDIT_MAX = 5_000;
 /**
- * Drop the oldest `member.login` rows beyond `max`. Sign-ins are the one audit action whose rate is
- * set by users rather than admins, so they are the one that is bounded.
- * @see member-auth-server.test.ts "keeps only the newest sign-in audit rows"
+ * A safety cap on `member.login` rows, on top of the one-year retention in `withMemberTransaction`.
+ * Sign-ins are the audit action whose rate users set, and the whole store is rewritten on every
+ * write, so a flood of successful sign-ins within a year must not grow it without bound. Large on
+ * purpose: retention is the rule, this only stops a flood.
+ */
+export const MEMBER_LOGIN_AUDIT_MAX = 100_000;
+/**
+ * Drop the oldest `member.login` rows beyond `max`; every other row is kept.
+ * @see member-store.test.ts "trimLoginAudit drops only the oldest sign-in rows beyond the cap"
  */
 export function trimLoginAudit(document: MemberDocument, max = MEMBER_LOGIN_AUDIT_MAX): void {
   let excess = document.audit.filter((a) => a.action === "member.login").length - max;
@@ -614,13 +634,17 @@ export function confirmOtp(document: MemberDocument, memberId: string, expectedO
 
 /**
  * Bind `(issuer, subject)` to the member the caller names. There is no lookup by email or
- * username here; a pair already bound to a different member is refused (409).
+ * username here; a pair already bound to a different member — including a deleted one, whose
+ * identities are kept as tombstones — is refused (409).
  */
 export function linkIdentity(document: MemberDocument, input: { memberId: string; issuer: string; subject: string }, ctx: MemberContext): MemberIdentity {
   requireNotDeleted(document, input.memberId);
   const issuer = issuerUrl(input.issuer); const subject = subjectId(input.subject);
   const existing = document.identities.find((i) => i.issuer === issuer && i.subject === subject);
-  if (existing && existing.memberId !== input.memberId) throw new MemberError("this identity is linked to another member", 409);
+  if (existing && existing.memberId !== input.memberId) {
+    const deleted = document.members.find((m) => m.id === existing.memberId)?.status === "deleted";
+    throw new MemberError(deleted ? "this identity belonged to a deleted member and cannot be linked again" : "this identity is linked to another member", 409);
+  }
   if (existing) return existing;
   const identity: MemberIdentity = { issuer, subject, memberId: input.memberId, linkedAt: nowIso(ctx.now), linkedBy: actorName(ctx.actor) };
   document.identities.push(identity);

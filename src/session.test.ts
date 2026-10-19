@@ -46,6 +46,19 @@ describe("the session store", () => {
     assert.equal(s.get(a.id), null, "an expired session must not authenticate anything");
   });
 
+  it("a per-session ttlSec replaces the store's absolute lifetime for that session only", () => {
+    let t = new Date("2026-08-05T00:00:00Z");
+    const s = new SessionStore({ ttlSec: 60, max: 10 }, () => t);
+    const long = s.create(who, { ttlSec: 120 });
+    const plain = s.create(who);
+    assert.equal(+long.expiresAt - +t, 120_000);
+    t = new Date("2026-08-05T00:01:01Z");
+    assert.equal(s.get(plain.id), null);
+    assert.ok(s.get(long.id), "the longer lifetime is honoured");
+    t = new Date("2026-08-05T00:02:00Z");
+    assert.equal(s.get(long.id), null, "and it is still absolute, however active the session was");
+  });
+
   it("forgets an expired session rather than holding it", () => {
     let t = new Date("2026-08-05T00:00:00Z");
     const s = new SessionStore({ ttlSec: 60, max: 10 }, () => t);

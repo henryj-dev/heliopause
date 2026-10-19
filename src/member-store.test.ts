@@ -7,8 +7,8 @@ import { after, describe, it } from "node:test";
 import {
   activeMember, bindCertCN, confirmOtp, consumeToken, createMember, deleteMember, emptyMemberDocument, findByCertCN, findByEmail,
   findByIdentity, findByUsername, initializeMemberDocument, issueToken, linkIdentity, loadMemberDocument, MEMBER_TOKEN_PREFIX,
-  MemberError, saveMemberDocument, setOtpUserId, setPassword, setRoles, suspendMember, unbindCertCN, unlinkIdentity, unsuspendMember,
-  withMemberTransaction, type MemberDocument,
+  MemberError, saveMemberDocument, setOtpUserId, setPassword, setRoles, suspendMember, trimLoginAudit, unbindCertCN, unlinkIdentity,
+  unsuspendMember, withMemberTransaction, type MemberDocument,
 } from "./member-store.ts";
 
 const root = mkdtempSync(join(tmpdir(), "heliopause-members-"));
@@ -270,7 +270,8 @@ describe("soft delete", () => {
       [null, null, [], [], false, null],
     );
     assert.equal(document.credentials.some((c) => c.memberId === member.id), false);
-    assert.equal(document.identities.some((i) => i.memberId === member.id), false);
+    // The identity stays, as a tombstone bound to the deleted member.
+    assert.deepEqual(document.identities.filter((i) => i.memberId === member.id).map((i) => [i.issuer, i.subject]), [[ISS, "s"]]);
     assert.equal(document.tokens.some((t) => t.memberId === member.id), false);
     assert.equal(findByUsername(document, "alice")?.id, member.id);
 
@@ -389,6 +390,32 @@ describe("otpUserId confirmation", () => {
   });
 });
 
+describe("audit retention", () => {
+  it("a transaction drops audit rows older than a year, of every kind", () => {
+    const path = storePath();
+    const { document } = withAdmin();
+    const now = new Date("2026-10-18T00:00:00.000Z");
+    const day = 86_400_000;
+    const row = (action: string, ageMs: number) => ({ at: new Date(now.getTime() - ageMs).toISOString(), actor: "cli", action, target: "t", sourceIp: null });
+    document.audit = [
+      row("member.login", 366 * day), row("member.create", 365 * day + 1), row("member.suspend", 400 * day),
+      row("member.login", 365 * day), row("member.create", 364 * day), row("member.delete", 1),
+    ];
+    saveMemberDocument(path, document);
+    withMemberTransaction(path, () => undefined, { now });
+    const kept = loadMemberDocument(path).audit.map((a) => [a.action, now.getTime() - Date.parse(a.at)]);
+    assert.deepEqual(kept, [["member.login", 365 * day], ["member.create", 364 * day], ["member.delete", 1]]);
+  });
+
+  it("trimLoginAudit drops only the oldest sign-in rows beyond the cap", () => {
+    const { document } = withAdmin();
+    const row = (action: string, target: string) => ({ at: "2026-10-18T00:00:00.000Z", actor: "cli", action, target, sourceIp: null });
+    document.audit = [row("member.login", "1"), row("member.create", "c"), row("member.login", "2"), row("member.login", "3"), row("member.login", "4")];
+    trimLoginAudit(document, 3);
+    assert.deepEqual(document.audit.map((a) => a.target), ["c", "2", "3", "4"]);
+  });
+});
+
 describe("one-time tokens", () => {
   it("stores only the digest, never the plaintext", () => {
     const path = storePath();
@@ -473,6 +500,31 @@ describe("one-time tokens", () => {
 });
 
 describe("linked identities", () => {
+  it("keeps a deleted member's identities as tombstones that cannot be linked again", () => {
+    const path = storePath();
+    const { document, adminId } = withAdmin();
+    const gone = createMember(document, { username: "gone", email: "g@example.com", status: "active", roles: ["reader"] }, ctx);
+    linkIdentity(document, { memberId: gone.id, issuer: ISS, subject: "sub-gone" }, ctx);
+    deleteMember(document, gone.id, ctx);
+    // The deleted shape with its identity survives save and load.
+    saveMemberDocument(path, document);
+    const loaded = loadMemberDocument(path);
+    assert.deepEqual(loaded.identities.map((i) => [i.memberId, i.subject]), [[gone.id, "sub-gone"]]);
+    // A tombstone identifies no one.
+    assert.equal(findByIdentity(loaded, ISS, "sub-gone"), null);
+    // Neither another member nor a new one may take it.
+    refuses(() => linkIdentity(loaded, { memberId: adminId, issuer: ISS, subject: "sub-gone" }, ctx), 409, /deleted member/);
+    const fresh = createMember(loaded, { username: "fresh", email: "g@example.com", status: "active", roles: ["reader"] }, ctx);
+    refuses(() => linkIdentity(loaded, { memberId: fresh.id, issuer: ISS, subject: "sub-gone" }, ctx), 409, /deleted member/);
+    // The tombstone cannot be removed through the member it names either.
+    refuses(() => unlinkIdentity(loaded, { memberId: gone.id, issuer: ISS, subject: "sub-gone" }, ctx), 409, /deleted/);
+    // An identity naming no member at all is still refused on load.
+    const raw = JSON.parse(readFileSync(path, "utf8"));
+    raw.identities[0].memberId = "00000000-0000-4000-8000-000000000000";
+    writeFileSync(path, JSON.stringify(raw));
+    refuses(() => loadMemberDocument(path), 400, /unknown member/);
+  });
+
   it("refuses linking an identity bound to another member", () => {
     const { document, adminId } = withAdmin();
     const other = createMember(document, { username: "other", status: "active", roles: ["reader"] }, ctx);

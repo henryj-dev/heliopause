@@ -461,6 +461,7 @@ const started = await startManager({
     mode: membersMode,
     ...(process.env.HELIOPAUSE_MEMBER_STORE ? { storeFile: process.env.HELIOPAUSE_MEMBER_STORE } : {}),
     sessionIdleSec: number("HELIOPAUSE_MEMBER_SESSION_IDLE_SEC"),
+    sessionTtlSec: number("HELIOPAUSE_MEMBER_SESSION_TTL_SEC"),
     // Invite and reset links are built on this when no OIDC redirect URI gives an origin.
     ...(process.env.HELIOPAUSE_PUBLIC_ORIGIN ? { publicOrigin: process.env.HELIOPAUSE_PUBLIC_ORIGIN } : {}),
   },

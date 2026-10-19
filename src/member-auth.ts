@@ -20,7 +20,7 @@ import {
   withMemberTransaction, type Member, type MemberDocument,
 } from "./member-store.ts";
 import {
-  checkPasswordPolicy, dummyVerify, hashPassword, MAX_PASSWORD_BYTES, PasswordBusyError, verifyPassword,
+  checkPasswordPolicy, dummyVerify, hashPassword, PasswordBusyError, verifyPassword,
 } from "./password.ts";
 import { statusFor, verifyOtp } from "./otp.ts";
 import { clearCookieHeader, cookieHeader, COOKIE, readCookie, type Principal, type Session, type SessionStore } from "./session.ts";
@@ -31,10 +31,16 @@ const MEMBER_HTTP_LOCK_WAIT_MS = 100;
 export const MEMBER_AUTH_RATE_MAX = 10;
 export const MEMBER_AUTH_RATE_WINDOW_MS = 60_000;
 const MEMBER_AUTH_RATE_SOURCES = 1024;
-/** Failed sign-ins for one username before each further attempt must wait. */
+// These counters live in this process's memory, not a shared store: a documented product exception
+// to the common "shared counter" rule, since the manager runs as a single instance.
+/** Failed sign-ins for one (account, source) before each further attempt must wait. */
 export const MEMBER_FAILURES_BEFORE_DELAY = 5;
-/** The wait doubles from 1 s per failure past the threshold, up to this. */
-const MEMBER_MAX_DELAY_SEC = 300;
+/** The wait starts at 1 s at the threshold and doubles per failure, up to this (15 min). */
+export const MEMBER_MAX_DELAY_SEC = 15 * 60;
+/** A failure record is forgotten once this long has passed since its last failure. */
+export const MEMBER_FAILURE_RESET_MS = 15 * 60_000;
+// Cap and reset together: past the threshold each attempt waits up to 15 min, so one (account, source)
+// gets about 28 attempts an hour at most, and the account-wide cap bounds all sources together.
 const MEMBER_FAILURE_KEYS = 4096;
 /** Sessions one member may hold at once; a further sign-in ends that member's oldest. */
 export const MEMBER_SESSIONS_PER_MEMBER = 5;
@@ -48,6 +54,12 @@ const MEMBER_ACCOUNT_WINDOW_MS = 15 * 60_000;
 const MEMBER_TRUSTED_SOURCE_MS = 30 * 24 * 60 * 60_000;
 const MEMBER_TRUSTED_SOURCES_PER_ACCOUNT = 16;
 const MAX_BODY_BYTES = 16 * 1024;
+/**
+ * Body cap for the four routes that carry a password (sign-in, invite accept, reset, change). There
+ * is no password length rule; this bounds what reaches scrypt. A password field's own limit is this
+ * same number, so it adds nothing beyond the body cap.
+ */
+export const PASSWORD_BODY_MAX_BYTES = 64 * 1024;
 const INVALID_LOGIN = "invalid username or password";
 
 type Hits = Map<string, { windowStartedAt: number; count: number }>;
@@ -57,6 +69,8 @@ export interface MemberAuthDeps {
   sessions: SessionStore;
   /** Idle limit, in seconds, given to every password session. */
   idleSec: number;
+  /** Absolute lifetime, in seconds, of every password session. */
+  ttlSec: number;
   otp?: { issuerUrl: string; serviceToken: string; fetchImpl?: typeof fetch };
   /** `operatorCNs` ∪ `writerCNs`. A member's principalName may equal one only if it is in its own `certCNs`. */
   certificateNames: ReadonlySet<string>;
@@ -93,12 +107,12 @@ function reply(res: ServerResponse, status: number, body: unknown, headers: Reco
   res.end(payload);
 }
 
-async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
+async function readJson(req: IncomingMessage, maxBytes = MAX_BODY_BYTES): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of req) {
     size += (chunk as Buffer).length;
-    if (size > MAX_BODY_BYTES) throw new BadRequest("request body too large");
+    if (size > maxBytes) throw new BadRequest("request body too large");
     chunks.push(chunk as Buffer);
   }
   let body: unknown;
@@ -168,18 +182,24 @@ export function normalizeSource(address: string | undefined): string {
  * @see member-auth-server.test.ts "a flood of new names does not evict an account that is waiting"
  */
 export function recordFailureIn(
-  failures: Map<string, { count: number; until: number }>, key: string, nowMs: number, maxKeys = MEMBER_FAILURE_KEYS,
+  failures: Map<string, { count: number; until: number; last: number }>, key: string, nowMs: number, maxKeys = MEMBER_FAILURE_KEYS,
 ): void {
-  const f = failures.get(key) ?? { count: 0, until: 0 };
+  const previous = failures.get(key);
+  // @see member-auth-server.test.ts "a failure record is forgotten 15 minutes after its last failure"
+  const f = previous && nowMs - previous.last < MEMBER_FAILURE_RESET_MS ? previous : { count: 0, until: 0, last: nowMs };
   failures.delete(key);
   f.count += 1;
+  f.last = nowMs;
   if (f.count >= MEMBER_FAILURES_BEFORE_DELAY) {
     f.until = nowMs + Math.min(2 ** (f.count - MEMBER_FAILURES_BEFORE_DELAY), MEMBER_MAX_DELAY_SEC) * 1000;
   }
   failures.set(key, f);
   while (failures.size > maxKeys) {
     let victim: string | undefined;
-    for (const [k, v] of failures) { if (v.count < MEMBER_FAILURES_BEFORE_DELAY) { victim = k; break; } }
+    // Expired records first (they would reset anyway), then ones below the threshold, then the oldest.
+    // @see member-auth-server.test.ts "eviction takes an expired record before one below the threshold"
+    for (const [k, v] of failures) { if (nowMs - v.last >= MEMBER_FAILURE_RESET_MS) { victim = k; break; } }
+    if (victim === undefined) for (const [k, v] of failures) { if (v.count < MEMBER_FAILURES_BEFORE_DELAY) { victim = k; break; } }
     victim ??= failures.keys().next().value as string | undefined;
     if (victim === undefined) break;
     failures.delete(victim);
@@ -213,11 +233,11 @@ export function createMemberAuth(deps: MemberAuthDeps) {
       const result = mutate(document);
       assertNoNameClash(document, deps);
       return result;
-    }, { waitMs: MEMBER_HTTP_LOCK_WAIT_MS });
+    }, { waitMs: MEMBER_HTTP_LOCK_WAIT_MS, now: deps.now() });
 
   const loginHits: Hits = new Map();
   const tokenHits: Hits = new Map();
-  const failures = new Map<string, { count: number; until: number }>();
+  const failures = new Map<string, { count: number; until: number; last: number }>();
   const meFailures: Hits = new Map();
 
   const source = (req: IncomingMessage): string => (deps.sourceOf ?? ((r) => normalizeSource(r.socket.remoteAddress)))(req);
@@ -345,14 +365,14 @@ export function createMemberAuth(deps: MemberAuthDeps) {
     return sessions.create({
       name: member.principalName, sub: `member:${member.id}`, groups: [], via: "password",
       canWrite: mfa && member.roles.includes("writer"), memberId: member.id, loginMfa: mfa, credentialChangedAt,
-    }, { idleSec: deps.idleSec, perMemberMax: MEMBER_SESSIONS_PER_MEMBER });
+    }, { idleSec: deps.idleSec, ttlSec: deps.ttlSec, perMemberMax: MEMBER_SESSIONS_PER_MEMBER });
   }
 
   async function login(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const body = await readJson(req);
+    const body = await readJson(req, PASSWORD_BODY_MAX_BYTES);
     fields(body, ["username", "password", "otp"]);
     const username = str(body, "username", 128);
-    const password = str(body, "password", MAX_PASSWORD_BYTES);
+    const password = str(body, "password", PASSWORD_BODY_MAX_BYTES);
     const code = optStr(body, "otp", 16);
     const from = source(req);
     const key = failureKey(username, from);
@@ -434,11 +454,11 @@ export function createMemberAuth(deps: MemberAuthDeps) {
   }
 
   async function acceptInvite(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const body = await readJson(req);
+    const body = await readJson(req, PASSWORD_BODY_MAX_BYTES);
     fields(body, ["token", "username", "password"]);
     const token = str(body, "token", 128);
     const rawName = str(body, "username", 128);
-    const password = str(body, "password", MAX_PASSWORD_BYTES);
+    const password = str(body, "password", PASSWORD_BODY_MAX_BYTES);
     let document: MemberDocument;
     try { document = loadMemberDocument(storeFile); } catch (e) { throw new StoreUnavailable((e as Error).message); }
     const row = peekToken(document, { kind: "invite", token }, deps.now());
@@ -452,7 +472,7 @@ export function createMemberAuth(deps: MemberAuthDeps) {
       throw e;
     };
     try { createMember(document, input, { actor: `invite:${row.id}`, now: deps.now() }); } catch (e) { unavailable(e); }
-    const problems = checkPasswordPolicy(password, { username, email: row.email ?? null });
+    const problems = checkPasswordPolicy(password);
     if (problems.length) return reply(res, 400, { error: "password refused", problems });
     const hash = await hashPassword(password);
     let member: Member;
@@ -471,17 +491,17 @@ export function createMemberAuth(deps: MemberAuthDeps) {
   }
 
   async function resetPassword(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const body = await readJson(req);
+    const body = await readJson(req, PASSWORD_BODY_MAX_BYTES);
     fields(body, ["token", "password", "otp"]);
     const token = str(body, "token", 128);
-    const password = str(body, "password", MAX_PASSWORD_BYTES);
+    const password = str(body, "password", PASSWORD_BODY_MAX_BYTES);
     const code = optStr(body, "otp", 16);
     let document: MemberDocument;
     try { document = loadMemberDocument(storeFile); } catch (e) { throw new StoreUnavailable((e as Error).message); }
     const row = peekToken(document, { kind: "password-reset", token }, deps.now());
     const member = document.members.find((m) => m.id === row.memberId);
     if (!member) throw new MemberError("token is invalid, used, or expired");
-    const problems = checkPasswordPolicy(password, { username: member.username, email: member.email });
+    const problems = checkPasswordPolicy(password);
     if (problems.length) return reply(res, 400, { error: "password refused", problems });
     const privileged = mayWriteRoles(member);
     if (privileged) {
@@ -555,10 +575,10 @@ export function createMemberAuth(deps: MemberAuthDeps) {
       });
     }
     if (req.method === "POST" && url.pathname === "/api/me/password") {
-      const body = await readJson(req);
+      const body = await readJson(req, PASSWORD_BODY_MAX_BYTES);
       fields(body, ["current", "next"]);
-      const currentPassword = str(body, "current", MAX_PASSWORD_BYTES);
-      const next = str(body, "next", MAX_PASSWORD_BYTES);
+      const currentPassword = str(body, "current", PASSWORD_BODY_MAX_BYTES);
+      const next = str(body, "next", PASSWORD_BODY_MAX_BYTES);
       const document = current();
       const m = activeMember(document, memberId);
       const credential = m ? passwordCredential(document, memberId) : null;
@@ -573,7 +593,7 @@ export function createMemberAuth(deps: MemberAuthDeps) {
         deps.rateLimited(meFailures, memberId, nowMs, ME_PASSWORD_FAILURES_MAX, ME_PASSWORD_WINDOW_MS, MEMBER_FAILURE_KEYS);
         return reply(res, 403, { error: "the current password is not correct" });
       }
-      const problems = checkPasswordPolicy(next, { username: m.username, email: m.email });
+      const problems = checkPasswordPolicy(next);
       if (problems.length) return reply(res, 400, { error: "password refused", problems });
       const hash = await hashPassword(next);
       const changed = write((d) => setPassword(d, memberId, hash, { mustChange: false }, { actor: memberId, sourceIp: source(req), now: deps.now() }));
