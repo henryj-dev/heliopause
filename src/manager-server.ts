@@ -53,7 +53,9 @@ import { readFile, readdir, realpath } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { createHash, createPublicKey, type KeyObject } from "node:crypto";
 import { peerCN, type FleetView } from "./relay.ts";
-import { readBoundedNodeBody, readBoundedText } from "./bounded-body.ts";
+import { BodyTooLargeError, readBoundedNodeBody, readBoundedText } from "./bounded-body.ts";
+import { NetworkObservationStore, observationFreshness, NETWORK_COLLECTOR_NAMES } from "./network-observation.ts";
+import { NetworkRegistryStore, NetworkRegistryError, MAX_NETWORK_REGISTRY_INPUT_BYTES } from "./network-registry.ts";
 import { MAX_PREVIEW_BYTES } from "./preview-limits.ts";
 import { buildId } from "./build-id.ts";
 
@@ -109,7 +111,7 @@ import {
 } from "./host-deregistration-policy-worker.ts";
 import { readRelayStatus, type RelayRead } from "./problem-watch.ts";
 import { startProblemWatch, type ProblemWatchDeps } from "./problem-watch-runner.ts";
-import { siteView, type RelaySource, type RelayResult, type SiteView } from "./manager.ts";
+import { fetchNetworkObservations, siteView, type RelaySource, type RelayResult, type SiteView } from "./manager.ts";
 import { bundleFromPlan, planHash, validateBundle, type PlanBundle } from "./bundle.ts";
 import { zoneMismatch } from "./site-zone.ts";
 import { diffRulesets } from "./ruleset-diff.ts";
@@ -296,6 +298,9 @@ export const API_ROUTES: ReadonlySet<string> = new Set([
   "/enrollment/tokens",
   "/enrollment/app-tokens",
   "/enrollment/audit",
+  "/network/inventory",
+  "/network/revisions",
+  "/network/observations",
   "/enrollment/revocations",
   "/enrollment/host-deregistrations",
 ]);
@@ -313,6 +318,8 @@ export const API_ROUTES: ReadonlySet<string> = new Set([
  * fleet agent fetches its own certificate from there, through a name in stardust's SNI allowlist.
  */
 export const API_ROUTE_PATTERNS: readonly RegExp[] = [
+  /^\/network\/inventory\/[^/]+$/,
+  /^\/network\/observations\/[^/]+\/[^/]+$/,
   /^\/plans\/[^/]+\/changes$/,
   /^\/plans\/[^/]+\/ruleset$/,
   /^\/plans\/[^/]+\/ruleset-diff$/,
@@ -413,6 +420,10 @@ export function consumePendingOidcLogin(
 }
 
 export interface ManagerOptions {
+  /** Opt-in local desired inventory store; never a configuration writer. */
+  networkRegistryFile?: string;
+  /** Per-relay cached observations, separate from desired state. */
+  networkObservationsDir?: string;
   port: number;
   hostname?: string;
   /** The relays this manager aggregates — one per VPC. */
@@ -2315,6 +2326,80 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     // One boolean, one place. Certificates read the live allowlist; sessions carry the decision
     // taken at login — see `Principal.canWrite` for why that is stated rather than hidden.
     const mayWrite = principal.canWrite;
+    const networkInventoryPath = /^\/network\/inventory\/([^/]+)$/.exec(url.pathname);
+    if (url.pathname === "/network/inventory" || url.pathname === "/network/revisions" || networkInventoryPath) {
+      if (!opts.networkRegistryFile) return send(res, 503, { error: "network registry is not configured" });
+      const store = new NetworkRegistryStore(opts.networkRegistryFile);
+      try {
+        const pathId = networkInventoryPath ? decodeURIComponent(networkInventoryPath[1]!) : undefined;
+        if (req.method === "GET") {
+          const doc = store.read();
+          if (url.pathname === "/network/revisions") return send(res, 200, { revision: doc.revision, history: doc.history });
+          if (pathId !== undefined) {
+            const resource = doc.resources.find(r => r.id === pathId);
+            return resource ? send(res, 200, { revision: doc.revision, resource }) : send(res, 404, { error: "resource not found" });
+          }
+          return send(res, 200, doc);
+        }
+        if (!["POST", "PUT", "DELETE"].includes(req.method ?? "") || url.pathname === "/network/revisions" || (req.method === "POST" && pathId !== undefined) || (req.method === "DELETE" && pathId === undefined)) return send(res, 405, { error: "method not allowed" });
+        if (crossSiteRequest(req)) return send(res, 403, { error: "cross-site registry writes are refused" });
+        if (!mayWrite) return refuseWrite(res, who, url.pathname, principal.via);
+        const raw = await readNetworkRegistryBody(req);
+        const body: unknown = JSON.parse(raw.toString("utf8"));
+        if (!body || typeof body !== "object" || Array.isArray(body)) throw new NetworkRegistryError("request must be an object");
+        const b = body as Record<string, unknown>;
+        const mutation = req.method === "DELETE" ? { action: "delete" as const, id: pathId! }
+          : req.method === "POST" ? { action: "create" as const, resource: b.resource }
+          : pathId === undefined ? { action: "replace" as const, resources: b.resources }
+          : { action: "update" as const, id: pathId, resource: b.resource };
+        const doc = store.mutate(b.expectedRevision, who, mutation);
+        return send(res, req.method === "POST" ? 201 : 200, doc);
+      } catch (e) {
+        if (e instanceof NetworkRegistryError) return send(res, e.statusCode, { error: e.message, ...(e.issues ? { issues: e.issues } : {}) });
+        if (e instanceof SyntaxError || e instanceof URIError) return send(res, 400, { error: "invalid registry request" });
+        if (e instanceof BodyTooLargeError) return send(res, 413, { error: "registry request exceeds size limit" }, { connection: "close" });
+        throw e;
+      }
+    }
+    const networkObservationPath = /^\/network\/observations\/([^/]+)\/([^/]+)$/.exec(url.pathname);
+    if (url.pathname === "/network/observations" || networkObservationPath) {
+      if (req.method !== "GET") return send(res, 405, { error: "observations are read-only" });
+      if (!opts.networkObservationsDir) return send(res, 503, { error: "network observation cache is not configured" });
+      let detail: { source: string; host: string } | undefined;
+      try {
+        if (url.pathname !== "/network/observations") {
+          detail = { source: decodeURIComponent(networkObservationPath![1]!), host: decodeURIComponent(networkObservationPath![2]!) };
+          if (!opts.relays.some(r => r.name === detail!.source)) return send(res, 404, { error: "unknown relay source" });
+        }
+      } catch { return send(res, 400, { error: "invalid observation identity" }); }
+      const sources = opts.relays.filter(r => !detail || r.name === detail.source);
+      const rows = await Promise.all(sources.map(async source => {
+        const cache = new NetworkObservationStore(join(opts.networkObservationsDir!, createHash("sha256").update(source.name).digest("hex")));
+        let status: "available" | "unavailable" = "available";
+        try {
+          const records = await fetchNetworkObservations(source);
+          for (const record of records) cache.put(record.host, record.report, { source: source.name, relayReceivedAt: record.receivedAt });
+        } catch { status = "unavailable"; }
+        try {
+          return { source: source.name, status, observations: cache.list().filter(r => !detail || r.host === detail.host).map(record => {
+            const now = Date.now();
+            const names = NETWORK_COLLECTOR_NAMES;
+            const collectors = Object.fromEntries(names.map(name => {
+              const collector = record.report.observations[name];
+              const ageMs = collector ? now - Date.parse(collector.completedAt) : undefined;
+              return [name, collector ? { status: collector.status, freshness: ageMs! >= 0 && ageMs! <= 10 * 60_000 ? "fresh" : "stale", completedAt: collector.completedAt } : { status: "never-observed", freshness: "never-observed" }];
+            }));
+            return { ...record, source: source.name, freshness: observationFreshness(record, now), collectors };
+          }) };
+        } catch { return { source: source.name, status: "unavailable" as const, observations: [], cacheError: true }; }
+      }));
+      if (detail) {
+        const observation = rows[0]?.observations[0];
+        if (!observation) return send(res, rows[0]?.status === "unavailable" ? 503 : 404, { source: detail.source, host: detail.host, status: rows[0]?.status ?? "unavailable", observation: null, freshness: "never-observed" });
+        return send(res, 200, { relayStatus: rows[0]!.status, observation });
+      }
+      return send(res, 200, { relays: rows.map(({ observations: _observations, ...source }) => source), observations: rows.flatMap(r => r.observations) });
+    }
     // Solo approval is a role, and only ever an OIDC one: a certificate carries no role claim, so a
     // CLI caller can never approve their own plan. That asymmetry is deliberate rather than an
     // oversight — the browser path is the one with a one-time code prompt in front of a person, and
@@ -5219,6 +5304,27 @@ function countRules(artifact: string | undefined): number {
  * exporting it would make the manager depend on the relay module for a five-line utility. The bound is
  * the part that matters and it is stated here.
  */
+/** Request overflow must leave the response writable so clients receive a useful 413.
+ * The shared relay-response reader destroys its stream on overflow, which is wrong for requests. */
+function readNetworkRegistryBody(req: IncomingMessage): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    const cleanup = () => { req.off("data", data); req.off("end", end); req.off("error", error); req.off("aborted", aborted); };
+    const fail = (e: Error) => { cleanup(); req.pause(); reject(e); };
+    const error = () => fail(new NetworkRegistryError("cannot read registry request"));
+    const aborted = () => fail(new NetworkRegistryError("registry request aborted"));
+    const data = (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > MAX_NETWORK_REGISTRY_INPUT_BYTES) return fail(new BodyTooLargeError("registry request exceeds size limit"));
+      chunks.push(chunk);
+    };
+    const end = () => { cleanup(); resolve(Buffer.concat(chunks, size)); };
+    if (Number(req.headers["content-length"]) > MAX_NETWORK_REGISTRY_INPUT_BYTES) return fail(new BodyTooLargeError("registry request exceeds size limit"));
+    req.on("data", data); req.on("end", end); req.on("error", error); req.on("aborted", aborted);
+  });
+}
+
 async function readBody(req: IncomingMessage, limit = 256 * 1024): Promise<string> {
   const chunks: Buffer[] = [];
   let size = 0;

@@ -251,6 +251,8 @@ const problemWatch = (() => {
 
 const started = await startManager({
   logLang,
+  ...(process.env.HELIOPAUSE_NETWORK_REGISTRY_FILE ? { networkRegistryFile: env("HELIOPAUSE_NETWORK_REGISTRY_FILE", "") } : {}),
+  ...(process.env.HELIOPAUSE_NETWORK_OBSERVATIONS_DIR ? { networkObservationsDir: env("HELIOPAUSE_NETWORK_OBSERVATIONS_DIR", "") } : {}),
   port,
   hostname,
   relays,

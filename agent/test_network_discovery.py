@@ -15,7 +15,7 @@ PUBLIC_KEY = base64.b64encode(bytes(range(32))).decode()
 
 class DiscoveryTests(unittest.TestCase):
     def test_fixed_allowlist_excludes_mutation_and_secrets(self):
-        self.assertEqual(set(discovery.COMMANDS), {"links", "addresses", "routes4", "routes6", "rules4", "rules6"} | {"wg-" + s for s in ("public-key", "listen-port", "peers", "endpoints", "allowed-ips", "latest-handshakes", "transfer", "persistent-keepalive")})
+        self.assertEqual(set(discovery.COMMANDS), {"links", "addresses", "routes4", "routes6", "rules4", "rules6", "frr-version", "frr-daemons", "frr-bgp-summary", "frr-routes4", "frr-routes6", "frr-bfd"} | {"wg-" + s for s in ("public-key", "listen-port", "peers", "endpoints", "allowed-ips", "latest-handshakes", "transfer", "persistent-keepalive")})
         for args in discovery.COMMANDS.values():
             self.assertNotIn("dump", args)
             self.assertNotIn("showconf", args)
@@ -155,7 +155,7 @@ class DiscoveryTests(unittest.TestCase):
             with self.assertRaises(ValueError): discovery.normalize_wireguard(field, raw)
 
     def test_report_omits_raw_error_data_and_includes_capability_timestamps(self):
-        def command(name):
+        def command(name, **kwargs):
             return ("success", b"[]") if name == "links" else ("unavailable", b"SECRET")
         with mock.patch.object(discovery, "run_command", side_effect=command):
             report = discovery.collect_network_state()
@@ -168,7 +168,7 @@ class DiscoveryTests(unittest.TestCase):
     def test_parse_error_never_echoes_unknown_output(self):
         with mock.patch.object(discovery, "run_command", return_value=("success", b"SECRET")):
             report = discovery.collect_network_state()
-        self.assertTrue(all(v["status"] == "error" and "data" not in v for v in report["observations"].values()))
+        self.assertTrue(all(v["status"] == ("unsupported" if name in ("frr-version", "frr-daemons") else "error") and "data" not in v for name, v in report["observations"].items()))
         self.assertNotIn("SECRET", json.dumps(report))
 
     def test_freshness_rejects_stale_future_naive_and_invalid_timestamps(self):
@@ -176,6 +176,158 @@ class DiscoveryTests(unittest.TestCase):
         for stamp in ((now - timedelta(seconds=31)).isoformat(), (now + timedelta(seconds=1)).isoformat(), "2026-01-01T00:00:00", "invalid"):
             self.assertFalse(discovery.is_fresh({"completedAt": stamp}, 30, now))
         self.assertFalse(discovery.is_fresh({}, 30, now))
+
+
+class FRRDiscoveryTests(unittest.TestCase):
+    # Shapes adapted from official FRR tagged regression expectations; addresses
+    # replaced by documentation ranges. Upstream expectations are partial JSON
+    # comparisons, not complete captured device replies.
+    # https://github.com/FRRouting/frr/blob/frr-8.5.6/tests/topotests/bfd_topo1/r1/bgp_summary.json
+    # https://github.com/FRRouting/frr/blob/frr-10.2.1/tests/topotests/bgp_features/r1/bgp_summary.json
+    # https://github.com/FRRouting/frr/blob/frr-10.2.1/tests/topotests/bgp_features/r1/show_bgp.json
+    # https://github.com/FRRouting/frr/blob/frr-10.2.1/tests/topotests/bgp_nexthop_ipv6/r1/show_bgp_ipv6_step1.json
+    # https://github.com/FRRouting/frr/blob/frr-10.2.1/tests/topotests/bfd_topo1/r1/peers.json
+    # Boolean flag omission and text commands verified against the same tag's
+    # bgpd/bgp_route.c, lib/command.c and vtysh/vtysh.c (show_daemons).
+    SUMMARY_8 = {"ipv4Unicast": {"as": 64512, "peers": {"192.0.2.2": {"remoteAs": 64513, "state": "Established"}}}}
+    SUMMARY_10 = {"ipv4Unicast": {"as": 64512, "routerId": "192.0.2.1", "peers": {"192.0.2.2": {"remoteAs": 64513, "state": "Established", "pfxRcd": 7, "pfxSnt": 3}}}}
+    RIB_10 = {"routerId": "192.0.2.1", "localAS": 64512, "routes": {"198.51.100.0/24": [
+        {"valid": True, "bestpath": True, "peerId": "192.0.2.2", "nexthops": [{"ip": "192.0.2.2", "afi": "ipv4", "used": True}]},
+        {"valid": True, "peerId": "192.0.2.3", "nexthops": [{"ip": "192.0.2.3", "afi": "ipv4", "used": True}]}]}}
+
+    def parse(self, name, value):
+        return discovery.normalize_frr(name, json.dumps(value).encode())
+
+    def test_fixed_frr_command_allowlist_is_read_only(self):
+        expected = {"frr-version": "show version", "frr-daemons": "show daemons", "frr-bgp-summary": "show bgp summary json", "frr-routes4": "show bgp ipv4 unicast json", "frr-routes6": "show bgp ipv6 unicast json", "frr-bfd": "show bfd peers json"}
+        for name, command in expected.items():
+            self.assertEqual(discovery.COMMANDS[name], ("vtysh", "-c", command))
+        with mock.patch.object(discovery, "_capture") as capture:
+            for command in ("configure terminal", "clear bgp *", "frr-show running-config"):
+                with self.assertRaises(ValueError): discovery.run_command(command)
+            capture.assert_not_called()
+
+    def test_version_uses_source_verified_text_grammar_without_host_or_build_details(self):
+        for version in ("8.5.6", "10.2.1", "10.2.1_git"):
+            raw = f"FRRouting {version} (private-host) on Linux(private-kernel).\nconfigured with: private-path\n".encode()
+            self.assertEqual(discovery.normalize_frr("frr-version", raw), [{"version": version}])
+        with self.assertRaises(discovery.UnsupportedObservation): discovery.normalize_frr("frr-version", b"different vendor private raw reply")
+
+    def test_daemons_are_connected_clients_not_process_liveness_or_installation(self):
+        self.assertEqual(discovery.normalize_frr("frr-daemons", b" zebra bgpd bfdd\n"), [{"name": "zebra", "state": "connected"}, {"name": "bgpd", "state": "connected"}, {"name": "bfdd", "state": "connected"}])
+        self.assertEqual(discovery.normalize_frr("frr-daemons", b"\n"), [])
+        with self.assertRaises(discovery.UnsupportedObservation): discovery.normalize_frr("frr-daemons", b"secret arbitrary-output")
+
+    def test_versioned_summary_shapes_keep_absent_counters_unknown(self):
+        old = self.parse("frr-bgp-summary", self.SUMMARY_8)[0]
+        new = self.parse("frr-bgp-summary", self.SUMMARY_10)[0]
+        self.assertNotIn("prefixesReceived", old)
+        self.assertNotIn("routerId", old)
+        self.assertEqual(new["prefixesReceived"], 7)
+        self.assertEqual(new["prefixesSent"], 3)
+        self.assertEqual(new["localAs"], 64512)
+        self.assertEqual(new["remoteAs"], 64513)
+
+    def test_all_six_bgp_states_remain_distinct(self):
+        for state in ("Idle", "Connect", "Active", "OpenSent", "OpenConfirm", "Established"):
+            data = json.loads(json.dumps(self.SUMMARY_10))
+            data["ipv4Unicast"]["peers"]["192.0.2.2"]["state"] = state
+            self.assertEqual(self.parse("frr-bgp-summary", data)[0]["state"], state)
+
+    def test_established_zero_received_prefixes_is_not_nonzero_or_connectivity(self):
+        data = json.loads(json.dumps(self.SUMMARY_10))
+        peer = data["ipv4Unicast"]["peers"]["192.0.2.2"]
+        peer["pfxRcd"] = 0
+        row = self.parse("frr-bgp-summary", data)[0]
+        self.assertEqual(row["state"], "Established")
+        self.assertEqual(row["prefixesReceived"], 0)
+        self.assertNotIn("reachable", row)
+        peer["pfxRcd"] = 4
+        self.assertEqual(self.parse("frr-bgp-summary", data)[0]["prefixesReceived"], 4)
+
+    def test_summary_ipv6_and_empty_peer_set(self):
+        data = {"ipv6Unicast": {"as": 64512, "peers": {"2001:db8::2": {"remoteAs": 64513, "state": "Established"}}}}
+        self.assertEqual(self.parse("frr-bgp-summary", data)[0]["addressFamily"], "ipv6")
+        data["ipv6Unicast"]["peers"] = {}
+        self.assertEqual(self.parse("frr-bgp-summary", data), [])
+        self.assertEqual(self.parse("frr-bgp-summary", {}), [])
+
+    def test_bestpath_is_distinct_from_other_candidates_and_kernel_fib(self):
+        rows = self.parse("frr-routes4", self.RIB_10)
+        self.assertEqual([r["bestPath"] for r in rows], [True, False])
+        self.assertEqual([r["valid"] for r in rows], [True, True])
+        self.assertEqual(rows[0]["nextHops"], ["192.0.2.2"])
+        self.assertTrue(all("installed" not in r and "reachable" not in r for r in rows))
+        # A separate Linux observation can be successfully empty while BGP selects
+        # a path; no implicit merge converts this into installed state.
+        self.assertEqual(discovery.normalize_linux("routes4", b"[]"), [])
+
+    def test_ipv6_rib_and_false_omission_follow_official_source(self):
+        data = {"routes": {"2001:db8::/64": [{"nexthops": [{"ip": "2001:db8::2", "afi": "ipv6", "used": True}]}]}}
+        row = self.parse("frr-routes6", data)[0]
+        self.assertEqual(row, {"addressFamily": "ipv6", "prefix": "2001:db8::/64", "valid": False, "bestPath": False, "nextHops": ["2001:db8::2"]})
+        with self.assertRaises(ValueError): self.parse("frr-routes4", data)
+
+    def test_bfd_down_is_a_state_not_a_collector_failure(self):
+        rows = self.parse("frr-bfd", [{"peer": "192.0.2.2", "status": "down", "remote-receive-interval": 1000}])
+        self.assertEqual(rows, [{"peer": "192.0.2.2", "state": "down"}])
+        self.assertEqual(self.parse("frr-bfd", []), [])
+
+    def test_unknown_variants_and_invalid_values_fail_closed(self):
+        for name, value in (("frr-bgp-summary", {"default": self.SUMMARY_10}), ("frr-routes4", {"newRoutes": {}}), ("frr-bfd", {"peers": []})):
+            with self.assertRaises(discovery.UnsupportedObservation): self.parse(name, value)
+        data = json.loads(json.dumps(self.SUMMARY_10))
+        data["ipv4Unicast"]["peers"]["192.0.2.2"]["pfxRcd"] = True
+        with self.assertRaises(ValueError): self.parse("frr-bgp-summary", data)
+        data = json.loads(json.dumps(self.RIB_10))
+        data["routes"]["198.51.100.0/24"][0]["bestpath"] = {"overall": True}
+        with self.assertRaises(ValueError): self.parse("frr-routes4", data)
+
+    def test_secret_unknown_fields_never_enter_normalized_frr_results(self):
+        data = json.loads(json.dumps(self.SUMMARY_10))
+        data["ipv4Unicast"]["peers"]["192.0.2.2"]["password"] = "FRR_SECRET"
+        self.assertNotIn("FRR_SECRET", json.dumps(self.parse("frr-bgp-summary", data)))
+        data = json.loads(json.dumps(self.RIB_10))
+        data["routes"]["198.51.100.0/24"][0]["secret"] = "FRR_SECRET"
+        self.assertNotIn("FRR_SECRET", json.dumps(self.parse("frr-routes4", data)))
+
+    def test_absent_bgpd_and_bfdd_are_unavailable_not_not_installed(self):
+        calls = []
+        def command(name, **kwargs):
+            calls.append(name)
+            if name == "frr-daemons": return "success", b" zebra\n"
+            if name.startswith("frr-"): return "unavailable", b""
+            return "success", b"[]" if not name.startswith("wg-") else b""
+        with mock.patch.object(discovery, "run_command", side_effect=command): report = discovery.collect_network_state()
+        self.assertEqual(report["observations"]["frr-daemons"]["data"], [{"name": "zebra", "state": "connected"}])
+        for name in ("frr-bgp-summary", "frr-routes4", "frr-routes6", "frr-bfd"):
+            self.assertEqual(report["observations"][name]["status"], "unavailable")
+            self.assertNotIn(name, calls)
+
+    def test_missing_vtysh_is_not_installed_and_never_launches(self):
+        with mock.patch.object(discovery.platform, "system", return_value="Linux"), mock.patch.object(discovery.shutil, "which", return_value=None), mock.patch.object(discovery, "_capture") as capture:
+            self.assertEqual(discovery.run_command("frr-version"), ("not-installed", b""))
+            capture.assert_not_called()
+
+    def test_total_budget_marks_unattempted_queries_timeout(self):
+        with mock.patch.object(discovery.time, "monotonic", side_effect=[0, 0] + [5] * len(discovery.COMMANDS)), mock.patch.object(discovery, "run_command", return_value=("success", b"[]")) as command:
+            report = discovery.collect_network_state(total_timeout=1)
+        self.assertEqual(command.call_count, 1)
+        self.assertEqual(report["observations"]["links"]["status"], "success")
+        self.assertTrue(all(r["status"] == "timeout" for key, r in report["observations"].items() if key != "links"))
+
+    def test_frr_parse_failures_never_forward_raw_secret_or_diagnostics(self):
+        def command(name, **kwargs):
+            return ("success", b"FRR_SECRET") if name.startswith("frr-") else ("unavailable", b"ignored")
+        with mock.patch.object(discovery, "run_command", side_effect=command): report = discovery.collect_network_state()
+        self.assertTrue(all(o["status"] in ("unsupported", "error") for k, o in report["observations"].items() if k.startswith("frr-")))
+        self.assertNotIn("FRR_SECRET", json.dumps(report))
+
+    def test_total_budget_parameters_reject_unbounded_or_non_numeric_values(self):
+        with mock.patch.object(discovery, "run_command") as command:
+            for value in (0, -1, 121, True, float("inf"), float("nan"), "30"):
+                with self.assertRaises(ValueError): discovery.collect_network_state(total_timeout=value)
+            command.assert_not_called()
 
 
 if __name__ == "__main__":
