@@ -205,7 +205,7 @@ test("legacy future-poisoned disk state is recovered with archived evidence, not
 
 
 test("freshness fails closed for missing receipts and invalid clock policies", () => {
-  const valid = { host: "host", receivedAt: at, report: report() };
+  const valid = { host: "host", receivedAt: at, report: validateNetworkObservation(report()) };
   for (const receivedAt of [undefined, null, ""]) assert.equal(observationFreshness({ ...valid, receivedAt } as any, Date.parse(at)), "stale");
   assert.equal(observationFreshness({ ...valid, source: "relay-a" }, Date.parse(at)), "stale");
   for (const age of [-1, Infinity, NaN, 600001]) assert.equal(observationFreshness(valid, Date.parse(at), age), "stale");
@@ -234,5 +234,5 @@ test("calendar-invalid timestamps are rejected without normalization", () => {
   const invalid = report(); invalid.startedAt = "2026-02-30T00:00:00Z"; invalid.completedAt = invalid.startedAt;
   invalid.observations.links.startedAt = invalid.observations.links.completedAt = invalid.startedAt;
   assert.throws(() => validateNetworkObservation(invalid), /envelope/);
-  assert.equal(observationFreshness({ host: "host", receivedAt: invalid.startedAt, report: report() }, Date.parse("2026-03-02T00:00:00Z")), "stale");
+  assert.equal(observationFreshness({ host: "host", receivedAt: invalid.startedAt, report: validateNetworkObservation(report()) }, Date.parse("2026-03-02T00:00:00Z")), "stale");
 });
