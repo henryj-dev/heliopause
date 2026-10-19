@@ -4,7 +4,8 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { request } from "node:https";
+import { Agent, request } from "node:https";
+import { createSecureContext } from "node:tls";
 import { startRelay } from "./relay.ts";
 import { SCHEMA_VERSION } from "./protocol.ts";
 import { startManager } from "./manager-server.ts";
@@ -14,6 +15,7 @@ import { createHash } from "node:crypto";
 const dir = mkdtempSync(join(tmpdir(), "hp-network-api-"));
 const read = (f: string) => readFileSync(join(dir, f));
 const site = { id: "site", kind: "site", owner: "team", management: { mode: "external", provider: "inventory" }, generation: 1 };
+const clientAgents = new Map<string, Agent>();
 let port = 0;
 let server: Awaited<ReturnType<typeof startManager>>["server"];
 before(async () => {
@@ -24,6 +26,12 @@ before(async () => {
     writeFileSync(join(dir, "leaf.ext"), `extendedKeyUsage=${name === "server" ? "serverAuth" : "clientAuth"}\n${name === "server" ? "subjectAltName=IP:127.0.0.1\n" : ""}`);
     ssl("x509", "-req", "-in", `${name}.csr`, "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial", "-out", `${name}.pem`, "-days", "1", "-extfile", "leaf.ext");
   }
+  // Load fixture credentials into TLS contexts once; request options carry only
+  // opaque TLS state, while JSON request bodies remain independent of file data.
+  clientAgents.set("none", new Agent({ secureContext: createSecureContext({ ca: read("ca.pem") }), keepAlive: false, maxCachedSessions: 0 }));
+  for (const name of ["reader", "writer", "host"]) {
+    clientAgents.set(name, new Agent({ secureContext: createSecureContext({ ca: read("ca.pem"), cert: read(`${name}.pem`), key: read(`${name}.key`) }), keepAlive: false, maxCachedSessions: 0 }));
+  }
   writeFileSync(join(dir, "operator-writer.pem"), read("writer.pem"));
   writeFileSync(join(dir, "operator-writer.key"), read("writer.key"));
   const started = await startManager({ port: 0, hostname: "127.0.0.1", relays: [{ name: "example", url: "https://127.0.0.1:1", pkiDir: dir }],
@@ -33,12 +41,12 @@ before(async () => {
   server = started.server;
   port = (server.address() as { port: number }).port;
 });
-after(async () => { if (server) await new Promise<void>(resolve => server.close(() => resolve())); rmSync(dir, { recursive: true, force: true }); });
+after(async () => { for (const agent of clientAgents.values()) agent.destroy(); if (server) await new Promise<void>(resolve => server.close(() => resolve())); rmSync(dir, { recursive: true, force: true }); });
 function call(path: string, method = "GET", who = "reader", body?: unknown, headers: Record<string, string> = {}) {
   const payload = body === undefined ? undefined : JSON.stringify(body);
   return new Promise<{ status: number; body: any }>((resolve, reject) => {
-    const req = request({ host: "127.0.0.1", port, path, method, agent: false, signal: AbortSignal.timeout(5000), ca: read("ca.pem"),
-      ...(who === "none" ? {} : { cert: read(`${who}.pem`), key: read(`${who}.key`) }), headers: { "content-type": "application/json", ...(payload === undefined ? {} : { "content-length": String(Buffer.byteLength(payload)) }), ...headers } }, res => {
+    const req = request({ host: "127.0.0.1", port, path, method, agent: clientAgents.get(who), signal: AbortSignal.timeout(5000),
+      headers: { "content-type": "application/json", ...(payload === undefined ? {} : { "content-length": String(Buffer.byteLength(payload)) }), ...headers } }, res => {
       let text = ""; res.on("data", chunk => text += chunk); res.on("end", () => resolve({ status: res.statusCode!, body: JSON.parse(text) }));
     });
     req.on("error", reject); req.end(payload);
@@ -107,8 +115,7 @@ test("real authenticated Agent upload reaches Manager cache and survives Manager
     observations: { links: { status: "success", startedAt: stamp, completedAt: stamp, data: [{ ifindex: 2, ifname: "example0", mtu: 1420 }] } }, capabilities: { links: { available: true, status: "success" } } };
   const relayPort = (relay.server.address() as { port: number }).port;
   const upload = () => new Promise<number>((resolve, reject) => {
-    const req = request({ host: "127.0.0.1", port: relayPort, path: "/network/observations", method: "POST", agent: false, signal: AbortSignal.timeout(5000),
-      ca: read("ca.pem"), cert: read("host.pem"), key: read("host.key") }, res => { res.resume(); res.on("end", () => resolve(res.statusCode!)); });
+    const req = request({ host: "127.0.0.1", port: relayPort, path: "/network/observations", method: "POST", agent: clientAgents.get("host"), signal: AbortSignal.timeout(5000) }, res => { res.resume(); res.on("end", () => resolve(res.statusCode!)); });
     req.on("error", reject); req.end(JSON.stringify({ host: "host", report }));
   });
   const options = { port: 0, hostname: "127.0.0.1", relays: [{ name: "live", url: `https://127.0.0.1:${relayPort}`, pkiDir: dir, operatorName: "writer" }],

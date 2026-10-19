@@ -1380,7 +1380,8 @@ export async function startRelay(
   const log = (en: string, ko: string) => writeLog(`[relay] ${formatOperatorEvent(opts.logLang ?? "en", { en, ko })}`);
   const now = opts.now ?? (() => new Date());
   const state = emptyState();
-  const networkObservations = new NetworkObservationStore(opts.networkObservationsDir ?? `${opts.artifactDir}/network-observations`);
+  let networkObservations: NetworkObservationStore | undefined;
+  const observationStore = () => networkObservations ??= new NetworkObservationStore(opts.networkObservationsDir ?? `${opts.artifactDir}/network-observations`);
   const operators = new Set(opts.operatorCNs ?? []);
   const publishers = new Set(opts.publisherCNs ?? []);
   let publishTail: Promise<void> = Promise.resolve();
@@ -1479,17 +1480,21 @@ export async function startRelay(
       try {
         const body = JSON.parse(await readBody(req, MAX_NETWORK_OBSERVATION_BYTES));
         if (!body || body.host !== cn || Object.keys(body).some(k => !["host", "report"].includes(k))) return send(res, 403, { error: "observation identity mismatch" });
-        const record = networkObservations.put(cn, validateNetworkObservation(body.report));
-        return send(res, 200, { collectionId: record.report.collectionId, receivedAt: record.receivedAt });
-      } catch (error) {
-        if (error instanceof NetworkObservationStoreBusyError) return send(res, 503, { error: "network observation store is busy" });
-        return send(res, 400, { error: "invalid or oversized network observation" });
-      }
+        const report = validateNetworkObservation(body.report);
+        try {
+          const record = observationStore().put(cn, report);
+          return send(res, 200, { collectionId: record.report.collectionId, receivedAt: record.receivedAt });
+        } catch (error) {
+          return send(res, 503, { error: error instanceof NetworkObservationStoreBusyError ? "network observation store is busy" : "network observation store is unavailable" });
+        }
+      } catch { return send(res, 400, { error: "invalid or oversized network observation" }); }
     }
     if (req.method === "GET" && url.pathname === "/network/observations") {
       if (!cn) return send(res, 401, { error: "authenticated operator required" });
       if (!operators.has(cn)) return send(res, 403, { error: "observation read is not allowed" });
-      return send(res, 200, { observations: networkObservations.list().filter(r => state.manifest && Object.hasOwn(state.manifest.hosts, r.host)) });
+      try {
+        return send(res, 200, { observations: observationStore().list().filter(r => state.manifest && Object.hasOwn(state.manifest.hosts, r.host)) });
+      } catch { return send(res, 503, { error: "network observation store is unavailable" }); }
     }
 
     if (req.method === "POST" && url.pathname === "/heartbeat") {

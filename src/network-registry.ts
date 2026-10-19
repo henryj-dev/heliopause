@@ -1,9 +1,9 @@
 /** Persistent desired inventory only. Nothing in this store authorizes a network apply. */
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, statSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { cidrRange } from "./nft.ts";
-import { atomicWriteFile, withFileLock } from "./json-store.ts";
+import { atomicWriteFile, readBoundedStoreFile, withFileLock } from "./json-store.ts";
 import { validateNetworkInventory, type NetworkInventoryIssue, type NetworkInventoryResource, type NetworkManagement } from "./network-inventory.ts";
 
 export const MAX_NETWORK_REGISTRY_RESOURCES = 512;
@@ -81,8 +81,7 @@ export class NetworkRegistryStore {
   read(): NetworkRegistryDocument {
     let text: string;
     try {
-      if (statSync(this.path).size > MAX_DOCUMENT_BYTES) throw fail("registry document exceeds size limit", 500);
-      text = readFileSync(this.path, "utf8");
+      text = readBoundedStoreFile(this.path, MAX_DOCUMENT_BYTES);
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code === "ENOENT") return empty();
       if (e instanceof NetworkRegistryError) throw e;

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, statSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync, statSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -138,4 +138,15 @@ test("stored ownership claims must be unique and consistent with all active clai
     assert.throws(() => store.read(), code(500));
     assert.throws(() => store.mutate(1, "a", { action: "delete", id: "iface" }), code(500));
   }
+});
+
+
+test("registry store refuses linked or oversized backing files instead of treating them as absent", t => {
+  const store = setup(t);
+  const target = store.path + ".target";
+  writeFileSync(target, "{}"); symlinkSync(target, store.path);
+  assert.throws(() => store.read(), code(500));
+  rmSync(store.path); writeFileSync(store.path, " ".repeat(4 * 1024 * 1024 + 1));
+  assert.throws(() => store.read(), code(500));
+  rmSync(store.path); assert.equal(store.read().revision, 0);
 });

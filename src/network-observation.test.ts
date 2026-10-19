@@ -1,11 +1,12 @@
 import { test, mock } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, unlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFile, execFileSync } from "node:child_process";
 import { createHash, X509Certificate } from "node:crypto";
-import { request } from "node:https";
+import { Agent, request } from "node:https";
+import { createSecureContext } from "node:tls";
 import { NetworkObservationStore, NetworkObservationStoreBusyError, observationFreshness, validateNetworkObservation, MAX_NETWORK_OBSERVATION_BYTES } from "./network-observation.ts";
 import { startRelay } from "./relay.ts";
 import { fetchNetworkObservations } from "./manager.ts";
@@ -54,18 +55,21 @@ test("observations persist separately scoped hosts and duplicate/replayed report
     assert.throws(() => store.put("../escape", report()));
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
-test("real mTLS observation upload binds manifest CN, isolates policy confirmation and persists after relay restart", async () => {
+test("real mTLS observation upload binds manifest CN, isolates policy confirmation and persists after relay restart", async t => {
   const dir = mkdtempSync(join(tmpdir(), "hp-observation-tls-")); const pki = join(dir, "pki");
   const cli = (...args: string[]) => execFileSync("node", ["bin/heliopause-pki.ts", ...args], { stdio: "pipe" });
   cli("init", pki); cli("issue", pki, "relay", "--role=relay", "--san=127.0.0.1");
   for (const [name, role] of [["host", "agent"], ["outsider", "agent"], ["reader", "operator"]]) cli("issue", pki, name!, `--role=${role}`);
+  // Fixture credentials initialize TLS state, never an HTTP payload.
+  const clientAgents = new Map(["agent-host", "agent-outsider", "operator-reader"].map(name => [name,
+    new Agent({ secureContext: createSecureContext({ ca: readFileSync(join(pki, "ca.pem")), cert: readFileSync(join(pki, `${name}.pem`)), key: readFileSync(join(pki, `${name}.key`)) }), keepAlive: false, maxCachedSessions: 0 })]));
   const options = { artifactDir: join(dir, "artifacts"), hostname: "127.0.0.1", port: 0, tls: { certFile: join(pki, "relay-relay.pem"), keyFile: join(pki, "relay-relay.key"), caFile: join(pki, "ca.pem") }, operatorCNs: ["reader"], log: () => {} };
   let relay = await startRelay(options);
   const manifest = { generation: "g1", issuedAt: at, schemaVersion: SCHEMA_VERSION, hosts: { host: { stage: "canary" as const, rulesetHash: "sha256:1", confirmTimeoutSec: 90, mustContain: [] } } };
   relay.state.manifest = manifest;
   const call = (who: string, path: string, body?: unknown) => new Promise<{ status: number; body: any }>((resolve, reject) => {
     const port = (relay.server.address() as { port: number }).port;
-    const req = request({ host: "127.0.0.1", port, path, method: body ? "POST" : "GET", ca: readFileSync(join(pki, "ca.pem")), cert: readFileSync(join(pki, `${who}.pem`)), key: readFileSync(join(pki, `${who}.key`)), agent: false }, res => { let raw = ""; res.on("data", d => raw += d); res.on("end", () => resolve({ status: res.statusCode!, body: JSON.parse(raw) })); });
+    const req = request({ host: "127.0.0.1", port, path, method: body ? "POST" : "GET", agent: clientAgents.get(who) }, res => { let raw = ""; res.on("data", d => raw += d); res.on("end", () => resolve({ status: res.statusCode!, body: JSON.parse(raw) })); });
     req.on("error", reject); req.end(body ? JSON.stringify(body) : undefined);
   });
   try {
@@ -73,6 +77,7 @@ test("real mTLS observation upload binds manifest CN, isolates policy confirmati
     assert.equal((await call("agent-outsider", "/network/observations", { host: "outsider", report: report() })).status, 403);
     assert.equal((await call("operator-reader", "/network/observations", { host: "reader", report: report() })).status, 403);
     assert.equal((await call("agent-host", "/network/observations", { host: "host", report: { ...report(), schemaVersion: 99 } })).status, 400);
+    mkdirSync(join(options.artifactDir, "network-observations"), { recursive: true });
     const contentionLock = join(options.artifactDir, "network-observations", "store.lock");
     writeFileSync(contentionLock, "another writer");
     assert.equal((await call("agent-host", "/network/observations", { host: "host", report: report() })).status, 503);
@@ -92,7 +97,25 @@ test("real mTLS observation upload binds manifest CN, isolates policy confirmati
     assert.equal(records.length, 1); assert.equal(records[0]!.host, "host");
     await new Promise<void>(resolve => relay.server.close(() => resolve())); relay = await startRelay(options); relay.state.manifest = manifest;
     const after = await call("operator-reader", "/network/observations"); assert.equal(after.body.observations[0].receivedAt, uploaded.body.receivedAt);
-  } finally { await new Promise<void>(resolve => relay.server.close(() => resolve())); rmSync(dir, { recursive: true, force: true }); }
+    await t.test("obstructed optional observation storage preserves startup and heartbeat", async () => {
+      await new Promise<void>(resolve => relay.server.close(() => resolve()));
+      const spool = join(options.artifactDir, "network-observations");
+      rmSync(spool, { recursive: true, force: true });
+      writeFileSync(spool, "pre-existing unrelated file");
+      relay = await startRelay(options); relay.state.manifest = manifest;
+      assert.equal((await call("agent-host", "/healthz")).status, 200);
+      const heartbeat = { host: "host", agentVersion: "0.1.0-pull", schemaVersion: SCHEMA_VERSION,
+        applied: { generation: null, state: "none", artifactHash: null, observedHash: null } };
+      assert.equal((await call("agent-host", "/heartbeat", heartbeat)).status, 200);
+      assert.ok(Object.hasOwn(relay.state.statuses, "host"));
+      const before = JSON.stringify({ statuses: relay.state.statuses, lastSeen: relay.state.lastSeen });
+      assert.equal((await call("agent-host", "/network/observations", { host: "host", report: report() })).status, 503);
+      assert.equal((await call("operator-reader", "/network/observations")).status, 503);
+      assert.equal(JSON.stringify({ statuses: relay.state.statuses, lastSeen: relay.state.lastSeen }), before);
+      assert.equal((await call("agent-host", "/heartbeat", heartbeat)).status, 200);
+      assert.equal(readFileSync(spool, "utf8"), "pre-existing unrelated file");
+    });
+  } finally { for (const agent of clientAgents.values()) agent.destroy(); await new Promise<void>(resolve => relay.server.close(() => resolve())); rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("contended telemetry writes fail immediately without sleeping the heartbeat event loop", () => {

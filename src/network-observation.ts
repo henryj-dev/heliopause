@@ -1,9 +1,9 @@
 /** Authenticated host claims, kept separate from policy confirmation and desired inventory. */
 import { createHash } from "node:crypto";
 import { isIP } from "node:net";
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { mkdirSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { atomicWriteFile, withFileLock } from "./json-store.ts";
+import { atomicWriteFile, readBoundedStoreFile, withFileLock } from "./json-store.ts";
 
 export const MAX_NETWORK_OBSERVATION_BYTES = 128 * 1024;
 export const MAX_NETWORK_OBSERVATION_HOSTS = 32;
@@ -110,18 +110,22 @@ export class NetworkObservationStore {
   readonly dir: string;
   constructor(dir: string) { this.dir = dir; mkdirSync(dir, { recursive: true, mode: 0o700 }); }
   private path(host: string, source?: string) { observationHost(host); if (source !== undefined) observationHost(source); return join(this.dir, createHash("sha256").update(JSON.stringify([source ?? "", host])).digest("hex") + ".json"); }
-  get(host: string, source?: string): NetworkObservationRecord | null {
-    const path = this.path(host, source); if (!existsSync(path)) return null;
-    if (statSync(path).size > MAX_NETWORK_OBSERVATION_BYTES + 2048) throw new Error("stored observation too large");
-    const record = JSON.parse(readFileSync(path, "utf8"));
+  private readRecord(path: string): NetworkObservationRecord {
+    const record: unknown = JSON.parse(readBoundedStoreFile(path, MAX_NETWORK_OBSERVATION_BYTES + 2048));
     if (!object(record)) throw new Error("invalid stored observation");
     keys(record, ["host", "receivedAt", "report", "source", "relayReceivedAt"]);
-    if (record.host !== host || record.source !== source || !timestamp(record.receivedAt) || (record.relayReceivedAt !== undefined && !timestamp(record.relayReceivedAt))) throw new Error("invalid stored observation");
+    observationHost(record.host);
+    if (record.source !== undefined) observationHost(record.source);
+    if (this.path(record.host, record.source) !== path || !timestamp(record.receivedAt) || (record.relayReceivedAt !== undefined && !timestamp(record.relayReceivedAt))) throw new Error("invalid stored observation");
     record.report = validateNetworkObservation(record.report); return record as unknown as NetworkObservationRecord;
+  }
+  get(host: string, source?: string): NetworkObservationRecord | null {
+    try { return this.readRecord(this.path(host, source)); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return null; throw error; }
   }
   list(): NetworkObservationRecord[] {
     const paths = readdirSync(this.dir).filter(n => /^[a-f0-9]{64}\.json$/.test(n)); if (paths.length > MAX_NETWORK_OBSERVATION_HOSTS) throw new Error("observation host limit exceeded");
-    return paths.map(name => { const path = join(this.dir, name); if (statSync(path).size > MAX_NETWORK_OBSERVATION_BYTES + 2048) throw new Error("stored observation too large"); const r = JSON.parse(readFileSync(path, "utf8")); const found = this.get(r.host, r.source); if (!found) throw new Error("missing stored observation"); return found; });
+    return paths.map(name => this.readRecord(join(this.dir, name)));
   }
   put(host: string, report: unknown, metadata: { relayReceivedAt?: string; source?: string } = {}): NetworkObservationRecord {
     const value = validateNetworkObservation(report); const path = this.path(host, metadata.source);
