@@ -1195,6 +1195,23 @@ export const MESSAGES = {
   "m.loginBack": { en: "start again", ko: "처음부터 다시" },
   "m.loginSso": { en: "sign in with SSO", ko: "SSO로 로그인" },
   "m.loginOr": { en: "or", ko: "또는" },
+  "m.loginForgot": { en: "Forgot your password?", ko: "비밀번호를 잊었나요?" },
+  "m.forgotHeading": { en: "reset your password", ko: "비밀번호 재설정" },
+  "m.forgotNote": {
+    en: "Enter your username or email address. If the account has a verified address, a reset link is mailed to it.",
+    ko: "사용자 이름이나 이메일 주소를 넣으십시오. 인증된 주소가 있는 계정이면 그 주소로 재설정 링크를 보낸다.",
+  },
+  "m.forgotLogin": { en: "username or email", ko: "사용자 이름 또는 이메일" },
+  "m.forgotSubmit": { en: "send a reset link", ko: "재설정 링크 보내기" },
+  "m.forgotSent": {
+    en: "If this account can receive a reset link, one is on its way. It expires in {minutes} minutes. Nothing arriving can also mean the account has no verified address — ask an admin then.",
+    ko: "재설정 링크를 받을 수 있는 계정이면 링크를 보냈다. {minutes}분 뒤 만료된다. 메일이 오지 않으면 인증된 주소가 없는 계정일 수도 있으니 관리자에게 문의하십시오.",
+  },
+  "m.forgotSentNoTtl": {
+    en: "If this account can receive a reset link, one is on its way. Nothing arriving can also mean the account has no verified address — ask an admin then.",
+    ko: "재설정 링크를 받을 수 있는 계정이면 링크를 보냈다. 메일이 오지 않으면 인증된 주소가 없는 계정일 수도 있으니 관리자에게 문의하십시오.",
+  },
+  "m.forgotBack": { en: "back to sign in", ko: "로그인으로 돌아가기" },
   "m.loginReading": { en: "reading how this manager signs people in…", ko: "로그인 방법을 읽는 중…" },
   "m.loginToSso": { en: "This manager signs in through SSO only. Going there…", ko: "이 매니저는 SSO로만 로그인한다. 그쪽으로 이동하는 중…" },
   "m.loginNone": {
@@ -1317,12 +1334,24 @@ export const MESSAGES = {
   "m.mmNeedRole": { en: "Pick at least one role.", ko: "역할을 하나 이상 고르십시오." },
   "m.mmLinkOnce": { en: "This link is shown once.", ko: "이 링크는 한 번만 보여 준다." },
   "m.mmInviteNoMail": {
-    en: "No mail is sent yet: copy the link and hand it to the person yourself. It expires at {at}.",
-    ko: "메일은 아직 보내지 않는다. 링크를 복사해 직접 전달하십시오. {at}에 만료된다.",
+    en: "This manager has no mail set up, so nothing was sent: copy the link and hand it to the person yourself. It expires at {at}.",
+    ko: "이 매니저에는 메일이 설정되지 않아 보내지 않았다. 링크를 복사해 직접 전달하십시오. {at}에 만료된다.",
+  },
+  "m.mmInviteMailed": {
+    en: "The invitation was mailed. The link below is the same one, in case it does not arrive. It expires at {at}.",
+    ko: "초대 메일을 보냈다. 메일이 오지 않을 때를 위해 같은 링크를 아래에 보여 준다. {at}에 만료된다.",
+  },
+  "m.mmInviteMailUnknown": {
+    en: "The relay refused the mail after taking it, so whether it was delivered cannot be confirmed. The link still works: hand it over yourself if it does not arrive. It expires at {at}.",
+    ko: "릴레이가 메일을 받은 뒤 거부해서 전달됐는지 확인할 수 없다. 링크는 그대로 쓸 수 있으니 메일이 오지 않으면 직접 전달하십시오. {at}에 만료된다.",
+  },
+  "m.mmInviteMailFailed": {
+    en: "The mail could not be sent (failed at {step}). The link still works: copy it and hand it to the person yourself. It expires at {at}.",
+    ko: "메일을 보내지 못했다({step} 단계에서 실패). 링크는 그대로 쓸 수 있으니 복사해 직접 전달하십시오. {at}에 만료된다.",
   },
   "m.mmResetNoMail": {
-    en: "No mail is sent yet: copy the link and hand it to the member yourself.",
-    ko: "메일은 아직 보내지 않는다. 링크를 복사해 그 회원에게 직접 전달하십시오.",
+    en: "This link is not mailed: copy it and hand it to the member yourself.",
+    ko: "이 링크는 메일로 보내지 않는다. 복사해 그 회원에게 직접 전달하십시오.",
   },
   "m.mmSaveRoles": { en: "save roles", ko: "역할 저장" },
   "m.mmSuspend": { en: "suspend", ko: "정지" },

@@ -6,6 +6,7 @@ import { errorText, isRecord, type Refusal } from "./answer.ts";
 export const METHODS_PATH = "/auth/methods";
 export const PASSWORD_LOGIN_PATH = "/auth/password/login";
 export const SSO_LOGIN_PATH = "/auth/login";
+export const RESET_REQUEST_PATH = "/auth/password/reset-request";
 const MAX_NEXT = 512;
 
 /** Which sign-ins `/auth/methods` says this manager offers. Anything unreadable offers nothing. */
@@ -99,4 +100,26 @@ export function nextStep(step: LoginStep, answer: LoginAnswer): LoginStep {
 
 export function loginBody(username: string, password: string, otp: string | null): string {
   return JSON.stringify({ username, password, ...(otp !== null ? { otp } : {}) });
+}
+
+/** `POST /auth/password/reset-request` takes a username or an email address as `login`. */
+export function resetRequestBody(login: string): string {
+  return JSON.stringify({ login: login.trim() });
+}
+
+/**
+ * What the "forgot your password" form shows after asking. The server answers 202 whether or not
+ * the account exists or mail is configured, so every 202 shows the one confirmation; a refusal is
+ * about this request (the address's limit, the page, the body), never about the account.
+ */
+export type ResetRequestAnswer = { kind: "sent"; minutes: number | null } | { kind: "refused"; refusal: Refusal };
+
+/** `minutes` is the link lifetime the server states (`linkExpiresInMinutes`), or null when it states none. */
+export function readResetRequest(status: number, body: unknown): ResetRequestAnswer {
+  if (status === 202) {
+    const m = isRecord(body) ? body.linkExpiresInMinutes : undefined;
+    return { kind: "sent", minutes: typeof m === "number" && Number.isInteger(m) && m > 0 ? m : null };
+  }
+  const key: MessageKey = status === 429 ? "m.loginTooMany" : status === 400 ? "m.loginBadInput" : status >= 500 ? "m.loginUnavailable" : "m.mbFailed";
+  return { kind: "refused", refusal: { key, detail: errorText(body), problems: [] } };
 }

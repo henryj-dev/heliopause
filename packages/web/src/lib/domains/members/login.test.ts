@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { afterSignIn, loginBody, nextStep, readLogin, readMethods, safeNext, ssoHref } from "./login.ts";
+import {
+  afterSignIn, loginBody, nextStep, readLogin, readMethods, readResetRequest, RESET_REQUEST_PATH, resetRequestBody, safeNext, ssoHref,
+} from "./login.ts";
 
 describe("which sign-ins the page offers", () => {
   it("reads only booleans that are true, and offers nothing for an unreadable answer", () => {
@@ -82,5 +84,38 @@ describe("where a sign-in goes next", () => {
   it("carries a safe next to SSO and drops an unsafe one", () => {
     assert.equal(ssoHref("/app/fleet", "/app"), "/auth/login?next=%2Fapp%2Ffleet");
     assert.equal(ssoHref("//evil.example", "/app"), "/auth/login");
+  });
+});
+
+describe("the forgot-password form", () => {
+  it("posts the trimmed login to the reset-request route", () => {
+    assert.equal(RESET_REQUEST_PATH, "/auth/password/reset-request");
+    assert.equal(resetRequestBody("  rita@example.com "), JSON.stringify({ login: "rita@example.com" }));
+  });
+
+  it("shows the one confirmation for every 202, whatever the body says", () => {
+    for (const body of [{ ok: true }, { ok: false, error: "x" }, null, "text"]) {
+      assert.deepEqual(readResetRequest(202, body), { kind: "sent", minutes: null });
+    }
+  });
+
+  it("takes the link lifetime from the server's answer, and only a positive whole number", () => {
+    assert.deepEqual(readResetRequest(202, { ok: true, linkExpiresInMinutes: 30 }), { kind: "sent", minutes: 30 });
+    assert.deepEqual(readResetRequest(202, { ok: true, linkExpiresInMinutes: 45 }), { kind: "sent", minutes: 45 });
+    for (const m of ["30", 0, -5, 1.5, null]) {
+      assert.deepEqual(readResetRequest(202, { linkExpiresInMinutes: m }), { kind: "sent", minutes: null });
+    }
+  });
+
+  it("maps a refusal by status, never to the confirmation", () => {
+    const key = (status: number) => {
+      const a = readResetRequest(status, { error: "server words" });
+      return a.kind === "refused" ? [a.refusal.key, a.refusal.detail] : [a.kind, ""];
+    };
+    assert.deepEqual(key(429), ["m.loginTooMany", "server words"]);
+    assert.deepEqual(key(400), ["m.loginBadInput", "server words"]);
+    assert.deepEqual(key(503), ["m.loginUnavailable", "server words"]);
+    assert.deepEqual(key(403), ["m.mbFailed", "server words"]);
+    assert.deepEqual(key(200), ["m.mbFailed", "server words"]);
   });
 });

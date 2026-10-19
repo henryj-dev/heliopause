@@ -8,13 +8,16 @@
  *
  * Bodies are JSON, every field is type- and length-checked before any hashing, and a write is a
  * `withMemberTransaction` with a short lock wait. Sessions stay in the manager's one `SessionStore`.
+ *
+ * With `mail` configured, a self-service reset request and an admin's invitation are mailed through
+ * `mail.ts`; without it, neither sends anything and the invite link is only in the admin's answer.
  */
-import { createHash } from "node:crypto";
+import { createHash, randomInt } from "node:crypto";
 import { isIPv6 } from "node:net";
 import { statSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import {
-  activeMember, bindCertCN, confirmOtp, consumeToken, createMember, deleteMember, findByEmail, findByUsername,
+  activeMember, bindCertCN, confirmOtp, consumeToken, createMember, DEFAULT_TOKEN_TTL_SEC, deleteMember, findByEmail, findByUsername,
   issueToken, loadMemberDocument, MemberError, normalizeMemberName, passwordCredential, peekToken,
   recordAudit, setOtpUserId, setPassword, setRoles, suspendMember, trimLoginAudit, unbindCertCN, unsuspendMember,
   withMemberTransaction, type Member, type MemberDocument,
@@ -23,6 +26,7 @@ import {
   checkPasswordPolicy, dummyVerify, hashPassword, PasswordBusyError, verifyPassword,
 } from "./password.ts";
 import { statusFor, verifyOtp } from "./otp.ts";
+import { MailError, sendMail, type MailConfig, type MailMessage } from "./mail.ts";
 import {
   checkCsrf, clearCookieHeader, cookieHeader, COOKIE, CSRF_HEADER, readCookie, type Principal, type Session, type SessionStore,
 } from "./session.ts";
@@ -63,6 +67,84 @@ const MAX_BODY_BYTES = 16 * 1024;
  */
 export const PASSWORD_BODY_MAX_BYTES = 64 * 1024;
 const INVALID_LOGIN = "invalid username or password";
+/** Reset mails one member may be sent per window, whoever asks; requests past it still answer 202. */
+export const RESET_MAILS_PER_MEMBER = 3;
+const RESET_MAIL_WINDOW_MS = 60 * 60_000;
+/**
+ * Reset requests one source may make per hour that can lead to mail. Past it the answer is still the
+ * same 202 and nothing is looked up: a 429 keyed on the source alone would reveal nothing about an
+ * account either, but one answer for everything leaves nothing to compare. The 10-a-minute limit
+ * shared with the other anonymous routes still answers 429 before this.
+ * @see member-mail-server.test.ts "a fourth request from one source in an hour sends nothing, still 202"
+ */
+export const RESET_REQUESTS_PER_SOURCE = 3;
+/**
+ * The one answer `POST /auth/password/reset-request` gives to every well-formed request it lets
+ * through, whatever the account's state and whether mail is configured.
+ * @see member-mail-server.test.ts "answers every reset request with the same 202"
+ */
+const resetMinutes = DEFAULT_TOKEN_TTL_SEC["password-reset"] / 60;
+export const RESET_REQUESTED = {
+  ok: true, note: "if this account can receive a reset link, one has been sent to its verified address",
+  // The console's confirmation states the link's lifetime from here, so the number lives in one place.
+  linkExpiresInMinutes: resetMinutes,
+} as const;
+/** Upper bound of the random wait before a reset request's lookup, in milliseconds. */
+const RESET_JITTER_MAX_MS = 2000;
+const inviteHours = DEFAULT_TOKEN_TTL_SEC.invite / 3600;
+
+/** Plain text, Korean first, then English. No HTML, no tracking. */
+export function resetMail(to: string, link: string): MailMessage {
+  return {
+    to,
+    subject: "heliopause 비밀번호 재설정 / password reset",
+    text: [
+      "heliopause 계정의 비밀번호 재설정을 요청받았습니다.",
+      `아래 링크에서 새 비밀번호를 정하십시오. 링크는 ${resetMinutes}분 뒤 만료되고 한 번만 쓸 수 있습니다.`,
+      "",
+      link,
+      "",
+      "요청하지 않았다면 이 메일을 무시하십시오. 비밀번호는 바뀌지 않습니다.",
+      "",
+      "---",
+      "",
+      "A password reset was requested for your heliopause account.",
+      `Set a new password at the link below. It expires in ${resetMinutes} minutes and works once.`,
+      "",
+      link,
+      "",
+      "If you did not ask for this, ignore this mail. Your password stays as it is.",
+      "",
+    ].join("\n"),
+  };
+}
+export function inviteMail(to: string, link: string): MailMessage {
+  return {
+    to,
+    subject: "heliopause 초대 / invitation",
+    text: [
+      "heliopause 매니저 콘솔에 초대받았습니다.",
+      `아래 링크에서 사용자 이름과 비밀번호를 정하십시오. 링크는 ${inviteHours}시간 뒤 만료되고 한 번만 쓸 수 있습니다.`,
+      "",
+      link,
+      "",
+      "초대받을 일이 없다면 이 메일을 무시하십시오.",
+      "",
+      "---",
+      "",
+      "You have been invited to the heliopause manager console.",
+      `Choose a username and password at the link below. It expires in ${inviteHours} hours and works once.`,
+      "",
+      link,
+      "",
+      "If you did not expect this, ignore this mail.",
+      "",
+    ].join("\n"),
+  };
+}
+/** What a failed send is logged and answered as: the step and reply code, never the server's text. */
+const mailFailure = (e: unknown): { step: string; code: number } =>
+  e instanceof MailError ? { step: e.step, code: e.code } : { step: "unknown", code: 0 };
 
 type Hits = Map<string, { windowStartedAt: number; count: number }>;
 
@@ -87,6 +169,10 @@ export interface MemberAuthDeps {
   rateLimited: (seen: Hits, key: string, nowMs: number, limit: number, windowMs: number, maxKeys: number) => boolean;
   /** The address a per-source limit counts. Defaults to `normalizeSource(req.socket.remoteAddress)`; a test seam. */
   sourceOf?: (req: IncomingMessage) => string;
+  /** The wait before a reset request's lookup. Defaults to a random 0..2000 ms; a test seam. */
+  resetDelayMs?: () => number;
+  /** SMTP relay for reset and invite mail. Absent or null: nothing is mailed. */
+  mail?: MailConfig | null;
   /** The manager's `requireOtp`; for a password principal it checks `otpUserId`. */
   requireOtp: (p: Principal, body: { otp?: unknown }, res: ServerResponse, path: string) => Promise<"ok" | "answered">;
 }
@@ -239,6 +325,9 @@ export function createMemberAuth(deps: MemberAuthDeps) {
 
   const loginHits: Hits = new Map();
   const tokenHits: Hits = new Map();
+  const resetRequestHits: Hits = new Map();
+  const resetMailHits: Hits = new Map();
+  const resetSourceHits: Hits = new Map();
   const failures = new Map<string, { count: number; until: number; last: number }>();
   const meFailures: Hits = new Map();
 
@@ -533,6 +622,89 @@ export function createMemberAuth(deps: MemberAuthDeps) {
   }
 
   /**
+   * `POST /auth/password/reset-request {login}`, a username or an email address. The 202 is written
+   * before the store is looked at, so its body and its own timing do not depend on the account; the
+   * lookup, token write and mail that follow still run on this process. They start after a random
+   * wait of up to 2 s, which spreads that work out in time; it does not remove the signal.
+   * @see member-mail-server.test.ts "answers every reset request with the same 202"
+   */
+  async function requestReset(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const body = await readJson(req);
+    fields(body, ["login"]);
+    const login = str(body, "login", 254);
+    const from = source(req);
+    reply(res, 202, RESET_REQUESTED);
+    if (deps.rateLimited(resetSourceHits, from, deps.now().getTime(), RESET_REQUESTS_PER_SOURCE, RESET_MAIL_WINDOW_MS, MEMBER_AUTH_RATE_SOURCES)) {
+      log(`reset request from ${from} not handled: per-source hourly limit`, `${from}의 재설정 요청 처리 안 함: 출처당 시간당 상한`);
+      return;
+    }
+    setTimeout(() => {
+      mailReset(login, from).catch((e: unknown) => {
+        log(`reset request not handled: ${(e as Error).message}`, `재설정 요청 처리 안 됨: ${(e as Error).message}`);
+      });
+    }, (deps.resetDelayMs ?? (() => randomInt(0, RESET_JITTER_MAX_MS + 1)))());
+  }
+
+  /**
+   * Mail a reset link to an active member with a verified address and a password. A send that fails
+   * withdraws the token it carried, so a link that may or may not have arrived never stays usable.
+   * @see member-mail-server.test.ts "a failed send withdraws its token and rejects nothing unhandled"
+   */
+  const linkOutstanding = (d: MemberDocument, memberId: string): boolean => d.tokens.some((t) =>
+    t.kind === "password-reset" && t.memberId === memberId && t.usedAt === null && Date.parse(t.expiresAt) > deps.now().getTime());
+
+  async function mailReset(login: string, from: string): Promise<void> {
+    const mail = deps.mail;
+    if (!mail) return;
+    const document = current();
+    const found = login.includes("@") ? findByEmail(document, login) : findByUsername(document, login);
+    if (!found) return;
+    const ctx = { actor: "system", sourceIp: from, now: deps.now() };
+    const issued = write((d) => {
+      // Every condition is read under the lock, where the token is written.
+      const live = activeMember(d, found.id);
+      if (!live || live.email === null || live.emailVerifiedAt === null) return null;
+      // A member without a password (SSO only) does not gain one through mail.
+      // @see member-mail-server.test.ts "an SSO-only member is not mailed a reset link"
+      if (!passwordCredential(d, live.id)) return null;
+      // An unexpired link already out (an admin's or an earlier request's) is left alone: an anonymous
+      // request never replaces it, so it cannot void a link an admin handed over.
+      // @see member-mail-server.test.ts "a request leaves an outstanding link alone, an admin's included"
+      if (linkOutstanding(d, live.id)) return null;
+      // Counted only for a token about to be issued, so requests made while a link is out do not use
+      // up the owner's hourly allowance.
+      // @see member-mail-server.test.ts "sends at most three reset mails an hour to one member"
+      // @see member-mail-server.test.ts "requests while a link is out do not use up the hourly allowance"
+      if (deps.rateLimited(resetMailHits, live.id, deps.now().getTime(), RESET_MAILS_PER_MEMBER, RESET_MAIL_WINDOW_MS, MEMBER_FAILURE_KEYS)) return "limited" as const;
+      return { ...issueToken(d, { kind: "password-reset", memberId: live.id }, ctx), to: live.email };
+    });
+    if (issued === "limited") {
+      log(`reset mail for member ${found.id} not sent: hourly limit`, `회원 ${found.id} 재설정 메일 보내지 않음: 시간당 상한`);
+      return;
+    }
+    if (!issued) return;
+    try {
+      await sendMail(mail, resetMail(issued.to, linkTo("reset", issued.token)));
+    } catch (e) {
+      const { step, code } = mailFailure(e);
+      let withdrawn = "withdrawn";
+      try {
+        write((d) => {
+          const before = d.tokens.length;
+          d.tokens = d.tokens.filter((t) => t.id !== issued.row.id || t.usedAt !== null);
+          if (d.tokens.length !== before) recordAudit(d, { ...ctx, now: deps.now() }, "token.withdraw.password-reset", issued.row.id);
+        });
+      } catch (w) {
+        withdrawn = `NOT withdrawn (${(w as Error).message})`;
+      }
+      log(`reset mail for member ${found.id} failed at ${step} (${code}); its link was ${withdrawn}`,
+        `회원 ${found.id} 재설정 메일 실패: ${step} (${code}); 링크 ${withdrawn === "withdrawn" ? "무효화함" : `무효화 못 함: ${withdrawn}`}`);
+      return;
+    }
+    log(`reset mail sent for member ${found.id}`, `회원 ${found.id} 재설정 메일 보냄`);
+  }
+
+  /**
    * `POST /auth/logout` for a member password session: it needs its CSRF token to end, and works
    * whether or not OIDC is configured. False for any other session, which the OIDC handler ends.
    * @see member-auth-server.test.ts "logout of a member session needs the CSRF token"
@@ -558,12 +730,13 @@ export function createMemberAuth(deps: MemberAuthDeps) {
     return true;
   }
 
-  /** `/auth/password/login`, `/auth/password/reset`, `/auth/invite/accept`, and a password session's `/auth/logout`. False for any other path. */
+  /** `/auth/password/{login,reset,reset-request}`, `/auth/invite/accept`, and a password session's `/auth/logout`. False for any other path. */
   async function handleAuthRoute(url: URL, req: IncomingMessage, res: ServerResponse): Promise<boolean> {
     if (req.method === "POST" && url.pathname === "/auth/logout") return logout(req, res);
     const route = req.method === "POST" ? ({
       "/auth/password/login": { run: login, hits: loginHits },
       "/auth/password/reset": { run: resetPassword, hits: tokenHits },
+      "/auth/password/reset-request": { run: requestReset, hits: resetRequestHits },
       "/auth/invite/accept": { run: acceptInvite, hits: tokenHits },
     } as const)[url.pathname as "/auth/password/login"] : undefined;
     if (!route) return false;
@@ -681,7 +854,23 @@ export function createMemberAuth(deps: MemberAuthDeps) {
         return issueToken(d, { kind: "invite", email, roles }, { actor, sourceIp: source(req), now: deps.now() });
       });
       log(`invitation ${issued.row.id} issued by ${principal.name}`, `${principal.name}이(가) 초대 ${issued.row.id} 발급`);
-      return reply(res, 201, { id: issued.row.id, expiresAt: issued.row.expiresAt, inviteUrl: linkTo("invite", issued.token) });
+      const inviteUrl = linkTo("invite", issued.token);
+      // A failed send leaves the invitation valid: unlike a reset, the admin holds the link from this
+      // answer and can hand it over. So the answer always carries it, and says whether mail went.
+      // @see member-mail-server.test.ts "an invitation whose mail fails keeps a working link"
+      let mailed = false;
+      let mailError: string | undefined;
+      if (deps.mail) {
+        try {
+          await sendMail(deps.mail, inviteMail(issued.row.email!, inviteUrl));
+          mailed = true;
+        } catch (e) {
+          const { step, code } = mailFailure(e);
+          mailError = step;
+          log(`invitation ${issued.row.id}: mail failed at ${step} (${code})`, `초대 ${issued.row.id}: 메일 실패 ${step} (${code})`);
+        }
+      }
+      return reply(res, 201, { id: issued.row.id, expiresAt: issued.row.expiresAt, inviteUrl, mailed, ...(mailError ? { mailError } : {}) });
     }
     const m = /^\/api\/members\/([0-9a-f-]{36})\/(roles|suspend|unsuspend|delete|otp-user|cert-cns|password-reset)$/.exec(url.pathname);
     if (!m) return reply(res, 404, { error: `no such route ${url.pathname}` });

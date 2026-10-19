@@ -3,7 +3,7 @@ import { describe, it } from "node:test";
 import { readAdminWrite, readInviteAccept, readPasswordChange, readReset, repeatProblem } from "./answer.ts";
 import { readMe, readSessions, sessionPath } from "./account.ts";
 import {
-  actionsFor, certCnBody, inviteBody, memberPath, otpUserBody, planRequest, readLink, readMembers, rolesBody,
+  actionsFor, certCnBody, inviteBody, inviteMailNote, memberPath, otpUserBody, planRequest, readLink, readMembers, rolesBody,
 } from "./members.ts";
 import { readFragmentToken, resetBody, withoutFragment } from "./token.ts";
 import { CSRF_HEADER, writeHeaders } from "./write.ts";
@@ -138,5 +138,18 @@ describe("token pages", () => {
     assert.equal(r.kind === "refused" && r.refusal.key, "m.mbResetOtpUnconfirmed");
     const c = readReset(409, {}, true);
     assert.equal(c.kind === "refused" && c.refusal.key, "m.mbResetChanged");
+  });
+});
+
+describe("the invitation's mail note", () => {
+  it("says mailed, failed at a step, or no mail set up", () => {
+    const at = "2026-10-22T00:00:00.000Z";
+    assert.deepEqual(inviteMailNote({ expiresAt: at, mailed: true }), { key: "m.mmInviteMailed", params: { at } });
+    assert.deepEqual(inviteMailNote({ expiresAt: at, mailed: false, mailError: "rcpt-to" }), { key: "m.mmInviteMailFailed", params: { at, step: "rcpt-to" } });
+    assert.deepEqual(inviteMailNote({ expiresAt: at, mailed: false }), { key: "m.mmInviteNoMail", params: { at } });
+    // Refused at the end of the data: delivery cannot be confirmed either way.
+    assert.deepEqual(inviteMailNote({ expiresAt: at, mailed: false, mailError: "data-end" }), { key: "m.mmInviteMailUnknown", params: { at } });
+    assert.deepEqual(inviteMailNote({ mailed: "true" }), { key: "m.mmInviteNoMail", params: { at: "" } });
+    assert.deepEqual(inviteMailNote(null), { key: "m.mmInviteNoMail", params: { at: "" } });
   });
 });

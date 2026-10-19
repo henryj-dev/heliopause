@@ -117,6 +117,19 @@ export function readLink(body: unknown, field: "inviteUrl" | "resetUrl"): string
   return typeof v === "string" && v.startsWith("https://") ? v : null;
 }
 
+/**
+ * The note shown beside an invitation link: whether the server mailed it. `mailed` is true only when
+ * the relay accepted the mail; `mailError` names the step that failed; neither means no mail is set up.
+ */
+export function inviteMailNote(body: unknown): { key: MessageKey; params: Record<string, string> } {
+  const at = isRecord(body) && typeof body.expiresAt === "string" ? body.expiresAt : "";
+  if (isRecord(body) && body.mailed === true) return { key: "m.mmInviteMailed", params: { at } };
+  // Refused at the end of the data, the relay may still have delivered it; the answer cannot say.
+  if (isRecord(body) && body.mailError === "data-end") return { key: "m.mmInviteMailUnknown", params: { at } };
+  if (isRecord(body) && typeof body.mailError === "string") return { key: "m.mmInviteMailFailed", params: { at, step: body.mailError } };
+  return { key: "m.mmInviteNoMail", params: { at } };
+}
+
 /** One panel request as the screen sends it: where, with what body, and how the code dialog names it. */
 export interface WritePlan {
   path: string;
