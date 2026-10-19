@@ -323,3 +323,19 @@ export {
   type Plan,
   type PlanSummary,
 } from "./approval.ts";
+
+export {
+  validateNetworkInventory,
+  type NetworkManagement,
+  type NetworkResource,
+  type NetworkInventoryResource,
+  type NetworkInventoryIssue,
+  type InventorySite,
+  type InventoryNode,
+  type InventoryGateway,
+  type InventoryNetwork,
+  type InventorySubnet,
+  type InventoryAddressPool,
+  type InventoryInterface,
+  type InventoryRoute,
+} from "./network-inventory.ts";
