@@ -15,12 +15,12 @@ export interface WhoView {
   /** True when this manager verifies a second factor. Missing is ask, not skip. */
   needsOtp: boolean;
   /** How the caller signed in. `null` when an older manager does not say. */
-  via: "certificate" | "oidc" | "password" | null;
-  /** Member administration. Only a member password session that passed its sign-in code is one. */
+  via: "certificate" | "oidc" | "password" | "sso" | null;
+  /** Member administration. Only a member session (password or SSO) that passed its sign-in code is one. */
   isAdmin: boolean;
 }
 
-const VIAS = ["certificate", "oidc", "password"] as const;
+const VIAS = ["certificate", "oidc", "password", "sso"] as const;
 
 export type WhoRead =
   | { ok: true; view: WhoView }

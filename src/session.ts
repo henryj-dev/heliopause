@@ -66,14 +66,27 @@ export interface Principal {
   sub: string;
   /** Group and role claims as they arrived. Authorisation reads these; nothing else does. */
   groups: readonly string[];
-  /** How this identity was proved. Recorded so a log line can say which door was used. */
-  via: "certificate" | "oidc" | "password";
   /**
-   * For `via: "password"`: the member this session belongs to. The manager re-reads the member from
-   * the store on every request and rebuilds `name`, `canWrite` and the fields below from it.
+   * How this identity was proved. Recorded so a log line can say which door was used.
+   *
+   * `password` and `sso` are both member sessions (`isMemberSession`): `sso` is a member who signed
+   * in through an identity linked to their record. Their authority is the member record, never the
+   * IdP's groups, which is why `sso` is its own value: every `via === "oidc"` path (group authority,
+   * the subject as KeyStone user, role-change events) must not apply to a member.
+   */
+  via: "certificate" | "oidc" | "password" | "sso";
+  /**
+   * For a member session: the member this session belongs to. The manager re-reads the member from
+   * the store on every request and rebuilds `name`, `canWrite` and the fields below from it. For a
+   * certificate: the member its CN is bound to, if any.
    */
   memberId?: string;
-  /** For `via: "password"`: a one-time code was verified when this session was created. */
+  /** For `via: "sso"`: the linked identity that signed in. Unlinking it ends the session. */
+  ssoIssuer?: string;
+  ssoSubject?: string;
+  /** For a member session, per request: the member may approve their own plan (see `maySoloApprove`). */
+  soloApprove?: boolean;
+  /** For a member session: a one-time code was verified when this session was created. */
   loginMfa?: boolean;
   /** For `via: "password"`: the credential's `changedAt` this session was issued against. Another value ends it. */
   credentialChangedAt?: string;
@@ -81,9 +94,9 @@ export interface Principal {
   mustChange?: boolean;
   /** For `via: "password"`, per request: the member holds the admin role (and `loginMfa` is true). */
   isAdmin?: boolean;
-  /** For `via: "password"`, per request: the KeyStone user id `requireOtp` checks codes against. */
+  /** For a member session or a bound certificate, per request: the KeyStone user id `requireOtp` checks codes against. */
   otpUserId?: string | null;
-  /** For `via: "password"`, per request: `otpUserId` has been confirmed by a sign-in code. */
+  /** For a member session or a bound certificate, per request: `otpUserId` has been confirmed by a sign-in code. */
   otpConfirmed?: boolean;
   /**
    * Whether this principal may propose, approve and publish.
@@ -97,6 +110,9 @@ export interface Principal {
    */
   canWrite: boolean;
 }
+
+/** A member's session, signed in by password or by a linked SSO identity. */
+export const isMemberSession = (p: Principal): boolean => p.via === "password" || p.via === "sso";
 
 export interface Session {
   id: string;
@@ -113,7 +129,7 @@ export interface Session {
 export interface SessionLimits {
   /** Absolute lifetime. A session does not extend past this however active it is. */
   ttlSec: number;
-  /** Ceiling on concurrent sessions per kind (password; everything else), so a login loop cannot grow this map without bound. */
+  /** Ceiling on concurrent sessions per kind (member; everything else), so a login loop cannot grow this map without bound. */
   max: number;
 }
 
@@ -155,7 +171,7 @@ export class SessionStore {
         .sort((a, b) => +a.createdAt - +b.createdAt);
       while (own.length >= options.perMemberMax) this.sessions.delete(own.shift()!.id);
     }
-    // Password sessions and the rest have a cap each, so one kind cannot push the other out.
+    // Member sessions (password or SSO) and the rest have a cap each, so one kind cannot push the other out.
     // @see member-auth-server.test.ts "password sign-ins cannot evict an OIDC session"
     const pool = [...this.sessions.values()].filter((x) => poolOf(x.principal) === poolOf(principal));
     if (pool.length >= this.limits.max) {
@@ -266,6 +282,20 @@ export class SessionStore {
     return { updated, ended };
   }
 
+  /**
+   * End every member SSO session signed in through this identity. For the IdP's back-channel logout:
+   * a member's password sessions are not the IdP's to end.
+   */
+  endIdentity(issuer: string, subject: string): number {
+    let ended = 0;
+    for (const [id, s] of this.sessions) {
+      if (s.principal.via !== "sso" || s.principal.ssoIssuer !== issuer || s.principal.ssoSubject !== subject) continue;
+      this.sessions.delete(id);
+      ended++;
+    }
+    return ended;
+  }
+
   get size(): number {
     return this.sessions.size;
   }
@@ -287,7 +317,7 @@ export class SessionStore {
   }
 }
 
-const poolOf = (p: Principal): "password" | "other" => (p.via === "password" ? "password" : "other");
+const poolOf = (p: Principal): "member" | "other" => (isMemberSession(p) ? "member" : "other");
 
 function idleExpired(s: Session, t: Date): boolean {
   return s.idleSec !== undefined && s.lastSeenAt.getTime() + s.idleSec * 1000 <= t.getTime();

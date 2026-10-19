@@ -198,6 +198,7 @@
             <th>{t(prefs.lang, "m.mmStatus")}</th>
             <th>{t(prefs.lang, "m.mmOtp")}</th>
             <th>{t(prefs.lang, "m.mmCerts")}</th>
+            <th>{t(prefs.lang, "m.mmSso")}</th>
             <th></th>
           </tr>
         </thead>
@@ -207,7 +208,10 @@
               <td><code>{member.username}</code>{#if member.principalName === view?.you} <span class="chip">{t(prefs.lang, "m.mmYou")}</span>{/if}</td>
               <td>{member.principalName}</td>
               <td>{member.email ?? ""}</td>
-              <td>{member.roles.join(", ")}</td>
+              <td>
+                {member.roles.join(", ")}
+                {#if member.soloApprove}<span class="chip">{t(prefs.lang, "m.mmSolo")}</span>{/if}
+              </td>
               <td>
                 {STATUS_KEY[member.status] ? t(prefs.lang, STATUS_KEY[member.status]!) : member.status}
                 {#if member.mustChange}<span class="chip warn">{t(prefs.lang, "m.mmMustChange")}</span>{/if}
@@ -220,6 +224,11 @@
               </td>
               <td>{member.certCNs.join(", ")}</td>
               <td>
+                {#each member.identities as identity (identity.id)}
+                  <div><code>{identity.issuer}</code> <code>{identity.subject}</code></div>
+                {/each}
+              </td>
+              <td>
                 {#if member.status !== "deleted"}
                   <button type="button" onclick={() => (open = open === member.id ? null : member.id)}>
                     {t(prefs.lang, open === member.id ? "m.mmClose" : "m.mmManage")}
@@ -229,7 +238,7 @@
             </tr>
             {#if open === member.id}
               <tr>
-                <td colspan="8">
+                <td colspan="9">
                   {#key member}
                     <MemberPanel {member} {busy} onrequest={(r) => void request(member, r)} />
                   {/key}

@@ -17,13 +17,22 @@
     readResetRequest,
     RESET_REQUEST_PATH,
     resetRequestBody,
+    readSsoOtp,
+    readSsoParam,
+    SSO_NOTICE,
+    SSO_OTP_PATH,
     ssoHref,
+    ssoOtpBody,
     type LoginStep,
     type Methods,
   } from "./login";
 
   const prefs = chromePrefs();
   const next = $derived(page.url.searchParams.get("next"));
+  // `otp`: the SSO callback is waiting for a writer's or admin's code. `unlinked`/`refused`: it would not sign them in.
+  const ssoParam = $derived(readSsoParam(page.url.searchParams.get("sso")));
+  let ssoCode = $state("");
+  let ssoSpent = $state(false);
 
   let methods = $state<Methods | null>(null);
   let methodsFailed = $state(false);
@@ -49,8 +58,9 @@
       methods = { password: false, sso: false };
       methodsFailed = true;
     }
-    // SSO is the only way in: this page has nothing to ask, so go on to the IdP.
-    if (methods.sso && !methods.password) location.replace(ssoHref(next, base));
+    // SSO is the only way in: this page has nothing to ask, so go on to the IdP — unless the IdP
+    // just sent the browser back here with something to finish or to say.
+    if (methods.sso && !methods.password && ssoParam === null) location.replace(ssoHref(next, base));
   });
 
   async function submit(): Promise<void> {
@@ -82,6 +92,33 @@
     } catch (e) {
       refusal = { key: "m.mbFailed", detail: e instanceof Error ? e.message : String(e), problems: [] };
     } finally {
+      busy = false;
+    }
+  }
+
+  /** The writer's or admin's code after SSO. The server spends the pending sign-in on any attempt. */
+  async function submitSsoCode(): Promise<void> {
+    if (busy) return;
+    busy = true;
+    refusal = null;
+    try {
+      const res = await fetch(SSO_OTP_PATH, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json" },
+        body: ssoOtpBody(ssoCode),
+      });
+      const answer = readSsoOtp(res.status, await res.json().catch(() => null));
+      if (answer.kind === "signedIn") {
+        location.assign(afterSignIn(false, answer.next ?? next, base));
+        return;
+      }
+      refusal = answer.refusal;
+      ssoSpent = true;
+    } catch (e) {
+      refusal = { key: "m.mbFailed", detail: e instanceof Error ? e.message : String(e), problems: [] };
+    } finally {
+      ssoCode = "";
       busy = false;
     }
   }
@@ -129,7 +166,34 @@
 
 <h2>{t(prefs.lang, "m.loginHeading")}</h2>
 
-{#if methods === null}
+{#if ssoParam === "unlinked" || ssoParam === "refused"}
+  <div class="banner warn"><div class="lead">{t(prefs.lang, SSO_NOTICE[ssoParam])}</div></div>
+{/if}
+
+{#if ssoParam === "otp"}
+  {#if refusal}
+    <RefusalNote {refusal} />
+  {/if}
+  {#if ssoSpent}
+    <p><a href={ssoHref(next, base)}>{t(prefs.lang, "m.loginSso")}</a></p>
+  {:else}
+    <p class="dim">{t(prefs.lang, "m.loginSsoOtpNote")}</p>
+    <form
+      class="stack"
+      onsubmit={(e) => {
+        e.preventDefault();
+        void submitSsoCode();
+      }}
+    >
+      <label>
+        {t(prefs.lang, "m.otpCode")}
+        <!-- svelte-ignore a11y_autofocus -->
+        <input class="otp" name="otp" inputmode="numeric" autocomplete="one-time-code" spellcheck="false" bind:value={ssoCode} required autofocus>
+      </label>
+      <p class="act"><button type="submit" disabled={busy}>{t(prefs.lang, "m.loginSubmit")}</button></p>
+    </form>
+  {/if}
+{:else if methods === null}
   <p class="dim">{t(prefs.lang, "m.loginReading")}</p>
 {:else if methods.sso && !methods.password}
   <p class="dim">{t(prefs.lang, "m.loginToSso")}</p>

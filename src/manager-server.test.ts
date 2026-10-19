@@ -2618,6 +2618,7 @@ describe("the data routes answer under /api/ as well", () => {
       "/auth/callback": "the identity provider redirects the browser here",
       "/auth/logout": "a browser navigation",
       "/auth/methods": "read by the sign-in page before anyone is signed in; names no account",
+      "/auth/link/start": "the account page starts an SSO login here; its answer is a browser navigation to the IdP",
       "/auth/backchannel-logout": "the identity provider posts here; not a caller of ours",
       // Found by this test, not by the hand-written list above it — which is the argument for
       // having it. The IdP posts a signed Security Event Token here and the signature is the

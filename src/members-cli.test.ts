@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { after, describe, it } from "node:test";
-import { confirmOtp, createMember, deleteMember, loadMemberDocument, withMemberTransaction } from "./member-store.ts";
+import { confirmOtp, createMember, deleteMember, identityHandle, linkIdentity, loadMemberDocument, withMemberTransaction } from "./member-store.ts";
 import { verifyPassword } from "./password.ts";
 
 const cli = resolve(import.meta.dirname, "../bin/heliopause-members.ts");
@@ -51,6 +51,50 @@ describe("heliopause-members CLI", () => {
     const reset = run(["reset-password", "--store", store, "--username", "henry"], "Another long passphrase\n");
     assert.equal(reset.status, 0, reset.stderr);
     assert.equal(loadMemberDocument(store).credentials[0]!.mustChange, true);
+  });
+
+  it("solo-approve turns a member's solo approval on and off, and refuses any other value", () => {
+    const store = freshStore();
+    assert.equal(run(["create-admin", "--store", store, "--username", "solo", "--email", "solo@example.com"], `${PASSWORD}\n`).status, 0);
+    const on = run(["solo-approve", "--store", store, "--username", "solo", "--value", "on"]);
+    assert.equal(on.status, 0, on.stderr);
+    assert.equal(loadMemberDocument(store).members[0]!.soloApprove, true);
+    assert.ok(loadMemberDocument(store).audit.some((a) => a.action === "member.solo-approve.on" && a.actor === "cli"));
+    assert.equal(run(["solo-approve", "--store", store, "--username", "solo", "--value", "yes"]).status, 64);
+    assert.equal(run(["solo-approve", "--store", store, "--username", "solo", "--value", "off"]).status, 0);
+    assert.equal(loadMemberDocument(store).members[0]!.soloApprove, false);
+  });
+
+  it("unlink-identity removes one linked identity, and refuses the last way in and a tombstone", () => {
+    const store = freshStore();
+    assert.equal(run(["create-admin", "--store", store, "--username", "keep", "--email", "keep@example.com"], `${PASSWORD}\n`).status, 0);
+    const iss = "https://idp.example.test";
+    const [pw, sso, gone] = withMemberTransaction(store, (d) => {
+      const pw = createMember(d, { username: "twoids", status: "active", roles: ["reader"] }, { actor: "cli" });
+      const sso = createMember(d, { username: "ssoonly", status: "active", roles: ["reader"] }, { actor: "cli" });
+      const gone = createMember(d, { username: "gone", status: "active", roles: ["reader"] }, { actor: "cli" });
+      linkIdentity(d, { memberId: pw.id, issuer: iss, subject: "s-pw" }, { actor: "cli" });
+      linkIdentity(d, { memberId: sso.id, issuer: iss, subject: "s-sso" }, { actor: "cli" });
+      linkIdentity(d, { memberId: gone.id, issuer: iss, subject: "s-gone" }, { actor: "cli" });
+      deleteMember(d, gone.id, { actor: "cli" });
+      return [pw, sso, gone];
+    });
+    // No member here has a password; a second identity is what makes the first not the last way in.
+    withMemberTransaction(store, (d) => linkIdentity(d, { memberId: pw.id, issuer: iss, subject: "s-pw-2" }, { actor: "cli" }));
+    const listed = JSON.parse(run(["list", "--store", store, "--json"]).stdout).members;
+    assert.deepEqual(listed.find((r: { username: string }) => r.username === "twoids").identities.map((i: { id: string }) => i.id).sort(),
+      [identityHandle({ issuer: iss, subject: "s-pw" }), identityHandle({ issuer: iss, subject: "s-pw-2" })].sort());
+    const ok = run(["unlink-identity", "--store", store, "--username", "twoids", "--handle", identityHandle({ issuer: iss, subject: "s-pw" })]);
+    assert.equal(ok.status, 0, ok.stderr);
+    assert.deepEqual(loadMemberDocument(store).identities.filter((i) => i.memberId === pw.id).map((i) => i.subject), ["s-pw-2"]);
+    const last = run(["unlink-identity", "--store", store, "--username", "ssoonly", "--handle", identityHandle({ issuer: iss, subject: "s-sso" })]);
+    assert.equal(last.status, 2);
+    assert.match(last.stderr, /last login method/);
+    const tomb = run(["unlink-identity", "--store", store, "--username", "gone", "--handle", identityHandle({ issuer: iss, subject: "s-gone" })]);
+    assert.equal(tomb.status, 2);
+    assert.match(tomb.stderr, /deleted/);
+    assert.equal(loadMemberDocument(store).identities.filter((i) => i.memberId === sso.id || i.memberId === gone.id).length, 2);
+    assert.equal(run(["unlink-identity", "--store", store, "--username", "twoids", "--handle", "0000000000000000"]).status, 2);
   });
 
   it("suspends and unsuspends an admin while another admin remains", () => {
