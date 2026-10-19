@@ -4,7 +4,9 @@ import { readBoundedStoreFile } from "../src/json-store.ts";
 import { compileWireGuard } from "../src/network-wireguard.ts";
 import { compileFrr } from "../src/network-frr.ts";
 import type { NetworkRegistryDocument } from "../src/network-registry.ts";
+import { installCliLanguage } from "../src/operator-i18n.ts";
 
+installCliLanguage();
 const [compiler, path, ...extra] = process.argv.slice(2);
 if (compiler === "--help") {
   console.log("Usage: node bin/heliopause-network-compile.ts wireguard|frr INPUT.json\nOffline incomplete templates only; INPUT includes registry, expectedRegistryRevision and spec. No apply or secret resolution.");

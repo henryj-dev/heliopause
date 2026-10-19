@@ -2,7 +2,9 @@
 /** Offline analysis only. This entry point has no publish/apply transport. */
 import { readBoundedStoreFile } from "../src/json-store.ts";
 import { buildNetworkPlan, type NetworkPlanInput } from "../src/network-planner.ts";
+import { installCliLanguage } from "../src/operator-i18n.ts";
 
+installCliLanguage();
 const args = process.argv.slice(2);
 if (args.length === 1 && (args[0] === "--help" || args[0] === "-h")) {
   console.log("Usage: node bin/heliopause-network-plan.ts INPUT.json\nOffline dry-run only. INPUT includes id, registry, expectedRegistryRevision, observations, bindings and explicit now (epoch milliseconds). Outputs a versioned plan; exit 2 means blocked.");
