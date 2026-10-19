@@ -365,3 +365,8 @@ export {
   type NetworkCollectorObservation,
   type CollectorStatus,
 } from "./network-observation.ts";
+
+export { matchNetworkInventory, type NetworkIdentityBinding, type NetworkMatchStatus, type NetworkMatch, type NetworkMatchEvidence, type NetworkMatchingInput, type NetworkMatchingResult } from "./network-matching.ts";
+export { buildNetworkPlan, type NetworkPlanInput, type NetworkPlan, type NetworkPlanBlocker, type NetworkDependency } from "./network-planner.ts";
+export { compileWireGuard, type WireGuardSpec, type WireGuardGatewaySpec, type WireGuardCompilation } from "./network-wireguard.ts";
+export { compileFrr, type FrrSpec, type FrrPeerSpec, type FrrCompilation } from "./network-frr.ts";
