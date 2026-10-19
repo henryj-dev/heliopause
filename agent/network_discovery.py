@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Opt-in, read-only Linux/WireGuard discovery. No heartbeat or configuration writer.
+"""Opt-in, read-only Linux/WireGuard discovery. No configuration writer.
 
 Only named fixed commands can cross the process boundary. Reports omit raw output,
-errors and unrecognized fields. This module is not installed by the agent package yet.
+errors and unrecognized fields. Importing this module never starts collection.
 """
 import base64
 from datetime import datetime, timezone
@@ -23,6 +23,12 @@ COMMANDS = {
     "routes6": ("ip", "-j", "-6", "route", "show", "table", "all"),
     "rules4": ("ip", "-j", "-4", "rule", "show"),
     "rules6": ("ip", "-j", "-6", "rule", "show"),
+    "frr-version": ("vtysh", "-c", "show version"),
+    "frr-daemons": ("vtysh", "-c", "show daemons"),
+    "frr-bgp-summary": ("vtysh", "-c", "show bgp summary json"),
+    "frr-routes4": ("vtysh", "-c", "show bgp ipv4 unicast json"),
+    "frr-routes6": ("vtysh", "-c", "show bgp ipv6 unicast json"),
+    "frr-bfd": ("vtysh", "-c", "show bfd peers json"),
     **{f"wg-{field}": ("wg", "show", "all", field) for field in (
         "public-key", "listen-port", "peers", "endpoints", "allowed-ips",
         "latest-handshakes", "transfer", "persistent-keepalive")},
@@ -162,7 +168,7 @@ class UnsupportedObservation(ValueError):
 
 def normalize_linux(name, raw):
     """Normalize known iproute2 JSON fields; unknown fields are never copied."""
-    if name not in COMMANDS or name.startswith("wg-"):
+    if name not in ("links", "addresses", "routes4", "routes6", "rules4", "rules6"):
         raise ValueError("unknown Linux collector")
     rows = json.loads(raw)
     if not isinstance(rows, list) or len(rows) > 10000:
@@ -282,16 +288,165 @@ def normalize_wireguard(field, raw):
     return result
 
 
-def collect_network_state():
-    """Explicit opt-in collection; importing this module performs no discovery."""
+# Contract checked against FRRouting tags frr-8.5.6 and frr-10.2.1, not a claim
+# of compatibility with every FRR release. Source URLs accompany the tests.
+_BGP_STATES = {"Idle", "Connect", "Active", "OpenSent", "OpenConfirm", "Established"}
+_DAEMONS = {"zebra", "bgpd", "bfdd", "ospfd", "ospf6d", "ripd", "ripngd", "isisd",
+            "pimd", "pim6d", "ldpd", "nhrpd", "eigrpd", "babeld", "sharpd", "staticd",
+            "pbrd", "vrrpd", "fabricd", "pathd", "mgmtd", "watchfrr"}
+
+
+def _frr_map(value):
+    if not isinstance(value, dict):
+        raise UnsupportedObservation("unsupported FRR object layout")
+    return value
+
+
+def _frr_rows(value):
+    if not isinstance(value, list) or len(value) > 10000:
+        raise UnsupportedObservation("unsupported FRR row layout")
+    return value
+
+
+def _boolean(value):
+    if type(value) is not bool:
+        raise ValueError("invalid FRR boolean")
+    return value
+
+
+def normalize_frr(name, raw):
+    """Project supported FRR replies onto a secret-free observation schema.
+
+    BGP bestpath is BGP's selection flag, never proof of kernel installation or
+    reachability. show version / show daemons have no JSON form in FRR 10.2.1.
+    Their deliberately narrow text grammars extract only release and client names.
+    """
+    if name not in {"frr-version", "frr-daemons", "frr-bgp-summary", "frr-routes4", "frr-routes6", "frr-bfd"}:
+        raise ValueError("unknown FRR collector")
+    text = raw.decode("utf-8", errors="strict") if isinstance(raw, bytes) else raw
+    if name == "frr-version":
+        first = text.splitlines()[0] if text.splitlines() else ""
+        match = re.match(r"^FRRouting ([0-9]+\.[0-9]+(?:\.[0-9]+)?(?:[-+_][A-Za-z0-9_.-]+)?) \(", first)
+        if not match or len(match[1]) > 64:
+            raise UnsupportedObservation("unsupported FRR version reply")
+        return [{"version": match[1]}]
+    if name == "frr-daemons":
+        names = text.split()
+        if len(names) > len(_DAEMONS) or len(set(names)) != len(names) or any(n not in _DAEMONS for n in names):
+            raise UnsupportedObservation("unsupported FRR daemon reply")
+        return [{"name": n, "state": "connected"} for n in names]
+    data = json.loads(text)
+    if name == "frr-bgp-summary":
+        root = _frr_map(data)
+        if any(k not in ("ipv4Unicast", "ipv6Unicast") for k in root):
+            raise UnsupportedObservation("unsupported FRR address family")
+        result = []
+        for key, group in root.items():
+            group = _frr_map(group)
+            if "as" not in group or "peers" not in group:
+                raise UnsupportedObservation("unsupported FRR summary layout")
+            peers = _frr_map(group["peers"])
+            if len(peers) > 10000:
+                raise ValueError("too many FRR peers")
+            for peer, info in peers.items():
+                info = _frr_map(info)
+                state = info.get("state")
+                if not isinstance(state, str) or state not in _BGP_STATES:
+                    raise UnsupportedObservation("unsupported BGP state")
+                row = {"addressFamily": "ipv4" if key == "ipv4Unicast" else "ipv6",
+                       "localAs": _integer(group["as"]), "peer": _ip(peer),
+                       "remoteAs": _integer(info["remoteAs"]), "state": state}
+                if "routerId" in group:
+                    row["routerId"] = _ip(group["routerId"])
+                    if ipaddress.ip_address(row["routerId"]).version != 4:
+                        raise ValueError("invalid router ID")
+                for field, output in (("pfxRcd", "prefixesReceived"), ("pfxSnt", "prefixesSent")):
+                    if field in info:
+                        row[output] = _integer(info[field])
+                result.append(row)
+        return result
+    if name in ("frr-routes4", "frr-routes6"):
+        root = _frr_map(data)
+        if "routes" not in root:
+            raise UnsupportedObservation("unsupported FRR RIB layout")
+        routes = _frr_map(root["routes"])
+        if len(routes) > 10000:
+            raise ValueError("too many FRR prefixes")
+        result = []
+        family = 4 if name == "frr-routes4" else 6
+        for prefix, paths in routes.items():
+            canonical = _prefix(prefix)
+            if ipaddress.ip_network(canonical).version != family:
+                raise ValueError("FRR route family mismatch")
+            for path in _frr_rows(paths):
+                path = _frr_map(path)
+                # FRR bgp_route.c emits true flags, omitting them for false.
+                row = {"addressFamily": "ipv4" if family == 4 else "ipv6", "prefix": canonical,
+                       "valid": _boolean(path.get("valid", False)),
+                       "bestPath": _boolean(path.get("bestpath", False)),
+                       "nextHops": []}
+                if "nexthops" not in path:
+                    raise UnsupportedObservation("unsupported FRR nexthop layout")
+                for hop in _frr_rows(path["nexthops"]):
+                    hop = _frr_map(hop)
+                    row["nextHops"].append(_ip(hop["ip"]))
+                if "peerId" in path and path["peerId"] != "(unspec)":
+                    row["peerId"] = _ip(path["peerId"])
+                result.append(row)
+                if len(result) > 10000:
+                    raise ValueError("too many FRR paths")
+        return result
+    result = []
+    for peer in _frr_rows(data):
+        peer = _frr_map(peer)
+        state = peer.get("status")
+        if not isinstance(state, str) or state not in {"up", "down", "init", "admin-down"}:
+            raise UnsupportedObservation("unsupported BFD state")
+        row = {"peer": _ip(peer["peer"]), "state": state}
+        for field in ("local", "interface", "vrf"):
+            if field in peer:
+                row[field] = _ip(peer[field]) if field == "local" else _name(peer[field])
+        result.append(row)
+    return result
+
+
+def collect_network_state(*, timeout=DEFAULT_TIMEOUT, total_timeout=30.0, output_limit=DEFAULT_OUTPUT_LIMIT):
+    """Explicit opt-in collection, with both per-command and total run deadlines.
+
+    Budget exhaustion is a timeout observation for each unattempted query. JSON
+    parsing also consumes the total budget but is bounded by the capture byte cap.
+    Daemon availability describes vtysh connectivity, not installed packages.
+    """
+    if type(timeout) not in (int, float) or not 0 < timeout <= 30:
+        raise ValueError("invalid command timeout")
+    if type(total_timeout) not in (int, float) or not 0 < total_timeout <= 120:
+        raise ValueError("invalid collection timeout")
+    if type(output_limit) is not int or not 0 < output_limit <= 16 * 1024 * 1024:
+        raise ValueError("invalid output limit")
+    deadline = time.monotonic() + total_timeout
     report = {"schemaVersion": 1, "startedAt": utc_now(), "observations": {}, "capabilities": {}}
+    connected_daemons = None
     for name in COMMANDS:
         started = utc_now()
-        status, raw = run_command(name)
+        remaining = deadline - time.monotonic()
+        needed_daemon = "bgpd" if name in ("frr-bgp-summary", "frr-routes4", "frr-routes6") else "bfdd" if name == "frr-bfd" else None
+        if remaining <= 0:
+            status, raw = "timeout", b""
+        elif needed_daemon and connected_daemons is not None and needed_daemon not in connected_daemons:
+            status, raw = "unavailable", b""
+        else:
+            status, raw = run_command(name, timeout=min(timeout, remaining), output_limit=output_limit)
         data = None
         if status == "success":
             try:
-                data = normalize_wireguard(name[3:], raw) if name.startswith("wg-") else normalize_linux(name, raw)
+                if name.startswith("frr-"):
+                    data = normalize_frr(name, raw)
+                elif name.startswith("wg-"):
+                    data = normalize_wireguard(name[3:], raw)
+                else:
+                    data = normalize_linux(name, raw)
+                if name == "frr-daemons":
+                    connected_daemons = {d["name"] for d in data}
             except UnsupportedObservation:
                 status = "unsupported"
             except (ValueError, TypeError, KeyError, UnicodeError):
