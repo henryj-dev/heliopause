@@ -159,6 +159,47 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(report["observations"]["links"]["status"], "output-limit")
         self.assertFalse(report["capabilities"]["links"]["available"])
 
+    def test_row_ceiling_preserves_other_queries_below_byte_limit(self):
+        value = fixture()
+        query = dict(value["observations"]["links"], data=[{"dst": "default"}] * 2049)
+        value["observations"]["routes4"] = query
+        value["capabilities"]["routes4"] = {"available": True, "status": "success"}
+        self.assertLess(len(json.dumps(value).encode()), worker.MAX_REPORT_BYTES)
+        with mock.patch.object(worker, "collect_network_state", return_value=value):
+            report = worker.collect_report()
+        self.assertEqual(report["observations"]["routes4"]["status"], "output-limit")
+        self.assertNotIn("data", report["observations"]["routes4"])
+        self.assertEqual(report["capabilities"]["routes4"], {"available": False, "status": "output-limit"})
+        self.assertEqual(report["observations"]["links"]["data"], [])
+        self.assertEqual(report["capabilities"]["links"], {"available": True, "status": "success"})
+
+    def test_nested_array_ceiling_preserves_other_queries_below_byte_limit(self):
+        for name, row in (
+            ("addresses", {"ifindex": 1, "ifname": "example0", "addresses": [{"family": "inet6", "local": "::", "prefixlen": 128}] * 2049}),
+            ("wg-allowed-ips", {"interface": "example0", "peerPublicKey": "A" * 43 + "=", "allowedIPs": ["::/0"] * 2049}),
+            ("frr-routes6", {"addressFamily": "ipv6", "prefix": "::/0", "valid": True, "bestPath": True, "nextHops": ["::"] * 2049}),
+        ):
+            with self.subTest(query=name):
+                value = fixture()
+                value["observations"][name] = dict(value["observations"]["links"], data=[row])
+                value["capabilities"][name] = {"available": True, "status": "success"}
+                self.assertLess(len(json.dumps(value).encode()), worker.MAX_REPORT_BYTES)
+                with mock.patch.object(worker, "collect_network_state", return_value=value):
+                    report = worker.collect_report()
+                self.assertEqual(report["observations"][name]["status"], "output-limit")
+                self.assertNotIn("data", report["observations"][name])
+                self.assertFalse(report["capabilities"][name]["available"])
+                self.assertEqual(report["observations"]["links"]["status"], "success")
+                self.assertTrue(report["capabilities"]["links"]["available"])
+
+    def test_array_ceiling_allows_exactly_2048_rows(self):
+        value = fixture()
+        value["observations"]["links"]["data"] = [{"ifindex": 1, "ifname": "example0"}] * 2048
+        with mock.patch.object(worker, "collect_network_state", return_value=value):
+            report = worker.collect_report()
+        self.assertEqual(report["observations"]["links"]["status"], "success")
+        self.assertEqual(len(report["observations"]["links"]["data"]), 2048)
+
     def test_invalid_schedule_has_no_process_side_effect(self):
         with mock.patch.object(lifecycle.subprocess, "Popen") as launch:
             with self.assertRaises(ValueError): lifecycle.start_discovery_worker(threading.Event(), enabled=True, interval=0)

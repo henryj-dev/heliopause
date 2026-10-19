@@ -1,4 +1,4 @@
-import { NetworkObservationStore, MAX_NETWORK_OBSERVATION_BYTES, validateNetworkObservation } from "./network-observation.ts";
+import { NetworkObservationStore, NetworkObservationStoreBusyError, MAX_NETWORK_OBSERVATION_BYTES, validateNetworkObservation } from "./network-observation.ts";
 // The relay — one per gateway. Serves artifacts to the agents behind it and collects their state.
 //
 // It is deliberately not a decision-maker. It does not render policy and it cannot invent a
@@ -1481,7 +1481,10 @@ export async function startRelay(
         if (!body || body.host !== cn || Object.keys(body).some(k => !["host", "report"].includes(k))) return send(res, 403, { error: "observation identity mismatch" });
         const record = networkObservations.put(cn, validateNetworkObservation(body.report));
         return send(res, 200, { collectionId: record.report.collectionId, receivedAt: record.receivedAt });
-      } catch { return send(res, 400, { error: "invalid or oversized network observation" }); }
+      } catch (error) {
+        if (error instanceof NetworkObservationStoreBusyError) return send(res, 503, { error: "network observation store is busy" });
+        return send(res, 400, { error: "invalid or oversized network observation" });
+      }
     }
     if (req.method === "GET" && url.pathname === "/network/observations") {
       if (!cn) return send(res, 401, { error: "authenticated operator required" });

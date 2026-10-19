@@ -104,6 +104,8 @@ export function observationFreshness(record: NetworkObservationRecord | null, no
   const times = [record.receivedAt, record.report.completedAt, record.relayReceivedAt].filter((v): v is string => !!v).map(Date.parse);
   return times.every(t => Number.isFinite(t) && now >= t && now - t <= maxAgeMs) ? "fresh" : "stale";
 }
+/** Telemetry contention must not put the Relay event loop to sleep beside heartbeats. */
+export class NetworkObservationStoreBusyError extends Error {}
 export class NetworkObservationStore {
   readonly dir: string;
   constructor(dir: string) { this.dir = dir; mkdirSync(dir, { recursive: true, mode: 0o700 }); }
@@ -124,7 +126,7 @@ export class NetworkObservationStore {
   put(host: string, report: unknown, metadata: { relayReceivedAt?: string; source?: string } = {}): NetworkObservationRecord {
     const value = validateNetworkObservation(report); const path = this.path(host, metadata.source);
     if (metadata.relayReceivedAt !== undefined && !timestamp(metadata.relayReceivedAt)) throw new Error("invalid relay receive time");
-    return withFileLock(join(this.dir, "store"), 1000, "network observations", message => new Error(message), () => {
+    return withFileLock(join(this.dir, "store"), 0, "network observations", (message, status) => status === 503 ? new NetworkObservationStoreBusyError("network observation store is busy") : new Error(message), () => {
       const previous = this.get(host, metadata.source);
       if (previous && (previous.report.collectionId === value.collectionId || Date.parse(value.completedAt) <= Date.parse(previous.report.completedAt))) return previous;
       if (!previous && this.list().length >= MAX_NETWORK_OBSERVATION_HOSTS) throw new Error("observation host limit exceeded");

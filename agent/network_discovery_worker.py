@@ -13,11 +13,27 @@ import uuid
 from network_discovery import collect_network_state
 
 MAX_REPORT_BYTES = 128 * 1024 - 1024
+MAX_REPORT_ARRAY_ROWS = 2048
+
+
+def _arrays_within_wire_limit(value):
+    # Match the receiver's row and nested-list ceiling before any upload. A collector
+    # can produce a small-byte report with too many rows; that is failure evidence.
+    if isinstance(value, list):
+        return len(value) <= MAX_REPORT_ARRAY_ROWS and all(_arrays_within_wire_limit(item) for item in value)
+    if isinstance(value, dict):
+        return all(_arrays_within_wire_limit(item) for item in value.values())
+    return True
 
 
 def collect_report():
     report = collect_network_state(timeout=2.0, total_timeout=30.0, output_limit=128 * 1024)
     report["collectionId"] = str(uuid.uuid4())
+    for name, result in report["observations"].items():
+        if result["status"] == "success" and not _arrays_within_wire_limit(result.get("data")):
+            result.pop("data", None)
+            result["status"] = "output-limit"
+            report["capabilities"][name] = {"available": False, "status": "output-limit"}
     if len(json.dumps(report).encode()) > MAX_REPORT_BYTES:
         # Preserve per-collector failure evidence rather than silently truncating routes/peers.
         for result in report["observations"].values():

@@ -1,12 +1,12 @@
-import { test } from "node:test";
+import { test, mock } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFile, execFileSync } from "node:child_process";
 import { createHash, X509Certificate } from "node:crypto";
 import { request } from "node:https";
-import { NetworkObservationStore, observationFreshness, validateNetworkObservation, MAX_NETWORK_OBSERVATION_BYTES } from "./network-observation.ts";
+import { NetworkObservationStore, NetworkObservationStoreBusyError, observationFreshness, validateNetworkObservation, MAX_NETWORK_OBSERVATION_BYTES } from "./network-observation.ts";
 import { startRelay } from "./relay.ts";
 import { fetchNetworkObservations } from "./manager.ts";
 import { SCHEMA_VERSION } from "./protocol.ts";
@@ -73,6 +73,11 @@ test("real mTLS observation upload binds manifest CN, isolates policy confirmati
     assert.equal((await call("agent-outsider", "/network/observations", { host: "outsider", report: report() })).status, 403);
     assert.equal((await call("operator-reader", "/network/observations", { host: "reader", report: report() })).status, 403);
     assert.equal((await call("agent-host", "/network/observations", { host: "host", report: { ...report(), schemaVersion: 99 } })).status, 400);
+    const contentionLock = join(options.artifactDir, "network-observations", "store.lock");
+    writeFileSync(contentionLock, "another writer");
+    assert.equal((await call("agent-host", "/network/observations", { host: "host", report: report() })).status, 503);
+    assert.deepEqual(relay.state.statuses, {}); assert.deepEqual(relay.state.lastSeen, {});
+    unlinkSync(contentionLock);
     const uploaded = await call("agent-host", "/network/observations", { host: "host", report: report() }); assert.equal(uploaded.status, 200);
     // Invoke only the worker's transport with a synthetic report: no ip/wg/vtysh command runs.
     await new Promise<void>((resolve, reject) => {
@@ -88,4 +93,18 @@ test("real mTLS observation upload binds manifest CN, isolates policy confirmati
     await new Promise<void>(resolve => relay.server.close(() => resolve())); relay = await startRelay(options); relay.state.manifest = manifest;
     const after = await call("operator-reader", "/network/observations"); assert.equal(after.body.observations[0].receivedAt, uploaded.body.receivedAt);
   } finally { await new Promise<void>(resolve => relay.server.close(() => resolve())); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("contended telemetry writes fail immediately without sleeping the heartbeat event loop", () => {
+  const dir = mkdtempSync(join(tmpdir(), "hp-observation-contention-"));
+  try {
+    const store = new NetworkObservationStore(dir);
+    writeFileSync(join(dir, "store.lock"), "another writer");
+    const wait = mock.method(Atomics, "wait", () => "timed-out" as const);
+    try {
+      assert.throws(() => store.put("host", report()), NetworkObservationStoreBusyError);
+      assert.equal(wait.mock.callCount(), 0, "observation lock contention cannot synchronously wait beside policy heartbeats");
+      assert.equal(readFileSync(join(dir, "store.lock"), "utf8"), "another writer");
+    } finally { wait.mock.restore(); }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
