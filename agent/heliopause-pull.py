@@ -5651,7 +5651,7 @@ def main():
                 interval=int(os.environ.get("HELIOPAUSE_NETWORK_DISCOVERY_INTERVAL", "300")),
                 budget=int(os.environ.get("HELIOPAUSE_NETWORK_DISCOVERY_BUDGET", "45")),
             )
-        except (ImportError, ValueError, OSError):
+        except (ImportError, ValueError, OSError, RuntimeError):
             log("network discovery unavailable; policy heartbeat continues")
 
     # Watches the ruleset for changes this agent did not make. Daemon, so a wedged monitor can

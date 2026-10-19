@@ -135,6 +135,31 @@ class WorkerTests(unittest.TestCase):
             finally:
                 stop.set(); release.set(); timer.join(1)
 
+    def test_discovery_thread_start_failure_does_not_stop_policy_heartbeat(self):
+        spec = importlib.util.spec_from_file_location("startup_failure_policy_agent", Path(__file__).with_name("heliopause-pull.py"))
+        agent = importlib.util.module_from_spec(spec); spec.loader.exec_module(agent)
+        stop = threading.Event()
+        with ExitStack() as patches:
+            for name in ("CA_FILE", "CERT_FILE", "KEY_FILE", "TARGET", "MANAGER_SIGNING_KEYS_DIR", "BREAK_GLASS_KEYS_DIR"):
+                patches.enter_context(mock.patch.object(agent, name, "fixture"))
+            patches.enter_context(mock.patch.object(agent, "RELAY_URL", "https://relay.invalid"))
+            patches.enter_context(mock.patch.object(agent, "INTERVAL_ERROR", ""))
+            patches.enter_context(mock.patch.object(agent, "_stop", stop))
+            patches.enter_context(mock.patch.dict(os.environ, {"HELIOPAUSE_NETWORK_DISCOVERY": "1"}))
+            patches.enter_context(mock.patch.object(agent.signal, "signal"))
+            patches.enter_context(mock.patch.object(agent, "load_artifact_trust", return_value={"managerKeyIds": [], "breakGlassKeyIds": [], "trustDigest": "fixture"}))
+            for name in ("log", "backfill_current_authorization", "recover_commitment", "recover_workload_commitment", "reconcile_recovered_commitments", "_boot_restore", "monitor_loop", "handle_reply_safely"):
+                patches.enter_context(mock.patch.object(agent, name))
+            patches.enter_context(mock.patch.object(agent, "load_state", return_value={}))
+            patches.enter_context(mock.patch.object(agent, "build_heartbeat", return_value={"host": "fixture"}))
+            beat = patches.enter_context(mock.patch.object(agent, "post_heartbeat", return_value={}))
+            patches.enter_context(mock.patch.object(agent, "_has_live_commitment", return_value=False))
+            patches.enter_context(mock.patch.object(agent, "sleep_interval", side_effect=stop.set))
+            startup = patches.enter_context(mock.patch.object(lifecycle, "start_discovery_worker", side_effect=RuntimeError("can't start new thread")))
+            self.assertEqual(agent.main(), 0)
+            startup.assert_called_once()
+            beat.assert_called_once_with({"host": "fixture"})
+
     def test_shutdown_terminates_running_child(self):
         stop = threading.Event()
         timer = threading.Timer(.05, stop.set); timer.start()
