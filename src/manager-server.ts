@@ -156,6 +156,7 @@ import { certificateInventory, certificateProblems, prose, type CertificateRepor
 import type { CertificateRevocation } from "./enrollment-store.ts";
 import type { MembersMode } from "./env-spec.ts";
 import { createMemberAuth } from "./member-auth.ts";
+import type { MailConfig } from "./mail.ts";
 
 /**
  * Body limit for `POST /plan`, well above the relay's.
@@ -515,6 +516,10 @@ export interface ManagerOptions {
     publicOrigin?: string;
     /** Test seam: the source address member sign-in limits count. See `MemberAuthDeps.sourceOf`. */
     sourceOf?: (req: IncomingMessage) => string;
+    /** Test seam: the wait before a reset request's lookup. See `MemberAuthDeps.resetDelayMs`. */
+    resetDelayMs?: () => number;
+    /** SMTP relay for reset and invite mail (`mailConfigFromEnv`). Absent or null: nothing is mailed. */
+    mail?: MailConfig | null;
   };
   /** Enrollment store or standalone JSON denylist, reloaded on every authenticated request. */
   revocationFile?: string;
@@ -1453,6 +1458,8 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         otpUsers: opts.otp?.users ?? new Map(),
         publicOrigin: memberPublicOrigin!,
         ...(opts.members?.sourceOf ? { sourceOf: opts.members.sourceOf } : {}),
+        ...(opts.members?.resetDelayMs ? { resetDelayMs: opts.members.resetDelayMs } : {}),
+        mail: opts.members?.mail ?? null,
         aliasNames: new Set(opts.oidc?.aliases.values() ?? []),
         now,
         log,

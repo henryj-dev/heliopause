@@ -14,6 +14,9 @@
     PASSWORD_LOGIN_PATH,
     readLogin,
     readMethods,
+    readResetRequest,
+    RESET_REQUEST_PATH,
+    resetRequestBody,
     ssoHref,
     type LoginStep,
     type Methods,
@@ -31,6 +34,11 @@
   let wrongCode = $state(false);
   let busy = $state(false);
   let refusal = $state<Refusal | null>(null);
+  // The "forgot your password" form, shown in place of the sign-in form.
+  let forgot = $state(false);
+  let forgotLogin = $state("");
+  // The link lifetime the server stated, once the request was answered; null before that.
+  let forgotSent = $state<{ minutes: number | null } | null>(null);
 
   onMount(async () => {
     try {
@@ -78,6 +86,34 @@
     }
   }
 
+  async function requestReset(): Promise<void> {
+    if (busy) return;
+    busy = true;
+    refusal = null;
+    try {
+      const res = await fetch(RESET_REQUEST_PATH, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json" },
+        body: resetRequestBody(forgotLogin),
+      });
+      const answer = readResetRequest(res.status, await res.json().catch(() => null));
+      if (answer.kind === "sent") forgotSent = { minutes: answer.minutes };
+      else refusal = answer.refusal;
+    } catch (e) {
+      refusal = { key: "m.mbFailed", detail: e instanceof Error ? e.message : String(e), problems: [] };
+    } finally {
+      busy = false;
+    }
+  }
+
+  function showForgot(on: boolean): void {
+    forgot = on;
+    forgotSent = null;
+    forgotLogin = on ? username : "";
+    refusal = null;
+  }
+
   function restart(): void {
     step = "password";
     password = "";
@@ -100,6 +136,34 @@
   <p><a href={ssoHref(next, base)}>{t(prefs.lang, "m.loginSso")}</a></p>
 {:else if !methods.password}
   <p>{t(prefs.lang, methodsFailed ? "m.loginMethodsError" : "m.loginNone")}</p>
+{:else if forgot}
+  <h3>{t(prefs.lang, "m.forgotHeading")}</h3>
+  {#if refusal}
+    <RefusalNote {refusal} />
+  {/if}
+  {#if forgotSent}
+    <p>
+      {forgotSent.minutes === null
+        ? t(prefs.lang, "m.forgotSentNoTtl")
+        : t(prefs.lang, "m.forgotSent", { minutes: forgotSent.minutes })}
+    </p>
+  {:else}
+    <p class="dim">{t(prefs.lang, "m.forgotNote")}</p>
+    <form
+      class="stack"
+      onsubmit={(e) => {
+        e.preventDefault();
+        void requestReset();
+      }}
+    >
+      <label>
+        {t(prefs.lang, "m.forgotLogin")}
+        <input name="login" autocomplete="username" spellcheck="false" bind:value={forgotLogin} required>
+      </label>
+      <p class="act"><button type="submit" disabled={busy}>{t(prefs.lang, "m.forgotSubmit")}</button></p>
+    </form>
+  {/if}
+  <p><button type="button" class="link" onclick={() => showForgot(false)}>{t(prefs.lang, "m.forgotBack")}</button></p>
 {:else}
   {#if refusal}
     <RefusalNote {refusal} />
@@ -143,6 +207,9 @@
       {/if}
     </p>
   </form>
+  {#if step === "password"}
+    <p><button type="button" class="link" onclick={() => showForgot(true)}>{t(prefs.lang, "m.loginForgot")}</button></p>
+  {/if}
   {#if methods.sso}
     <p class="dim">{t(prefs.lang, "m.loginOr")}</p>
     <p><a href={ssoHref(next, base)}>{t(prefs.lang, "m.loginSso")}</a></p>
@@ -153,4 +220,5 @@
   .stack { display: grid; gap: 12px; }
   .stack label { display: grid; gap: 4px; }
   .otp { font-family: var(--font-mono); letter-spacing: 0.2em; }
+  .link { background: none; border: none; padding: 0; color: inherit; text-decoration: underline; cursor: pointer; font: inherit; }
 </style>

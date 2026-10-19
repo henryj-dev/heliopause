@@ -23,6 +23,7 @@ import {
   planLimitsFromEnv, startupLimitSources, type BoundedEnvName, type MembersMode,
 } from "../src/env-spec.ts";
 import { shutdownManager, startManager } from "../src/manager-server.ts";
+import { mailConfigFromEnv, type MailConfig } from "../src/mail.ts";
 import { problemWatchFromEnv, ProblemWatchLockError } from "../src/problem-watch-runner.ts";
 import type { RelaySource } from "../src/manager.ts";
 import { resolveWebRoot, serveConsole } from "../src/web-console.ts";
@@ -113,6 +114,22 @@ const membersMode = ((): MembersMode => {
     return refuse(error);
   }
 })();
+
+// A partial or unreadable SMTP setting refuses to start rather than run without the mail it asked for.
+// The line names the relay host and port only; credentials are never printed.
+// It refuses with HELIOPAUSE_MEMBERS=off too, where the setting is unused: a broken setting is still an error.
+// @see manager-startup-env.test.ts "refuses to start on a partial mail setting, with members off too (a config error is an error)"
+const mail = ((): MailConfig | null => {
+  try {
+    return mailConfigFromEnv(process.env);
+  } catch (error) {
+    console.error(`[manager] ${(error as Error).message}`);
+    return process.exit(2);
+  }
+})();
+console.error(mail
+  ? `[manager] mail: reset and invite mail via ${mail.host}:${mail.port ?? 465}${membersMode === "off" ? " (unused while HELIOPAUSE_MEMBERS is off)" : ""}`
+  : "[manager] mail: not configured — reset links are not mailed and invite links are only shown to the admin");
 
 const relays = relaysFrom(env("HELIOPAUSE_RELAYS")).map((r) => ({
   ...r,
@@ -464,6 +481,7 @@ const started = await startManager({
     sessionTtlSec: number("HELIOPAUSE_MEMBER_SESSION_TTL_SEC"),
     // Invite and reset links are built on this when no OIDC redirect URI gives an origin.
     ...(process.env.HELIOPAUSE_PUBLIC_ORIGIN ? { publicOrigin: process.env.HELIOPAUSE_PUBLIC_ORIGIN } : {}),
+    mail,
   },
   ...(problemWatch ? { problemWatch } : {}),
   timeoutMs: relayTimeoutMs,

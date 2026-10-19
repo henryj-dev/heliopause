@@ -11,6 +11,7 @@
   import {
     INVITES_PATH,
     inviteBody,
+    inviteMailNote,
     MEMBERS_PATH,
     planRequest,
     readLink,
@@ -112,8 +113,8 @@
     const roles = [...inviteRoles];
     const reply = await send(t(prefs.lang, "m.mmWhatInvite", { email: to }), INVITES_PATH, (otp) => inviteBody(to, roles, otp));
     if (reply === null) return;
-    const at = (reply as { expiresAt?: unknown }).expiresAt;
-    reveal(readLink(reply, "inviteUrl"), t(prefs.lang, "m.mmInviteNoMail", { at: typeof at === "string" ? at : "" }));
+    const mailNote = inviteMailNote(reply);
+    reveal(readLink(reply, "inviteUrl"), t(prefs.lang, mailNote.key, mailNote.params));
     email = "";
   }
 

@@ -32,9 +32,36 @@ before(() => {
 
 after(() => rmSync(dir, { recursive: true, force: true }));
 
-/** Start the binary, return its `limits:` line, and stop it. Fails if it exits or stays silent. */
-function startupLimitsLine(extraEnv: Record<string, string>): Promise<string> {
-  const proc = spawn(process.execPath, [BIN], {
+/** Start the binary, return its first line matching `pattern` (default its `limits:` line), and stop it. Fails if it exits or stays silent. */
+function startupLimitsLine(extraEnv: Record<string, string>, pattern = / limits: /): Promise<string> {
+  const proc = spawnManager(extraEnv);
+  return new Promise((resolve, reject) => {
+    let err = "";
+    const timer = setTimeout(() => { proc.kill("SIGKILL"); reject(new Error(`no line matching ${pattern} in 20s:\n${err}`)); }, 20_000);
+    proc.stderr!.on("data", (b: Buffer) => {
+      err += b;
+      // Complete lines only: a chunk can end mid-line, and the last piece of the split is that
+      // unterminated fragment (review round 1).
+      const line = err.split("\n").slice(0, -1).find((l) => pattern.test(l));
+      if (line) { clearTimeout(timer); proc.kill("SIGKILL"); resolve(line); }
+    });
+    proc.on("exit", (code) => { clearTimeout(timer); reject(new Error(`the manager exited ${code} first:\n${err}`)); });
+  });
+}
+
+/** Start the binary expecting it to refuse: resolves with its exit code and stderr; fails if it is still up after 20 s. */
+function startupRefusal(extraEnv: Record<string, string>): Promise<{ code: number | null; err: string }> {
+  const proc = spawnManager(extraEnv);
+  return new Promise((resolve, reject) => {
+    let err = "";
+    const timer = setTimeout(() => { proc.kill("SIGKILL"); reject(new Error(`still running after 20s:\n${err}`)); }, 20_000);
+    proc.stderr!.on("data", (b: Buffer) => { err += b; });
+    proc.on("exit", (code) => { clearTimeout(timer); resolve({ code, err }); });
+  });
+}
+
+function spawnManager(extraEnv: Record<string, string>) {
+  return spawn(process.execPath, [BIN], {
     env: {
       PATH: process.env.PATH ?? "",
       HELIOPAUSE_RELAYS: `alpha=https://127.0.0.1:1/=${dir}`,
@@ -48,18 +75,6 @@ function startupLimitsLine(extraEnv: Record<string, string>): Promise<string> {
       ...extraEnv,
     },
     stdio: ["ignore", "ignore", "pipe"],
-  });
-  return new Promise((resolve, reject) => {
-    let err = "";
-    const timer = setTimeout(() => { proc.kill("SIGKILL"); reject(new Error(`no limits line in 20s:\n${err}`)); }, 20_000);
-    proc.stderr.on("data", (b: Buffer) => {
-      err += b;
-      // Complete lines only: a chunk can end mid-line, and the last piece of the split is that
-      // unterminated fragment (review round 1).
-      const line = err.split("\n").slice(0, -1).find((l) => / limits: /.test(l));
-      if (line) { clearTimeout(timer); proc.kill("SIGKILL"); resolve(line); }
-    });
-    proc.on("exit", (code) => { clearTimeout(timer); reject(new Error(`the manager exited ${code} first:\n${err}`)); });
   });
 }
 
@@ -83,5 +98,41 @@ describe("the manager binary passes each plan limit on its own (#161)", () => {
   it("names the defaults when neither is set, with the authorization TTL beside the protocol cap", { timeout: 30_000 }, async () => {
     const line = await startupLimitsLine({});
     assert.match(line, /limits: artifact authorization TTL 24h \(default\), protocol cap 168h; plan TTL 10m \(default\); at most 32 pending plans \(default\)$/);
+  });
+});
+
+describe("the manager binary's mail setting", () => {
+  it("refuses to start on a partial mail setting, with members off too (a config error is an error)", { timeout: 30_000 }, async () => {
+    const r = await startupRefusal({ HELIOPAUSE_SMTP_HOST: "smtp.example.com" });
+    assert.equal(r.code, 2);
+    assert.match(r.err, /^\[manager\] HELIOPAUSE_SMTP_FROM is required when HELIOPAUSE_SMTP_HOST is set$/m);
+  });
+
+  it("refuses to start on a password file others can read", { timeout: 30_000 }, async () => {
+    const file = join(dir, "smtp-open.txt");
+    writeFileSync(file, "smtp-secret-value\n");
+    chmodSync(file, 0o644);
+    const r = await startupRefusal({
+      HELIOPAUSE_SMTP_HOST: "smtp.example.com", HELIOPAUSE_SMTP_FROM: "hp@example.com",
+      HELIOPAUSE_SMTP_USER: "api_token", HELIOPAUSE_SMTP_PASSWORD_FILE: file,
+    });
+    assert.equal(r.code, 2);
+    assert.match(r.err, /HELIOPAUSE_SMTP_PASSWORD_FILE: /);
+    assert.ok(!r.err.includes("smtp-secret-value"));
+  });
+
+  it("names the relay host and port, never the credentials", { timeout: 30_000 }, async () => {
+    const file = join(dir, "smtp-password.txt");
+    writeFileSync(file, "smtp-secret-value\n");
+    chmodSync(file, 0o600);
+    const line = await startupLimitsLine({
+      HELIOPAUSE_SMTP_HOST: "smtp.example.com", HELIOPAUSE_SMTP_PORT: "2465", HELIOPAUSE_SMTP_FROM: "hp@example.com",
+      HELIOPAUSE_SMTP_USER: "api_token", HELIOPAUSE_SMTP_PASSWORD_FILE: file,
+    }, / mail: /);
+    assert.equal(line, "[manager] mail: reset and invite mail via smtp.example.com:2465 (unused while HELIOPAUSE_MEMBERS is off)");
+  });
+
+  it("says when mail is not configured", { timeout: 30_000 }, async () => {
+    assert.match(await startupLimitsLine({}, / mail: /), /^\[manager\] mail: not configured/);
   });
 });
