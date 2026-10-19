@@ -212,3 +212,69 @@ Relay telemetry storage fails immediately with a generic 503 when its local stor
 Transport validation allows at most 2,048 rows per successful query and 2,048 elements in a normalized nested array. The integrated sender applies the same ceilings before upload. A query exceeding either limit becomes output-limit without data, while unrelated query results remain intact; the sender does not label a truncated table successful. The combined envelope still has its independent 128 KiB ceiling.
 
 Optional relay telemetry storage is initialized lazily at its own endpoint. An obstructed or unavailable observation directory returns a generic telemetry 503 without preventing Relay startup, health checks or legacy heartbeats. Persistent registry and observation reads open a regular file without following a final symlink, use the same descriptor for size validation and bounded reads, and close it in all cases. A file replacement or growth between validation and reading cannot turn the read into an unbounded path-based load. The size cap remains enforced during the read, not only by an earlier stat.
+
+## Phase 4: offline orchestration foundation
+
+### Implemented boundary
+
+This delivery adds offline comparison, planning and configuration compilation. It does not introduce a network execution driver, extend an agent command, grant adoption authority or connect these results to the existing firewall publisher. Every new artifact has its own schema version and kind; plans and templates are `dry-run` and `executable: false`. A generated template is not a valid deployment authorization.
+
+### Observation clocks and recovery
+
+The store admits at most 30 seconds of future skew for collection completion and relay receipt. This is a deliberately conservative acceptance policy, not a measured synchronization guarantee: it is much shorter than the default 300-second collection interval and 600-second freshness window. Larger offsets fail closed and need clock investigation. Old reports may be retained for diagnostics, but collection time, relay receipt and manager receipt each constrain freshness. Updating local receipt never rejuvenates an old collection. Matching additionally requires valid local receipt and, for source-scoped manager evidence, relay receipt.
+
+Normal writes do not replace a future-poisoned record. A trusted local operator can call `NetworkObservationStore.recover(host, report, {expectedCollectionId, actor, reason}, metadata)` after fixing the clock. It compares the current collection identity, requires a recent replacement, and archives the previous record before replacing it. This method is not exposed as an unauthenticated HTTP endpoint. Recovery preserves evidence; it is not automatic adoption or policy confirmation. Per-source/host recovery archives are capped at 32; further recovery fails closed until an operator explicitly retains and manages those files offline. Recent collection IDs are persisted to reject retransmission across restarts; this bounded history is not an all-time replay ledger. Authenticated observations remain host claims, not independent health proofs.
+
+### Identity and drift
+
+`matchNetworkInventory` accepts a registry snapshot, observations, an explicit evaluation clock, and trusted bindings `{source, host, siteId, nodeId}`. The source is the configured relay trust scope. These bindings belong to the trusted caller; an offline JSON file cannot authenticate a host merely by naming one. Site/node references and ambiguous identities are rejected or classified unknown. Interface names are used only after this identity binding. Explicit VRF domains additionally require interface master evidence; external domains cannot be inferred from host links.
+
+Supported comparisons are interface presence and optional desired MTU, and route destination/table/interface. IPv4/IPv6 prefixes and standard table aliases are normalized. The current registry has no desired WireGuard peer or BGP session settings, so those telemetry queries are not represented as declarative drift. Counters, handshake times, link operational state and BGP session/prefix counts never become configuration differences.
+
+| Classification | Meaning |
+| --- | --- |
+| matched | Supported declarative fields agree; no connectivity claim |
+| missing | A fresh successful relevant collector, with verified identity/domain prerequisites, lacks the desired identity |
+| different | Supported declarative fields differ |
+| unknown | Identity, required receipt, relevant field, or successful collection evidence is absent/ambiguous |
+| stale | Retained evidence exceeded its validity window or has invalid future clock evidence |
+| unsupported | Resource/domain or collector cannot support the comparison |
+| unexpected | A successful collector observed an unclaimed object; it remains external |
+
+External ownership is retained in results and never produces a repair proposal. Adopted metadata cannot authorize a writer.
+
+### Deterministic planning
+
+`buildNetworkPlan` recomputes matching; callers cannot submit a preclassified match as authority. It binds the registry revision, resource generations and digests, trusted identity bindings, exact observation digests, collector capabilities, explicit evaluation time and dependency graph. Caller-selected `id` is a review label outside `contentHash`. Object keys and set-like resource/binding/dependency collections are canonicalized; the observation report's arrays remain exact evidence, so changing their order changes its digest. There is no generated UUID or implicit current clock in the plan.
+
+Dependencies come from inventory references and optional explicit `{resourceId, dependsOn}` edges. Missing references and cycles block an ordered plan. Proposals are limited to modeled managed interface/route creation or updates. A failed/unsupported collector, stale evidence, ambiguous identity, revision mismatch, invalid inventory or ownership conflict prevents an execution-ready result. Independent management/gateway connectivity, write capabilities, approval and durable undo are not yet implemented and remain explicit blockers/preconditions. This analysis neither auto-repairs drift nor schedules reconciliation.
+
+The canonical helper shares the sorted JSON approach used by the registry while deliberately remaining separate from the signed policy bundle byte format. It rejects non-JSON numbers, sparse arrays, exotic objects, accessors and cycles rather than producing ambiguous hashes.
+
+### Offline CLI
+
+```
+node bin/heliopause-network-plan.ts INPUT.json
+node bin/heliopause-network-compile.ts wireguard INPUT.json
+node bin/heliopause-network-compile.ts frr INPUT.json
+```
+
+Planner input contains `id`, `registry: {revision, resources}`, `expectedRegistryRevision`, `observations`, `bindings`, explicit epoch-millisecond `now`, and optional `maxAgeMs`/`additionalDependencies`. Compiler input contains `registry`, `expectedRegistryRevision` and a closed versioned `spec`. WireGuard also accepts a prior artifact for a hash-only interface diff. Exit 2 means a blocked plan or invalid compilation; exit 1 means malformed input/usage. No CLI has an apply option or network transport. Inputs must be trusted local exports; copying JSON is not an authentication mechanism.
+
+### WireGuard compilation
+
+`compileWireGuard` supports an explicit `wg-quick` full-mesh specification referencing an overlay network, gateways, managed WireGuard interfaces and independent underlay interfaces. Gateway entries declare tunnel host addresses, public keys, literal public endpoint/port, listen port, allowed local prefixes, opaque private-key references and optional MTU/keepalive. Tunnel addresses must fit declared tunnel pools; allocation is not performed. Duplicate addresses/keys/peers and overlapping peer cryptokey ranges are refused. Management and Kubernetes ranges are not implicitly exported.
+
+Templates intentionally omit `PrivateKey`; references are separate metadata and no secret provider is invoked. `Table = off` belongs only to this `wg-quick` backend, not a generic interface option or `wg setconf`. Peer tunnel host routes are separately listed, so a `/32` or `/128` address is never assumed to create peer reachability. Underlay endpoint reachability and policy routing still require independent verification. The template hash binds the normalized intent and desired snapshot. The optional previous-artifact diff exposes only interface hashes and added/changed/removed labels, not prior raw template contents.
+
+### FRRouting compilation
+
+`compileFrr` generates narrow eBGP templates for explicit FRR `8.5.6` and `10.2.1` targets, with IPv4/IPv6 address families and a primary managed native/WireGuard plus secondary external Cloudflare backbone for each remote node/family. It requires explicit private ASNs, router ID, peer/source addresses, inventory interface/network references and declared peer reachability routes. External interfaces are referenced, never reconfigured. Only global routing domains/main-table reachability are currently supported; other domain semantics are refused.
+
+Each peer receives exact inbound and outbound prefix allowlists and default-deny route maps. Inbound local preference 200/100 expresses backbone preference. Outbound filtering also requires an empty AS path, preventing learned eBGP routes from becoming transit exports. `network import-check` remains enabled; no `redistribute` or automatic service/default advertisement is generated. Only explicit site-local infrastructure subnet references are supported. Any overlap with management, Pod or Service reservations is refused, including an infrastructure aggregate covering such a pool. Service VIP approval and independently verified Pod summaries are future work and fail closed today. BFD is optional syntax, never a failover claim.
+
+The reviewed syntax follows the official FRR stable-8.5 and stable-10.2 BGP/route-map manuals. Unit tests verify generation and filters, not daemon acceptance on every build. A container syntax check, real BGP/BFD sessions, FIB installation and packet forwarding were not established in this sandbox; exact runtime compatibility is a deployment gate, not a consequence of selecting a version string.
+
+### Remaining execution work
+
+The compilers are separate offline previews; they are not yet bound into one signed, approved executable ChangeSet. A future planner must bind exact compiler artifacts, independent reachability evidence, secret versions and per-driver recovery requirements before any execution protocol can accept them. Next gates are: WireGuard driver with local secret resolution and explicit host routes; NetworkManager/nmstate persistence; FRR driver with config validation and durable undo; dependency-ordered multi-site changes; independent management checks; dual-backbone withdrawal/failover rehearsals; restart recovery; and staged operational migration. Rollback must remain local when manager/relay connectivity is lost. Network Overview UI is deferred until these analysis contracts are stable.

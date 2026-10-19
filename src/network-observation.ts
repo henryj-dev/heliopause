@@ -8,6 +8,9 @@ import { atomicWriteFile, readBoundedStoreFile, withFileLock } from "./json-stor
 export const MAX_NETWORK_OBSERVATION_BYTES = 128 * 1024;
 export const MAX_NETWORK_OBSERVATION_HOSTS = 32;
 export const MAX_NETWORK_OBSERVATIONS_BYTES = 5 * 1024 * 1024;
+/** Conservative admission tolerance, not a guarantee of synchronized clocks. */
+export const NETWORK_OBSERVATION_FUTURE_SKEW_MS = 30_000;
+export const NETWORK_OBSERVATION_REPLAY_HISTORY = 256;
 export type CollectorStatus = "success" | "not-installed" | "unsupported" | "unavailable" | "timeout" | "output-limit" | "error";
 export interface NetworkCollectorObservation { status: CollectorStatus; startedAt: string; completedAt: string; data?: Record<string, unknown>[] }
 export interface NetworkObservationReport {
@@ -15,7 +18,7 @@ export interface NetworkObservationReport {
   observations: Record<string, NetworkCollectorObservation>;
   capabilities: Record<string, { available: boolean; status: CollectorStatus }>;
 }
-export interface NetworkObservationRecord { host: string; receivedAt: string; report: NetworkObservationReport; source?: string; relayReceivedAt?: string }
+export interface NetworkObservationRecord { host: string; receivedAt: string; report: NetworkObservationReport; source?: string; relayReceivedAt?: string; collectionIds?: string[]; recovery?: { previousCollectionId: string; actor: string; reason: string; at: string } }
 const statuses = new Set(["success", "not-installed", "unsupported", "unavailable", "timeout", "output-limit", "error"]);
 const fields: Record<string, string[]> = {
   links: ["ifindex", "ifname", "mtu", "master", "link_index", "operstate", "flags"],
@@ -40,7 +43,11 @@ export function observationHost(host: unknown): asserts host is string {
 }
 function object(v: unknown): v is Record<string, unknown> { return !!v && typeof v === "object" && !Array.isArray(v); }
 function keys(v: Record<string, unknown>, allowed: readonly string[]) { if (Object.keys(v).some(k => !allowed.includes(k))) throw new Error("unknown observation field"); }
-function timestamp(v: unknown): v is string { return typeof v === "string" && /^\d{4}-\d\d-\d\dT.*(?:Z|\+00:00)$/.test(v) && Number.isFinite(Date.parse(v)); }
+function timestamp(v: unknown): v is string {
+  if (typeof v !== "string" || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,9})?(?:Z|\+00:00)$/.test(v)) return false;
+  const time = Date.parse(v);
+  return Number.isFinite(time) && new Date(time).toISOString().slice(0, 19) === v.slice(0, 19);
+}
 function label(v: unknown): boolean { return typeof v === "string" && /^[A-Za-z0-9_.:@/-]{1,128}$/.test(v); }
 function integer(v: unknown, max = Number.MAX_SAFE_INTEGER): boolean { return typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= max; }
 function prefix(v: unknown): boolean {
@@ -101,22 +108,30 @@ export function validateNetworkObservation(input: unknown): NetworkObservationRe
 }
 export function observationFreshness(record: NetworkObservationRecord | null, now = Date.now(), maxAgeMs = 10 * 60_000): "never-observed" | "fresh" | "stale" {
   if (!record) return "never-observed";
-  const times = [record.receivedAt, record.report.completedAt, record.relayReceivedAt].filter((v): v is string => !!v).map(Date.parse);
-  return times.every(t => Number.isFinite(t) && now >= t && now - t <= maxAgeMs) ? "fresh" : "stale";
+  if (!Number.isFinite(now) || !Number.isFinite(maxAgeMs) || maxAgeMs < 0 || maxAgeMs > 10 * 60_000 || !timestamp(record.receivedAt) || !timestamp(record.report?.completedAt) || (record.source !== undefined && !timestamp(record.relayReceivedAt)) || (record.relayReceivedAt !== undefined && !timestamp(record.relayReceivedAt))) return "stale";
+  const times = [record.receivedAt, record.report.completedAt, ...(record.relayReceivedAt === undefined ? [] : [record.relayReceivedAt])].map(Date.parse);
+  return times.every(t => Number.isFinite(t) && t <= now + NETWORK_OBSERVATION_FUTURE_SKEW_MS && now - t <= maxAgeMs) ? "fresh" : "stale";
 }
 /** Telemetry contention must not put the Relay event loop to sleep beside heartbeats. */
 export class NetworkObservationStoreBusyError extends Error {}
 export class NetworkObservationStore {
   readonly dir: string;
-  constructor(dir: string) { this.dir = dir; mkdirSync(dir, { recursive: true, mode: 0o700 }); }
+  private readonly options: { now?: () => number };
+  constructor(dir: string, options: { now?: () => number } = {}) { this.options = options; this.dir = dir; mkdirSync(dir, { recursive: true, mode: 0o700 }); }
   private path(host: string, source?: string) { observationHost(host); if (source !== undefined) observationHost(source); return join(this.dir, createHash("sha256").update(JSON.stringify([source ?? "", host])).digest("hex") + ".json"); }
   private readRecord(path: string): NetworkObservationRecord {
-    const record: unknown = JSON.parse(readBoundedStoreFile(path, MAX_NETWORK_OBSERVATION_BYTES + 2048));
+    const record: unknown = JSON.parse(readBoundedStoreFile(path, MAX_NETWORK_OBSERVATION_BYTES + 24_000));
     if (!object(record)) throw new Error("invalid stored observation");
-    keys(record, ["host", "receivedAt", "report", "source", "relayReceivedAt"]);
+    keys(record, ["host", "receivedAt", "report", "source", "relayReceivedAt", "collectionIds", "recovery"]);
     observationHost(record.host);
     if (record.source !== undefined) observationHost(record.source);
     if (this.path(record.host, record.source) !== path || !timestamp(record.receivedAt) || (record.relayReceivedAt !== undefined && !timestamp(record.relayReceivedAt))) throw new Error("invalid stored observation");
+    if (record.collectionIds !== undefined && (!Array.isArray(record.collectionIds) || record.collectionIds.length > NETWORK_OBSERVATION_REPLAY_HISTORY || !record.collectionIds.every(id => typeof id === "string" && /^[a-f0-9-]{16,64}$/.test(id)))) throw new Error("invalid replay history");
+    if (record.recovery !== undefined) {
+      if (!object(record.recovery)) throw new Error("invalid recovery audit");
+      keys(record.recovery, ["previousCollectionId", "actor", "reason", "at"]);
+      if (!label(record.recovery.actor) || typeof record.recovery.reason !== "string" || !record.recovery.reason.trim() || record.recovery.reason.length > 512 || !timestamp(record.recovery.at) || typeof record.recovery.previousCollectionId !== "string") throw new Error("invalid recovery audit");
+    }
     record.report = validateNetworkObservation(record.report); return record as unknown as NetworkObservationRecord;
   }
   get(host: string, source?: string): NetworkObservationRecord | null {
@@ -127,14 +142,45 @@ export class NetworkObservationStore {
     const paths = readdirSync(this.dir).filter(n => /^[a-f0-9]{64}\.json$/.test(n)); if (paths.length > MAX_NETWORK_OBSERVATION_HOSTS) throw new Error("observation host limit exceeded");
     return paths.map(name => this.readRecord(join(this.dir, name)));
   }
+  /** Compare-and-swap recovery preserves the poisoned record as an immutable audit file.
+   * Replay history is bounded; old reports outside it remain stale by collection time. */
+  recover(host: string, report: unknown, recovery: { expectedCollectionId: string; actor: string; reason: string }, metadata: { relayReceivedAt?: string; source?: string } = {}): NetworkObservationRecord {
+    if (!label(recovery.actor) || typeof recovery.reason !== "string" || !recovery.reason.trim() || recovery.reason.length > 512) throw new Error("invalid recovery audit");
+    return this.write(host, report, metadata, recovery);
+  }
   put(host: string, report: unknown, metadata: { relayReceivedAt?: string; source?: string } = {}): NetworkObservationRecord {
+    return this.write(host, report, metadata);
+  }
+  private write(host: string, report: unknown, metadata: { relayReceivedAt?: string; source?: string } = {}, recovery?: { expectedCollectionId: string; actor: string; reason: string }): NetworkObservationRecord {
     const value = validateNetworkObservation(report); const path = this.path(host, metadata.source);
     if (metadata.relayReceivedAt !== undefined && !timestamp(metadata.relayReceivedAt)) throw new Error("invalid relay receive time");
+    const now = (this.options.now ?? Date.now)();
+    if (!Number.isFinite(now)) throw new Error("invalid observation clock");
+    if ([value.completedAt, metadata.relayReceivedAt].some(t => t !== undefined && Date.parse(t) > now + NETWORK_OBSERVATION_FUTURE_SKEW_MS)) throw new Error("observation timestamp exceeds future skew");
     return withFileLock(join(this.dir, "store"), 0, "network observations", (message, status) => status === 503 ? new NetworkObservationStoreBusyError("network observation store is busy") : new Error(message), () => {
       const previous = this.get(host, metadata.source);
-      if (previous && (previous.report.collectionId === value.collectionId || Date.parse(value.completedAt) <= Date.parse(previous.report.completedAt))) return previous;
+      const history = previous ? [...new Set([...(previous.collectionIds ?? []), previous.report.collectionId])] : [];
+      if (!recovery && history.includes(value.collectionId)) return previous!;
+      if (recovery) {
+        if (!previous || previous.report.collectionId !== recovery.expectedCollectionId || ![previous.receivedAt, previous.report.completedAt, previous.relayReceivedAt].some(t => t !== undefined && Date.parse(t) > now + NETWORK_OBSERVATION_FUTURE_SKEW_MS)) throw new Error("recovery requires matching future-poisoned observation");
+        if (history.includes(value.collectionId)) throw new Error("recovery requires a new collection ID");
+        // Require a recent replacement so an archived old report cannot become current evidence.
+        if (now - Date.parse(value.completedAt) > 10 * 60_000) throw new Error("recovery requires recent observation");
+        const archive = createHash("sha256").update(JSON.stringify(previous)).digest("hex");
+        const archivePrefix = `recovery-${createHash("sha256").update(JSON.stringify([metadata.source ?? "", host])).digest("hex")}-`;
+        if (readdirSync(this.dir).filter(name => name.startsWith(archivePrefix)).length >= 32) throw new Error("recovery archive limit reached; operator archival required");
+        atomicWriteFile(join(this.dir, `${archivePrefix}${archive}.json`), JSON.stringify(previous));
+      } else if (previous) {
+        // A corrected local receipt clock must not silently erase poisoned evidence either.
+        if ([previous.receivedAt, previous.report.completedAt, previous.relayReceivedAt].some(t => t !== undefined && Date.parse(t) > now + NETWORK_OBSERVATION_FUTURE_SKEW_MS)) return previous;
+        if (Date.parse(value.completedAt) <= Date.parse(previous.report.completedAt)) return previous;
+      }
       if (!previous && this.list().length >= MAX_NETWORK_OBSERVATION_HOSTS) throw new Error("observation host limit exceeded");
-      const record: NetworkObservationRecord = { host, receivedAt: new Date().toISOString(), report: value, ...metadata };
+      const record: NetworkObservationRecord = { host, receivedAt: new Date(now).toISOString(), report: value,
+        ...(metadata.source === undefined ? {} : { source: metadata.source }),
+        ...(metadata.relayReceivedAt === undefined ? {} : { relayReceivedAt: metadata.relayReceivedAt }),
+        collectionIds: [...history, value.collectionId].slice(-NETWORK_OBSERVATION_REPLAY_HISTORY),
+        ...(recovery && previous ? { recovery: { previousCollectionId: previous.report.collectionId, actor: recovery.actor, reason: recovery.reason, at: new Date(now).toISOString() } } : previous?.recovery ? { recovery: previous.recovery } : {}) };
       atomicWriteFile(path, JSON.stringify(record)); return record;
     });
   }
