@@ -338,4 +338,9 @@ export {
   type InventoryAddressPool,
   type InventoryInterface,
   type InventoryRoute,
+  type InventoryRoutingDomain,
+  type InventoryDomainConnection,
+  type InventoryLearnedRoute,
+  type NetworkPurpose,
+  type AddressPoolPurpose,
 } from "./network-inventory.ts";
