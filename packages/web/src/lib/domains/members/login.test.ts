@@ -1,8 +1,31 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
-  afterSignIn, loginBody, nextStep, readLogin, readMethods, readResetRequest, RESET_REQUEST_PATH, resetRequestBody, safeNext, ssoHref,
+  afterSignIn, loginBody, nextStep, readLogin, readMethods, readResetRequest, readSsoOtp, readSsoParam, RESET_REQUEST_PATH, resetRequestBody,
+  safeNext, SSO_NOTICE, ssoHref, ssoOtpBody,
 } from "./login.ts";
+
+describe("the SSO code step", () => {
+  it("reads only the three values the callback sends", () => {
+    assert.equal(readSsoParam("otp"), "otp");
+    assert.equal(readSsoParam("unlinked"), "unlinked");
+    assert.equal(readSsoParam("refused"), "refused");
+    assert.equal(readSsoParam("OTP"), null);
+    assert.equal(readSsoParam(null), null);
+    assert.equal(SSO_NOTICE.unlinked, "m.loginSsoUnlinked");
+  });
+
+  it("signs in on 200 with where the login was headed, and otherwise means SSO again", () => {
+    assert.equal(ssoOtpBody(" 123456 "), JSON.stringify({ otp: "123456" }));
+    assert.deepEqual(readSsoOtp(200, { next: "/app/changes" }), { kind: "signedIn", next: "/app/changes" });
+    assert.deepEqual(readSsoOtp(200, {}), { kind: "signedIn", next: null });
+    const key = (status: number) => { const a = readSsoOtp(status, { error: "w" }); return a.kind === "refused" ? a.refusal.key : a.kind; };
+    assert.equal(key(400), "m.loginSsoRestart");
+    assert.equal(key(401), "m.loginSsoRestart");
+    assert.equal(key(429), "m.loginTooMany");
+    assert.equal(key(503), "m.loginUnavailable");
+  });
+});
 
 describe("which sign-ins the page offers", () => {
   it("reads only booleans that are true, and offers nothing for an unreadable answer", () => {

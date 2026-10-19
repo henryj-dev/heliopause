@@ -54,6 +54,16 @@
     </p>
   {/if}
 
+  {#if actions.includes("solo-approve")}
+    <p class="act">
+      <span>{t(prefs.lang, member.soloApprove ? "m.mmSoloIsOn" : "m.mmSoloIsOff")}</span>
+      <button type="button" disabled={busy} onclick={() => onrequest({ action: "solo-approve", soloApprove: !member.soloApprove })}>
+        {t(prefs.lang, member.soloApprove ? "m.mmSoloOff" : "m.mmSoloOn")}
+      </button>
+    </p>
+    <p class="dim">{t(prefs.lang, "m.mmSoloNote")}</p>
+  {/if}
+
   <p class="act">
     {#if actions.includes("suspend")}
       <button type="button" disabled={busy} onclick={() => onrequest({ action: "suspend" })}>{t(prefs.lang, "m.mmSuspend")}</button>

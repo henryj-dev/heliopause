@@ -1,14 +1,17 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { base } from "$app/paths";
+  import { page } from "$app/state";
+  import { replaceState } from "$app/navigation";
   import { t } from "$lib/i18n";
   import { chromePrefs } from "$lib/shell/prefs.svelte";
   import { loginHref } from "$lib/shell/who";
   import { whoQuery } from "$lib/shell/who.svelte";
   import { writeHeaders } from "./write";
   import { errorText } from "./answer";
-  import { ME_PATH, ME_SESSIONS_PATH, readMe, readSessions, sessionPath, type MeView, type SessionRow } from "./account";
+  import { linkResult, ME_PATH, ME_SESSIONS_PATH, readMe, readSessions, sessionPath, type MeView, type SessionRow } from "./account";
   import ChangePassword from "./ChangePassword.svelte";
+  import SsoAccounts from "./SsoAccounts.svelte";
 
   type MeState =
     | { kind: "loading" }
@@ -54,6 +57,12 @@
   }
 
   onMount(() => {
+    // The SSO callback lands here with `?link=`; say what happened once, and drop it from the address.
+    const linked = linkResult(page.url.searchParams.get("link"));
+    if (linked) {
+      done(t(prefs.lang, linked.key), !linked.ok);
+      replaceState(`${base}/account`, {});
+    }
     void load();
   });
 
@@ -128,7 +137,13 @@
     <dd>{me.otpConfirmedAt ? t(prefs.lang, "m.acOtpConfirmed", { at: me.otpConfirmedAt }) : t(prefs.lang, "m.acOtpNone")}</dd>
   </dl>
 
-  <ChangePassword {csrf} onchanged={(n) => void changed(n)} />
+  {#if me.hasPassword}
+    <ChangePassword {csrf} onchanged={(n) => void changed(n)} />
+  {:else}
+    <p class="dim">{t(prefs.lang, "m.acPasswordNone")}</p>
+  {/if}
+
+  <SsoAccounts {me} onchanged={(key) => { done(t(prefs.lang, key)); void load(); }} />
 
   <h2>{t(prefs.lang, "m.acSessions")}</h2>
   <p class="dim">{t(prefs.lang, "m.acSessionsNote")}</p>

@@ -1,10 +1,12 @@
 /**
- * Member password sign-in for the manager: the `/auth/password/*`, `/auth/invite/accept`,
- * `/api/me*` and `/api/members*` routes, and the per-request re-read of a password session's member.
+ * Member sign-in for the manager: the `/auth/password/*`, `/auth/invite/accept`, `/auth/sso/otp`,
+ * `/api/me*` and `/api/members*` routes, the per-request re-read of a member session's member, and
+ * the member half of SSO (`ssoSignIn`, `linkStart`, `completeLink`).
  *
- * `manager-server.ts` builds one of these when `members.mode` is not `off` and calls it at three
- * points: `resolve` for a session whose principal is `via: "password"`, `handleAuthRoute` before its
- * own `/auth/*` routes, and `handleApiRoute` after authorisation and the CSRF check.
+ * `manager-server.ts` builds one of these when `members.mode` is not `off` and calls `resolve` for a
+ * member session (`via: "password"` or `"sso"`), `handleAuthRoute` before its own `/auth/*` routes,
+ * `handleApiRoute` after authorisation and the CSRF check, and the three SSO functions from its OIDC
+ * routes.
  *
  * Bodies are JSON, every field is type- and length-checked before any hashing, and a write is a
  * `withMemberTransaction` with a short lock wait. Sessions stay in the manager's one `SessionStore`.
@@ -12,14 +14,14 @@
  * With `mail` configured, a self-service reset request and an admin's invitation are mailed through
  * `mail.ts`; without it, neither sends anything and the invite link is only in the admin's answer.
  */
-import { createHash, randomInt } from "node:crypto";
+import { createHash, randomBytes, randomInt } from "node:crypto";
 import { isIPv6 } from "node:net";
 import { statSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import {
   activeMember, bindCertCN, confirmOtp, consumeToken, createMember, DEFAULT_TOKEN_TTL_SEC, deleteMember, findByEmail, findByUsername,
-  issueToken, loadMemberDocument, MemberError, normalizeMemberName, passwordCredential, peekToken,
-  recordAudit, setOtpUserId, setPassword, setRoles, suspendMember, trimLoginAudit, unbindCertCN, unsuspendMember,
+  identityHandle, identityOwner, issueToken, linkIdentity, loadMemberDocument, MemberError, normalizeMemberName, passwordCredential, peekToken,
+  recordAudit, setOtpUserId, setPassword, setRoles, setSoloApprove, suspendMember, trimLoginAudit, unbindCertCN, unlinkIdentity, unsuspendMember,
   withMemberTransaction, type Member, type MemberDocument,
 } from "./member-store.ts";
 import {
@@ -28,8 +30,30 @@ import {
 import { statusFor, verifyOtp } from "./otp.ts";
 import { MailError, sendMail, type MailConfig, type MailMessage } from "./mail.ts";
 import {
-  checkCsrf, clearCookieHeader, cookieHeader, COOKIE, CSRF_HEADER, readCookie, type Principal, type Session, type SessionStore,
+  checkCsrf, clearCookieHeader, cookieHeader, COOKIE, CSRF_HEADER, isMemberSession, readCookie, type Principal, type Session, type SessionStore,
 } from "./session.ts";
+
+/**
+ * The browser's half of an SSO sign-in that still needs a writer's or admin's one-time code. Only
+ * its digest is kept here; the entry is single-use and short-lived.
+ */
+export const SSO_PENDING_COOKIE = "__Host-heliopause-sso";
+/** How long the browser has to enter the code after the IdP sent it back. */
+export const SSO_PENDING_TTL_SEC = 5 * 60;
+const SSO_PENDING_MAX = 256;
+const ssoPendingCookie = (value: string): string =>
+  `${SSO_PENDING_COOKIE}=${value}; Max-Age=${SSO_PENDING_TTL_SEC}; Path=/; Secure; HttpOnly; SameSite=Strict`;
+const clearSsoPendingCookie = (): string => `${SSO_PENDING_COOKIE}=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Strict`;
+
+/** What `/auth/link/start` stores beside the OIDC `state`, server-side. The browser never sends it. */
+export interface LinkIntent { kind: "link"; memberId: string; sessionId: string }
+
+/** What an SSO callback with a verified `(issuer, subject)` turned into. */
+export type SsoSignIn =
+  | { kind: "unlinked" }
+  | { kind: "refused"; status: 403 | 503; error: string }
+  | { kind: "session"; session: Session }
+  | { kind: "otp"; cookie: string };
 
 /** Lock wait for a transaction taken on the request path; see `ENROLLMENT_HTTP_LOCK_WAIT_MS`. */
 const MEMBER_HTTP_LOCK_WAIT_MS = 100;
@@ -415,9 +439,12 @@ export function createMemberAuth(deps: MemberAuthDeps) {
   }
 
   /**
-   * Rebuild a password session's principal from the store. A member who is missing, not active, or
-   * whose credential is gone or changed since sign-in ends the session (401); an unreadable store is 503.
+   * Rebuild a member session's principal from the store. A member who is missing or not active ends
+   * the session (401), and so does, for a password session, a credential gone or changed since
+   * sign-in, and for an SSO session, the identity it signed in with no longer linked to the member.
+   * An unreadable store is 503.
    * @see member-auth-server.test.ts "suspension takes effect on the next request"
+   * @see member-sso-server.test.ts "unlinking ends the sessions that identity signed in"
    */
   function resolve(session: Session): Resolved {
     let document: MemberDocument;
@@ -427,18 +454,29 @@ export function createMemberAuth(deps: MemberAuthDeps) {
     }
     const id = session.principal.memberId ?? "";
     const member = activeMember(document, id);
+    const sso = session.principal.via === "sso";
     const credential = member ? passwordCredential(document, member.id) : null;
-    if (!member || !credential || credential.changedAt !== session.principal.credentialChangedAt) {
+    const stillValid = sso
+      ? !!member && identityOwner(document, session.principal.ssoIssuer ?? "", session.principal.ssoSubject ?? "")?.id === member.id
+      : !!member && !!credential && credential.changedAt === session.principal.credentialChangedAt;
+    if (!member || !stillValid) {
       sessions.destroy(session.id);
       return { ok: false, status: 401, error: "this session has ended — sign in again" };
     }
     const mfa = session.principal.loginMfa === true;
     const principal: Principal = {
-      name: member.principalName, sub: `member:${member.id}`, groups: [], via: "password",
+      name: member.principalName, sub: `member:${member.id}`, groups: [], via: sso ? "sso" : "password",
       canWrite: mfa && member.roles.includes("writer"),
-      memberId: member.id, loginMfa: mfa, credentialChangedAt: credential.changedAt,
-      mustChange: credential.mustChange, isAdmin: mfa && member.roles.includes("admin"), otpUserId: member.otpUserId,
+      memberId: member.id, loginMfa: mfa,
+      ...(sso
+        ? { ssoIssuer: session.principal.ssoIssuer!, ssoSubject: session.principal.ssoSubject!, mustChange: false }
+        : { credentialChangedAt: credential!.changedAt, mustChange: credential!.mustChange }),
+      isAdmin: mfa && member.roles.includes("admin"), otpUserId: member.otpUserId,
       otpConfirmed: member.otpConfirmedAt !== null,
+      // The flag and a confirmed KeyStone user. The manager also needs `canWrite`, which a member
+      // session has only after its sign-in code. @see `maySoloApprove` in manager-server.ts
+      // @see member-sso-server.test.ts "solo approval needs soloApprove, a confirmed code and a session that passed it"
+      soloApprove: member.soloApprove && member.otpUserId !== null && member.otpConfirmedAt !== null,
     };
     session.principal = principal;
     return { ok: true, principal };
@@ -450,12 +488,18 @@ export function createMemberAuth(deps: MemberAuthDeps) {
     return !((method === "GET" && path === "/api/me") || (method === "POST" && path === "/api/me/password"));
   }
 
-  function newSession(req: IncomingMessage, member: Member, mfa: boolean, credentialChangedAt: string): Session {
+  function newSession(
+    req: IncomingMessage, member: Member, mfa: boolean,
+    proof: { via: "password"; credentialChangedAt: string } | { via: "sso"; issuer: string; subject: string },
+  ): Session {
     // A cookie presented with the sign-in is ended, so a planted id never becomes a signed-in one.
     sessions.destroy(readCookie(req.headers["cookie"], COOKIE));
     return sessions.create({
-      name: member.principalName, sub: `member:${member.id}`, groups: [], via: "password",
-      canWrite: mfa && member.roles.includes("writer"), memberId: member.id, loginMfa: mfa, credentialChangedAt,
+      name: member.principalName, sub: `member:${member.id}`, groups: [], via: proof.via,
+      canWrite: mfa && member.roles.includes("writer"), memberId: member.id, loginMfa: mfa,
+      ...(proof.via === "password"
+        ? { credentialChangedAt: proof.credentialChangedAt }
+        : { ssoIssuer: proof.issuer, ssoSubject: proof.subject }),
     }, { idleSec: deps.idleSec, ttlSec: deps.ttlSec, perMemberMax: MEMBER_SESSIONS_PER_MEMBER });
   }
 
@@ -536,7 +580,7 @@ export function createMemberAuth(deps: MemberAuthDeps) {
     failures.delete(key);
     trustSource(account, from, nowMs);
 
-    const s = newSession(req, member, mfa, changedAt);
+    const s = newSession(req, member, mfa, { via: "password", credentialChangedAt: changedAt });
     log(`password session for ${member.principalName} (${member.id})`, `${member.principalName}(${member.id})의 비밀번호 세션`);
     reply(res, 200, {
       you: member.principalName, canWrite: mfa && member.roles.includes("writer"), isAdmin: mfa && member.roles.includes("admin"),
@@ -704,6 +748,236 @@ export function createMemberAuth(deps: MemberAuthDeps) {
     log(`reset mail sent for member ${found.id}`, `회원 ${found.id} 재설정 메일 보냄`);
   }
 
+  // ── SSO: sign-in of a linked member, linking, unlinking ────────────────────────────────────
+
+  /** Writer and admin SSO sign-ins waiting for their one-time code, keyed by the cookie's digest. */
+  const ssoPending = new Map<string, { memberId: string; issuer: string; subject: string; otpUserId: string; at: number; returnTo: string | null }>();
+  const digestOf = (value: string): string => createHash("sha256").update(value).digest("base64url");
+  function trimSsoPending(nowMs: number): void {
+    for (const [k, v] of ssoPending) if (nowMs - v.at >= SSO_PENDING_TTL_SEC * 1000) ssoPending.delete(k);
+    while (ssoPending.size >= SSO_PENDING_MAX) ssoPending.delete(ssoPending.keys().next().value as string);
+  }
+
+  /**
+   * An SSO callback whose `(issuer, subject)` the IdP just proved. A linked, active member gets a
+   * session from the member record (`via: "sso"`); a writer or admin first owes the sign-in code, so
+   * they get a single-use pending entry instead. An identity row of a member who is not active — a
+   * tombstone included — refuses: the IdP cannot undo a local suspension or deletion. No row at all
+   * is `unlinked`, and the manager decides by mode. Nothing here looks at email or username.
+   * @see member-sso-server.test.ts "an SSO account whose email is a member's does not become that member"
+   * @see member-sso-server.test.ts "a suspended or deleted member's identity is refused, not treated as unlinked"
+   */
+  function ssoSignIn(req: IncomingMessage, issuer: string, subject: string, returnTo: string | null): SsoSignIn {
+    let document: MemberDocument;
+    try { document = current(); } catch (e) {
+      log(`member store unavailable: ${(e as Error).message}`, `회원 저장소를 읽을 수 없음: ${(e as Error).message}`);
+      return { kind: "refused", status: 503, error: "the member store is unavailable" };
+    }
+    const owner = identityOwner(document, issuer, subject);
+    if (!owner) return { kind: "unlinked" };
+    if (owner.status !== "active") {
+      log(`SSO sign-in refused for member ${owner.id}: ${owner.status}`, `회원 ${owner.id}의 SSO 로그인 거부: ${owner.status}`);
+      return { kind: "refused", status: 403, error: "the member this SSO account is linked to cannot sign in" };
+    }
+    if (mayWriteRoles(owner)) {
+      if (!deps.otp) return { kind: "refused", status: 503, error: "writer and admin accounts need a one-time code, and this manager has no OTP verifier configured" };
+      if (!owner.otpUserId) return { kind: "refused", status: 403, error: "this account needs a one-time code but has no OTP user id — ask an admin to set one" };
+      const nowMs = deps.now().getTime();
+      trimSsoPending(nowMs);
+      const value = randomBytes(32).toString("base64url");
+      ssoPending.set(digestOf(value), { memberId: owner.id, issuer, subject, otpUserId: owner.otpUserId, at: nowMs, returnTo });
+      return { kind: "otp", cookie: ssoPendingCookie(value) };
+    }
+    // No await separates the read above from this write, and the session is re-read on every
+    // request (`resolve`), so the member is not checked again under the lock.
+    try {
+      write((d) => {
+        recordAudit(d, { actor: owner.id, sourceIp: source(req), now: deps.now() }, "member.login", owner.id);
+        trimLoginAudit(d);
+      });
+    } catch (e) {
+      log(`SSO sign-in not recorded: ${(e as Error).message}`, `SSO 로그인 기록 실패: ${(e as Error).message}`);
+      return { kind: "refused", status: 503, error: "the member store is unavailable" };
+    }
+    const s = newSession(req, owner, false, { via: "sso", issuer, subject });
+    log(`SSO session for ${owner.principalName} (${owner.id})`, `${owner.principalName}(${owner.id})의 SSO 세션`);
+    return { kind: "session", session: s };
+  }
+
+  /**
+   * `POST /auth/sso/otp {otp}`: the writer's or admin's code after an SSO callback. The pending entry
+   * is spent by the first attempt, right or wrong, and lives `SSO_PENDING_TTL_SEC`; a wrong code
+   * means signing in with SSO again.
+   * @see member-sso-server.test.ts "the pending SSO step is single-use and expires"
+   */
+  async function ssoOtp(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const body = await readJson(req);
+    fields(body, ["otp"]);
+    const code = str(body, "otp", 16);
+    const clear = { "set-cookie": clearSsoPendingCookie() };
+    const raw = readCookie(req.headers["cookie"], SSO_PENDING_COOKIE);
+    const pendingKey = raw ? digestOf(raw) : null;
+    const entry = pendingKey ? ssoPending.get(pendingKey) : undefined;
+    if (pendingKey) ssoPending.delete(pendingKey);
+    if (!entry || deps.now().getTime() - entry.at >= SSO_PENDING_TTL_SEC * 1000) {
+      return reply(res, 400, { error: "this SSO sign-in has expired or was already used — sign in with SSO again", restart: true }, clear);
+    }
+    const changed = (): void => reply(res, 401, { error: "this account changed during sign-in — sign in with SSO again", restart: true }, clear);
+    const document = current();
+    const member = activeMember(document, entry.memberId);
+    if (!member || identityOwner(document, entry.issuer, entry.subject)?.id !== member.id || !mayWriteRoles(member) || member.otpUserId !== entry.otpUserId) {
+      return changed();
+    }
+    // Wrong codes count like wrong passwords: the per-(account, source) wait and the account-wide cap.
+    // @see member-sso-server.test.ts "wrong SSO codes wait like wrong passwords, and reach the account cap"
+    const from = source(req);
+    const key = failureKey(member.username, from);
+    const account = accountKey(member.username);
+    const nowMs = deps.now().getTime();
+    const wait = delayedFor(key, nowMs);
+    if (wait > 0) {
+      return reply(res, 429, { error: `too many failed sign-ins for this account — try again in ${wait}s`, restart: true }, { ...clear, "retry-after": String(wait) });
+    }
+    if (accountCapped(account, from, nowMs)) {
+      log(`SSO code refused from ${from}: account-wide failure cap`, `${from}의 SSO 코드 거부: 계정 실패 상한`);
+      return reply(res, 429, { error: "too many failed sign-ins for this account — try again later", restart: true }, clear);
+    }
+    const refused = await memberOtp(member, code, "/auth/sso/otp");
+    if (refused) {
+      if (refused.status === 401) {
+        recordFailure(key, nowMs);
+        deps.rateLimited(accountFailures, account, nowMs, MEMBER_ACCOUNT_FAILURES_MAX, MEMBER_ACCOUNT_WINDOW_MS, MEMBER_FAILURE_KEYS);
+      }
+      return reply(res, refused.status, { error: refused.body.error, restart: true }, clear);
+    }
+    try {
+      write((d) => {
+        const ctx = { actor: member.id, sourceIp: source(req), now: deps.now() };
+        // Re-checked under the lock, as a password sign-in is.
+        const live = activeMember(d, member.id);
+        if (!live || identityOwner(d, entry.issuer, entry.subject)?.id !== member.id || !mayWriteRoles(live) || live.otpUserId !== entry.otpUserId) {
+          throw new MemberError("this account changed during sign-in — sign in with SSO again", 401);
+        }
+        recordAudit(d, ctx, "member.login", member.id);
+        trimLoginAudit(d);
+        confirmOtp(d, member.id, entry.otpUserId, ctx);
+      });
+    } catch (e) {
+      if (e instanceof MemberError && e.statusCode === 401) return changed();
+      throw e;
+    }
+    failures.delete(key);
+    trustSource(account, from, nowMs);
+    const s = newSession(req, member, true, { via: "sso", issuer: entry.issuer, subject: entry.subject });
+    log(`SSO session for ${member.principalName} (${member.id}) after its one-time code`, `${member.principalName}(${member.id})의 SSO 세션(일회용 코드 확인 후)`);
+    reply(res, 200, {
+      you: member.principalName, canWrite: member.roles.includes("writer"), isAdmin: member.roles.includes("admin"),
+      csrf: s.csrf, mustChange: false, ...(entry.returnTo ? { next: entry.returnTo } : {}),
+    }, { "set-cookie": [cookieHeader(s), clearSsoPendingCookie()] });
+  }
+
+  /**
+   * The current password, and for a writer or admin a one-time code (`requireOtp`). Answers and
+   * returns null on refusal. Wrong passwords share `/api/me/password`'s per-member limit.
+   */
+  async function reauthenticate(principal: Principal, body: Record<string, unknown>, res: ServerResponse, path: string): Promise<Member | null> {
+    const memberId = principal.memberId ?? "";
+    const password = str(body, "password", PASSWORD_BODY_MAX_BYTES);
+    const document = current();
+    const m = activeMember(document, memberId);
+    if (!m) { reply(res, 401, { error: "this session has ended — sign in again" }); return null; }
+    const credential = passwordCredential(document, memberId);
+    if (!credential) { reply(res, 409, { error: "this needs the account's current password, and the account has none" }); return null; }
+    const nowMs = deps.now().getTime();
+    const failed = meFailures.get(memberId);
+    if (failed && nowMs - failed.windowStartedAt < ME_PASSWORD_WINDOW_MS && failed.count >= ME_PASSWORD_FAILURES_MAX) {
+      reply(res, 429, { error: "too many wrong current passwords — try again later" });
+      return null;
+    }
+    // @see member-sso-server.test.ts "link start needs the current password, and a writer's code"
+    if (!(await verifyPassword(password, credential.hash)).ok) {
+      deps.rateLimited(meFailures, memberId, nowMs, ME_PASSWORD_FAILURES_MAX, ME_PASSWORD_WINDOW_MS, MEMBER_FAILURE_KEYS);
+      reply(res, 403, { error: "the current password is not correct" });
+      return null;
+    }
+    if (mayWriteRoles(m) && (await deps.requireOtp(principal, body, res, path)) === "answered") return null;
+    return m;
+  }
+
+  /**
+   * `POST /auth/link/start {password, otp?}` from a member password session. `begin` starts the
+   * manager's OIDC login with the intent stored server-side beside its `state`, and returns where
+   * the browser goes next and the login binder cookie.
+   * @see member-sso-server.test.ts "a member links an SSO account and then signs in with it"
+   */
+  async function linkStart(req: IncomingMessage, res: ServerResponse, begin: (intent: LinkIntent) => Promise<{ location: string; setCookie: string }>): Promise<void> {
+    if (!sameOrigin(req)) return reply(res, 403, { error: "this route only answers the console's own page" });
+    const s = sessions.get(readCookie(req.headers["cookie"], COOKIE));
+    if (!s || s.principal.via !== "password") {
+      return reply(res, 403, { error: "linking an SSO account needs a password session — sign in with your password" });
+    }
+    const refusal = checkCsrf(s, {
+      origin: typeof req.headers["origin"] === "string" ? req.headers["origin"] : undefined,
+      csrf: typeof req.headers[CSRF_HEADER] === "string" ? (req.headers[CSRF_HEADER] as string) : undefined,
+    }, selfOrigin(req));
+    if (refusal) return reply(res, 403, { error: "missing or invalid CSRF token — reload the console" });
+    try {
+      const resolved = resolve(s);
+      if (!resolved.ok) return reply(res, resolved.status, { error: resolved.error }, resolved.status === 401 ? { "set-cookie": clearCookieHeader() } : {});
+      if (resolved.principal.mustChange) return reply(res, 403, { error: "password change required", mustChange: true });
+      const body = await readJson(req, PASSWORD_BODY_MAX_BYTES);
+      fields(body, ["password", "otp"]);
+      const m = await reauthenticate(resolved.principal, body, res, "/auth/link/start");
+      if (!m) return;
+      const started = await begin({ kind: "link", memberId: m.id, sessionId: s.id });
+      log(`SSO link started for ${m.username} (${m.id})`, `${m.username}(${m.id})의 SSO 연결 시작`);
+      reply(res, 200, { location: started.location }, { "set-cookie": started.setCookie });
+    } catch (e) { sendError(res, e); }
+  }
+
+  /**
+   * The callback half of a link. The intent came from the pending login record, never from the
+   * request. The session that started it must still be alive and the member's, and the identity
+   * must be free: one bound to another member, or kept as a deleted member's tombstone, refuses.
+   * Group claims play no part.
+   * @see member-sso-server.test.ts "linking refuses an identity bound to another member or kept as a tombstone"
+   */
+  function completeLink(intent: LinkIntent, issuer: string, subject: string, from: string):
+    { ok: true } | { ok: false; code: "ended" | "taken" | "tombstone" | "invalid" | "unavailable"; error: string } {
+    const s = sessions.get(intent.sessionId);
+    if (!s || s.principal.via !== "password" || s.principal.memberId !== intent.memberId) {
+      return { ok: false, code: "ended", error: "the session that started this link has ended — sign in and start again" };
+    }
+    // Rebuild from the store, as every protected request does. A direct credential or status edit
+    // during the IdP round trip must not let a session which is already invalid bind an identity.
+    // @see member-sso-server.test.ts "a link callback re-reads the session that started it"
+    const resolved = resolve(s);
+    if (!resolved.ok || resolved.principal.via !== "password" || resolved.principal.memberId !== intent.memberId) {
+      return { ok: false, code: resolved.ok ? "invalid" : resolved.status === 503 ? "unavailable" : "ended", error: resolved.ok ? "the link session is not a password session" : resolved.error };
+    }
+    try {
+      write((d) => {
+        if (!activeMember(d, intent.memberId)) throw new MemberError("the member that started this link cannot sign in", 401);
+        linkIdentity(d, { memberId: intent.memberId, issuer, subject }, { actor: intent.memberId, sourceIp: from, now: deps.now() });
+      });
+    } catch (e) {
+      if (!(e instanceof MemberError)) {
+        log(`SSO link failed: ${(e as Error).message}`, `SSO 연결 실패: ${(e as Error).message}`);
+        return { ok: false, code: "unavailable", error: "the member store is unavailable" };
+      }
+      const code = e.statusCode === 401 ? "ended" : e.code === "identity-tombstone" ? "tombstone" : e.code === "identity-taken" ? "taken" : "invalid";
+      log(`SSO link refused for member ${intent.memberId}: ${e.message}`, `회원 ${intent.memberId}의 SSO 연결 거부: ${e.message}`);
+      return { ok: false, code, error: e.message };
+    }
+    log(`SSO account linked to member ${intent.memberId}`, `회원 ${intent.memberId}에 SSO 계정 연결`);
+    return { ok: true };
+  }
+
+  /** An identity as screens show it: the issuer, and only the subject's last four characters. */
+  const identityView = (i: { issuer: string; subject: string; linkedAt: string }): Record<string, unknown> => ({
+    id: identityHandle(i), issuer: i.issuer, subject: `…${i.subject.length > 4 ? i.subject.slice(-4) : ""}`, linkedAt: i.linkedAt,
+  });
+
   /**
    * `POST /auth/logout` for a member password session: it needs its CSRF token to end, and works
    * whether or not OIDC is configured. False for any other session, which the OIDC handler ends.
@@ -713,7 +987,7 @@ export function createMemberAuth(deps: MemberAuthDeps) {
   function logout(req: IncomingMessage, res: ServerResponse): boolean {
     const id = readCookie(req.headers["cookie"], COOKIE);
     const s = sessions.get(id);
-    if (!s || s.principal.via !== "password") return false;
+    if (!s || !isMemberSession(s.principal)) return false;
     const origin = req.headers["origin"];
     const refusal = checkCsrf(s, {
       origin: typeof origin === "string" ? origin : undefined,
@@ -730,7 +1004,7 @@ export function createMemberAuth(deps: MemberAuthDeps) {
     return true;
   }
 
-  /** `/auth/password/{login,reset,reset-request}`, `/auth/invite/accept`, and a password session's `/auth/logout`. False for any other path. */
+  /** `/auth/password/{login,reset,reset-request}`, `/auth/invite/accept`, `/auth/sso/otp`, and a member session's `/auth/logout`. False for any other path. */
   async function handleAuthRoute(url: URL, req: IncomingMessage, res: ServerResponse): Promise<boolean> {
     if (req.method === "POST" && url.pathname === "/auth/logout") return logout(req, res);
     const route = req.method === "POST" ? ({
@@ -738,6 +1012,7 @@ export function createMemberAuth(deps: MemberAuthDeps) {
       "/auth/password/reset": { run: resetPassword, hits: tokenHits },
       "/auth/password/reset-request": { run: requestReset, hits: resetRequestHits },
       "/auth/invite/accept": { run: acceptInvite, hits: tokenHits },
+      "/auth/sso/otp": { run: ssoOtp, hits: loginHits },
     } as const)[url.pathname as "/auth/password/login"] : undefined;
     if (!route) return false;
     if (!sameOrigin(req)) {
@@ -759,6 +1034,7 @@ export function createMemberAuth(deps: MemberAuthDeps) {
       id: m.id, username: m.username, principalName: m.principalName, email: m.email, emailVerifiedAt: m.emailVerifiedAt,
       status: m.status, roles: m.roles, soloApprove: m.soloApprove, otpUserId: m.otpUserId, otpConfirmedAt: m.otpConfirmedAt,
       certCNs: m.certCNs,
+      identities: document.identities.filter((i) => i.memberId === m.id).map(identityView),
       hasPassword: credential !== null, mustChange: credential?.mustChange ?? false,
       createdAt: m.createdAt, updatedAt: m.updatedAt,
     };
@@ -774,6 +1050,8 @@ export function createMemberAuth(deps: MemberAuthDeps) {
       return reply(res, 200, {
         id: m.id, username: m.username, principalName: m.principalName, email: m.email, roles: m.roles,
         status: m.status, mustChange: principal.mustChange === true, via: principal.via, otpConfirmedAt: m.otpConfirmedAt,
+        hasPassword: passwordCredential(document, m.id) !== null, soloApprove: m.soloApprove,
+        identities: document.identities.filter((i) => i.memberId === m.id).map(identityView),
         // The session's own token, for the one caller holding its cookie. `/api/authz` carries it
         // too, but answers nothing while the password must change, and sign-out still needs it then.
         csrf: session.csrf,
@@ -817,6 +1095,23 @@ export function createMemberAuth(deps: MemberAuthDeps) {
     }
     if (req.method === "DELETE" && url.pathname === "/api/me/sessions") {
       return reply(res, 200, { ended: sessions.endMember(memberId, session.id) });
+    }
+    // Unlinking needs the current password (and a writer's code). A member without a password is
+    // therefore refused by `reauthenticate` before the store's last-login-method guard is reached;
+    // that guard is reached by the admin unlink route below.
+    // @see member-sso-server.test.ts "unlinking needs the password, and ends the sessions that identity signed in"
+    // @see member-sso-server.test.ts "a member without a password cannot self-unlink: reauthentication needs a password"
+    const linked = /^\/api\/me\/identities\/([0-9a-f]{16})$/.exec(url.pathname);
+    if (req.method === "DELETE" && linked) {
+      const body = await readJson(req, PASSWORD_BODY_MAX_BYTES);
+      fields(body, ["password", "otp"]);
+      const target = current().identities.find((i) => i.memberId === memberId && identityHandle(i) === linked[1]);
+      if (!target) return reply(res, 404, { error: "no such linked identity" });
+      if (!(await reauthenticate(principal, body, res, url.pathname))) return;
+      // The SSO sessions it signed in end on their next request: `resolve` checks the link.
+      write((d) => unlinkIdentity(d, { memberId, issuer: target.issuer, subject: target.subject }, { actor: memberId, sourceIp: source(req), now: deps.now() }));
+      log(`identity unlinked from member ${memberId}`, `회원 ${memberId}의 identity 연결 해제`);
+      return reply(res, 200, { ok: true });
     }
     const one = /^\/api\/me\/sessions\/([0-9a-f]{16})$/.exec(url.pathname);
     if (req.method === "DELETE" && one) {
@@ -872,11 +1167,30 @@ export function createMemberAuth(deps: MemberAuthDeps) {
       }
       return reply(res, 201, { id: issued.row.id, expiresAt: issued.row.expiresAt, inviteUrl, mailed, ...(mailError ? { mailError } : {}) });
     }
-    const m = /^\/api\/members\/([0-9a-f-]{36})\/(roles|suspend|unsuspend|delete|otp-user|cert-cns|password-reset)$/.exec(url.pathname);
+    // An admin removes another member's linked identity. The store keeps refusing a member's last
+    // way in and a deleted member's tombstones.
+    // @see member-sso-server.test.ts "an admin unlinks another member's identity with a code, never their own"
+    const unlink = /^\/api\/members\/([0-9a-f-]{36})\/identities\/([0-9a-f]{16})\/unlink$/.exec(url.pathname);
+    if (unlink) {
+      const [, id, handle] = unlink as unknown as [string, string, string];
+      fields(body, ["otp"]);
+      if (id === actor) return reply(res, 403, { error: "an admin cannot unlink their own identities here — use the account page" });
+      const target = current().identities.find((i) => i.memberId === id && identityHandle(i) === handle);
+      if (!target) return reply(res, 404, { error: "no such linked identity" });
+      if ((await deps.requireOtp(principal, body, res, url.pathname)) === "answered") return;
+      write((d) => unlinkIdentity(d, { memberId: id, issuer: target.issuer, subject: target.subject }, { actor, sourceIp: source(req), now: deps.now() }));
+      const ended = sessions.endIdentity(target.issuer, target.subject);
+      log(`identity unlinked from member ${id} by ${principal.name}; ended ${ended} sessions`, `${principal.name}이(가) 회원 ${id}의 identity 연결 해제; 세션 ${ended}개 종료`);
+      const after = current();
+      const member = after.members.find((x) => x.id === id);
+      return reply(res, 200, { ...(member ? { member: memberView(after, member) } : {}), endedSessions: ended });
+    }
+    const m = /^\/api\/members\/([0-9a-f-]{36})\/(roles|suspend|unsuspend|delete|otp-user|cert-cns|password-reset|solo-approve)$/.exec(url.pathname);
     if (!m) return reply(res, 404, { error: `no such route ${url.pathname}` });
     const [, id, action] = m as unknown as [string, string, string];
     const allowed: Record<string, readonly string[]> = {
       "roles": ["roles", "otp"], "otp-user": ["otpUserId", "otp"], "cert-cns": ["add", "remove", "otp"],
+      "solo-approve": ["soloApprove", "otp"],
     };
     fields(body, allowed[action] ?? ["otp"]);
     const roles = action === "roles" ? stringList(body, "roles") : null;
@@ -886,10 +1200,13 @@ export function createMemberAuth(deps: MemberAuthDeps) {
     const add = action === "cert-cns" ? optStr(body, "add", 128) : undefined;
     const remove = action === "cert-cns" ? optStr(body, "remove", 128) : undefined;
     if (action === "cert-cns" && (add === undefined) === (remove === undefined)) throw new BadRequest("send exactly one of add or remove");
+    if (action === "solo-approve" && typeof body.soloApprove !== "boolean") throw new BadRequest("soloApprove must be true or false");
+    const solo = body.soloApprove === true;
     // An admin may not raise or re-point their own authority here; another admin, or the CLI, must.
     // @see member-auth-server.test.ts "an admin cannot change their own roles or otpUserId"
-    if (id === actor && (action === "roles" || action === "otp-user")) {
-      return reply(res, 403, { error: "an admin cannot change their own roles or one-time code — another admin must" });
+    // @see member-sso-server.test.ts "an admin sets another member's solo approval with a code, never their own"
+    if (id === actor && (action === "roles" || action === "otp-user" || action === "solo-approve")) {
+      return reply(res, 403, { error: "an admin cannot change their own roles, one-time code or solo approval — another admin must" });
     }
     if ((await deps.requireOtp(principal, body, res, url.pathname)) === "answered") return;
     const ctx = { actor, sourceIp: source(req), now: deps.now() };
@@ -913,6 +1230,7 @@ export function createMemberAuth(deps: MemberAuthDeps) {
         setOtpUserId(d, id, otpUser!, ctx);
       }
       else if (action === "cert-cns") { if (add !== undefined) bindCertCN(d, id, add, ctx); else unbindCertCN(d, id, remove!, ctx); }
+      else if (action === "solo-approve") setSoloApprove(d, id, solo, ctx);
       else return { endSessions: false, resetToken: issueToken(d, { kind: "password-reset", memberId: id }, ctx).token };
       return { endSessions: action === "suspend" || action === "delete" || action === "otp-user", resetToken: null };
     });
@@ -927,13 +1245,13 @@ export function createMemberAuth(deps: MemberAuthDeps) {
     });
   }
 
-  /** `/api/me*` and `/api/members*`, for a password session only. False for any other path. */
+  /** `/api/me*` and `/api/members*`, for a member session only. False for any other path. */
   async function handleApiRoute(principal: Principal, session: Session | null, url: URL, req: IncomingMessage, res: ServerResponse): Promise<boolean> {
     const p = url.pathname;
     const isMe = p === "/api/me" || p.startsWith("/api/me/");
     const isMembers = p === "/api/members" || p.startsWith("/api/members/");
     if (!isMe && !isMembers) return false;
-    if (principal.via !== "password" || !session) {
+    if (!isMemberSession(principal) || !session) {
       reply(res, 403, { error: "this route needs a member session" });
       return true;
     }
@@ -946,5 +1264,5 @@ export function createMemberAuth(deps: MemberAuthDeps) {
   /** The store as of now, for callers outside this module. Throws when it cannot be read. */
   const document = (): MemberDocument => current();
 
-  return { resolve, mustChangeRefuses, handleAuthRoute, handleApiRoute, document };
+  return { resolve, mustChangeRefuses, handleAuthRoute, handleApiRoute, document, ssoSignIn, linkStart, completeLink };
 }

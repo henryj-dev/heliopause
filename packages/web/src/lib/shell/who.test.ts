@@ -51,6 +51,8 @@ describe("readWho", () => {
     const admin = readWho({ you: "root", canWrite: true, via: "password", isAdmin: true });
     assert.equal(admin.ok && admin.view.via, "password");
     assert.equal(admin.ok && admin.view.isAdmin, true);
+    const sso = readWho({ you: "rita", canWrite: false, via: "sso", isAdmin: false });
+    assert.equal(sso.ok && sso.view.via, "sso");
     // Only `true` is an admin: a string or a missing field from an older manager is not.
     const loose = readWho({ you: "root", canWrite: true, via: "magic", isAdmin: "yes" });
     assert.equal(loose.ok && loose.view.via, null);

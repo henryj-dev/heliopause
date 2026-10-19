@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { readAdminWrite, readInviteAccept, readPasswordChange, readReset, repeatProblem } from "./answer.ts";
-import { readMe, readSessions, sessionPath } from "./account.ts";
+import { identityPath, linkResult, readLinkStart, readMe, readReauth, readSessions, reauthBody, reauthNeedsOtp, sessionPath } from "./account.ts";
 import {
   actionsFor, certCnBody, inviteBody, inviteMailNote, memberPath, otpUserBody, planRequest, readLink, readMembers, rolesBody,
 } from "./members.ts";
@@ -77,14 +77,69 @@ describe("member admin answers", () => {
     assert.equal(rows[0]!.otpUserId, null);
     assert.deepEqual(rows[0]!.certCNs, ["ops-r"]);
     assert.deepEqual(readMembers(null), []);
+    assert.deepEqual([rows[0]!.soloApprove, rows[0]!.identities], [false, []]);
+  });
+
+  it("offers solo approval for a member who is not deleted, and sends it with the code", () => {
+    assert.ok(actionsFor({ status: "active" }).includes("solo-approve"));
+    assert.ok(!actionsFor({ status: "deleted" }).includes("solo-approve"));
+    const on = planRequest({ id: "m1", username: "wade" }, { action: "solo-approve", soloApprove: true });
+    assert.deepEqual([on.path, on.body("123456"), on.what.key], ["/api/members/m1/solo-approve", JSON.stringify({ soloApprove: true, otp: "123456" }), "m.mmWhatSoloOn"]);
+    assert.equal(planRequest({ id: "m1", username: "wade" }, { action: "solo-approve", soloApprove: false }).what.key, "m.mmWhatSoloOff");
+    const row = readMembers({ members: [{ id: "3", username: "wade", status: "active", soloApprove: true, identities: [{ id: "0123456789abcdef", issuer: "https://idp.example", subject: "…wade" }] }] })[0]!;
+    assert.deepEqual([row.soloApprove, row.identities.map((i) => i.subject)], [true, ["…wade"]]);
   });
 });
 
 describe("account answers", () => {
   it("reads /api/me with its CSRF token", () => {
     const me = readMe({ username: "rita", principalName: "rita", email: "r@e", roles: ["reader", 3], mustChange: true, otpConfirmedAt: null, csrf: "tok" });
-    assert.deepEqual(me, { username: "rita", principalName: "rita", email: "r@e", roles: ["reader"], mustChange: true, otpConfirmedAt: null, csrf: "tok" });
+    // An older answer names no via, no hasPassword and no identities: only a password session could read it.
+    assert.deepEqual(me, {
+      username: "rita", principalName: "rita", email: "r@e", roles: ["reader"], mustChange: true, otpConfirmedAt: null, csrf: "tok",
+      via: null, hasPassword: true, identities: [],
+    });
     assert.equal(readMe({ username: "rita" }), null);
+  });
+
+  it("reads linked identities by their opaque id only, and says when there is no password", () => {
+    const me = readMe({
+      username: "rita", principalName: "rita", roles: ["reader"], via: "sso", hasPassword: false,
+      identities: [
+        { id: "0123456789abcdef", issuer: "https://idp.example", subject: "…rita", linkedAt: "t" },
+        { id: "../x", issuer: "https://idp.example" },
+        { id: "fedcba9876543210" },
+      ],
+    });
+    assert.deepEqual([me?.via, me?.hasPassword], ["sso", false]);
+    assert.deepEqual(me?.identities, [{ id: "0123456789abcdef", issuer: "https://idp.example", subject: "…rita", linkedAt: "t" }]);
+    assert.equal(identityPath("0123456789abcdef"), "/api/me/identities/0123456789abcdef");
+  });
+
+  it("re-authenticates with the password, and with a code for a writer or admin", () => {
+    assert.equal(reauthNeedsOtp(["reader"]), false);
+    assert.equal(reauthNeedsOtp(["reader", "writer"]), true);
+    assert.equal(reauthNeedsOtp(["admin"]), true);
+    assert.equal(reauthBody("pw", null), JSON.stringify({ password: "pw" }));
+    assert.equal(reauthBody("pw", " 123456 "), JSON.stringify({ password: "pw", otp: "123456" }));
+    assert.equal(readReauth(200, {}), null);
+    assert.equal(readReauth(403, { error: "the current password is not correct" })?.key, "m.mbCurrentWrong");
+    assert.equal(readReauth(403, { error: "linking an SSO account needs a password session — sign in with your password" })?.key, "m.acSsoLinkNeedsPassword");
+    assert.equal(readReauth(401, { error: "x" })?.key, "m.loginWrongCode");
+    assert.equal(readReauth(409, { error: "x" })?.key, "m.acUnlinkNeedsPassword");
+    assert.equal(readReauth(503, {})?.key, "m.mbUnavailable");
+  });
+
+  it("goes to the identity provider only by an https location, and reads the callback's link result", () => {
+    assert.equal(readLinkStart({ location: "https://idp.example/authorize?x" }), "https://idp.example/authorize?x");
+    assert.equal(readLinkStart({ location: "javascript:alert(1)" }), null);
+    assert.equal(readLinkStart(null), null);
+    assert.deepEqual(linkResult("ok"), { key: "m.acLinked", ok: true });
+    assert.deepEqual(linkResult("taken"), { key: "m.acLinkTaken", ok: false });
+    assert.deepEqual(linkResult("tombstone"), { key: "m.acLinkTombstone", ok: false });
+    assert.deepEqual(linkResult("ended"), { key: "m.acLinkEnded", ok: false });
+    assert.deepEqual(linkResult("something"), { key: "m.acLinkFailed", ok: false });
+    assert.equal(linkResult(null), null);
   });
 
   it("reads sessions by their opaque id only", () => {

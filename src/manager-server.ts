@@ -64,7 +64,7 @@ import { RoleChangeLedger, verifyBackchannelLogout, verifyRoleChange } from "./s
 import {
   checkCsrf, clearCookieHeader, clearLoginCookieHeader, cookieHeader, COOKIE, CSRF_HEADER,
   DEFAULT_LIMITS as DEFAULT_SESSION_LIMITS, LOGIN_COOKIE, loginBinder, loginBinderMatches,
-  loginCookieHeader, readCookie, SessionStore, type Principal,
+  isMemberSession, loginCookieHeader, readCookie, SessionStore, type Principal,
 } from "./session.ts";
 
 import { CONSOLE_ENTRY, consoleAppPath, policyAppPath } from "./app-shell.ts";
@@ -155,7 +155,8 @@ import { certFactsFromPeer, certFactsFromPem, pemCertificateCount, type CertFact
 import { certificateInventory, certificateProblems, prose, type CertificateReport, type FileReading } from "./cert-inventory.ts";
 import type { CertificateRevocation } from "./enrollment-store.ts";
 import type { MembersMode } from "./env-spec.ts";
-import { createMemberAuth } from "./member-auth.ts";
+import { createMemberAuth, type LinkIntent } from "./member-auth.ts";
+import { findByCertCN } from "./member-store.ts";
 import type { MailConfig } from "./mail.ts";
 
 /**
@@ -341,6 +342,11 @@ export type PendingOidcLogin = {
    * missing field; `loginBinderMatches` treats `undefined` as no match.
    */
   binder?: string;
+  /**
+   * Set only by `POST /auth/link/start`: this login links the identity to a member instead of
+   * signing anyone in. Kept here, server-side, so no request parameter can ask for it.
+   */
+  intent?: LinkIntent;
 };
 
 /**
@@ -520,6 +526,12 @@ export interface ManagerOptions {
     resetDelayMs?: () => number;
     /** SMTP relay for reset and invite mail (`mailConfigFromEnv`). Absent or null: nothing is mailed. */
     mail?: MailConfig | null;
+    /**
+     * Creating a member on an unlinked SSO sign-in. Not implemented: only `false` (the default) is
+     * accepted and `true` refuses to start. An unlinked SSO account never becomes a member here; an
+     * admin invites the person and they link the account themselves.
+     */
+    jit?: false;
   };
   /** Enrollment store or standalone JSON denylist, reloaded on every authenticated request. */
   revocationFile?: string;
@@ -1235,6 +1247,12 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     throw new Error("oidc.soloApprovalRoles requires otp — solo approval may not run without a second factor");
   }
   const membersOn = (opts.members?.mode ?? "off") !== "off";
+  // @see member-sso-server.test.ts "refuses to start with JIT member creation"
+  if ((opts.members as { jit?: unknown } | undefined)?.jit !== undefined && opts.members?.jit !== false) {
+    throw new Error("members.jit: creating members on SSO sign-in is not implemented — only false is accepted");
+  }
+  /** `on`: the console is for members only, and an unlinked SSO account is refused. */
+  const membersOnly = opts.members?.mode === "on";
   if (membersOn && !opts.members?.storeFile) {
     throw new Error(`members.mode=${opts.members?.mode} requires members.storeFile (HELIOPAUSE_MEMBER_STORE)`);
   }
@@ -1470,7 +1488,9 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
 
   /** The KeyStone user that answers for this principal's one-time codes, if any. */
   const otpIdentityOf = (p: Principal): string | null =>
-    p.via === "oidc" ? p.sub : p.via === "password" ? (p.otpUserId ?? null) : (opts.otp?.users.get(p.name) ?? null);
+    p.via === "oidc" ? p.sub : isMemberSession(p) ? (p.otpUserId ?? null)
+      // A certificate: its member's KeyStone user when bound to one, else the CN's mapping.
+      : (p.otpUserId ?? opts.otp?.users.get(p.sub) ?? null);
 
   /**
    * Every other name that is the same human as `p`: writer CNs sharing its KeyStone user
@@ -1480,7 +1500,8 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
    * @see "a member and their own certificate are one approver" in member-auth-server.test.ts
    */
   function alsoKnownAsFor(p: Principal): string[] | null {
-    const names = new Set(sameHumanAs.get(p.name) ?? []);
+    // A certificate bound to a member carries the member's name; `sub` is still the CN.
+    const names = new Set([...(sameHumanAs.get(p.name) ?? []), ...(p.via === "certificate" ? sameHumanAs.get(p.sub) ?? [] : [])]);
     const otpId = otpIdentityOf(p);
     if (otpId) for (const [cn, uid] of opts.otp?.users ?? []) if (uid === otpId) names.add(cn);
     if (memberAuth) {
@@ -2123,9 +2144,9 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     // resolved from the session alone, and a browser that happens to hold a client certificate is
     // sent to the IdP like any other.
     //
-    // The reason is what a certificate cannot say. Authorisation here reads group claims — that is
-    // why `maySoloApprove` requires `via === "oidc"` — and a certificate carries a CN and nothing
-    // else, so an operator arriving that way is a name with no role.
+    // The reason is what a certificate cannot say. Authorisation here reads group claims or a member
+    // record — `maySoloApprove` needs one of them — and a certificate carries a CN and nothing else,
+    // so an operator arriving that way is a name with no role.
     //
     // **Guarded on `oidc` being configured.** With no IdP there is no other way to reach the console,
     // and disabling the one that works would lock the operator out of their own firewall.
@@ -2147,10 +2168,10 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       || typeof req.headers["origin"] === "string";
     const certIsAcceptable = membersOn ? !fromBrowser : !(oidc && wantsHtml);
     const session = sessions ? sessions.get(readCookie(req.headers["cookie"], COOKIE)) : null;
-    // A password session's authority is the member record as it is now, not as it was at sign-in.
+    // A member session's authority (password or SSO) is the member record as it is now, not as it was at sign-in.
     // @see "suspension takes effect on the next request" in member-auth-server.test.ts
     let memberPrincipal: Principal | null = null;
-    if (session && session.principal.via === "password") {
+    if (session && isMemberSession(session.principal)) {
       if (!memberAuth) {
         sessions!.destroy(session.id);
         return send(res, 401, { error: "this session has ended — sign in again" }, { "set-cookie": clearCookieHeader() });
@@ -2161,6 +2182,37 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
           resolved.status === 401 ? { "set-cookie": clearCookieHeader() } : {});
       }
       memberPrincipal = resolved.principal;
+    }
+    // ## A certificate CN bound to a member is that member
+    //
+    // Its name is the member's principalName, its KeyStone user the member's, and it is refused while
+    // the member is not active. Its authority stays `operatorCNs`/`writerCNs` on the CN. An unbound CN
+    // is unchanged. Shadow and on alike; with members off there is no store to read.
+    //
+    // This lookup deliberately fails closed for every certificate request, reads included, when the
+    // member store cannot be read. Otherwise a suspended member-bound certificate would regain its
+    // old CN authority precisely while the store which records the suspension is unavailable.
+    // @see member-sso-server.test.ts "a certificate read fails closed when the member store is unavailable"
+    // @see member-sso-server.test.ts "a certificate bound to a member signs as that member, and not while they are suspended"
+    let certPrincipal: Principal | null = null;
+    if (cn && certIsAcceptable && !memberPrincipal && !session) {
+      certPrincipal = { name: cn, sub: cn, groups: [], via: "certificate", canWrite: writers.has(cn) };
+      if (memberAuth) {
+        let bound;
+        try { bound = findByCertCN(memberAuth.document(), cn); } catch {
+          return send(res, 503, { error: "the member store is unavailable" });
+        }
+        if (bound && bound.status !== "active") {
+          log(`refused ${url.pathname} for certificate ${cn}: its member ${bound.username} is ${bound.status}`, `인증서 ${cn}의 ${url.pathname} 거부: 회원 ${bound.username}이(가) ${bound.status}`);
+          return send(res, 403, { error: `certificate ${cn} belongs to a member who cannot sign in` });
+        }
+        if (bound) {
+          certPrincipal = {
+            ...certPrincipal, name: bound.principalName, memberId: bound.id,
+            otpUserId: bound.otpUserId, otpConfirmed: bound.otpConfirmedAt !== null,
+          };
+        }
+      }
     }
 
     // ## The session wins, and the `Accept` rule above is not enough on its own
@@ -2173,17 +2225,14 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     // `Accept` rule alone: `curl --cert … /site` with a default `Accept` answered 200.
     //
     // Three things follow from that, and none of them are visible on the screen: the solo-approve
-    // control disappears because `maySoloApprove` needs `via === "oidc"`; `canWrite` comes from
+    // control disappears because `maySoloApprove` never holds for a certificate; `canWrite` comes from
     // `writerCNs` rather than from the group decision the session already made; and **the CSRF check
     // is skipped entirely**, because it too is gated on `via === "oidc"`.
     //
     // So the order is session first. A CLI never carries a cookie, which is what makes this safe to
     // state so bluntly: presenting both is a browser, and a browser that has signed in has already
     // said who it is with claims a certificate cannot carry.
-    const principal: Principal | null = memberPrincipal ?? session?.principal
-      ?? (cn && certIsAcceptable
-        ? { name: cn, sub: cn, groups: [], via: "certificate", canWrite: writers.has(cn) }
-        : null);
+    const principal: Principal | null = memberPrincipal ?? session?.principal ?? certPrincipal;
 
     if (!principal) {
       // Every page, not just the console root. `/policy` used to answer 401 JSON to a browser that
@@ -2217,7 +2266,8 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     // Two allowlists, one decision point. A certificate is checked against `operatorCNs`; a session
     // was already checked against the group claims when it was created, and carrying that decision
     // rather than re-deriving it is what keeps one identity from being evaluated two ways.
-    const isOperator = principal.via === "certificate" ? operators.has(principal.name) : true;
+    // `sub` is the CN for a certificate, bound to a member or not.
+    const isOperator = principal.via === "certificate" ? operators.has(principal.sub) : true;
     if (!isOperator) {
       log(`refused ${url.pathname} for ${principal.name}: not an operator`, `${principal.name}의 ${url.pathname} 거부: 운영자가 아님`);
       return send(res, 403, { error: "this certificate is not authorised to read the site view" });
@@ -2269,9 +2319,16 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     // CLI caller can never approve their own plan. That asymmetry is deliberate rather than an
     // oversight — the browser path is the one with a one-time code prompt in front of a person, and
     // the rule this switches off is worth keeping wherever it can be kept.
+    //
+    // A member session may too: the member's `soloApprove` with a confirmed KeyStone user (`resolve`
+    // sets `principal.soloApprove`), in a session that may write — which a member session can only
+    // after passing its sign-in code. Never a certificate, bound or not. Each approval still needs
+    // its own one-time code.
+    // @see member-sso-server.test.ts "solo approval needs soloApprove, a confirmed code and a session that passed it"
     const soloRoles = new Set(opts.oidc?.soloApprovalRoles ?? []);
     const maySoloApprove =
-      principal.via === "oidc" && principal.groups.some((g) => soloRoles.has(g));
+      (principal.via === "oidc" && principal.groups.some((g) => soloRoles.has(g)))
+      || (isMemberSession(principal) && principal.soloApprove === true && principal.canWrite);
 
     if (opts.enrollment && req.method === "GET" && url.pathname === "/enrollment/requests") {
       try {
@@ -4095,30 +4152,24 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
   ): Promise<void> {
     const selfOrigin = `https://${req.headers["host"] ?? ""}`;
 
-    if (req.method === "GET" && url.pathname === "/auth/login") {
+    /** Start an authorization request: the pending record, and where the browser goes with which binder. */
+    async function begin(returnTo: string | null, intent: LinkIntent | null): Promise<{ location: string; setCookie: string }> {
       // Expire only from the oldest end, then evict the oldest live attempt at the hard cap. A full
       // scan on every anonymous request made a login flood quadratic; an unbounded map made it a
       // memory flood. `Map` insertion order gives both operations a bounded oldest-first path.
       const startedAt = Date.now();
       trimPendingOidcLogins(o.pending, startedAt);
-
       const { verifier, challenge } = pkce();
       const state = randomNonce();
       const n = randomNonce();
-      // Stored as given and judged where it is used. **Validating here as well would be a check no
-      // test can reach** — the callback's `safeReturnTo` already refuses everything this one would,
-      // so injecting a defect into the second copy breaks nothing and it is indistinguishable from
-      // dead code. One gate, at the point the value becomes a `Location` header.
-      const next = url.searchParams.get("next");
-      const returnTo = next && next.length <= 512 ? next : null;
       // The value goes to this browser as a cookie; only its digest is kept here. `state` travels
       // through the IdP in a URL and is therefore something an attacker can hold; this is not.
       const binder = loginBinder();
       o.pending.set(state, {
-        verifier, nonce: n, at: startedAt, binder: binder.digest, ...(returnTo ? { returnTo } : {}),
+        verifier, nonce: n, at: startedAt, binder: binder.digest, ...(returnTo ? { returnTo } : {}), ...(intent ? { intent } : {}),
       });
       const d = await o.provider.load();
-      const to = authorizeUrl(d, {
+      const location = authorizeUrl(d, {
         clientId: o.conf.clientId,
         redirectUri: o.conf.redirectUri,
         state,
@@ -4128,14 +4179,33 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         // without it produces a principal with no groups and no access.
         scopes: ["openid", "profile", "email", "groups"],
       });
+      return { location, setCookie: loginCookieHeader(binder.value) };
+    }
+
+    // ## Linking an SSO account to the member signed in by password
+    //
+    // `member-auth.ts` checks the session, the CSRF token and a fresh password (and a writer's code),
+    // then this starts an ordinary login whose pending record carries the link intent.
+    if (req.method === "POST" && url.pathname === "/auth/link/start") {
+      if (!memberAuth) return send(res, 404, { error: "member accounts are off" });
+      return await memberAuth.linkStart(req, res, (intent) => begin(null, intent));
+    }
+
+    if (req.method === "GET" && url.pathname === "/auth/login") {
+      // Stored as given and judged where it is used. **Validating here as well would be a check no
+      // test can reach** — the callback's `safeReturnTo` already refuses everything this one would,
+      // so injecting a defect into the second copy breaks nothing and it is indistinguishable from
+      // dead code. One gate, at the point the value becomes a `Location` header.
+      const next = url.searchParams.get("next");
+      const returnTo = next && next.length <= 512 ? next : null;
+      const started = await begin(returnTo, null);
       res.writeHead(302, {
-        location: to,
-        "set-cookie": loginCookieHeader(binder.value),
+        location: started.location,
+        "set-cookie": started.setCookie,
         "cache-control": "no-store",
       });
       return void res.end();
     }
-
     if (req.method === "GET" && url.pathname === "/auth/callback") {
       const state = url.searchParams.get("state") ?? "";
       const code = url.searchParams.get("code") ?? "";
@@ -4198,6 +4268,38 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       } catch (e) {
         log(`login failed: ${(e as Error).message}`, `로그인 실패: ${(e as Error).message}`);
         return send(res, 401, { error: `login failed: ${(e as Error).message}` });
+      }
+
+      // ## Members: the identity is `(issuer, subject)` and nothing else
+      //
+      // The issuer is the configured one, which the ID token's `iss` was just checked against. Email
+      // and username play no part, so an unlinked account whose address is a member's stays unlinked.
+      const back = (location: string, extra: string[] = []): void => {
+        res.writeHead(302, { location, "set-cookie": [...extra, clearLoginCookieHeader()], "cache-control": "no-store" });
+        res.end();
+      };
+      if (found.intent?.kind === "link") {
+        if (!memberAuth) return back(`${CONSOLE_ENTRY}/account?link=ended`);
+        const linked = memberAuth.completeLink(found.intent, o.conf.issuer, identity.sub, req.socket.remoteAddress ?? "unknown");
+        return back(`${CONSOLE_ENTRY}/account?link=${linked.ok ? "ok" : linked.code}`);
+      }
+      if (memberAuth) {
+        const returnTo = safeReturnTo(found.returnTo ?? null);
+        const signIn = memberAuth.ssoSignIn(req, o.conf.issuer, identity.sub, returnTo);
+        if (signIn.kind === "session") return back(returnTo ?? "/", [cookieHeader(signIn.session)]);
+        if (signIn.kind === "otp") {
+          return back(`${CONSOLE_ENTRY}/login?sso=otp${returnTo ? `&next=${encodeURIComponent(returnTo)}` : ""}`, [signIn.cookie]);
+        }
+        if (signIn.kind === "refused") {
+          if (signIn.status === 503) return send(res, 503, { error: signIn.error }, { "set-cookie": clearLoginCookieHeader() });
+          return back(`${CONSOLE_ENTRY}/login?sso=refused`);
+        }
+        // Unlinked. Under `on` that is a refusal; under `shadow` the group-based sign-in below runs.
+        // @see member-sso-server.test.ts "on refuses an unlinked SSO account and admits members and the CLI"
+        if (membersOnly) {
+          log(`SSO sign-in refused for sub ${identity.sub}: not linked to a member`, `sub ${identity.sub}의 SSO 로그인 거부: 회원에 연결되지 않음`);
+          return back(`${CONSOLE_ENTRY}/login?sso=unlinked`);
+        }
       }
 
       const decision = authorize(identity, {
@@ -4357,7 +4459,9 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
 
       // Every session this subject holds. `backchannel_logout_session_required` is off, so the token
       // names a person and not a session — see `verifyBackchannelLogout`.
+      // A linked member's SSO sessions end too; their password sessions are not the IdP's to end.
       const outcome = o.sessions.applyToSubject(logout.sub, () => null);
+      outcome.ended += o.sessions.endIdentity(o.conf.issuer, logout.sub);
       log(`backchannel-logout for sub ${logout.sub}: ${outcome.ended} session(s) ended`, `sub ${logout.sub}의 백채널 로그아웃: 세션 ${outcome.ended}개 종료`);
       // 204 even when nothing matched. A person who is not signed in has been logged out as far as
       // the administrator is concerned, and a 404 here would read as a delivery failure worth
@@ -4772,11 +4876,13 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     const otp = opts.otp;
     if (!otp) return "ok";
 
-    const userId = p.via === "oidc" ? p.sub : p.via === "password" ? (p.otpUserId ?? undefined) : otp.users.get(p.name);
-    // A password session whose otpUserId is not (or no longer) confirmed by a sign-in code. Admin
-    // changes end the member's sessions; a store edit outside the API does not, and lands here.
+    const userId = p.via === "oidc" ? p.sub : isMemberSession(p) ? (p.otpUserId ?? undefined)
+      : (p.otpUserId ?? otp.users.get(p.sub));
+    // A member's otpUserId (a session's, or a bound certificate's) that is not (or no longer)
+    // confirmed by a sign-in code. Admin changes end the member's sessions; a store edit outside the
+    // API does not, and lands here.
     // @see "an unconfirmed otpUserId refuses the approval code" in member-auth-server.test.ts
-    if (p.via === "password" && userId && !p.otpConfirmed) {
+    if (p.memberId !== undefined && p.otpUserId && userId === p.otpUserId && !p.otpConfirmed) {
       log(`${path} REFUSED for ${p.name}: otpUserId not confirmed`, `${p.name}의 ${path} 거부: otpUserId 미확인`);
       return answered(res, 403, "confirm your one-time code by signing in again");
     }

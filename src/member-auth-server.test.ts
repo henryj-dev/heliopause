@@ -183,6 +183,7 @@ describe("signing in", () => {
     assert.deepEqual(me.body, {
       id: ids.rita, username: "rita", principalName: "rita", email: "rita@example.com", roles: ["reader"],
       status: "active", mustChange: false, via: "password", otpConfirmedAt: null, csrf: s.csrf,
+      hasPassword: true, soloApprove: false, identities: [],
     });
   });
 
@@ -1087,7 +1088,8 @@ describe("approval compares people, not names", () => {
     const hash = await propose(bobby, "gen-bound-cert");
     const r = await certCall("bob", "POST", "/approve", { hash, otp: GOOD_OTP });
     assert.equal(r.status, 403, JSON.stringify(r.body));
-    assert.match(String(r.body.error), /same person as bobby/);
+    // A bound certificate signs as its member, so this is the proposer by name.
+    assert.match(String(r.body.error), /bobby proposed this plan/);
   });
 
   it("a member and an OIDC session whose subject is their KeyStone user are one approver", async () => {
