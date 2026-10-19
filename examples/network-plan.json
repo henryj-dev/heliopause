@@ -1,0 +1,102 @@
+{
+  "id": "example-mtu-review",
+  "registry": {
+    "revision": 1,
+    "resources": [
+      {
+        "owner": "example-operator",
+        "generation": 1,
+        "management": {
+          "mode": "managed",
+          "provider": "linux",
+          "driver": "nmstate"
+        },
+        "id": "example-site",
+        "kind": "site"
+      },
+      {
+        "owner": "example-operator",
+        "generation": 1,
+        "management": {
+          "mode": "managed",
+          "provider": "linux",
+          "driver": "nmstate"
+        },
+        "id": "example-node",
+        "kind": "node",
+        "siteId": "example-site"
+      },
+      {
+        "owner": "example-operator",
+        "generation": 1,
+        "management": {
+          "mode": "managed",
+          "provider": "linux",
+          "driver": "nmstate"
+        },
+        "id": "example-network",
+        "kind": "network",
+        "siteId": "example-site"
+      },
+      {
+        "owner": "example-operator",
+        "generation": 1,
+        "management": {
+          "mode": "managed",
+          "provider": "linux",
+          "driver": "nmstate"
+        },
+        "id": "example-interface",
+        "kind": "interface",
+        "nodeId": "example-node",
+        "networkId": "example-network",
+        "name": "example0",
+        "mtu": 1420
+      }
+    ]
+  },
+  "expectedRegistryRevision": 1,
+  "observations": [
+    {
+      "source": "example-relay",
+      "host": "example-host",
+      "receivedAt": "2026-01-01T00:00:00Z",
+      "relayReceivedAt": "2026-01-01T00:00:00Z",
+      "report": {
+        "schemaVersion": 1,
+        "collectionId": "12345678-1234-1234-1234-123456789abc",
+        "startedAt": "2026-01-01T00:00:00Z",
+        "completedAt": "2026-01-01T00:00:00Z",
+        "observations": {
+          "links": {
+            "status": "success",
+            "startedAt": "2026-01-01T00:00:00Z",
+            "completedAt": "2026-01-01T00:00:00Z",
+            "data": [
+              {
+                "ifindex": 2,
+                "ifname": "example0",
+                "mtu": 1380
+              }
+            ]
+          }
+        },
+        "capabilities": {
+          "links": {
+            "available": true,
+            "status": "success"
+          }
+        }
+      }
+    }
+  ],
+  "bindings": [
+    {
+      "source": "example-relay",
+      "host": "example-host",
+      "siteId": "example-site",
+      "nodeId": "example-node"
+    }
+  ],
+  "now": 1767225600000
+}

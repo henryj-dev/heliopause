@@ -255,3 +255,11 @@ test("explicit route domain cannot be silently ignored in a legacy inventory", (
   assert.match(messages(data), /routingDomainId must reference/);
   assert.match(messages(data), /migrate all legacy networks together/);
 });
+
+test("desired interface MTU is optional and must be a bounded integer", () => {
+  const data = fixture();
+  const iface = data.find(r => r.kind === "interface")!;
+  assert.deepEqual(validateNetworkInventory(data), []);
+  for (const mtu of [68, 1420, 65535]) assert.deepEqual(validateNetworkInventory(data.map(r => r.id === iface.id ? { ...r, mtu } : r)), []);
+  for (const mtu of [0, 67, 65536, 1420.5, "1420", null]) assert.match(messages(data.map(r => r.id === iface.id ? { ...r, mtu } : r)), /interface mtu/);
+});

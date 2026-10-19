@@ -57,6 +57,8 @@ export interface InventoryInterface extends NetworkResource {
   nodeId: string;
   networkId: string;
   name: string;
+  /** Explicit desired MTU; omission does not assert the host default. */
+  mtu?: number;
 }
 export interface InventoryRoute extends NetworkResource {
   kind: "route";
@@ -192,6 +194,7 @@ export function validateNetworkInventory(input: unknown): NetworkInventoryIssue[
         const network = ref(r, "networkId", "network");
         if (node && network && !sitesOf(network).includes(node.siteId)) add(id, "interface node and network must belong to the same site or explicit network membership");
         if (!text(r.name)) add(id, "interface name must be nonempty");
+        if (r.mtu !== undefined && (!Number.isInteger(r.mtu) || Number(r.mtu) < 68 || Number(r.mtu) > 65535)) add(id, "interface mtu must be an integer between 68 and 65535");
         const key = JSON.stringify([r.nodeId, r.name]);
         if (interfaces.has(key)) add(id, "interface already has an inventory owner");
         interfaces.add(key);
