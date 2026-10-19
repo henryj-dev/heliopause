@@ -5641,6 +5641,19 @@ def main():
     # starts, so the restore is not observed as a change this agent did not make. Writes no state.
     _boot_restore()
 
+    # Entire discovery/parser/upload runs in a separate bounded process after recovery. It
+    # cannot acquire the policy state/apply locks and its uploads are never confirmation signals.
+    if os.environ.get("HELIOPAUSE_NETWORK_DISCOVERY", "") == "1":
+        try:
+            from network_discovery_lifecycle import start_discovery_worker
+            start_discovery_worker(
+                _stop, enabled=True,
+                interval=int(os.environ.get("HELIOPAUSE_NETWORK_DISCOVERY_INTERVAL", "300")),
+                budget=int(os.environ.get("HELIOPAUSE_NETWORK_DISCOVERY_BUDGET", "45")),
+            )
+        except (ImportError, ValueError, OSError):
+            log("network discovery unavailable; policy heartbeat continues")
+
     # Watches the ruleset for changes this agent did not make. Daemon, so a wedged monitor can
     # never keep the process alive; the heartbeat loop is what must not stop.
     threading.Thread(target=monitor_loop, name="nft-monitor", daemon=True).start()

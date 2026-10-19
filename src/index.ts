@@ -344,3 +344,24 @@ export {
   type NetworkPurpose,
   type AddressPoolPurpose,
 } from "./network-inventory.ts";
+
+export {
+  NetworkRegistryStore,
+  NetworkRegistryError,
+  MAX_NETWORK_REGISTRY_RESOURCES,
+  MAX_NETWORK_REGISTRY_INPUT_BYTES,
+  type NetworkRegistryDocument,
+  type NetworkRegistryRevision,
+  type NetworkRegistryMutation,
+} from "./network-registry.ts";
+
+export {
+  NetworkObservationStore,
+  validateNetworkObservation,
+  observationFreshness,
+  NETWORK_COLLECTOR_NAMES,
+  type NetworkObservationReport,
+  type NetworkObservationRecord,
+  type NetworkCollectorObservation,
+  type CollectorStatus,
+} from "./network-observation.ts";

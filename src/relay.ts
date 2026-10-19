@@ -1,3 +1,4 @@
+import { NetworkObservationStore, MAX_NETWORK_OBSERVATION_BYTES, validateNetworkObservation } from "./network-observation.ts";
 // The relay — one per gateway. Serves artifacts to the agents behind it and collects their state.
 //
 // It is deliberately not a decision-maker. It does not render policy and it cannot invent a
@@ -1319,6 +1320,8 @@ export interface RelayOptions {
    * rather than being silently ignored on every poll.
    */
   minAgentVersion?: string;
+  /** Optional persistent observation spool; defaults below artifactDir. */
+  networkObservationsDir?: string;
 }
 
 /**
@@ -1377,6 +1380,7 @@ export async function startRelay(
   const log = (en: string, ko: string) => writeLog(`[relay] ${formatOperatorEvent(opts.logLang ?? "en", { en, ko })}`);
   const now = opts.now ?? (() => new Date());
   const state = emptyState();
+  const networkObservations = new NetworkObservationStore(opts.networkObservationsDir ?? `${opts.artifactDir}/network-observations`);
   const operators = new Set(opts.operatorCNs ?? []);
   const publishers = new Set(opts.publisherCNs ?? []);
   let publishTail: Promise<void> = Promise.resolve();
@@ -1465,6 +1469,24 @@ export async function startRelay(
     if (url.pathname !== "/healthz" && certificateIsRevoked(opts.revocationFile, req, "snapshot")) {
       log(`request REFUSED for ${cn ?? "unknown"}: certificate fingerprint is revoked`, `요청 거부: ${cn ?? "알 수 없음"}의 인증서 지문이 폐기됨`);
       return send(res, 401, { error: "client certificate has been revoked" });
+    }
+
+    // Separate upload cannot confirm a generation or mutate heartbeat state. Existing PKI has no
+    // agent-role extension: manifest membership plus exclusion of privileged CNs is the allowlist.
+    if (req.method === "POST" && url.pathname === "/network/observations") {
+      if (!cn) return send(res, 401, { error: "authenticated host required" });
+      if (operators.has(cn) || publishers.has(cn) || !state.manifest || !Object.hasOwn(state.manifest.hosts, cn)) return send(res, 403, { error: "observation host is not allowed" });
+      try {
+        const body = JSON.parse(await readBody(req, MAX_NETWORK_OBSERVATION_BYTES));
+        if (!body || body.host !== cn || Object.keys(body).some(k => !["host", "report"].includes(k))) return send(res, 403, { error: "observation identity mismatch" });
+        const record = networkObservations.put(cn, validateNetworkObservation(body.report));
+        return send(res, 200, { collectionId: record.report.collectionId, receivedAt: record.receivedAt });
+      } catch { return send(res, 400, { error: "invalid or oversized network observation" }); }
+    }
+    if (req.method === "GET" && url.pathname === "/network/observations") {
+      if (!cn) return send(res, 401, { error: "authenticated operator required" });
+      if (!operators.has(cn)) return send(res, 403, { error: "observation read is not allowed" });
+      return send(res, 200, { observations: networkObservations.list().filter(r => state.manifest && Object.hasOwn(state.manifest.hosts, r.host)) });
     }
 
     if (req.method === "POST" && url.pathname === "/heartbeat") {

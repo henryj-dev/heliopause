@@ -310,3 +310,38 @@ export function siteNeedsAttention(view: SiteView): boolean {
   if (view.reachable < view.asked) return true;
   return view.problems.length > 0;
 }
+
+/** Independent telemetry fetch; this does not evaluate rollout gates or publish anything. */
+export async function fetchNetworkObservations(source: RelaySource): Promise<import("./network-observation.ts").NetworkObservationRecord[]> {
+  const { operatorCreds } = await import("./api-client.ts");
+  const { request } = await import("node:https");
+  const { MAX_NETWORK_OBSERVATIONS_BYTES, MAX_NETWORK_OBSERVATION_HOSTS, validateNetworkObservation, observationHost } = await import("./network-observation.ts");
+  const creds = operatorCreds(source.pkiDir, source.operatorName);
+  const url = new URL(source.url); if (url.protocol !== "https:") throw new Error("relay must use https");
+  url.pathname = url.pathname.replace(/\/$/, "") + "/network/observations";
+  return new Promise((resolve, reject) => {
+    const req = request(url, { cert: creds.cert, key: creds.key, ca: creds.ca, method: "GET", agent: false }, res => {
+      const chunks: Buffer[] = []; let size = 0;
+      res.on("data", (chunk: Buffer) => { size += chunk.length; if (size > MAX_NETWORK_OBSERVATIONS_BYTES) { req.destroy(new Error("relay observations too large")); } else chunks.push(chunk); });
+      res.on("error", reject);
+      res.on("end", () => {
+        try {
+          if (res.statusCode !== 200) throw new Error("relay observations unavailable");
+          const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+          if (!body || !Array.isArray(body.observations) || body.observations.length > MAX_NETWORK_OBSERVATION_HOSTS) throw new Error("invalid relay observations");
+          const hosts = new Set<string>();
+          resolve(body.observations.map((record: Record<string, unknown>) => {
+            if (typeof record.host !== "string") throw new Error("invalid host");
+            if (!/^[A-Za-z0-9_.-]{1,128}$/.test(record.host)) throw new Error("invalid host");
+            if (hosts.has(record.host) || typeof record.receivedAt !== "string" || !Number.isFinite(Date.parse(record.receivedAt))) throw new Error("invalid relay observation receipt");
+            hosts.add(record.host);
+            // Never accept a remote source label. The caller binds the configured relay identity.
+            return { host: record.host, receivedAt: record.receivedAt, report: validateNetworkObservation(record.report) };
+          }));
+        } catch (error) { reject(error); }
+      });
+    });
+    const deadline = setTimeout(() => req.destroy(new Error("relay observation deadline exceeded")), 10_000);
+    req.on("close", () => clearTimeout(deadline)); req.on("error", reject); req.end();
+  });
+}
