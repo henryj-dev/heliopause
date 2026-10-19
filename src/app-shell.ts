@@ -52,13 +52,20 @@ import { LANGS, LANG_NAME, t, type Lang } from "./i18n.ts";
  * moves through them.
  */
 export const CONSOLE_ROUTES = [
-  { path: "/fleet", key: "fleet", label: "nav.fleet", group: "g.fleet", spa: true },
-  { path: "/changes", key: "changes", label: "nav.changes", group: "g.fleet", spa: true },
-  { path: "/enrollment", key: "enrollment", label: "nav.enrollment", group: "g.fleet", spa: true },
-  { path: "/lookup", key: "lookup", label: "nav.lookup", group: "g.evidence", spa: true },
-  { path: "/traffic", key: "traffic", label: "nav.traffic", group: "g.evidence", spa: true },
-  { path: "/routing", key: "routing", label: "nav.routing", group: "g.evidence", spa: true },
-  { path: "/policy", key: "policy", label: "nav.policy", group: "g.policy", spa: false },
+  { path: "/fleet", key: "fleet", label: "nav.fleet", group: "g.fleet", spa: true, nav: true },
+  { path: "/changes", key: "changes", label: "nav.changes", group: "g.fleet", spa: true, nav: true },
+  { path: "/enrollment", key: "enrollment", label: "nav.enrollment", group: "g.fleet", spa: true, nav: true },
+  { path: "/lookup", key: "lookup", label: "nav.lookup", group: "g.evidence", spa: true, nav: true },
+  { path: "/traffic", key: "traffic", label: "nav.traffic", group: "g.evidence", spa: true, nav: true },
+  { path: "/routing", key: "routing", label: "nav.routing", group: "g.evidence", spa: true, nav: true },
+  { path: "/policy", key: "policy", label: "nav.policy", group: "g.policy", spa: false, nav: true },
+  // Member screens. Not in the classic menu (`nav: false`): that page is a fallback with no member
+  // session, and `/members` is for admins only, which the Svelte menu decides from `/api/authz`.
+  // `/app/invite` and `/app/reset` are not here: their links are built under `/app` already
+  // (`member-auth.ts`), with the token in the fragment, which a browser does not send to a server.
+  { path: "/login", key: "login", label: "nav.login", group: "g.account", spa: true, nav: false },
+  { path: "/account", key: "account", label: "nav.account", group: "g.account", spa: true, nav: false },
+  { path: "/members", key: "members", label: "nav.members", group: "g.account", spa: true, nav: false },
 ] as const;
 
 /** The classic HTML fleet. `/fleet` keeps this meaning; `/` no longer points here. */
@@ -261,6 +268,7 @@ export function sideNav(groups: readonly NavGroup[], foot?: string): string {
 export function consoleNav(lang: Lang, active: string): readonly NavGroup[] {
   const groups: NavGroup[] = [];
   for (const r of CONSOLE_ROUTES) {
+    if (!r.nav) continue;
     const label = t(lang, r.group as Parameters<typeof t>[1]);
     let g = groups.find((x) => x.label === label);
     if (!g) groups.push((g = { label, items: [] }));

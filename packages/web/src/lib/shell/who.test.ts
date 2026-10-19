@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { loginHref, LOGOUT_PATH, logoutDestination, mayLabel, readWho, shouldAskOtp, viaLabel } from "./who.ts";
+import { loginHref, LOGOUT_PATH, logoutDestination, logoutHeaders, mayLabel, readWho, readWhoRefusal, shouldAskOtp, viaLabel } from "./who.ts";
 
 describe("readWho", () => {
   it("reads the caller the chrome draws", () => {
     const read = readWho({ you: "ops-alice", canWrite: true, csrf: "tok" });
     assert.deepEqual(read, {
       ok: true,
-      view: { you: "ops-alice", canWrite: true, csrf: "tok", pendingPlans: 0, pendingCsrs: 0, needsOtp: true },
+      view: { you: "ops-alice", canWrite: true, csrf: "tok", pendingPlans: 0, pendingCsrs: 0, needsOtp: true, via: null, isAdmin: false },
     });
   });
 
@@ -15,7 +15,7 @@ describe("readWho", () => {
     const read = readWho({ you: "ops-alice", canWrite: false });
     assert.deepEqual(read, {
       ok: true,
-      view: { you: "ops-alice", canWrite: false, csrf: null, pendingPlans: 0, pendingCsrs: 0, needsOtp: true },
+      view: { you: "ops-alice", canWrite: false, csrf: null, pendingPlans: 0, pendingCsrs: 0, needsOtp: true, via: null, isAdmin: false },
     });
   });
 
@@ -45,6 +45,16 @@ describe("readWho", () => {
   it("treats an empty csrf field as absent, not as a token", () => {
     const read = readWho({ you: "ops-alice", canWrite: true, csrf: "" });
     assert.equal(read.ok && read.view.csrf, null);
+  });
+
+  it("reads how the caller signed in and whether they administer members", () => {
+    const admin = readWho({ you: "root", canWrite: true, via: "password", isAdmin: true });
+    assert.equal(admin.ok && admin.view.via, "password");
+    assert.equal(admin.ok && admin.view.isAdmin, true);
+    // Only `true` is an admin: a string or a missing field from an older manager is not.
+    const loose = readWho({ you: "root", canWrite: true, via: "magic", isAdmin: "yes" });
+    assert.equal(loose.ok && loose.view.via, null);
+    assert.equal(loose.ok && loose.view.isAdmin, false);
   });
 
   it("refuses a body that does not name the caller", () => {
@@ -98,7 +108,22 @@ describe("login and logout paths", () => {
   });
 
   it("carries the screen back after login and refuses to leave it raw in the query", () => {
-    assert.equal(loginHref("/app/fleet"), "/auth/login?next=%2Fapp%2Ffleet");
-    assert.equal(loginHref("/app/policy?s=files"), "/auth/login?next=%2Fapp%2Fpolicy%3Fs%3Dfiles");
+    assert.equal(loginHref("/app/fleet"), "/app/login?next=%2Fapp%2Ffleet");
+    assert.equal(loginHref("/app/policy?s=files"), "/app/login?next=%2Fapp%2Fpolicy%3Fs%3Dfiles");
+  });
+
+  it("sends the CSRF token with a sign-out when there is one", () => {
+    assert.deepEqual(logoutHeaders("tok"), { "x-heliopause-csrf": "tok" });
+    assert.deepEqual(logoutHeaders(null), {});
+  });
+});
+
+describe("readWhoRefusal", () => {
+  it("tells a password that must change apart from signed out and from a broken read", () => {
+    assert.equal(readWhoRefusal(401, { error: "x" }), "unauth");
+    assert.equal(readWhoRefusal(403, { error: "password change required", mustChange: true }), "mustChange");
+    assert.equal(readWhoRefusal(403, { error: "not an operator" }), "error");
+    assert.equal(readWhoRefusal(403, { mustChange: "true" }), "error");
+    assert.equal(readWhoRefusal(503, null), "error");
   });
 });

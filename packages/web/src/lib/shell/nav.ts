@@ -13,12 +13,15 @@ export const NAV_I18N: Record<string, MessageKey> = {
   traffic: "nav.traffic",
   routing: "nav.routing",
   policy: "nav.policy",
+  account: "nav.account",
+  members: "nav.members",
 };
 
 export const GROUP_I18N: Record<string, MessageKey> = {
   fleet: "g.fleet",
   evidence: "g.evidence",
   policy: "g.policy",
+  account: "g.account",
 };
 
 export interface AppNavItem {
@@ -26,6 +29,8 @@ export interface AppNavItem {
   key: string;
   label: string;
   group: string;
+  /** Who the item is for. Absent means every caller; an item a caller may not use is left out, not greyed. */
+  for?: "member" | "admin";
 }
 
 export interface AppNavGroup {
@@ -41,16 +46,48 @@ export const APP_NAV: readonly AppNavItem[] = [
   { href: "/traffic", key: "traffic", label: "traffic", group: "evidence" },
   { href: "/routing", key: "routing", label: "routing", group: "evidence" },
   { href: "/policy", key: "policy", label: "policy", group: "policy" },
+  { href: "/account", key: "account", label: "account", group: "account", for: "member" },
+  { href: "/members", key: "members", label: "members", group: "account", for: "admin" },
 ];
 
-export function navGroups(): AppNavGroup[] {
+/** What decides which `for` items show: from `/api/authz`, or null before it has been read. */
+export interface NavCaller {
+  via: string | null;
+  isAdmin: boolean;
+}
+
+function shows(item: AppNavItem, caller: NavCaller | null): boolean {
+  if (item.for === "admin") return caller?.isAdmin === true;
+  if (item.for === "member") return caller?.via === "password";
+  return true;
+}
+
+export function navGroups(caller: NavCaller | null = null): AppNavGroup[] {
   const groups: AppNavGroup[] = [];
   for (const item of APP_NAV) {
+    if (!shows(item, caller)) continue;
     let group = groups.find((g) => g.label === item.group);
     if (!group) groups.push((group = { label: item.group, items: [] }));
     group.items.push(item);
   }
   return groups;
+}
+
+/**
+ * The pages a signed-out browser uses: sign-in, and the invitation and reset links (whose token is
+ * in the fragment, not the path). They draw no menu and poll nothing.
+ */
+export function isPublicPath(pathname: string, base: string): boolean {
+  const rest = pathname.startsWith(base) ? pathname.slice(base.length) : pathname;
+  return rest === "/login" || rest === "/invite" || rest === "/reset";
+}
+
+/**
+ * Where the chrome sends a browser whose password must change: `/account`, the one screen that
+ * answers then. Null when it may stay where it is.
+ */
+export function mustChangeRedirect(whoKind: string, key: string, base: string): string | null {
+  return whoKind === "mustChange" && key !== "account" ? `${base}/account` : null;
 }
 
 /** Which screen the path is on. `/app` and `/app/` are fleet, like CONSOLE_HOME. */

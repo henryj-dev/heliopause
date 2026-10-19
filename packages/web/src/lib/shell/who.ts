@@ -14,7 +14,13 @@ export interface WhoView {
   pendingCsrs: number;
   /** True when this manager verifies a second factor. Missing is ask, not skip. */
   needsOtp: boolean;
+  /** How the caller signed in. `null` when an older manager does not say. */
+  via: "certificate" | "oidc" | "password" | null;
+  /** Member administration. Only a member password session that passed its sign-in code is one. */
+  isAdmin: boolean;
 }
+
+const VIAS = ["certificate", "oidc", "password"] as const;
 
 export type WhoRead =
   | { ok: true; view: WhoView }
@@ -37,6 +43,8 @@ export function readWho(data: unknown): WhoRead {
       pendingPlans: typeof data.pendingPlans === "number" && data.pendingPlans > 0 ? data.pendingPlans : 0,
       pendingCsrs: typeof data.pendingCsrs === "number" && data.pendingCsrs > 0 ? data.pendingCsrs : 0,
       needsOtp: data.otp !== null,
+      via: VIAS.find((v) => v === data.via) ?? null,
+      isAdmin: data.isAdmin === true,
     },
   };
 }
@@ -55,9 +63,28 @@ export function mayLabel(canWrite: boolean, lang: Lang = "en"): string {
 }
 
 export const LOGOUT_PATH = "/auth/logout";
-export const LOGIN_PATH = "/auth/login";
+/**
+ * The console's own sign-in page. It offers the password form, SSO, or both, as `/auth/methods`
+ * says; with SSO alone it goes straight on to `/auth/login`. `/app` is the build's `paths.base`.
+ */
+export const LOGIN_PATH = "/app/login";
 
-/** Where a signed-out browser is sent. Same-origin path; `/auth/login` encodes it. */
+/**
+ * What a refused `/api/authz` means for the chrome. 401 is signed out; 403 with `mustChange` is a
+ * member whose password must change first, which only `/account` can answer; anything else is a
+ * failure to read, not a verdict.
+ */
+export function readWhoRefusal(status: number, body: unknown): "unauth" | "mustChange" | "error" {
+  if (status === 401) return "unauth";
+  if (status === 403 && isRecord(body) && body.mustChange === true) return "mustChange";
+  return "error";
+}
+
+/** Headers for `POST /auth/logout`. A member password session needs its CSRF token to end. */
+export function logoutHeaders(csrf: string | null): Record<string, string> {
+  return csrf ? { "x-heliopause-csrf": csrf } : {};
+}
+
 /**
  * Where the browser goes after a sign-out.
  *

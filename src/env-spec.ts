@@ -281,9 +281,12 @@ export type MembersMode = "off" | "shadow";
 /**
  * Unset or blank is `off`, which is the behaviour before member accounts existed.
  *
+ * `shadow` serves member password sign-in from `HELIOPAUSE_MEMBER_STORE` and stops browsers signing
+ * in by certificate. It does not need OIDC: the console has its own sign-in page.
+ *
  * `on` is refused rather than accepted early: it means "only members may use the console", and the
- * pieces that make that reachable (password sign-in, SSO linking) are later phases. Accepting the
- * word now would let a deployment set it and get a console nobody can enter.
+ * pieces that make that safe for an OIDC-only operator (SSO linking) are a later phase. Accepting
+ * the word now would let a deployment set it and lock such an operator out.
  * @see "HELIOPAUSE_MEMBERS" in env-spec.test.ts
  */
 export function membersModeFromEnv(env: NodeJS.ProcessEnv): MembersMode {
@@ -291,7 +294,7 @@ export function membersModeFromEnv(env: NodeJS.ProcessEnv): MembersMode {
   if (raw === "" || raw === "off") return "off";
   if (raw === "shadow") return "shadow";
   if (raw === "on") {
-    throw new EnvSpecError("HELIOPAUSE_MEMBERS=on is not available yet — it needs member sign-in; use off or shadow");
+    throw new EnvSpecError("HELIOPAUSE_MEMBERS=on is not available yet — it needs SSO linking; use off or shadow");
   }
   throw new EnvSpecError(`HELIOPAUSE_MEMBERS must be off or shadow, not ${JSON.stringify(raw)}`);
 }
