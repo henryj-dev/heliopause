@@ -126,6 +126,13 @@ def verify(envelope, domain, keydir, provider):
     return value
 
 
+def independent_trust(config, provider):
+    manager={row[0] for row in provider._load_artifact_key_dir(config['managerKeys'],'manager')}
+    verifier={row[0] for row in provider._load_artifact_key_dir(config['verifierKeys'],'manager')}
+    if not manager or not verifier or manager & verifier:
+        raise ValueError('independent verifier trust must use distinct signing keys')
+
+
 def host(value):
     if not isinstance(value, str):
         raise ValueError('invalid host route')
@@ -463,6 +470,7 @@ class Executor:
         with self.locked():
             if self.config.get('enabled') is not True:
                 raise ValueError('new network execution disabled')
+            independent_trust(self.config,self.provider)
             a=verify(envelope,EXECUTION,self.config['managerKeys'],self.provider)
             exact(a,'schemaVersion transactionId target registryRevision resources desiredDigest reviewHash artifactHash observation localPrecondition operation issuedAt expiresAt rollbackAt approval')
             now=int(time.time()*1000)
@@ -537,6 +545,7 @@ class Executor:
     def confirm(self,envelope):
         with self.locked():
             data=self.load()
+            independent_trust(self.config,self.provider)
             c=verify(envelope,CONFIRM,self.config['managerKeys'],self.provider)
             exact(c,'transactionId authorizationHash artifactHash expiresAt verification')
             row=data['transactions'].get(c['transactionId'])

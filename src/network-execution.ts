@@ -65,6 +65,7 @@ export function authorizeNetworkExecution(store: NetworkRegistryStore, approvals
 /** Explicit confirm issuance after the original approval was consumed, using an independent ring. */
 export function confirmNetworkExecution(authorization: NetworkSignedEnvelope, receipt: NetworkSignedEnvelope, verifierKeys: readonly KeyObject[], managerKey: KeyObject, now=Date.now()): NetworkSignedEnvelope {
   const a=JSON.parse(Buffer.from(authorization.payload,'base64url').toString());
+  if(verifierKeys.some(k=>artifactSigningKeyId(k)===artifactSigningKeyId(createPublicKey(managerKey)))) throw new Error('independent verifier must use separate signing keys');
   if(receipt.version!=='heliopause-ed25519-v1'||receipt.algorithm!=='Ed25519'||receipt.payload.length>180000||receipt.signature.length!==86) throw new Error('invalid verifier envelope');
   const publicKey=verifierKeys.find(k=>artifactSigningKeyId(k)===receipt.keyId);
   const bytes=Buffer.from(receipt.payload,'base64url');

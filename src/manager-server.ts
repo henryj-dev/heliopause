@@ -1400,6 +1400,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     throw new Error("artifact signing authorizationTtlSec must be an integer between 900 and 604800");
   }
   if (opts.artifactSigning) artifactSigningKeyId(createPublicKey(opts.artifactSigning.privateKey));
+  if (opts.artifactSigning && opts.networkExecutionTargets?.length && opts.networkVerifierKeys?.some(k => artifactSigningKeyId(k) === artifactSigningKeyId(createPublicKey(opts.artifactSigning!.privateKey)))) throw new Error("network verifier signing keys must be independent");
   if (opts.tls.public && opts.tls.public.serverNames.length === 0) {
     throw new Error("public serverNames must contain at least one exact DNS name");
   }

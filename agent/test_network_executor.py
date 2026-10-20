@@ -59,6 +59,7 @@ class Transactions(unittest.TestCase):
         self.temp=tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.patch=patch.object(n,'crypto_helpers',return_value=object());self.patch.start();self.addCleanup(self.patch.stop)
+        self.trust=patch.object(n,'independent_trust');self.trust.start();self.addCleanup(self.trust.stop)
         self.decode=patch.object(n,'verify',side_effect=lambda value,*args:value);self.decode.start();self.addCleanup(self.decode.stop)
         self.driver=Fake();self.a=authorization()
         self.cfg={'enabled':True,'identity':self.a['target'],'managerKeys':'unused','verifierKeys':'unused','secrets':'unused','protectedAddresses':['192.0.2.1']}
@@ -74,6 +75,13 @@ class Transactions(unittest.TestCase):
         self.assertEqual(self.e.accept(self.a),'awaiting-verification')
         self.assertEqual(self.e.confirm(self.confirmation()),'confirmed')
         self.e.recover();self.assertTrue(self.driver.exists)
+    def test_overlapping_verifier_trust_is_rejected(self):
+        class Provider:
+            def _load_artifact_key_dir(self,*args):return [('same-key','manager','unused')]
+        # Invoke the real trust predicate outside the signature/driver unit stubs.
+        self.trust.stop()
+        with self.assertRaises(ValueError): n.independent_trust(self.cfg,Provider())
+        self.trust.start()
     def test_signature_rejection_has_no_driver_calls(self):
         with patch.object(n,'verify',side_effect=ValueError('bad signature')):
             with self.assertRaises(ValueError): self.e.accept(self.a)

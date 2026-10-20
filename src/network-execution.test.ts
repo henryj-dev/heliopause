@@ -7,7 +7,7 @@ import { generateKeyPairSync, verify } from 'node:crypto';
 import { NetworkRegistryStore } from './network-registry.ts';
 import { buildNetworkChangeSet } from './network-change-set.ts';
 import { emptyApprovals, propose, approve } from './approval.ts';
-import { authorizeNetworkExecution, networkExecutionHash, NETWORK_EXECUTION_DOMAIN, type NetworkExecutionDraft } from './network-execution.ts';
+import { authorizeNetworkExecution, confirmNetworkExecution, networkExecutionHash, NETWORK_EXECUTION_DOMAIN, type NetworkExecutionDraft } from './network-execution.ts';
 import { networkDigest } from './network-canonical.ts';
 import { networkLabInput } from '../examples/network-lab.ts';
 
@@ -67,5 +67,12 @@ for (const [field,value] of [['protocol','boot'],['metric',123],['nextHop','198.
     f.draft.desiredDigest=review.desiredDigest;f.draft.reviewHash=review.contentHash;
     f.proposeDraft();f.approveDraft();
     assert.throws(()=>authorizeNetworkExecution(f.store,f.approvals,f.draft,'alice',f.key.privateKey,{observation:f.observation,review},new Date(f.draft.issuedAt)),/host route ownership/);
+  } finally {rmSync(f.dir,{recursive:true,force:true});}
+});
+
+test('manager signing key cannot impersonate an independent verifier',()=>{
+  const f=fixture();try {
+    f.proposeDraft();f.approveDraft();const envelope=f.issue();
+    assert.throws(()=>confirmNetworkExecution(envelope,envelope,[f.key.publicKey],f.key.privateKey),/separate signing keys/);
   } finally {rmSync(f.dir,{recursive:true,force:true});}
 });
