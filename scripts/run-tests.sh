@@ -77,6 +77,7 @@ run "@heliopause/web" npm test -w @heliopause/web --if-present
 # what makes `npm test` mean "everything", and what stops `packages/agent`'s `test` script from
 # being a suite nobody calls (`check-workspace-suites.sh` enforces that).
 run "@heliopause/agent" npm test -w @heliopause/agent --if-present
+run "VM read-only preflight" python3 scripts/network-vm-lab/test_preflight.py
 
 printf '\n'
 if [ ${#failed[@]} -eq 0 ]; then
