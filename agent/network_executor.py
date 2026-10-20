@@ -55,8 +55,8 @@ def owner_group(owner):
 
 def kernel_multicast_route(row, dev):
     # Linux installs this local IPv6 multicast route even on an IPv4-only WG link.
-    expected={'type':'multicast','dst':'ff00::/8','table':'local','protocol':'kernel','metric':256,'flags':[],'pref':'medium'}
-    return row.get('dev',dev)==dev and {k:v for k,v in row.items() if k!='dev'}==expected
+    expected={'type':'multicast','dst':'ff00::/8','table':'local','protocol':'kernel','metric':256,'pref':'medium'}
+    return row.get('dev',dev)==dev and row.get('flags',[])==[] and {k:v for k,v in row.items() if k not in {'dev','flags'}}==expected
 
 
 def integer(value, low, high):

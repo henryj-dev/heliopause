@@ -235,6 +235,8 @@ class Ownership(unittest.TestCase):
     def test_kernel_multicast_only_is_owned_but_foreign_ipv6_route_is_preserved(self):
         self.routes6=[{'type':'multicast','dst':'ff00::/8','table':'local','protocol':'kernel','metric':256,'flags':[],'pref':'medium'}]
         self.assertTrue(self.driver.owned(self.op,self.owner))
+        normalized=dict(self.routes6[0]);normalized.pop('flags');normalized['dev']=self.op['interfaceName']
+        self.assertTrue(n.kernel_multicast_route(normalized,self.op['interfaceName']))
         self.routes6[0]['metric']=257
         with self.assertRaises(ValueError): self.driver.owned(self.op,self.owner)
     def test_foreign_ipv6_preserved(self):
