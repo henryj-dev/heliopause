@@ -193,12 +193,14 @@ class LinuxWireGuard:
     def snapshot(self):
         links = self.ip('-d', 'link', 'show')
         addresses = self.ip('address', 'show')
-        routes = self.ip('route', 'show', 'table', 'all')
-        rules = self.ip('rule', 'show')
+        routes = self.ip('-4', 'route', 'show', 'table', 'all')
+        rules = self.ip('-4', 'rule', 'show')
         # Exclude counters, lifetimes and link operational status; preserve configured identity.
         return {'links': sorted([{'name': x['ifname'], 'index': x['ifindex'], 'mtu': x['mtu'], 'master': x.get('master'), 'alias': x.get('ifalias'), 'kind': x.get('linkinfo', {}).get('info_kind')} for x in links], key=lambda x:x['name']),
                 'addresses': sorted([{'name': x['ifname'], 'addresses': sorted([a['local']+'/'+str(a['prefixlen']) for a in x.get('addr_info', [])])} for x in addresses], key=lambda x:x['name']),
-                'routes': sorted([{k:v for k,v in r.items() if k not in {'expires', 'cache', 'flags'}} for r in routes], key=canonical), 'rules': rules}
+                'routes': sorted([{k:v for k,v in r.items() if k not in {'expires', 'cache', 'flags'}} for r in routes], key=canonical), 'rules': rules,
+                'routes6':sorted([{k:v for k,v in r.items() if k not in {'expires','cache','flags'}} for r in self.ip('-6','route','show','table','all')],key=canonical),
+                'rules6':self.ip('-6','rule','show')}
 
     def route_get(self, address):
         rows = self.ip('route', 'get', address)
@@ -311,7 +313,7 @@ class LinuxWireGuard:
                 raise ValueError('address ownership conflict')
         if any(line.split()[1]!='(none)' for line in self.run(['wg','show',op['interfaceName'],'preshared-keys']).splitlines()):
             raise ValueError('PSK ownership conflict')
-        current = self.ip('route', 'show', 'table', 'all')
+        current = self.ip('-4', 'route', 'show', 'table', 'all')
         for r in current:
             dst=r.get('dst')
             normalized=dst+'/32' if dst and '/' not in dst and dst!='default' else dst
