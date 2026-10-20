@@ -165,8 +165,11 @@ class LinuxWireGuard:
     """No shell, wg-quick hooks, FRR, NetworkManager profiles, or existing-interface adoption."""
     def __init__(self, secrets):
         self.secrets = secrets
+        self.deadline = None
 
     def run(self, args, data=None, pass_fds=()):
+        if self.deadline is not None and time.monotonic()>=self.deadline:
+            raise RuntimeError('apply deadline elapsed')
         try:
             p = subprocess.run(args, input=data, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5, check=False, pass_fds=pass_fds)
         except (OSError, subprocess.TimeoutExpired):
@@ -414,6 +417,7 @@ class Executor:
             self.event(state)
 
     def rollback(self, data, row):
+        self.driver.deadline=None
         self.save(data,row,'rolling-back')
         try:
             if row.get('configuredFingerprint') is not None and self.driver.owned(row['authorization']['operation'],row['owner']) and self.driver.fingerprint(row['authorization']['operation'])!=row['configuredFingerprint']:
@@ -472,16 +476,23 @@ class Executor:
                 raise ValueError('clock/replay capacity or unsettled transaction')
             if len(canonical(data).encode())>6*1024*1024:
                 raise ValueError('transaction journal capacity reached')
+            started_mono=time.monotonic()
             before,paths=self.driver.preflight(a['operation'],self.config['protectedAddresses'])
             if digest(before)!=a['localPrecondition']:
                 raise ValueError('local precondition changed: replan and reapprove')
-            row={'authorization':a,'state':'prepared','before':before,'paths':paths,'owner':'heliopause:'+a['transactionId']+':'+os.urandom(16).hex(),'acceptedAt':now,'mono':time.monotonic(),'diagnostic':None,'history':[]}
+            fresh_now=int(time.time()*1000)
+            if fresh_now<now or fresh_now>=a['expiresAt'] or (time.monotonic()-started_mono)*1000>=a['expiresAt']-now:
+                raise ValueError('authorization expired during preflight')
+            row={'authorization':a,'state':'prepared','before':before,'paths':paths,'owner':'heliopause:'+a['transactionId']+':'+os.urandom(16).hex(),'acceptedAt':now,'mono':started_mono,'diagnostic':None,'history':[]}
             data['transactions'][a['transactionId']]=row
             data['lastClock']=now
             # Every undo input exists on disk before the first network write.
             self.save(data,row,'prepared')
             try:
+                self.driver.deadline=started_mono+(a['rollbackAt']-now)/1000
                 self.save(data,row,'applying')
+                if int(time.time()*1000)>=a['expiresAt'] or time.monotonic()-started_mono>=(a['expiresAt']-now)/1000:
+                    raise ValueError('authorization expired before first write')
                 self.driver.create(a['operation'],row['owner'])
                 self.event('created')
                 self.driver.configure(a['operation'])
@@ -491,6 +502,8 @@ class Executor:
                 self.driver.routes(a['operation'])
                 self.event('routes')
                 self.save(data,row,'awaiting-verification')
+                if int(time.time()*1000)>=a['rollbackAt'] or time.monotonic()>=self.driver.deadline:
+                    self.rollback(data,row)
             except Exception:
                 self.rollback(data,row)
             return row['state']

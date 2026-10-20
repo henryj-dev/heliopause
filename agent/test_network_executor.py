@@ -159,4 +159,41 @@ class Transactions(unittest.TestCase):
             self.assertNotIn('privateKey',stream.read())
 
 
+class Ownership(unittest.TestCase):
+    def setUp(self):
+        self.op=authorization()['operation']
+        self.owner='heliopause:owner'
+        self.routes=[{'dst':'192.0.2.130','dev':'hp6test','protocol':'static','scope':'link','metric':42760}]
+        self.link={'ifindex':3,'ifname':'hp6test','mtu':1400,'ifalias':self.owner,'linkinfo':{'info_kind':'wireguard'}}
+        self.driver=n.LinuxWireGuard('/unused')
+        self.psk='(none)'
+        self.v6=[]
+        def ip(*args):
+            if args[0]=='-6': return [{'addr_info':self.v6}] if 'address' in args else []
+            if 'link' in args: return [self.link]
+            if 'address' in args: return [{'addr_info':[{'family':'inet','local':'192.0.2.129','prefixlen':32}]}]
+            return self.routes
+        def run(args,*unused,**kwargs):
+            command=args[-1]
+            return {'public-key':PUB,'listen-port':'51820','endpoints':PEER+'\t203.0.113.2:51820','peers':PEER,'allowed-ips':PEER+'\t192.0.2.130/32','preshared-keys':PEER+'\t'+self.psk}[command]
+        self.driver.ip=ip;self.driver.run=run
+        self.guard=patch.object(n.subprocess,'run',side_effect=AssertionError('escaped unit driver boundary'));self.guard.start();self.addCleanup(self.guard.stop)
+    def test_expected_owned_shape(self): self.assertTrue(self.driver.owned(self.op,self.owner))
+    def test_foreign_gateway_route_preserved(self):
+        self.routes[0]['gateway']='192.0.2.131'
+        with self.assertRaises(ValueError): self.driver.owned(self.op,self.owner)
+    def test_foreign_table_preserved(self):
+        self.routes[0]['table']=100
+        with self.assertRaises(ValueError): self.driver.owned(self.op,self.owner)
+    def test_foreign_kernel_route_preserved(self):
+        self.routes.append({'dst':'192.0.2.140','dev':'hp6test','protocol':'kernel'})
+        with self.assertRaises(ValueError): self.driver.owned(self.op,self.owner)
+    def test_foreign_psk_preserved(self):
+        self.psk='opaque-foreign-secret'
+        with self.assertRaises(ValueError): self.driver.owned(self.op,self.owner)
+    def test_foreign_ipv6_preserved(self):
+        self.v6=[{'local':'2001:db8::1'}]
+        with self.assertRaises(ValueError): self.driver.owned(self.op,self.owner)
+
+
 if __name__=='__main__': unittest.main()

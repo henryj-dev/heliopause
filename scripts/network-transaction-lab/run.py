@@ -179,7 +179,7 @@ def scenario(kind):
             stop(p);p=start(path);await_state(path,{'rollback-failed'});assert exists();assert 'rollback' in row(path)['diagnostic'];stop(p);return
         if kind=='rollback-command-failed':
             stop(p)
-            code="import sys;sys.path.insert(0,'/source/agent');import network_executor as n;e=n.Executor(n.read_json(sys.argv[1]),sys.argv[2]);e.driver.remove=lambda *a:(_ for _ in ()).throw(RuntimeError('delete failed'));e.recover()"
+            code="import sys;sys.path.insert(0,'/source/agent');import network_executor as n;e=n.Executor(n.read_json(sys.argv[1]),sys.argv[2]);original=e.driver.run;e.driver.run=lambda args,*a,**kw:original(['ip','link','del','dev','does-not-exist']) if args[:3]==['ip','link','del'] else original(args,*a,**kw);e.recover()"
             run('python3','-c',code,path+'/config.json',path+'/state',ns='p6-gw');assert state(path)=='rollback-failed' and exists()
             p=start(path);await_state(path,{'rolled-back'});assert not exists();stop(p);return
         if kind=='peer-route-loss':
@@ -204,6 +204,11 @@ def scenario(kind):
             r=n.read_json(path+'/receipt.json');r['signature']='A'*86;n.atomic(path+'/receipt.json',r)
             authority('confirm',path);shutil.copyfile(path+'/confirmation.json',path+'/state/confirm.json')
             wait_for(lambda:n.read_json(path+'/state/response.json')['state']=='rejected')
+        if kind=='lost-confirm':
+            run('python3','scripts/network-transaction-lab/verifier.py',path,ns='p6-verifier')
+            assert all(n.read_json(path+'/verification.json').values())
+            authority('confirm',path)
+            assert os.path.exists(path+'/confirmation.json') and not os.path.exists(path+'/state/confirm.json')
         # absent verifier, lost confirm and all injected delivery failures must time out locally.
         if kind in {'crash-rollback','crash-after-remove'}:
             wait_for(lambda:os.path.exists(path+'/state/barrier.json'),15);stop(p)

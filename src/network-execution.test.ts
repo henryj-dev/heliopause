@@ -14,7 +14,7 @@ import { networkLabInput } from '../examples/network-lab.ts';
 function fixture() {
   const dir=mkdtempSync(join(tmpdir(),'hp-execution-')),store=new NetworkRegistryStore(join(dir,'registry.json'));
   const input=networkLabInput();
-  for (const r of input.registry.resources) if (r.management.mode==='managed') { r.management.driver='wg-quick'; if(r.kind==='interface'&&r.id==='wg0')r.name='hp6test'; }
+  for (const r of input.registry.resources) if (r.management.mode==='managed') { r.management.driver='wg-quick'; if(r.kind==='interface'&&r.id==='wg0')r.name='hp6test'; if(r.kind==='route'&&r.interfaceId==='wg0'){r.protocol='static';r.metric=42760;} }
   const registry=store.mutate(0,'alice',{action:'replace',resources:input.registry.resources});
   const now=Date.now();
   const observation=structuredClone(input.observations[0]!);observation.receivedAt=new Date(now).toISOString();observation.report.completedAt=observation.receivedAt;

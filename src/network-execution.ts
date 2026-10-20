@@ -54,7 +54,7 @@ export function authorizeNetworkExecution(store: NetworkRegistryStore, approvals
     if(node?.kind!=='node'||iface?.kind!=='interface'||iface.nodeId!==node.id||iface.name!==op.interfaceName||iface.mtu!==op.mtu||iface.management.mode!=='managed'||iface.management.provider!=='wireguard'||iface.management.driver!=='wg-quick'||!draft.resources.some(r=>r.id===iface.id)) throw new Error('interface ownership mismatch');
     const net=registry.resources.find(r=>r.id===iface.networkId);
     if(net?.kind!=='network'||net.purpose!=='backbone'||!registry.resources.some(r=>r.kind==='subnet'&&r.networkId===net.id&&prefixContains(r.cidr,op.address))) throw new Error('address outside backbone');
-    for(const dst of op.routes) if(!registry.resources.some(r=>r.kind==='route'&&r.interfaceId===iface.id&&r.destination===dst&&r.table===254&&r.management.mode==='managed'&&r.management.provider==='wireguard'&&draft.resources.some(e=>e.id===r.id))) throw new Error('host route ownership mismatch');
+    for(const dst of op.routes) if(!registry.resources.some(r=>r.kind==='route'&&r.interfaceId===iface.id&&r.destination===dst&&r.table===254&&r.management.mode==='managed'&&r.management.provider==='wireguard'&&r.management.driver==='wg-quick'&&r.nextHop===null&&r.protocol==='static'&&r.metric===42760&&r.preferredSource===undefined&&(r.routeType===undefined||r.routeType==='unicast')&&draft.resources.some(e=>e.id===r.id))) throw new Error('host route ownership mismatch');
     const envelope=signNetworkMessage(NETWORK_EXECUTION_DOMAIN,{...draft,approval:{mode:'two-person',planHash:hash,proposedBy:plan.proposedBy,approvedBy:plan.approval!.by,approvedAt:Date.parse(plan.approval!.at)}},key);
     settle(approvals,hash);
     return envelope;

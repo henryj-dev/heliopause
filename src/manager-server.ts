@@ -321,6 +321,7 @@ export const API_ROUTES: ReadonlySet<string> = new Set([
  * fleet agent fetches its own certificate from there, through a name in stardust's SNI allowlist.
  */
 export const API_ROUTE_PATTERNS: readonly RegExp[] = [
+  /^\/network\/execution\/(?:propose|approve|authorize|confirm|review)$/,
   /^\/network\/inventory\/[^/]+$/,
   /^\/network\/observations\/[^/]+\/[^/]+$/,
   /^\/plans\/[^/]+\/changes$/,
