@@ -53,6 +53,12 @@ def owner_group(owner):
     return 0x80000000 | (int.from_bytes(hashlib.sha256(owner.encode()).digest()[:4],'big') & 0x7fffffff)
 
 
+def kernel_multicast_route(row, dev):
+    # Linux installs this local IPv6 multicast route even on an IPv4-only WG link.
+    expected={'type':'multicast','dst':'ff00::/8','table':'local','protocol':'kernel','metric':256,'flags':[],'pref':'medium'}
+    return row.get('dev',dev)==dev and {k:v for k,v in row.items() if k!='dev'}==expected
+
+
 def integer(value, low, high):
     return type(value) is int and low <= value <= high
 
@@ -346,7 +352,7 @@ class LinuxWireGuard:
             pub, endpoint=line.split()
             if endpoint!=next((p['endpoint'] for p in op['peers'] if p['publicKey']==pub), None):
                 raise ValueError('endpoint ownership conflict')
-        if any(row.get('addr_info') for row in self.ip('-6','address','show','dev',op['interfaceName'])) or self.ip('-6','route','show','table','all','dev',op['interfaceName']):
+        if any(row.get('addr_info') for row in self.ip('-6','address','show','dev',op['interfaceName'])) or any(not kernel_multicast_route(r,op['interfaceName']) for r in self.ip('-6','route','show','table','all','dev',op['interfaceName'])):
             raise ValueError('IPv6 ownership conflict')
         peers = self.run(['wg', 'show', op['interfaceName'], 'peers']).split()
         if alias is None and ('UP' in link.get('flags',[]) or public not in {'','(none)'} or peers or self.run(['wg','show',op['interfaceName'],'listen-port'])!='0' or any(row.get('addr_info') for row in self.ip('address','show','dev',op['interfaceName']))):
@@ -417,6 +423,7 @@ class LinuxWireGuard:
         base['links']=[x for x in base['links'] if x['name']!=op['interfaceName']]
         base['addresses']=[x for x in base['addresses'] if x['name']!=op['interfaceName']]
         base['routes']=[r for r in base['routes'] if r.get('dev')!=op['interfaceName']]
+        base['routes6']=[r for r in base['routes6'] if not (r.get('dev')==op['interfaceName'] and kernel_multicast_route(r,op['interfaceName']))]
         if base!=before:
             raise ValueError('protected configuration changed')
         handshakes=self.run(['wg','show',op['interfaceName'],'latest-handshakes'])

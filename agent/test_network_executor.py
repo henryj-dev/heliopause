@@ -186,9 +186,9 @@ class Ownership(unittest.TestCase):
         self.psk='(none)'
         self.public=PUB;self.port='51820';self.peers=PEER
         self.addresses=[{'family':'inet','local':'192.0.2.129','prefixlen':32}]
-        self.v6=[]
+        self.v6=[];self.routes6=[]
         def ip(*args):
-            if args[0]=='-6': return [{'addr_info':self.v6}] if 'address' in args else []
+            if args[0]=='-6': return [{'addr_info':self.v6}] if 'address' in args else self.routes6
             if 'link' in args: return [self.link]
             if 'address' in args: return [{'addr_info':self.addresses}]
             return self.routes
@@ -232,6 +232,11 @@ class Ownership(unittest.TestCase):
         original=self.driver.ip
         self.driver.ip=lambda *args: [] if args[0]=='-6' and 'address' in args else original(*args)
         self.assertTrue(self.driver.owned(self.op,self.owner))
+    def test_kernel_multicast_only_is_owned_but_foreign_ipv6_route_is_preserved(self):
+        self.routes6=[{'type':'multicast','dst':'ff00::/8','table':'local','protocol':'kernel','metric':256,'flags':[],'pref':'medium'}]
+        self.assertTrue(self.driver.owned(self.op,self.owner))
+        self.routes6[0]['metric']=257
+        with self.assertRaises(ValueError): self.driver.owned(self.op,self.owner)
     def test_foreign_ipv6_preserved(self):
         self.v6=[{'local':'2001:db8::1'}]
         with self.assertRaises(ValueError): self.driver.owned(self.op,self.owner)
