@@ -126,6 +126,7 @@ export function matchNetworkInventory(input: NetworkMatchingInput): NetworkMatch
       }
       if (row.type !== undefined && row.type !== "unicast") { add(r, "unsupported", "non-unicast observation cannot match a static unicast route"); continue; }
       const address = (v: unknown) => typeof v === "string" ? prefix(v + (v.includes(":") ? "/128" : "/32")) : v;
+      if ([r.nextHop, r.preferredSource, row.gateway, row.prefsrc].some(v => typeof v === "string" && address(v) === undefined)) { add(r, "unknown", "scoped or unsupported route address cannot be compared"); continue; }
       const attributes: Array<[unknown, unknown, string]> = [
         [r.nextHop, row.gateway ?? null, "next hop"], [r.metric, row.metric, "metric"],
         [r.preferredSource, row.prefsrc, "preferred source"], [r.protocol, proto, "protocol"],

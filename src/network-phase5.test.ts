@@ -159,3 +159,13 @@ test('the shared policy cannot authorize a management prefix by relabeling it in
   assert.equal(compileWireGuard({registry:f.registry,expectedRegistryRevision:1,spec:f.wireguard,prefixPolicy:f.prefixPolicy}).ok,false);
   assert.equal(compileFrr({registry:f.registry,expectedRegistryRevision:1,spec:f.frr[0],prefixPolicy:f.prefixPolicy}).ok,false);
 });
+test('IPv6 zone identifiers cannot collapse to equal unsupported route addresses',()=>{
+  const f=networkLabInput(),r=f.registry.resources.find(r=>r.id==='route-p-0-1')!;
+  Object.assign(r,{destination:'2001:db8:20::/64',nextHop:'fe80::1%wg0'});
+  assert.ok(validateNetworkInventory(f.registry.resources).some(e=>e.message.includes('nextHop')));
+  Object.assign(r,{nextHop:'fe80::1'});
+  const report=f.observations[0]!.report;
+  report.observations.routes6={status:'success',startedAt:report.startedAt,completedAt:report.completedAt,data:[{dst:'2001:db8:20::/64',dev:'wg0',table:254,protocol:'boot',gateway:'fe80::2%wg0'}]};
+  report.capabilities.routes6={available:true,status:'success'};
+  assert.equal(matchNetworkInventory(f).matches.find(m=>m.resourceId===r.id)!.status,'unknown');
+});

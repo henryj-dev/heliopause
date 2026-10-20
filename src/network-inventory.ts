@@ -234,7 +234,7 @@ export function validateNetworkInventory(input: unknown): NetworkInventoryIssue[
         }
         if (r.kind === "route") {
           const family = typeof r.destination === "string" ? isIP(r.destination.split("/")[0]!) : 0;
-          for (const field of ["nextHop", "preferredSource"]) if (r[field] !== undefined && !(field === "nextHop" && r[field] === null) && (typeof r[field] !== "string" || !family || isIP(r[field] as string) !== family)) add(id, `${field} must match route address family`);
+          for (const field of ["nextHop", "preferredSource"]) if (r[field] !== undefined && !(field === "nextHop" && r[field] === null) && (typeof r[field] !== "string" || (r[field] as string).includes("%") || !family || isIP(r[field] as string) !== family)) add(id, `${field} must match route address family`);
           if (r.metric !== undefined && (!Number.isSafeInteger(r.metric) || Number(r.metric) < 0 || Number(r.metric) > 4294967295)) add(id, "metric must be uint32");
           if (r.routeType !== undefined && r.routeType !== "unicast") add(id, "only unicast desired routes are supported");
           if (r.protocol !== undefined && !["static", "boot"].includes(String(r.protocol))) add(id, "only static or boot desired route protocols are supported");
