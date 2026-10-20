@@ -128,30 +128,64 @@ Upstream references: [FRR daemon common options](https://github.com/FRRouting/fr
 
 ## Validation status
 
-Local root/manager type checks, workspace suite coverage and icon checks passed.
-The focused network, CLI and packaging suite passed 203 tests before the final
-management-policy regression addition. Local full regression did not pass: Unix
+Local root/manager type checks, workspace suite coverage, icon checks and 205 focused
+network/CLI/packaging tests passed. Local full regression did not pass: Unix
 socket/terminal restrictions prevented several existing integration suites from
 running successfully. Those failures are not counted as successful verification.
-Linux CI is the authority for complete regression, mTLS and real-kernel rollback.
+Linux CI passed complete regression, mTLS and real-kernel rollback. The PR body
+records final-head counts and links after the last validation run.
 
 Recorded isolated lab run:
-[39348507489](https://github.com/henryj-dev/heliopause/actions/runs/39348507489),
-source revision `9365061`. Both daemon versions passed all ten checks, including
-actual workload, synthetic Pod-prefix and synthetic VIP packets. This revision
-includes host-route restoration; subsequent lab changes add explicit handshake
-and fresh-container guards and local management ping assertions.
+[39349509294](https://github.com/henryj-dev/heliopause/actions/runs/39349509294),
+source revision `948aea5`. Both daemon versions passed all twelve checks, including
+exact compiled IPv4/IPv6+BFD syntax, actual IPv4 workload/synthetic Pod-prefix/VIP
+packets, primary session withdrawal, recovery and two post-recovery samples.
 
 | FRR | Full validation convergence after primary failure | After explicit interface/host-route recovery | Lost dedicated samples (failure / recovery) |
 | --- | --- | --- | --- |
-| 8.5.6 | 926.507 ms | 905.573 ms | 1 of 2 / 0 of 2 |
-| 10.2.1 | 618.218 ms | 591.230 ms | 1 of 2 / 0 of 2 |
+| 8.5.6 | 710.372 ms | 2307.729 ms | 1 of 1 / 0 of 6 |
+| 10.2.1 | 1618.950 ms | 1918.485 ms | 1 of 2 / 0 of 7 |
 
 These are single-run lab measurements with short explicit BGP timers. They include
 sequential FIB, BGP and all-pairs forwarding verification overhead. They are not
 production outage guarantees or total packet-loss measurements. Dedicated sample
-counts exclude packets sent by the all-pairs validator. The current PR's final
-checks must be green independently of these recorded earlier measurements.
+counts exclude packets sent by the all-pairs validator. The failure convergence
+measurement ends at verified secondary forwarding; full BGP-session/path withdrawal
+is a separate check performed before recovery.
+
+Earlier 8.5.6 runs intermittently retained invalid primary next hops after sessions
+returned. Waiting for all interfaces to be observed Up by zebra before restoring
+dependent host routes eliminated that failure in the recorded run. That is a lab
+recovery ordering finding, not proof of an upstream FRR defect or long-term
+production stability. Only two post-recovery samples are checked.
+
+The final report binds registry revision, ChangeSet hash and source artifact hashes,
+and identifies the lab-specific key, secondary-tunnel and timer transformations.
+These references make reports traceable, not signed or authorized execution evidence.
+
+## Delivered scope and review
+
+[PR #199](https://github.com/henryj-dev/heliopause/pull/199) is submitted for review.
+Main comparison uses [PR #198](https://github.com/henryj-dev/heliopause/pull/198).
+
+- `src/network-inventory.ts`, `src/network-matching.ts`: static route schema,
+  explicit MTU semantics, strict fields, zone-identifier safety and observation classes.
+- `src/network-prefix-policy.ts`, `src/network-change-set.ts`: shared export rules,
+  evidence/ownership consistency, compiler composition and blocked operation graph.
+- `src/network-canonical.ts`, `src/network-planner.ts`, `src/network-wireguard.ts`,
+  `src/network-frr.ts`: binary ordering and reuse of existing compiler/plan modules.
+- Existing `bin/heliopause-network-plan.ts` and `bin/heliopause-network-compile.ts`:
+  offline unified planning and policy input; no new apply path.
+- `examples/network-lab.ts`, `scripts/network-lab/`, `.github/workflows/network-lab.yml`:
+  synthetic four-site model and isolated real-kernel verification matrix.
+- Inventory, network CLI and Phase 5 regression tests plus public exports were updated.
+
+No Manager/Relay/Agent transport, signature, approval, heartbeat, policy application
+or rollback implementation is replaced. Existing security/compatibility regressions
+remain in the complete CI run. No production VPC, Cloudflare Mesh, WARP, K3s or RHEL
+gateway was accessed or modified. Network Overview UI and a real K3s/Cilium lab are
+not implemented. ECMP, non-global FRR writer domains, NetworkManager execution,
+IPv6 forwarding and BFD liveness remain outside verified scope.
 
 ## Next phase
 

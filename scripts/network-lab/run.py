@@ -324,6 +324,10 @@ def main():
     initial_links=json.loads(command('ip','-j','link','show').stdout)
     assert {link['ifname'] for link in initial_links} == {'lo'}, 'lab requires a fresh --network none container; refuse existing or host networking'
     bundle = json.loads((RESULTS/'input.json').read_text())
+    REPORT['registryRevision']=bundle['changeSet']['registryRevision']
+    REPORT['changeSetHash']=bundle['changeSet']['contentHash']
+    REPORT['sourceArtifactHashes']={a['targetId']:a['hash'] for a in bundle['changeSet']['artifacts']}
+    REPORT['runtimeTransforms']=['ephemeral lab keys and public-key substitution','secondary tunnel simulation','lab-only pre-negotiation BGP timers']
     record('FRR parser accepts exact compiled IPv4/IPv6 templates and optional BFD syntax', lambda: syntax(bundle))
     record('isolated namespaces and compiler-fed WireGuard setup', lambda: setup(bundle))
     record('all six neighbors per site established', lambda: eventually(sessions))
