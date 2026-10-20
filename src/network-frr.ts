@@ -1,4 +1,5 @@
 /** Pure conservative FRR template compiler. Never invokes FRR or mutates an interface. */
+import { normalizePrefixPolicy, validatePrefixPolicy, permittedPrefix, type NetworkPrefixPolicy } from './network-prefix-policy.ts';
 import { isIP } from 'node:net';
 import { cidrRange } from './nft.ts';
 import { networkDigest } from './network-canonical.ts';
@@ -71,6 +72,7 @@ export function compileFrr(input: {
     registry: Pick<NetworkRegistryDocument, 'revision' | 'resources'>;
     expectedRegistryRevision: number;
     spec: unknown;
+    prefixPolicy?: NetworkPrefixPolicy;
 }): {
     ok: true;
     artifact: FrrCompilation;
@@ -86,6 +88,7 @@ export function compileFrr(input: {
         bad('registry revision mismatch');
     for (const e of validateNetworkInventory(registry.resources))
         bad(`inventory ${e.resourceId}: ${e.message}`);
+    if(input.prefixPolicy) for(const e of validatePrefixPolicy(registry.resources,input.prefixPolicy)) bad(e);
     const s = input.spec;
     if (!obj(s) || !keys(s, ['schemaVersion', 'frrVersion', 'nodeId', 'siteId', 'routerId', 'localAsn', 'exportSubnetIds', 'peers']) || s.schemaVersion !== 1 || !['8.5.6', '10.2.1'].includes(String(s.frrVersion)) || !id(s.nodeId) || !id(s.siteId) || typeof s.routerId !== 'string' || isIP(s.routerId) !== 4 || !asn(s.localAsn) || !ids(s.exportSubnetIds) || !Array.isArray(s.peers) || s.peers.length < 2 || s.peers.length > 128)
         return {
@@ -111,6 +114,18 @@ export function compileFrr(input: {
     function prefixes(refs: string[], site: string, family?: string) {
         return refs.flatMap(ref => {
             const r = rs.get(ref);
+            if (input.prefixPolicy) {
+                if(r?.kind!=='subnet' && r?.kind!=='address-pool') {bad(`prefix must reference subnet or pool: ${ref}`);return [];}
+                const subnet=r.kind==='subnet'?r:rs.get(r.subnetId);
+                const net=subnet?.kind==='subnet'?rs.get(subnet.networkId):undefined;
+                const candidates=input.prefixPolicy.permissions.filter(p=>p.resourceId===ref&&p.siteId===site);
+                if(!candidates.length || net?.kind!=='network') {bad(`prefix lacks explicit policy permission: ${ref}`);return [];}
+                return candidates.flatMap(p=>{
+                    if(family && cidrRange(p.prefix)?.family!==family) {bad(`unsafe or mismatched prefix: ${ref}`);return [];}
+                    if(site===spec.siteId && !permittedPrefix(input.prefixPolicy!,site,p.prefix,{nodeId:spec.nodeId,provider:'native',driver:'frr'})) bad(`prefix advertisement owner mismatch: ${ref}`);
+                    return [p.prefix];
+                }).sort();
+            }
             if (r?.kind !== 'subnet') {
                 bad(`prefix must reference subnet: ${ref}`);
                 return [];
@@ -200,13 +215,13 @@ export function compileFrr(input: {
     }
     const body = {
         schemaVersion: 1 as const, kind: 'frr-compilation' as const, mode: 'dry-run' as const, executable: false as const, registryRevision: registry.revision, inputDigest: networkDigest({
-            resources: [...registry.resources].sort((a, b) => a.id.localeCompare(b.id)), spec: {
+            ...(input.prefixPolicy?{prefixPolicy:normalizePrefixPolicy(input.prefixPolicy)}:{}), resources: [...registry.resources].sort((a, b) => a.id.localeCompare(b.id)), spec: {
                 ...spec, exportSubnetIds: [...spec.exportSubnetIds].sort(), peers: peers.map(p => ({
                     ...p, importSubnetIds: [...p.importSubnetIds].sort()
                 }))
             }
         }), nodeId: spec.nodeId, frrVersion: spec.frrVersion, template: lines.join('\n') + '\n', changedInterfaceIds: [] as [
-        ], preconditions: ['Declared reachability is not independent connectivity evidence. Verify source binding, TCP/179 and hop limits independently.', 'Verify local origin routes in RIB; service /32 authorization and pod reachability are unsupported and refused.', 'BFD is optional syntax only; no session, forwarding or failover proof exists.', 'No approval, persistence, execution or rollback is provided.']
+        ], preconditions: ['Declared reachability is not independent connectivity evidence. Verify source binding, TCP/179 and hop limits independently.', 'Verify local origin routes in RIB and independently authenticate every prefix reachability and exposure reference.', 'BFD is optional syntax only; no session, forwarding or failover proof exists.', 'No approval, persistence, execution or rollback is provided.']
     };
     return {
         ok: true, artifact: {

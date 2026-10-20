@@ -370,3 +370,6 @@ export { matchNetworkInventory, type NetworkIdentityBinding, type NetworkMatchSt
 export { buildNetworkPlan, type NetworkPlanInput, type NetworkPlan, type NetworkPlanBlocker, type NetworkDependency } from "./network-planner.ts";
 export { compileWireGuard, type WireGuardSpec, type WireGuardGatewaySpec, type WireGuardCompilation } from "./network-wireguard.ts";
 export { compileFrr, type FrrSpec, type FrrPeerSpec, type FrrCompilation } from "./network-frr.ts";
+
+export { buildNetworkChangeSet, type NetworkChangeSetInput, type NetworkChangeSet, type NetworkChangeOperation } from "./network-change-set.ts";
+export { validatePrefixPolicy, type NetworkPrefixPolicy, type PrefixPermission } from "./network-prefix-policy.ts";

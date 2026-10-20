@@ -55,3 +55,14 @@ test("documented example exposes MTU drift as a blocked update proposal", () => 
   assert.deepEqual(plan.proposals.map((p: { resourceId: string; action: string }) => [p.resourceId, p.action]), [["example-interface", "update"]]);
   assert.ok(plan.blockers.some((b: { code: string }) => b.code === "writer-capability-unavailable"));
 });
+
+test("unified offline CLI composes both compilers while retaining disabled execution", async () => {
+  const {networkLabInput}=await import('../examples/network-lab.ts');
+  const dir=mkdtempSync(join(tmpdir(),'hp-unified-cli-'));
+  try {
+    const path=join(dir,'input.json');writeFileSync(path,JSON.stringify(networkLabInput()));
+    const r=spawnSync(process.execPath,['bin/heliopause-network-plan.ts','--unified',path],{encoding:'utf8',timeout:10000});
+    assert.equal(r.status,2,r.stderr);const plan=JSON.parse(r.stdout);
+    assert.equal(plan.kind,'network-change-set');assert.equal(plan.executable,false);assert.equal(plan.artifacts.length,5);
+  }finally{rmSync(dir,{recursive:true,force:true});}
+});
