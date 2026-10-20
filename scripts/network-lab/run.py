@@ -209,14 +209,15 @@ def failover(primary, bundle):
     started = time.monotonic()
     for i in range(4):
         ns(i, 'ip', 'link', 'set', 'wg0', 'up' if primary else 'down')
-        if primary:
-            # Administrative down deletes these non-persistent kernel routes. Recovery is
-            # interface-up PLUS restoration of the compiler's declared host-route artifacts.
-            # Do not imply that plain link-up is sufficient, or reset BGP to hide the gap.
+    if primary:
+        # Interface and provider state must converge before dependent routes. Checking the
+        # command's exit code alone races the provider's asynchronous interface/NHT updates.
+        for i in range(4):
+            eventually(lambda i=i: provider_interface_up(i),20)
+        for i in range(4):
             for route in bundle['wireguard']['interfaces'][i]['peerHostRoutes']:
                 ns(i,'ip','route','replace',route['destination'],'dev','wg0')
-    if primary:
-        REPORT['recoveryActions']=['bring native interface up','restore compiler-declared peer host routes deleted by administrative down']
+        REPORT['recoveryActions']=['bring all native interfaces up','wait until zebra observes interface-up','restore compiler-declared peer host routes deleted by administrative down']
     sent = 0
     lost = 0
     last = None
@@ -238,6 +239,11 @@ def failover(primary, bundle):
             last=str(error)
             time.sleep(0.25)
     raise AssertionError('failover/recovery forwarding did not converge: '+str(last))
+
+
+def provider_interface_up(i):
+    state=ns(i,'vtysh','--vty_socket',str(ROOT/str(i)),'-d','zebra','-c','show interface wg0').stdout
+    assert 'wg0 is up' in state and 'line protocol is up' in state, state
 
 
 def management():
