@@ -56,6 +56,9 @@ def authorization():
 
 class Transactions(unittest.TestCase):
     def setUp(self):
+        for module,name in [(n.subprocess,'run'),(n.socket,'socket')]:
+            boundary=patch.object(module,name,side_effect=AssertionError('escaped transaction unit boundary'))
+            boundary.start();self.addCleanup(boundary.stop)
         self.temp=tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.patch=patch.object(n,'crypto_helpers',return_value=object());self.patch.start();self.addCleanup(self.patch.stop)
