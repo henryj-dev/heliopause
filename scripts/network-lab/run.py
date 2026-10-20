@@ -110,7 +110,7 @@ def syntax(bundle):
     version = command('/usr/lib/frr/bgpd', '--version').stdout
     assert expected in version, version
     REPORT['frrVersion'] = expected
-    for i, artifact in enumerate(bundle['frr']):
+    for i, artifact in enumerate(bundle['frr']+bundle['syntaxFrr']):
         path = ROOT/f'bgp{i}.conf'
         path.write_text(artifact['template'])
         result = command('/usr/lib/frr/bgpd', '-C', '-S', '-f', str(path), check=False)
@@ -297,7 +297,7 @@ def main():
     initial_links=json.loads(command('ip','-j','link','show').stdout)
     assert {link['ifname'] for link in initial_links} == {'lo'}, 'lab requires a fresh --network none container; refuse existing or host networking'
     bundle = json.loads((RESULTS/'input.json').read_text())
-    record('FRR parser accepts exact compiled templates', lambda: syntax(bundle))
+    record('FRR parser accepts exact compiled IPv4/IPv6 templates and optional BFD syntax', lambda: syntax(bundle))
     record('isolated namespaces and compiler-fed WireGuard setup', lambda: setup(bundle))
     record('all six neighbors per site established', lambda: eventually(sessions))
     record('all twelve ordered workload paths use native WireGuard with FIB and byte evidence', lambda: eventually(lambda: all_paths(True)))
