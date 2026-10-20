@@ -12,6 +12,7 @@ import ipaddress
 import json
 import os
 import re
+import signal
 import stat
 import subprocess
 import sys
@@ -578,25 +579,32 @@ def main(argv=None):
     fd=os.open(os.path.join(args.state_dir,'worker.lock'),os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)
     fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
     executor.recover()
+    stopping=[False]
+    def stop(*_): stopping[0]=True
+    signal.signal(signal.SIGTERM,stop)
+    signal.signal(signal.SIGINT,stop)
     seen={}
-    while True:
-        for filename,action in [('request.json',executor.accept),('confirm.json',executor.confirm)]:
-            path=os.path.join(args.state_dir,filename)
-            try:
-                raw=read_file(path)
-                stamp=hashlib.sha256(raw).hexdigest()
-                if seen.get(filename)==stamp:
-                    continue
-                seen[filename]=stamp
+    try:
+        while not stopping[0]:
+            for filename,action in [('request.json',executor.accept),('confirm.json',executor.confirm)]:
+                path=os.path.join(args.state_dir,filename)
                 try:
-                    result=action(read_json(path))
-                    atomic(os.path.join(args.state_dir,'response.json'),{'requestHash':stamp,'state':result})
-                except Exception as error:
-                    atomic(os.path.join(args.state_dir,'response.json'),{'requestHash':stamp,'state':'rejected','diagnostic':safe_diagnostic(error)})
-            except FileNotFoundError:
-                pass
-        executor.tick()
-        time.sleep(0.25)
+                    raw=read_file(path)
+                    stamp=hashlib.sha256(raw).hexdigest()
+                    if seen.get(filename)==stamp:
+                        continue
+                    seen[filename]=stamp
+                    try:
+                        result=action(read_json(path))
+                        atomic(os.path.join(args.state_dir,'response.json'),{'requestHash':stamp,'state':result})
+                    except Exception as error:
+                        atomic(os.path.join(args.state_dir,'response.json'),{'requestHash':stamp,'state':'rejected','diagnostic':safe_diagnostic(error)})
+                except FileNotFoundError:
+                    pass
+            executor.tick()
+            time.sleep(0.25)
+    finally:
+        executor.recover()
 
 
 if __name__=='__main__':

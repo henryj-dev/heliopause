@@ -54,6 +54,7 @@ if(action==='keys') {
     if(kind==='expiry') a.expiresAt=1;
     if(kind==='hash') a.artifactHash='0'.repeat(64);
     if(kind==='approval') a.approval.approvedBy=a.approval.proposedBy;
+    a.approval.planHash='sha256:'+networkDigest(Object.fromEntries(Object.entries(a).filter(([k])=>k!=='approval')));
     save('request-tampered.json',signNetworkMessage('heliopause-network-execution-v1',a,createPrivateKey(readFileSync(join(dir,'manager.key')))));process.exit(0);
   }
   save('request-tampered.json',env);

@@ -128,6 +128,7 @@ def await_state(path,wanted,seconds=7):
 def verify_and_confirm(path):
     run('python3','scripts/network-transaction-lab/verifier.py',path,ns='p6-verifier')
     checks=n.read_json(path+'/verification.json')
+    if not all(checks.values()): assert not authority('confirm',path,ok=False)
     authority('confirm' if all(checks.values()) else 'unsafe-confirm',path)
     shutil.copyfile(path+'/confirmation.json',path+'/state/confirm.json')
     return checks
@@ -157,7 +158,7 @@ def scenario(kind):
             assert not run('python3','-c',code,path+'/config.json',path+'/state',ns='p6-gw',ok=False)
             assert not exists();return
         fault={'fail-created':'fail-created','fail-routes':'fail-routes','crash-partial-routes':'first-route','crash-apply':'created','crash-rollback':'rolling-back','crash-after-remove':'removed'}.get(kind,'')
-        p=start(path,fault,production=kind in {'normal','writer-conflict'})
+        p=start(path,fault,production=kind in {'normal','writer-conflict','graceful-stop'})
         if kind in {'fail-created','fail-routes'}:
             await_state(path,{'rolled-back'});assert not exists();stop(p);return
         if kind in {'crash-apply','crash-partial-routes'}:
@@ -166,6 +167,9 @@ def scenario(kind):
             stop(p)
             p=start(path);await_state(path,{'rolled-back'});assert not exists();stop(p);return
         await_state(path,{'awaiting-verification'})
+        if kind=='graceful-stop':
+            p.terminate();p.wait(timeout=5)
+            assert state(path)=='rolled-back' and not exists();return
         if kind=='writer-conflict':
             second=start(path,production=True);second.wait(timeout=4)
             assert second.returncode!=0 and p.poll() is None and exists()
@@ -238,7 +242,7 @@ def scenario(kind):
         await_state(path,{'rolled-back'},15);assert not exists();stop(p)
 
 
-cases=['normal','signature','target','expiry','hash','approval','registry-changed','local-changed','duplicate','prepare-failed','fail-created','fail-routes','management-failed','asymmetric','blackhole','absent-verifier','lost-confirm','forged-verifier','crash-apply','crash-partial-routes','crash-wait','crash-rollback','crash-after-remove','foreign-writer','rollback-command-failed','peer-route-loss','secret-redaction','disabled-recovery','writer-conflict']
+cases=['normal','signature','target','expiry','hash','approval','registry-changed','local-changed','duplicate','prepare-failed','fail-created','fail-routes','management-failed','asymmetric','blackhole','absent-verifier','lost-confirm','forged-verifier','crash-apply','crash-partial-routes','crash-wait','crash-rollback','crash-after-remove','foreign-writer','rollback-command-failed','peer-route-loss','secret-redaction','disabled-recovery','writer-conflict','graceful-stop']
 for case in cases:
     started=time.monotonic()
     try:
@@ -252,5 +256,5 @@ for case in cases:
         for p,log in processes: stop(p);log.close()
         processes.clear()
         for ns in NAMES: run('ip','netns','del',ns,ok=False)
-assert len(results)==29
+assert len(results)==30
 print(json.dumps({'kind':'network-transaction-kernel-report','passed':len(results),'failed':0,'skipped':0,'hostRebootVerified':False,'backend':n.DRIVER,'scenarios':results}),flush=True)
