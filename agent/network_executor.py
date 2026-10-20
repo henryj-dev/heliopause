@@ -608,6 +608,7 @@ class Executor:
                 self.rollback(data,row)
                 raise ValueError('confirmation deadline elapsed')
             self.save(data,row,'confirmed')
+            self.driver.deadline=None
             return row['state']
 
     def tick(self):

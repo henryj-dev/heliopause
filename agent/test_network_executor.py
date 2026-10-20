@@ -78,6 +78,36 @@ class Transactions(unittest.TestCase):
         self.assertEqual(self.e.accept(self.a),'awaiting-verification')
         self.assertEqual(self.e.confirm(self.confirmation()),'confirmed')
         self.e.recover();self.assertTrue(self.driver.exists)
+    def test_confirmed_deadline_does_not_poison_next_real_preflight(self):
+        # Real Linux preflight/run deadline predicate; only reads, secret lookup and command
+        # boundary are replaced. Writes remain Fake and no host networking is invoked.
+        from types import SimpleNamespace
+        real=n.LinuxWireGuard(self.temp.name)
+        snapshot={'links':[],'routes':[]}
+        real.snapshot=lambda:copy.deepcopy(snapshot)
+        real.route_get=lambda address:{'dev':'underlay'}
+        secret=os.path.join(self.temp.name,'local-secret')
+        with open(secret,'w') as stream:stream.write('test-only')
+        real.secret=lambda op:os.open(secret,os.O_RDONLY)
+        fake=self.driver
+        for method in ['create','configure','routes','fingerprint','verify_local','owned','remove']:
+            setattr(real,method,getattr(fake,method))
+        self.e.driver=real
+        self.a['localPrecondition']=n.digest(snapshot);self.reapprove()
+        with patch.object(n.subprocess,'run',return_value=SimpleNamespace(returncode=0,stdout=b'version')) as command:
+            self.assertEqual(self.e.accept(self.a),'awaiting-verification')
+            self.assertEqual(self.e.confirm(self.confirmation()),'confirmed')
+            later_wall=time.time()+20;later_mono=time.monotonic()+20
+            with patch.object(n.time,'time',return_value=later_wall),patch.object(n.time,'monotonic',return_value=later_mono):
+                self.a=authorization();self.a['transactionId']='b'*32
+                self.a['operation']['interfaceName']='hpbbbbbbbbbbbb'
+                self.a['artifactHash']=n.digest(self.a['operation'])
+                self.a['localPrecondition']=n.digest(snapshot);self.reapprove()
+                self.assertEqual(self.e.accept(self.a),'awaiting-verification')
+                self.assertEqual(self.e.confirm(self.confirmation()),'confirmed')
+            self.assertEqual(command.call_count,2)
+        self.assertEqual(len(self.e.load()['transactions']),2)
+
     def test_overlapping_verifier_trust_is_rejected(self):
         class Provider:
             def _load_artifact_key_dir(self,*args):return [('same-key','manager','unused')]
