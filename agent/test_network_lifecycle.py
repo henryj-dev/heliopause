@@ -84,6 +84,14 @@ class Lifecycle(unittest.TestCase):
         other.recover();other.step();other.close()
         self.assertIsNone(other.worker_fd)
         other_executor.tick.assert_not_called();other_executor.recover.assert_not_called();other_executor.publish_results.assert_not_called()
+    def test_runtime_corruption_and_missing_known_firewall_block_new_admission(self):
+        self.assertTrue(os.path.exists(self.agent.STATE_FILE+'.required'))
+        os.unlink(self.agent.STATE_FILE)
+        self.assertFalse(self.l.begin_firewall())
+        self.assertEqual(self.l.report()['recoveryDebt']['firewall'],'unknown')
+        n.atomic(self.agent.STATE_FILE,{'state':'garbage'})
+        self.assertFalse(self.l.begin_firewall())
+        self.assertEqual(n.read_json(self.agent.STATE_FILE)['state'],'garbage')
     def test_unknown_state_and_corrupt_recovery_material_fail_closed(self):
         for bad in [{'state':'garbage'},{'state':'confirmed'},{'state':'pending','generation':'g','pendingRoutes':'invalid'}]:
             n.atomic(self.agent.STATE_FILE,bad)

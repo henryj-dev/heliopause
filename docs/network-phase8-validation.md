@@ -1,0 +1,78 @@
+# Persistent Agent lifecycle and bounded trial preparation
+
+Base PR201 `cd1c238c1a45e6a4a961b0ed928eaec8ccdbfba3`. Implementation/validation in progress; no operational deployment. Exact final-head reports and measured counts are required before completion.
+
+## Current paths and ownership
+
+The audited paths remain `agent/heliopause-pull.py`, `network_executor.py`, `network_terminal_delivery.py`, `network_discovery_lifecycle.py`, `src/network-execution*.ts`, `network-registry*.ts`, `manager-server.ts`, `packaging/systemd/`, and `scripts/network-transaction-lab/`. Phase6/7 validation documents remain tracked under `docs/`.
+
+`run_writer_mode()` owns the original host `writer.lock` for the complete process lifetime. It now enters the existing firewall `main()` with a narrow `network_lifecycle.Lifecycle` mailbox worker, rather than starting two independent main loops. A short admission mutex protects the active writer marker; it is never held over network commands. Firewall admission begins before artifact fetch/preflight and ends after reply processing. A pending firewall/workload promise continues to block network admission even after that synchronous call returns. A pending/failed network journal keeps the active network reservation until verified terminal storage. There is no waiting queue and no authority lifetime extension.
+
+The original `_generation_rollback_lock`, `_apply_lock`, `_wl_lock` and `_state_lock` are unchanged. Network code does not acquire them for its command path. Existing timers can therefore enter their original rollback paths during a delayed network command. The conservative admission policy avoids creating overlapping live firewall/network promises during normal operation. Recovery of preexisting obligations is not conditional on successful transport or reporting.
+
+| Operation | External state | Lock/admission | Conflict and wait | Execution/interruption boundary | Recovery owner |
+| --- | --- | --- | --- | --- | --- |
+| Firewall fetch/preflight/apply | own nft table, explicitly approved routes, durable firewall commitment | host flock; firewall reservation; original apply/state locks | network admission rejected before apply; no queue | existing nft commands20s each; route commands10s each; at most64 signed routes; durable prepared record/timer precedes mutation | original host/generation watchdog |
+| Firewall rollback | prior own table/routes | generation rollback → apply → state | never waits for network gate/commands; may wait for existing bounded nft write | delete+restore can take40s, plus up to10s per recorded route; deadline is trigger time, not a universal completion guarantee | original retry timer and restart recovery |
+| Workload apply/undo | owned Kubernetes objects | original workload/state locks, same generation reservation | new network admission blocked while pending/failed | preflight30s; existing apply deadline; undo budget60s; UID/resourceVersion protection retained | original workload/generation watchdog |
+| Network preflight/apply | new dedicated WG link/address/peers/host routes | host flock, worker flock, executor nonblocking mutation flock; network reservation | new firewall policy deferred with lastRefusal; heartbeat still runs | preflight command budget capped by authorization expiry (≤60s); apply commands min(5s,remaining rollback window), authorization rollback window≤180s | durable Executor journal; tick/restart |
+| Network confirm | exact approved live network transaction | same network reservation and executor lock | no generic heartbeat confirmation | existing Manager/verifier signature and independent proof checks; command timeouts respect original deadline | timeout/restart rollback if unconfirmed |
+| Network rollback | only transaction-owned objects | worker/executor locks, no firewall apply lock | always before new mailbox work | command budget60s; failure remains rollback-failed; partial undo retried | local Executor independent of Relay/Manager |
+| Heartbeat/reply | TLS telemetry; firewall confirmation only | no network/executor lock; only brief admission check | no network-command wait; busy policies are not marked applied | existing request total timeout10s; normal interval+jitter; pending firewall failures retry5s | original heartbeat loop/watchdogs |
+| Discovery | read-only collectors and observation upload | original separate child process, no writer locks | collection does not grant writer/confirm authority | existing total child budget5..120s, process-group kill; stdout/stderr discarded by scheduler | bounded discovery lifecycle |
+| Terminal delivery | outbox reads, local acknowledgments, authenticated Manager settlement | separate read-only courier; no writer lock | never a prerequisite for local undo | direct mTLS, bounded response and retry batch; transport status uses fixed redacted codes | independent courier plus durable Manager ledger |
+| Confirmed kernel observation | owned WG shape reads only | network worker, no heartbeat lock | one record per30s round-robin, no observation while debt is active | total command budget2s; cache includes observation timestamp; no repair/reapply | operator observes drift; no reconciliation |
+
+These command budgets assume a responsive local filesystem/process scheduler. Existing firewall route restoration may exceed its trigger deadline under repeated command timeouts; this PR does not claim hard real-time completion or replace its watchdog algorithm. The new network path adds no wait on those original writer locks. Kernel reports measure actual trigger/deadline and completion observation separately.
+
+## Start, stop and crash behavior
+
+Before reading network configuration, startup attempts existing firewall and workload recovery independently. Legacy network locator/configuration is then validated; an active network path migration is refused rather than abandoning the previous journal. When network state exists, firewall promises are settled before local network recovery. A failed recovery helper does not skip the other helper or the network recovery attempt. Network feature disablement only disables new acceptance.
+
+Raw firewall storage is checked for supported state, commitment identity and recovery-material types before new admission. A known journal has a protected `.required` marker; loss of that journal is not treated as first boot. Invalid/missing known storage blocks new changes and is reported unknown. The original heartbeat loop remains available for diagnostics when configuration permits, and invalid storage is preserved. Missing/corrupt network identity or replay storage is never initialized at runtime. Recovery errors latch new admission off until evidence is repaired and the process restarted. Rollback-failed itself is retried locally and remains visible.
+
+| Crash/failure | Durable evidence | Next start/action |
+| --- | --- | --- |
+| Before reservation/undo storage | no accepted network mutation | retry must revalidate authority/expiry/local state |
+| During applying, verification wait or rollback | existing exact Executor journal and owned-object evidence | new process immediately retries undo, including when new execution disabled |
+| One recovery journal unreadable | unreadable bytes preserved, opposite journal retained | attempt the other local recovery; keep new admission blocked |
+| Terminal persisted, outbox missing | terminal proof/replay record | regenerate outbox; no reapply |
+| Manager/courier unavailable or certificate refused | local terminal and pending delivery status | local recovery continues; fence remains until authenticated settlement |
+| Graceful stop | writer lock retained until mailbox worker joins; then firewall/network recovery | no new admission; complete bounded undo when possible |
+| SIGKILL/service stop timeout | durable existing debts, no successful shutdown claim | kernel releases flock; next process recovers before accepting work |
+| Confirmed interface disappears | confirmed history plus separate absent/drifted observation | report discrepancy; do not infer presence, reapply, adopt or delete |
+
+Normal firewall-only startup retains its existing pending-promise recovery/heartbeat confirmation behavior. The original service without the opt-in drop-in keeps its existing configuration. `--network-executor --config ... --state-dir ...` is a compatibility alias for the full persistent Agent and now requires the full firewall Agent environment; it is no longer an isolated replacement loop.
+
+## Visibility and service transition
+
+Local `lifecycle-status.json` beside the firewall journal reports mode, network enablement, active writer/transaction, recovery debt, recent heartbeat/discovery outcomes, per-transaction network state, cached confirmed-kernel observations, Agent ledger usage/limit/remaining and terminal result/ack status. The independent courier records `terminal-delivery-status.json` with fixed categories for TLS authentication, identity/certificate refusal, settlement refusal, local outbox/configuration and transport failure. Raw exception text, keys and secret paths are not copied into these status documents. Delivery pending is distinct from rollback-failed.
+
+Existing operator `GET /api/network/execution/status` now includes Manager capacity and fence reason as well as its issued/confirm-issued/settled records. Manager256 and Agent1024 record limits remain fail-closed, with storage byte limits also unchanged. No pruning, journal reset or force-unlock endpoint is added. The courier is independent of the execution enable flag.
+
+Transition procedure (documentation, not executed on an operational host):
+
+1. Read the existing service environment, writer lock, locator and exact journal/outbox paths. Preserve protected copies and hashes. Check both debts and Manager fence; do not move or recreate a journal to hide debt.
+2. Stop the old writer service normally. If recovery cannot complete, retain evidence and use its original repair/undo path. Never start a second writer to bypass the lock.
+3. Install `network_lifecycle.py` with the existing Agent modules. Keep the full firewall TLS/signing/target environment. Prefer the existing `heliopause-agent.service` plus `heliopause-agent-network.conf` drop-in; keep the legacy network unit disabled. The alias still refuses a second process.
+4. Keep existing state paths. The opt-in drop-in permits only the specific network state directory under ProtectSystem=strict; provision its owned0700 directory explicitly. It does not chmod the shared relay parent. Custom paths require an explicit allowlist adjustment. A different existing locator requires offline reconciliation, not automatic migration.
+5. Enable `HELIOPAUSE_NETWORK_EXECUTOR=1` only with an already provisioned replay journal and protected management addresses. For read-only/recovery-only operation leave it unset/0. Start the separate terminal courier with the same config/state binding.
+6. Confirm recent heartbeats/discovery and both debt/status views before admitting work. A blocked/unknown state is not an instruction to delete files. The network drop-in/compatibility unit permits up to300s graceful stop; an eventual systemd SIGKILL is restart recovery, not proof of completed undo. The original firewall-only stop timeout is unchanged.
+
+## Trial prerequisites, deliberately not implemented here
+
+**Boot persistence:** select the actual target OS/kernel/network manager first. No target RHEL/NetworkManager host was contacted for this work. Decide whether confirmed state belongs to NetworkManager profiles or another explicit persistence backend; define delete/ownership semantics and ordering with existing firewall boot restore. Completion requires real isolated VM reboot with confirmed/pending/debt states, kernel presence checks and independent management/data probes. Process restart is not host reboot.
+
+**Certificate rotation/revocation:** before ordinary rotation, finish local debt and authenticated settlement with the existing valid identity. Preserve journalId and replay records. Issue a proper clientAuth leaf, independently verify CN/CA/EKU/DER fingerprint, explicitly update Manager's leaf pin and Agent courier credentials, restart the relevant services and test direct mTLS. Issuance does not update pins automatically. Revoke/remove the retired pin only after checking unresolved work. If revocation happened first, old results cannot authenticate: preserve journal/outbox/fence and independently validate the same host/journal before an audited new credential/pin binding. A fresh certificate does not justify resetting replay storage. Test old-leaf rejection and valid historical result settlement as separate requirements.
+
+**Capacity/archive:** warn operationally before record or byte limits. Copy complete Manager/Agent evidence with integrity hashes and restrictive access, not just human-readable summaries. Capacity exhaustion must still permit undo, terminal export/delivery and settlement. An identity/ledger replacement procedure is a follow-up: requires no unresolved local debt or fence, immutable archived evidence, independently provisioned fresh journal identity and explicit Manager binding/reapproval, plus tests that old authority and terminal results cannot affect a new fence. This PR provides visibility and refusal, not a safe pruning tool.
+
+**Read-only target preflight:** collect OS release, kernel, tool versions, active network manager/service unit restrictions, existing link/route ownership and independent management topology without changing them. Do not collect private WG keys or mount operational kubeconfig/PKI/site data in the lab. Build a disposable VM matching that OS/kernel/network manager; require loss of management, asymmetric/blackhole traffic, long-running stability and actual reboot tests before selecting a trial host. Define out-of-band access, maximum unconfirmed time, failure/stop criteria, recoverable backups and operator ownership before any trial authorization.
+
+**FRR:** remains a separate writer contract/approval. Capture exact prior configuration, define WireGuard/route/FRR undo order, and independently verify selected BGP path, FIB and actual bidirectional forwarding. Existing FRR lab regressions are not an FRR execution driver.
+
+## Evidence ledger
+
+Pending final exact-head report and independent review. Initial baseline with the integrated entry passed the existing38 scenarios. Expanded kernel scenarios are being debugged; no51-case completion is claimed yet. The first expanded attempt passed disabled operation and disabled recovery, then timed out waiting for an explicit firewall busy refusal. Added diagnostics preserve the distinction between a missed fixture path and an implementation failure. CodeQL found the lab TLS server needed an explicit TLS1.2 minimum; that was corrected.
+
+Focused results and final complete suite counts must be read from actual runner output, not computed by adding tests to PR201's totals. Local Python uses explicit OpenSSL3; local sandbox socket/TTY/Docker restrictions are recorded separately from hosted results. Unit boundary details: Lifecycle tests use fake apply/transport writers and actual temporary filesystem/flocks with fatal run/Popen/socket guards. The delayed network test now invokes the production firewall rollback callback with only kernel restore/route boundaries replaced; it is not a bare Timer success marker. Kernel fault launchers wrap the production `run_writer_mode()` only to stop at existing durable event boundaries; they do not implement a second scheduler.

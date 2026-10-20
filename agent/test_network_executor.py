@@ -467,7 +467,7 @@ class WriterMode(unittest.TestCase):
         self.calls=[];self.terminal=True
         owner=self
         class Recovery:
-            def __init__(self,cfg,directory):
+            def __init__(self,cfg,directory,**kwargs):
                 os.makedirs(directory,mode=0o700,exist_ok=True);owner.calls.append(('locate',directory))
             def recover(self): owner.calls.append(('recover',))
             def publish_results(self): owner.calls.append(('publish',))

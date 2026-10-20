@@ -518,6 +518,8 @@ class Executor:
     def save(self, data, row=None, state=None):
         backup=json.loads(canonical(data))
         transaction=row['authorization']['transactionId'] if row else None
+        if transaction is not None:
+            self.current_transaction=transaction
         if state:
             row['state']=state
             row.setdefault('history',[]).append({'state':state,'at':int(time.time()*1000)})

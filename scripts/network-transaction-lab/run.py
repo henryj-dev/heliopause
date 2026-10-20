@@ -128,6 +128,7 @@ def start(path,fault='',production=False,normal_entry=False,network_enabled=True
         assert relay.poll() is None
     args=['python3','agent/heliopause-pull.py','--network-executor','--config',path+'/config.json','--state-dir',path+'/state'] if production else ['python3','scripts/network-transaction-lab/worker.py',path+'/config.json',path+'/state',fault]
     if normal_entry:args=['python3','agent/heliopause-pull.py']
+    if production and fault:args=['python3','scripts/network-transaction-lab/lifecycle-fault-entry.py',path,fault]
     log=open(path+'/worker.log','ab',buffering=0)
     env={**os.environ,'HELIOPAUSE_STATE_FILE':path+'/firewall-state.json','HELIOPAUSE_WRITER_LOCK':path+'/writer.lock','HELIOPAUSE_NETWORK_EXECUTOR_CONFIG':path+'/config.json','HELIOPAUSE_NETWORK_EXECUTOR_STATE_DIR':path+'/state'}
     if production:
@@ -463,9 +464,16 @@ def integrated(kind):
             run('nft','add','table','inet','heliopause',ns='p6-gw')
             n.atomic(path+'/firewall-state.json',{'state':'pending','generation':'recovery-fixture','pendingBackup':{'elements':None},'rollbackAt':time.time()-1})
             with open(path+'/state/transactions.json','w') as stream:stream.write('{')
-        agent=start(path,production=True,normal_entry=normal,network_enabled=enabled,extra_env=extra)
+        fault={'integrated-crash-apply':'created','integrated-crash-rollback':'rolling-back'}.get(kind,'')
+        agent=start(path,fault=fault,production=True,normal_entry=normal,network_enabled=enabled,extra_env=extra)
         pid=agent.pid
-        if kind=='integrated-disabled':
+        if kind in {'integrated-crash-apply','integrated-crash-rollback'}:
+            wait_for(lambda:os.path.exists(path+'/state/barrier.json'),18)
+            assert exists()
+            before=len(relay_events(path));wait_for(lambda:len(relay_events(path))>=before+2)
+            stop(agent);agent=start(path,production=True,normal_entry=True)
+            await_state(path,{'rolled-back'});assert not exists() and agent.pid!=pid
+        elif kind=='integrated-disabled':
             wait_for(lambda:os.path.exists(path+'/state/response.json'))
             assert n.read_json(path+'/state/response.json')['state']=='rejected' and not exists()
         elif kind=='integrated-corrupt-network':
@@ -502,9 +510,16 @@ def integrated(kind):
             assert not exists() and any('timed out' in h.get('diagnostic','') for h in [row(path)])
         else:
             await_state(path,{'awaiting-verification'})
-            if kind=='integrated-disabled-recovery':
-                stop(agent);agent=start(path,production=True,normal_entry=True,network_enabled=False)
+            if kind in {'integrated-disabled-recovery','integrated-crash-wait','integrated-dual-debt'}:
+                stop(agent)
+                if kind=='integrated-dual-debt':
+                    run('nft','add','table','inet','heliopause',ns='p6-gw')
+                    n.atomic(path+'/firewall-state.json',{'state':'pending','generation':'dual-recovery','pendingBackup':{'elements':None},'rollbackAt':time.time()-1})
+                agent=start(path,production=True,normal_entry=True,network_enabled=kind!='integrated-disabled-recovery')
                 await_state(path,{'rolled-back'});assert not exists() and agent.pid!=pid
+                if kind=='integrated-dual-debt':
+                    assert n.read_json(path+'/firewall-state.json')['state']=='rolled-back'
+                    assert not run('nft','list','table','inet','heliopause',ns='p6-gw',ok=False)
             elif kind=='integrated-network-busy':
                 n.atomic(path+'/wanted.json',{'generation':'deferred-firewall'})
                 try:
@@ -550,7 +565,7 @@ def integrated(kind):
 
 
 cases=['normal','signature','target','expiry','hash','approval','registry-changed','local-changed','duplicate','prepare-failed','fail-created','fail-routes','management-failed','asymmetric','blackhole','absent-verifier','lost-confirm','forged-verifier','crash-apply','crash-before-alias','crash-partial-routes','crash-wait','crash-rollback','crash-after-remove','foreign-writer','rollback-command-failed','peer-route-loss','secret-redaction','disabled-recovery','writer-conflict','graceful-stop','foreign-create','consecutive-confirmed','consecutive-rolled-back','consecutive-rollback-failed','consecutive-manager-restart','consecutive-agent-restart','consecutive-delayed-duplicate']
-cases += ['integrated-disabled','integrated-disabled-recovery','integrated-network-busy','integrated-firewall-busy','integrated-command-timeout','integrated-firewall-watchdog','integrated-confirmed-missing','integrated-corrupt-network','integrated-corrupt-firewall']
+cases += ['integrated-disabled','integrated-disabled-recovery','integrated-network-busy','integrated-firewall-busy','integrated-command-timeout','integrated-firewall-watchdog','integrated-confirmed-missing','integrated-corrupt-network','integrated-corrupt-firewall','integrated-crash-apply','integrated-crash-rollback','integrated-crash-wait','integrated-dual-debt']
 # New continuity cases run first for useful fail-fast diagnostics; success still requires all38.
 cases.sort(key=lambda name:0 if name.startswith('integrated-') else 1 if name.startswith('consecutive-') else 2)
 for case in cases:
@@ -566,5 +581,5 @@ for case in cases:
         for p,log in processes: stop(p);log.close()
         processes.clear()
         for ns in NAMES: run('ip','netns','del',ns,ok=False)
-assert len(results)==47
+assert len(results)==51
 print(json.dumps({'kind':'network-transaction-kernel-report','passed':len(results),'failed':0,'skipped':0,'hostRebootVerified':False,'backend':n.DRIVER,'sourceCommit':os.environ.get('HELIOPAUSE_LAB_SOURCE_COMMIT'),'kernel':platform.release(),'wireguardTools':run('wg','--version'),'iproute2':run('ip','-Version'),'scenarios':results}),flush=True)

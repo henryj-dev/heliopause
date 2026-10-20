@@ -23,7 +23,7 @@ class Lifecycle:
         self.observations = {}
         self.last_observation = float('-inf')
         self.snapshot = {'mode': 'integrated', 'networkEnabled': enabled, 'activeWriter': None,
-                         'network': {'state': 'unconfigured', 'ledger': {'used': None, 'limit': 1024, 'remaining': None}}, 'heartbeat': {}, 'discovery': {}}
+                         'network': {'state': 'unconfigured', 'ledger': {'used': None, 'limit': 1024, 'remaining': None}}, 'heartbeat': {}, 'discovery': {'enabled': os.environ.get('HELIOPAUSE_NETWORK_DISCOVERY') == '1'}}
         self.status_lock = threading.Lock()
         self.executor = executor
         if config is not None and executor is None:
@@ -31,7 +31,17 @@ class Lifecycle:
             config = {**config, 'enabled': enabled and config.get('enabled') is True}
             self.enabled = config['enabled']
             self.snapshot['networkEnabled'] = self.enabled
-            self.executor = Executor(config, directory)
+            self.executor = Executor(config, directory, event=self.network_event)
+
+    def network_event(self, point):
+        # Executor supplies this identity only at its existing durable transition boundary.
+        # Telemetry performs no journal, kernel, socket or subprocess operation here.
+        tx=getattr(self.executor,'current_transaction',None)
+        with self.gate:
+            if self.active and self.active['kind']=='network':
+                self.active={**self.active,'transactionId':tx,'phase':point}
+        with self.status_lock:
+            self.snapshot['network']['phase']=point
 
     def error(self, key, reason):
         # Codes only: raw exceptions may contain credentials or secret paths.
@@ -42,6 +52,9 @@ class Lifecycle:
 
     def firewall_state(self):
         # Legacy load_state projects malformed storage to a default. Admission may not do that.
+        marker=self.agent.STATE_FILE+'.required'
+        if os.path.exists(marker) and read_json(marker)!={'required':True}:
+            raise ValueError('firewall journal marker invalid')
         if os.path.exists(self.agent.STATE_FILE):
             doc = read_json(self.agent.STATE_FILE)
             allowed = {'none', 'unsupported', 'prepared', 'pending', 'confirmed', 'rolled-back', 'rollback-failed', 'rollback-incident'}
@@ -53,6 +66,9 @@ class Lifecycle:
             for field, kind in [('pendingBackup', dict), ('pendingRoutes', list), ('workloadApplied', list)]:
                 if doc.get(field) is not None and not isinstance(doc[field], kind):
                     raise ValueError('firewall recovery material invalid')
+            if not os.path.exists(marker):atomic(marker,{'required':True})
+        elif os.path.exists(marker):
+            raise ValueError('required firewall journal missing')
         return self.agent.load_state()
 
     def firewall_debt(self):
@@ -102,6 +118,11 @@ class Lifecycle:
         # Heartbeat processing never waits on a network command or its journal lock.
         with self.gate:
             if self.active is not None or self.blocked():
+                return False
+            try:
+                self.firewall_state()
+            except Exception:
+                self.error('firewall-journal', 'firewall-journal-unreadable')
                 return False
             self.active = {'kind': 'firewall', 'transactionId': None, 'startedAt': time.time()}
             return True
