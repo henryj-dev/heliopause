@@ -2350,9 +2350,10 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     // One boolean, one place. Certificates read the live allowlist; sessions carry the decision
     // taken at login — see `Principal.canWrite` for why that is stated rather than hidden.
     const mayWrite = principal.canWrite;
-    if (url.pathname.startsWith("/network/execution/")) {
+    const networkExecutionMatch = /^\/network\/execution\/(propose|approve|authorize|confirm|review)$/.exec(url.pathname);
+    if (networkExecutionMatch) {
       if (!opts.networkExecutionTargets?.length || !opts.networkVerifierKeys?.length || !opts.networkRegistryFile || !opts.artifactSigning || !opts.networkObservationsDir) return send(res, 503, { error: "network execution issuance disabled" });
-      if (req.method === "GET" && url.pathname === "/network/execution/review") {
+      if (req.method === "GET" && networkExecutionMatch[1] === "review") {
         const draft = networkDrafts.get(url.searchParams.get("hash") ?? "");
         if (!draft) return send(res, 404, { error: "network proposal unavailable" });
         try { return send(res, 200, { draft, review: networkEvidence(draft).review }); }
@@ -2363,7 +2364,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       if (crossSiteRequest(req)) return send(res, 403, { error: "cross-site execution refused" });
       try {
         const body = JSON.parse((await readNetworkRegistryBody(req)).toString("utf8"));
-        const action = url.pathname.slice("/network/execution/".length);
+        const action = networkExecutionMatch[1];
         if (action === "propose") {
           const draft = body.draft as NetworkExecutionDraft;
           if (!draft || !opts.networkExecutionTargets.some(t => t.source === draft.target?.source && t.host === draft.target?.host && t.nodeId === draft.target?.nodeId)) return send(res, 403, { error: "untrusted execution identity" });
