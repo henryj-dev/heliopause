@@ -75,10 +75,11 @@ export function buildNetworkChangeSet(input: NetworkChangeSetInput): NetworkChan
   for(const [id,generation] of Object.entries(input.expectedGenerations??{})) {
     if(!Number.isSafeInteger(generation)||rs.get(id)?.generation!==generation) block(id,'generation-mismatch','resource generation differs from review commitment');
   }
-  if(input.prefixPolicy) {
-    for(const reason of validatePrefixPolicy(input.registry.resources,input.prefixPolicy)) block('','invalid-prefix-policy',reason);
-    if(input.prefixPolicy.evaluatedAt!==input.now) block('','prefix-policy-clock-mismatch','policy and plan must use the same explicit evaluation clock');
-    for(const p of validatePrefixPolicy(input.registry.resources,input.prefixPolicy).length ? [] : input.prefixPolicy.permissions) if(p.evidence) {
+  if(input.prefixPolicy!==undefined) {
+    const policyErrors=validatePrefixPolicy(input.registry.resources,input.prefixPolicy);
+    for(const reason of policyErrors) block('','invalid-prefix-policy',reason);
+    if(!policyErrors.length&&input.prefixPolicy.evaluatedAt!==input.now) block('','prefix-policy-clock-mismatch','policy and plan must use the same explicit evaluation clock');
+    for(const p of policyErrors.length ? [] : input.prefixPolicy.permissions) if(p.evidence) {
       const e=p.evidence;
       const binding=input.bindings.filter(b=>b.nodeId===p.owner.nodeId&&b.host===e.host&&b.source===e.source);
       const report=input.observations.filter(r=>r.host===e.host&&r.source===e.source&&r.report.collectionId===e.collectionId);

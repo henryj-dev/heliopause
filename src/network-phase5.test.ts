@@ -177,3 +177,12 @@ test('policy commitments remain bound even when no compiler artifacts are reques
   const permission=f.prefixPolicy!.permissions.find(p=>p.siteId==='s0')!;permission.prefix='192.0.2.0/28';
   assert.notEqual(buildNetworkChangeSet(f).contentHash,a.contentHash);
 });
+
+test('ChangeSet rejects malformed policies even without compiler requests',()=>{
+  for(const prefixPolicy of [null,false,0,'',{schemaVersion:1,permissions:null}]) {
+    const f=networkLabInput();
+    const result=buildNetworkChangeSet({...f,wireguard:undefined,frr:undefined,prefixPolicy:prefixPolicy as any});
+    assert.ok(result.blockers.some(b=>b.code==='invalid-prefix-policy'));
+    assert.equal(result.executable,false);
+  }
+});
