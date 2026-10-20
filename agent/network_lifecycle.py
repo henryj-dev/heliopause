@@ -281,6 +281,7 @@ class Lifecycle:
             result = copy.deepcopy(self.snapshot)
             result['errors'] = dict(self.errors)
             result['reportedAt'] = time.time()
+            result['agentPid'] = os.getpid()
         with self.gate:
             result['activeWriter'] = copy.deepcopy(self.active)
         try:

@@ -582,6 +582,10 @@ def integrated(kind):
         allowed=6 if kind=='integrated-firewall-watchdog' else 5 if kind=='integrated-firewall-busy' else 3
         assert max(gaps)<allowed,(kind,gaps)
         assert agent.poll() is None
+        def current_status():
+            report=n.read_json(path+'/lifecycle-status.json')
+            return report.get('agentPid')==agent.pid and bool(report['heartbeat'].get('lastSuccess'))
+        wait_for(current_status,5)
         report=n.read_json(path+'/lifecycle-status.json')
         assert report['mode']=='integrated'
         assert report['heartbeat'].get('lastSuccess'),report
