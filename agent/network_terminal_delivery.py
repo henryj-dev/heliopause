@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import ssl
 import time
 import urllib.parse
@@ -14,6 +15,14 @@ from network_executor import atomic, canonical, read_file, read_json
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         raise ValueError('terminal delivery redirects forbidden')
+
+
+def validate_acks(ack):
+    if (not isinstance(ack, dict) or len(ack)>1024 or
+            any(not isinstance(key,str) or re.fullmatch(r'[0-9a-f]{64}',key) is None or value is not True
+                for key,value in ack.items())):
+        raise ValueError('invalid terminal delivery acknowledgments')
+    return ack
 
 
 def deliver(config, directory):
@@ -31,7 +40,7 @@ def deliver(config, directory):
     opener=urllib.request.build_opener(urllib.request.ProxyHandler({}),urllib.request.HTTPSHandler(context=context),NoRedirect())
     try:ack=read_json(os.path.join(directory,'terminal-acks.json'))
     except FileNotFoundError:ack={}
-    if not isinstance(ack,dict) or len(ack)>1024:raise ValueError('invalid terminal delivery acknowledgments')
+    validate_acks(ack)
     results=read_json(os.path.join(directory,'terminal-results.json'))
     if not isinstance(results,list) or len(results)>1024:raise ValueError('invalid terminal outbox')
     sent=0
@@ -64,7 +73,7 @@ def record_delivery_status(directory, error=None):
     try:previous=read_json(path)
     except Exception:previous={}
     now=time.time()
-    status={'state':'pending' if error else 'delivered','reason':delivery_diagnostic(error) if error else None,
+    status={'state':'pending' if error else 'ready','reason':delivery_diagnostic(error) if error else None,
             'lastSuccess':previous.get('lastSuccess') if error else now,
             'lastFailure':now if error else previous.get('lastFailure')}
     atomic(path,status)

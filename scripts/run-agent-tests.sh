@@ -85,7 +85,7 @@ python3 agent/test_network_discovery_worker.py 2>&1 | tee "$log"
 check_suite "test_network_discovery_worker.py" 10 || rc=1
 
 python3 agent/test_network_executor.py 2>&1 | tee "$log"
-check_suite "test_network_executor.py" 62 || rc=1
+check_suite "test_network_executor.py" 63 || rc=1
 
 python3 agent/test_network_lifecycle.py 2>&1 | tee "$log"
 check_suite "test_network_lifecycle.py" 23 || rc=1

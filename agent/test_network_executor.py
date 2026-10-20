@@ -327,6 +327,12 @@ class TerminalCourier(unittest.TestCase):
         self.assertFalse(os.path.exists(self.path+'/terminal-acks.json'))
         self.opener.open.side_effect=None
         self.assertEqual(self.d.deliver(self.cfg,self.path),1)
+    def test_corrupt_acknowledgments_fail_closed_before_delivery(self):
+        for ack in [{'a'*64:False},{'not-a-hash':True},{'a'*64:1},[],{format(i,'064x'):True for i in range(1025)}]:
+            with self.subTest(ack_type=type(ack).__name__):
+                n.atomic(self.path+'/terminal-acks.json',ack)
+                with self.assertRaises(ValueError):self.d.deliver(self.cfg,self.path)
+        self.opener.open.assert_not_called()
     def test_unsuccessful_manager_response_never_acknowledges(self):
         self.opener.open.return_value.__enter__.return_value.read.return_value=b'{"settled":false}'
         with self.assertRaises(ValueError):self.d.deliver(self.cfg,self.path)
@@ -351,7 +357,7 @@ class TerminalCourier(unittest.TestCase):
             status=n.read_json(self.path+'/terminal-delivery-status.json')
             self.assertEqual(status['reason'],code);self.assertNotIn('sensitive/path',n.canonical(status))
         self.d.record_delivery_status(self.path)
-        self.assertEqual(n.read_json(self.path+'/terminal-delivery-status.json')['state'],'delivered')
+        self.assertEqual(n.read_json(self.path+'/terminal-delivery-status.json')['state'],'ready')
     def test_oversized_untrusted_response_is_not_recorded(self):
         self.opener.open.return_value.__enter__.return_value.read.return_value=b'X'*4097
         with self.assertRaises(ValueError):self.d.deliver(self.cfg,self.path)

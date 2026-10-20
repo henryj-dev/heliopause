@@ -51,7 +51,7 @@ class Lifecycle:
             if key in {'network-configuration', 'network-recovery'}:
                 self.snapshot['network']['state'] = 'unknown'
 
-    def firewall_state(self):
+    def firewall_state(self, mark=False):
         # Legacy load_state projects malformed storage to a default. Admission may not do that.
         marker=self.agent.STATE_FILE+'.required'
         if os.path.exists(marker) and read_json(marker)!={'required':True}:
@@ -70,7 +70,7 @@ class Lifecycle:
             backup=doc.get('pendingBackup')
             if backup is not None and (set(backup)!={'elements'} or backup['elements'] is not None and not isinstance(backup['elements'],list)):
                 raise ValueError('firewall backup shape invalid')
-            if not os.path.exists(marker):atomic(marker,{'required':True})
+            if mark and not os.path.exists(marker):atomic(marker,{'required':True})
             defaults=getattr(self.agent,'_EMPTY_STATE',None)
             if defaults is not None:
                 return {key:doc.get(key,value) for key,value in defaults.items()}
@@ -86,12 +86,12 @@ class Lifecycle:
         # Each recovery is attempted even if a different journal/helper fails.
         for name in ['recover_commitment', 'recover_workload_commitment', 'reconcile_recovered_commitments']:
             try:
-                self.firewall_state()
+                self.firewall_state(mark=True)
                 getattr(self.agent, name)()
             except Exception:
                 self.error('firewall-recovery', 'firewall-recovery-unresolved')
         try:
-            st = self.firewall_state()
+            st = self.firewall_state(mark=True)
             for generation in {st.get('generation'), st.get('workloadGeneration')} - {None}:
                 if settle and self.firewall_debt():
                     self.agent.rollback_generation('integrated lifecycle recovery', generation)
@@ -193,15 +193,16 @@ class Lifecycle:
             results = read_json(os.path.join(self.directory, 'terminal-results.json'))
             ack_path = os.path.join(self.directory, 'terminal-acks.json')
             acks = read_json(ack_path) if os.path.exists(ack_path) else {}
-            if not isinstance(acks, dict):
-                raise ValueError('invalid terminal acknowledgment storage')
+            from network_terminal_delivery import validate_acks
+            validate_acks(acks)
             with self.status_lock:
-                self.snapshot['terminalDelivery'] = {'results': len(results), 'acknowledged': sum(hashlib.sha256(__import__('network_executor').canonical(r).encode()).hexdigest() in acks for r in results)}
+                acknowledged=sum(hashlib.sha256(__import__('network_executor').canonical(r).encode()).hexdigest() in acks for r in results)
+                self.snapshot['terminalDelivery'] = {'results':len(results),'acknowledged':acknowledged,'pending':len(results)-acknowledged}
             delivery_path=os.path.join(self.directory, 'terminal-delivery-status.json')
             if os.path.exists(delivery_path):
                 delivery=read_json(delivery_path)
                 allowed={None,'identity-or-certificate-refused','settlement-refused','tls-authentication-failed','local-configuration-or-outbox-invalid','manager-transport-unavailable'}
-                if delivery.get('state') not in {'pending','delivered'} or delivery.get('reason') not in allowed:
+                if delivery.get('state') not in {'pending','ready'} or delivery.get('reason') not in allowed:
                     raise ValueError('invalid terminal transport status')
                 with self.status_lock:
                     self.snapshot['terminalDelivery']['transport']={k:delivery.get(k) for k in ['state','reason','lastSuccess','lastFailure']}
