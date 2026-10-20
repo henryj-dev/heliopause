@@ -5700,4 +5700,7 @@ def main():
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["--network-executor"]:
+        from network_executor import main as network_main
+        sys.exit(network_main(sys.argv[2:]))
     sys.exit(main())

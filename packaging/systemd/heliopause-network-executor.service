@@ -1,0 +1,18 @@
+[Unit]
+Description=Heliopause experimental single-gateway network executor
+After=network.target
+# Explicit alternative Agent mode; never combine firewall and interface writers on one gateway.
+Conflicts=heliopause-agent.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/heliopause/agent/heliopause-pull.py --network-executor --config /etc/heliopause/network-executor.json --state-dir /var/lib/heliopause/network-executor
+Restart=always
+RestartSec=1
+UMask=0077
+User=root
+# No NetworkManager profile or reboot reapply is installed by this service.
+
+[Install]
+WantedBy=multi-user.target

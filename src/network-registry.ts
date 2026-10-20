@@ -1,6 +1,6 @@
 /** Persistent desired inventory only. Nothing in this store authorizes a network apply. */
 import { createHash } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, existsSync } from "node:fs";
 import { dirname } from "node:path";
 import { cidrRange } from "./nft.ts";
 import { atomicWriteFile, readBoundedStoreFile, withFileLock } from "./json-store.ts";
@@ -116,12 +116,28 @@ export class NetworkRegistryStore {
     } catch { throw fail("network registry document is invalid; refusing to overwrite", 500); }
   }
 
+  /** An offline Agent cannot check latest Registry state. Keep all mutations fenced until an
+   * authenticated operator reconciles a terminal Agent result, including after issuer crashes.
+   * No automatic expiry: a clock change must not revive a stale execution authorization. */
+  fenceExecution<T>(revision: number, transactionId: string, issue: (doc: NetworkRegistryDocument) => T): T {
+    return withFileLock(this.path, 500, "network registry", fail, () => {
+      if (existsSync(this.path + ".execution-fence")) throw fail("network execution fence requires reconciliation", 409);
+      const doc = this.read();
+      if (doc.revision !== revision) throw fail("registry revision conflict", 409);
+      // Validation/signing is side-effect-free until the fence has been durably installed.
+      const result = issue(doc);
+      atomicWriteFile(this.path + ".execution-fence", JSON.stringify({ schemaVersion: 1, transactionId, revision }));
+      return result;
+    });
+  }
+
   /** Actor must come from the caller's authenticated principal, never a JSON body field. */
   mutate(expectedRevision: unknown, actor: string, mutation: NetworkRegistryMutation): NetworkRegistryDocument {
     if (!Number.isSafeInteger(expectedRevision) || Number(expectedRevision) < 0) throw fail("expectedRevision must be a nonnegative safe integer");
     if (typeof actor !== "string" || !actor.trim() || actor.length > 256) throw fail("authenticated actor is required");
     const input = JSON.parse(boundedJson(mutation)) as NetworkRegistryMutation;
     return withFileLock(this.path, 500, "network registry", fail, () => {
+      if (existsSync(this.path + ".execution-fence")) throw fail("network execution fence requires reconciliation", 409);
       const current = this.read();
       if (current.revision !== expectedRevision) throw fail(`registry revision conflict: current revision is ${current.revision}`, 409);
       const before = new Map(current.resources.map(r => [r.id, r]));

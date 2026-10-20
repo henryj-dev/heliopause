@@ -1,6 +1,7 @@
 [Unit]
 Description=heliopause firewall agent (pull)
 Documentation=https://github.com/henryj-dev/heliopause
+Conflicts=heliopause-network-executor.service
 
 # `network.target` only, and deliberately **not** `network-online.target`.
 #

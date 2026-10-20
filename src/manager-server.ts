@@ -1,3 +1,6 @@
+import { buildNetworkChangeSet } from './network-change-set.ts';
+import { authorizeNetworkExecution, networkExecutionHash, type NetworkExecutionDraft } from './network-execution.ts';
+import { networkDigest } from './network-canonical.ts';
 // The manager's HTTP surface (H26): reads the whole site, and is the ordinary way a generation gets
 // published.
 //
@@ -422,6 +425,8 @@ export function consumePendingOidcLogin(
 export interface ManagerOptions {
   /** Opt-in local desired inventory store; never a configuration writer. */
   networkRegistryFile?: string;
+  /** Separate opt-in writer issuance; identities are deployment trust, never request claims. */
+  networkExecutionTargets?: readonly { source: string; host: string; nodeId: string }[];
   /** Per-relay cached observations, separate from desired state. */
   networkObservationsDir?: string;
   port: number;
@@ -1572,6 +1577,8 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
   // What it does mean: `POST /publish` for a plan this process never saw answers 409 with "re-propose
   // it", not 404 — an operator whose approval evaporated needs to know which of the two happened.
   const approvals = emptyApprovals();
+  const networkApprovals = emptyApprovals();
+  const networkDrafts = new Map<string, NetworkExecutionDraft>();
   /** Plan hash → the bundle to push. Beside the plan, not inside it — see `POST /plan`. */
   const bundles = new Map<string, PlanBundle>();
   /** Plan hash → relay name. Stored at proposal so publishing cannot redirect the push. */
@@ -2326,6 +2333,49 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     // One boolean, one place. Certificates read the live allowlist; sessions carry the decision
     // taken at login — see `Principal.canWrite` for why that is stated rather than hidden.
     const mayWrite = principal.canWrite;
+    if (url.pathname.startsWith("/network/execution/")) {
+      if (!opts.networkExecutionTargets?.length || !opts.networkRegistryFile || !opts.artifactSigning || !opts.networkObservationsDir) return send(res, 503, { error: "network execution issuance disabled" });
+      if (req.method !== "POST") return send(res, 405, { error: "method not allowed" });
+      if (!mayWrite) return refuseWrite(res, who, url.pathname, principal.via);
+      if (crossSiteRequest(req)) return send(res, 403, { error: "cross-site execution refused" });
+      try {
+        const body = JSON.parse((await readNetworkRegistryBody(req)).toString("utf8"));
+        const action = url.pathname.slice("/network/execution/".length);
+        if (action === "propose") {
+          const draft = body.draft as NetworkExecutionDraft;
+          if (!draft || !opts.networkExecutionTargets.some(t => t.source === draft.target?.source && t.host === draft.target?.host && t.nodeId === draft.target?.nodeId)) return send(res, 403, { error: "untrusted execution identity" });
+          // Reconstruct the target keys rather than rely on request object key ordering.
+          const hash = networkExecutionHash(draft);
+          if (networkDrafts.size >= 32) return send(res, 409, { error: "network proposal capacity reached" });
+          const plan = propose(networkApprovals, { hash, generation: draft.transactionId, summary: { hosts: [{ host: draft.target.host, stage: "gateway", ruleCount: 1, rulesetHash: draft.artifactHash }] }, by: who, byOtp: otpIdentityOf(principal), now: now() });
+          networkDrafts.set(hash, draft);
+          return send(res, 201, { hash, plan, draft });
+        }
+        if ((await requireOtp(principal, body, res, url.pathname)) === "answered") return;
+        const hash = String(body.hash ?? ""), draft = networkDrafts.get(hash);
+        if (!draft) return send(res, 404, { error: "re-propose network execution" });
+        if (action === "approve") {
+          const aka = alsoKnownAsFor(principal);
+          if (!aka) return send(res, 503, { error: "identity store unavailable" });
+          const plan = approve(networkApprovals, { hash, by: who, now: now(), alsoKnownAs: aka, byOtp: otpIdentityOf(principal) });
+          return send(res, 200, { hash, plan });
+        }
+        if (action === "authorize") {
+          const source = opts.relays.find(r => r.name === draft.target.source);
+          if (!source) return send(res, 409, { error: "execution observation source unavailable" });
+          const cache = new NetworkObservationStore(join(opts.networkObservationsDir, createHash("sha256").update(source.name).digest("hex")));
+          const observation = cache.get(draft.target.host, source.name);
+          if (!observation || networkDigest(observation) !== draft.observation.digest || Date.parse(observation.report.completedAt) !== draft.observation.collectedAt || observationFreshness(observation, now().getTime(), draft.observation.maxAgeMs) !== "fresh") return send(res, 409, { error: "observation changed: replan" });
+          const envelope = authorizeNetworkExecution(new NetworkRegistryStore(opts.networkRegistryFile), networkApprovals, draft, who, opts.artifactSigning.privateKey, { observation, review: buildNetworkChangeSet({ id: "execution-review", registry: new NetworkRegistryStore(opts.networkRegistryFile).read(), expectedRegistryRevision: draft.registryRevision, now: draft.observation.collectedAt, observations: [observation], bindings: [{ ...draft.target, siteId: new NetworkRegistryStore(opts.networkRegistryFile).read().resources.flatMap(r => r.id === draft.target.nodeId && r.kind === "node" ? [r.siteId] : [])[0] ?? "" }] }) }, now());
+          networkDrafts.delete(hash);
+          return send(res, 200, { envelope });
+        }
+        return send(res, 404, { error: "unknown network execution action" });
+      } catch (e) {
+        if (e instanceof ApprovalError) return sendApprovalError(res, e);
+        return send(res, e instanceof NetworkRegistryError ? e.statusCode : 400, { error: "network execution refused; replan or reconcile fence" });
+      }
+    }
     const networkInventoryPath = /^\/network\/inventory\/([^/]+)$/.exec(url.pathname);
     if (url.pathname === "/network/inventory" || url.pathname === "/network/revisions" || networkInventoryPath) {
       if (!opts.networkRegistryFile) return send(res, 503, { error: "network registry is not configured" });
