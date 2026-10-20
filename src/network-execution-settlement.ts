@@ -33,7 +33,7 @@ export function settleNetworkExecution(store:NetworkRegistryStore,result:Network
       if(record) {record.audit.push({action:'settlement-refused',actor,at:now,reason});record.audit=record.audit.slice(-32);}
       return {reason};
     };
-    if(!exact(result,'schemaVersion domain transactionId fenceId target journalId authorizationHash artifactHash registryRevision state sequence stateHash proof')||!record) return refuse('invalid or unknown terminal contract');
+    if(!exact(result,'schemaVersion domain transactionId fenceId target journalId authorizationHash artifactHash registryRevision state sequence stateHash proof')||!record||!result.proof||typeof result.proof!=='object'||Array.isArray(result.proof)) return refuse('invalid or unknown terminal contract');
     const cancellation=result.schemaVersion===2&&result.domain===NETWORK_CANCELLATION_RESULT_DOMAIN;
     if(!cancellation&&(result.schemaVersion!==1||result.domain!==NETWORK_TERMINAL_DOMAIN)) return refuse('unsupported terminal schema/domain');
     if(networkDigest(result.target)!==networkDigest(record.target)||networkDigest(result.target)!==networkDigest({source:agent.source,host:agent.host,nodeId:agent.nodeId})||result.journalId!==agent.journalId||result.journalId!==record.journalId||result.fenceId!==record.fenceId||result.authorizationHash!==record.authorizationHash||result.artifactHash!==record.artifactHash||result.registryRevision!==record.registryRevision) return refuse('terminal identity or commitment mismatch');
