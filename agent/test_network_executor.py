@@ -155,6 +155,21 @@ class Transactions(unittest.TestCase):
         self.e.accept(self.a);os.unlink(self.e.path)
         with self.assertRaises((ValueError,FileNotFoundError)):self.e.accept(self.a)
         with self.assertRaises(ValueError):n.initialize_journal(self.temp.name)
+    def test_full_replay_ledger_refuses_new_work_but_recovers_and_reports(self):
+        self.e.accept(self.a);self.e.recover()
+        data=self.e.load();template=copy.deepcopy(self.row());rows={}
+        for i in range(1024):
+            tx=format(i,'032x');row=copy.deepcopy(template);a=row['authorization'];a['transactionId']=tx
+            result=row['terminalResult'];result.update({'transactionId':tx,'fenceId':tx,'authorizationHash':n.digest(a),'sequence':i+1})
+            result['stateHash']=n.digest({k:v for k,v in result.items() if k!='stateHash'})
+            row['authorizationHash']=n.digest(a);rows[tx]=row
+        data.update({'transactions':rows,'acceptedSequence':1024,'terminalSequence':1024});n.atomic(self.e.path,data)
+        calls=list(self.driver.calls)
+        with self.assertRaisesRegex(ValueError,'capacity'):self.e.accept(self.a)
+        self.e.recover();self.e.publish_results()
+        self.assertEqual(self.driver.calls,calls)
+        self.assertEqual(len(n.read_json(self.temp.name+'/terminal-results.json')),1024)
+        self.assertEqual(len(self.e.load()['transactions']),1024)
     def test_removed_transaction_is_detected_without_replay_ledger_pruning(self):
         self.e.accept(self.a);data=self.e.load();data['transactions']={};n.atomic(self.e.path,data)
         with self.assertRaises(ValueError):self.e.load()
@@ -327,6 +342,16 @@ class TerminalCourier(unittest.TestCase):
         with patch.object(n.os,'fstat',return_value=os.stat_result(metadata)):
             with self.assertRaises(ValueError):self.d.deliver(self.cfg,self.path)
         self.opener.open.assert_not_called()
+    def test_delivery_diagnostics_do_not_include_secret_paths(self):
+        import ssl
+        import urllib.error
+        errors=[(ssl.SSLError('sensitive/path'),'tls-authentication-failed'),(urllib.error.HTTPError('https://manager.example.invalid',401,'sensitive/path',None,None),'identity-or-certificate-refused'),(ValueError('sensitive/path'),'local-configuration-or-outbox-invalid'),(OSError('sensitive/path'),'manager-transport-unavailable')]
+        for error,code in errors:
+            self.d.record_delivery_status(self.path,error)
+            status=n.read_json(self.path+'/terminal-delivery-status.json')
+            self.assertEqual(status['reason'],code);self.assertNotIn('sensitive/path',n.canonical(status))
+        self.d.record_delivery_status(self.path)
+        self.assertEqual(n.read_json(self.path+'/terminal-delivery-status.json')['state'],'delivered')
     def test_oversized_untrusted_response_is_not_recorded(self):
         self.opener.open.return_value.__enter__.return_value.read.return_value=b'X'*4097
         with self.assertRaises(ValueError):self.d.deliver(self.cfg,self.path)
@@ -437,7 +462,7 @@ class WriterMode(unittest.TestCase):
         self.path=self.temp.name
         self.agent=n.crypto_helpers(self.path)
         self.agent.STATE_FILE=self.path+'/firewall.json'
-        self.config=self.path+'/custom-config.json';n.atomic(self.config,{})
+        self.config=self.path+'/custom-config.json';n.atomic(self.config,{'protectedAddresses':['192.0.2.1']})
         self.state=self.path+'/custom-state'
         self.calls=[];self.terminal=True
         owner=self

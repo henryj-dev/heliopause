@@ -457,6 +457,15 @@ def initialize_journal(directory):
     return journal_id
 
 
+def validate_execution_config(config):
+    protected=config.get('protectedAddresses')
+    if not isinstance(protected,list) or not 1<=len(protected)<=16 or len(set(protected))!=len(protected):
+        raise ValueError('one to sixteen independent protected management addresses required')
+    for address in protected:
+        if not isinstance(address,str):raise ValueError('invalid protected management address')
+        host(address+'/32')
+
+
 class Executor:
     def __init__(self, config, directory, driver=None, event=None):
         self.config=config
@@ -600,8 +609,12 @@ class Executor:
                 if digest(prior['authorization'])!=digest(a):
                     raise ValueError('transaction identity reused with different content')
                 return prior['state']
-            if now<data['lastClock'] or len(data['transactions'])>=1024 or any(r['state'] not in TERMINAL for r in data['transactions'].values()):
-                raise ValueError('clock/replay capacity or unsettled transaction')
+            if now<data['lastClock']:
+                raise ValueError('clock moved behind durable replay watermark')
+            if len(data['transactions'])>=1024:
+                raise ValueError('transaction replay ledger capacity reached')
+            if any(r['state'] not in TERMINAL for r in data['transactions'].values()):
+                raise ValueError('unsettled network transaction')
             # Clear a stale process-local budget only after the durable ledger proves no debt.
             # This also reconciles a terminal rename whose directory fsync raised afterward.
             self.driver.deadline=None
@@ -716,10 +729,7 @@ def main(argv=None):
         print(initialize_journal(args.state_dir));return
     if not args.config:parser.error('--config required for execution')
     config=read_json(args.config)
-    if not config.get('protectedAddresses'):
-        raise ValueError('independent protected management addresses required')
-    for address in config['protectedAddresses']:
-        host(address+'/32')
+    validate_execution_config(config)
     executor=Executor(config,args.state_dir)
     # Keep a process-wide lock as well as mutation locks; a second worker must not treat live
     # transactions as crashed and undo another worker's change.

@@ -199,7 +199,10 @@ test('mTLS network execution goes through distinct approval, fenced authorizatio
     manager=await startManager(options);port=(manager.server.address() as {port:number}).port;
     const retried=await call('/api/network/execution/authorize','POST','writer',{hash});
     assert.equal(retried.status,200);assert.deepEqual(retried.body.envelope,issued.body.envelope);
-    assert.equal((await call('/api/network/execution/status')).body.records[0].state,'issued');
+    const status=(await call('/api/network/execution/status')).body;
+    assert.equal(status.records[0].state,'issued');
+    assert.deepEqual(status.capacity,{used:1,limit:256,remaining:255});
+    assert.equal(status.fenceReason,'authenticated terminal settlement required');
     const a=JSON.parse(Buffer.from(issued.body.envelope.payload,'base64url').toString());
     const checks=Object.fromEntries(['interface','address','route','handshake','fib','forward','reverse','management','protected'].map(k=>[k,true]));
     const receipt=signNetworkMessage(NETWORK_VERIFY_DOMAIN,{transactionId:a.transactionId,authorizationHash:networkDigest(a),artifactHash:a.artifactHash,observedAt:Date.now(),expiresAt:Date.now()+3000,nonce:'d'.repeat(32),checks},verifierKey.privateKey);

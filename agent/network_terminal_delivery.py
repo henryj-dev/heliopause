@@ -7,6 +7,7 @@ import ssl
 import time
 import urllib.parse
 import urllib.request
+import urllib.error
 from network_executor import atomic, canonical, read_file, read_json
 
 
@@ -48,13 +49,38 @@ def deliver(config, directory):
     return sent
 
 
+def delivery_diagnostic(error):
+    if isinstance(error, urllib.error.HTTPError):
+        return 'identity-or-certificate-refused' if error.code in {401,403} else 'settlement-refused'
+    if isinstance(error, ssl.SSLError) or isinstance(getattr(error, 'reason', None), ssl.SSLError):
+        return 'tls-authentication-failed'
+    if isinstance(error, (FileNotFoundError, PermissionError, ValueError)):
+        return 'local-configuration-or-outbox-invalid'
+    return 'manager-transport-unavailable'
+
+
+def record_delivery_status(directory, error=None):
+    path=os.path.join(directory,'terminal-delivery-status.json')
+    try:previous=read_json(path)
+    except Exception:previous={}
+    now=time.time()
+    status={'state':'pending' if error else 'delivered','reason':delivery_diagnostic(error) if error else None,
+            'lastSuccess':previous.get('lastSuccess') if error else now,
+            'lastFailure':now if error else previous.get('lastFailure')}
+    atomic(path,status)
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config',required=True);parser.add_argument('--state-dir',required=True);parser.add_argument('--once',action='store_true')
     args=parser.parse_args()
     while True:
-        try:deliver(read_json(args.config),args.state_dir)
-        except Exception:
+        try:
+            deliver(read_json(args.config),args.state_dir)
+            record_delivery_status(args.state_dir)
+        except Exception as error:
+            try:record_delivery_status(args.state_dir,error)
+            except Exception:pass
             if args.once:raise RuntimeError('terminal delivery unavailable; local recovery remains independent') from None
         if args.once:return
         time.sleep(1)

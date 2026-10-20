@@ -161,3 +161,27 @@ test('post-rename directory fsync failure cannot expose a cached authority until
     assert.equal(recovered.records.length,1);assert.equal(recovered.fence!.transactionId,f.draft.transactionId);
   }finally{rmSync(f.dir,{recursive:true,force:true});}
 });
+
+test('full Manager ledger still settles its active fence and refuses a new issue before signing',()=>{
+  const f=issued();try {
+    const terminal=f.result();
+    f.store.executionTransaction(state=>{
+      const active=state.records[0]!;
+      const archived=Array.from({length:255},(_,i)=>{
+        const transactionId=(i+1).toString(16).padStart(32,'0');
+        const a={...f.a,transactionId};
+        const authorization=signNetworkMessage(NETWORK_EXECUTION_DOMAIN,a,f.key.privateKey);
+        const result={...terminal,transactionId,fenceId:transactionId,authorizationHash:networkDigest(a)};
+        const {stateHash,...body}=result;result.stateHash=networkDigest(body);
+        return {...structuredClone(active),sequence:i+1,transactionId,fenceId:transactionId,authorization,authorizationHash:networkDigest(a),state:'settled' as const,result,resultHash:networkDigest(result),settledAt:Date.now(),settledBy:'fixture'};
+      });
+      state.records=[...archived,{...active,sequence:256}];state.nextSequence=257;
+    });
+    assert.equal(f.store.executionStatus().records.length,256);
+    assert.equal(settleNetworkExecution(f.store,terminal,f.agent,'agent').settled,true);
+    assert.equal(f.store.executionStatus().fence,null);
+    let signed=false;
+    assert.throws(()=>f.store.fenceExecution(1,'f'.repeat(32),()=>{signed=true;throw new Error('must not sign');},'alice'),/capacity/);
+    assert.equal(signed,false);assert.equal(f.store.executionStatus().records.length,256);
+  } finally {f.cleanup();}
+});

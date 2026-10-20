@@ -4,7 +4,7 @@ import hashlib
 import os
 import threading
 import time
-from network_executor import Executor, TERMINAL, atomic, read_file, read_json, safe_diagnostic
+from network_executor import Executor, TERMINAL, atomic, read_file, read_json, safe_diagnostic, validate_execution_config
 
 DEBT = {'prepared', 'pending', 'rollback-failed', 'rollback-incident'}
 
@@ -23,10 +23,11 @@ class Lifecycle:
         self.observations = {}
         self.last_observation = float('-inf')
         self.snapshot = {'mode': 'integrated', 'networkEnabled': enabled, 'activeWriter': None,
-                         'network': {'state': 'disabled'}, 'heartbeat': {}, 'discovery': {}}
+                         'network': {'state': 'unconfigured', 'ledger': {'used': None, 'limit': 1024, 'remaining': None}}, 'heartbeat': {}, 'discovery': {}}
         self.status_lock = threading.Lock()
         self.executor = executor
         if config is not None and executor is None:
+            validate_execution_config(config)
             config = {**config, 'enabled': enabled and config.get('enabled') is True}
             self.enabled = config['enabled']
             self.snapshot['networkEnabled'] = self.enabled
@@ -36,6 +37,8 @@ class Lifecycle:
         # Codes only: raw exceptions may contain credentials or secret paths.
         with self.status_lock:
             self.errors[key] = reason
+            if key in {'network-configuration', 'network-recovery'}:
+                self.snapshot['network']['state'] = 'unknown'
 
     def firewall_state(self):
         # Legacy load_state projects malformed storage to a default. Admission may not do that.
@@ -166,6 +169,14 @@ class Lifecycle:
                 raise ValueError('invalid terminal acknowledgment storage')
             with self.status_lock:
                 self.snapshot['terminalDelivery'] = {'results': len(results), 'acknowledged': sum(hashlib.sha256(__import__('network_executor').canonical(r).encode()).hexdigest() in acks for r in results)}
+            delivery_path=os.path.join(self.directory, 'terminal-delivery-status.json')
+            if os.path.exists(delivery_path):
+                delivery=read_json(delivery_path)
+                allowed={None,'identity-or-certificate-refused','settlement-refused','tls-authentication-failed','local-configuration-or-outbox-invalid','manager-transport-unavailable'}
+                if delivery.get('state') not in {'pending','delivered'} or delivery.get('reason') not in allowed:
+                    raise ValueError('invalid terminal transport status')
+                with self.status_lock:
+                    self.snapshot['terminalDelivery']['transport']={k:delivery.get(k) for k in ['state','reason','lastSuccess','lastFailure']}
         except Exception:
             self.error('terminal-outbox', 'terminal-outbox-unavailable')
         else:
@@ -238,7 +249,7 @@ class Lifecycle:
             st = self.firewall_state()
             result['recoveryDebt'] = {'firewall': st.get('state') in DEBT,
                                      'workload': st.get('workloadState') in DEBT,
-                                     'network': result['network']['state'] == 'recovery-debt'}
+                                     'network': 'unknown' if result['network']['state'] == 'unknown' else result['network']['state'] == 'recovery-debt'}
         except Exception:
             result['recoveryDebt'] = {'firewall': 'unknown', 'workload': 'unknown', 'network': 'unknown'}
         return result

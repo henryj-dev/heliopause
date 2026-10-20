@@ -141,6 +141,10 @@ class Lifecycle(unittest.TestCase):
         report=n.read_json(self.path+'/lifecycle-status.json')
         self.assertGreater(report['heartbeat']['lastSuccess'],0);self.assertGreater(report['discovery']['lastFailure'],0)
         self.assertNotIn('secrets',n.canonical(report));self.assertNotIn(self.path,n.canonical(report))
+    def test_integrated_entry_requires_independent_protected_management(self):
+        for addresses in [[],['0.0.0.0'],['192.0.2.1']*17]:
+            with self.assertRaises(ValueError):
+                lifecycle.Lifecycle(self.agent,{'protectedAddresses':addresses},self.path,True)
     def test_command_budget_caps_timeout_and_fails_closed(self):
         driver=n.LinuxWireGuard('/unused');driver.deadline=time.monotonic()+.1
         self.assertGreater(driver.command_timeout(),0);self.assertLessEqual(driver.command_timeout(),.1)

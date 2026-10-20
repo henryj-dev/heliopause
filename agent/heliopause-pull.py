@@ -3895,6 +3895,8 @@ def _load_state_unlocked():
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             saved = json.load(f)
+            if not isinstance(saved, dict):
+                raise ValueError("state must be an object")
     except FileNotFoundError:
         return dict(_EMPTY_STATE)
     except (OSError, ValueError) as e:

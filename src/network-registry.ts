@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, existsSync, openSync, closeSync, fsyncSync, constants } from "node:fs";
 import { dirname } from "node:path";
 import { withNetworkRegistryLock } from './network-registry-lock.ts';
-import { validateExecutionState, type NetworkExecutionState, type NetworkExecutionRecord } from './network-execution-state.ts';
+import { NETWORK_EXECUTION_CAPACITY, validateExecutionState, type NetworkExecutionState, type NetworkExecutionRecord } from './network-execution-state.ts';
 import type { NetworkSignedEnvelope } from './network-execution.ts';
 import { cidrRange } from "./nft.ts";
 import { atomicWriteFile, readBoundedStoreFile } from "./json-store.ts";
@@ -174,7 +174,7 @@ export class NetworkRegistryStore {
       const doc=this.read();this.requireExecution(doc);
       const state=doc.execution!;
       if(state.fence) throw fail('network execution fence requires settlement',409);
-      if(state.records.length>=256||state.records.some(r=>r.transactionId===transactionId)) throw fail('execution replay/capacity refusal',409);
+      if(state.records.length>=NETWORK_EXECUTION_CAPACITY||state.records.some(r=>r.transactionId===transactionId)) throw fail('execution replay/capacity refusal',409);
       if(doc.revision!==revision) throw fail('registry revision conflict',409);
       const envelope=issue(doc),a=JSON.parse(Buffer.from(envelope.payload,'base64url').toString());
       const record:NetworkExecutionRecord={sequence:state.nextSequence++,transactionId,fenceId:transactionId,planHash:a.approval.planHash,authorization:envelope,authorizationHash:digest(a),target:a.target,journalId:a.journalId,registryRevision:revision,artifactHash:a.artifactHash,issuedAt:a.issuedAt,issuedBy:by,state:'issued',audit:[{action:'issued',actor:by,at:Date.now()}]};
