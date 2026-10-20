@@ -194,12 +194,20 @@ class LinuxWireGuard:
     def __init__(self, secrets):
         self.secrets = secrets
         self.deadline = None
+        self.command_deadline = None
+
+    def command_timeout(self):
+        limits = [value-time.monotonic() for value in [self.deadline, self.command_deadline] if value is not None]
+        remaining = min([5] + limits)
+        if remaining <= 0:
+            raise RuntimeError('network operation budget elapsed')
+        return remaining
 
     def run(self, args, data=None, pass_fds=()):
         if self.deadline is not None and time.monotonic()>=self.deadline:
             raise RuntimeError('apply deadline elapsed')
         try:
-            p = subprocess.run(args, input=data, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5, check=False, pass_fds=pass_fds)
+            p = subprocess.run(args, input=data, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=self.command_timeout(), check=False, pass_fds=pass_fds)
         except (OSError, subprocess.TimeoutExpired):
             raise RuntimeError('network command unavailable or timed out') from None
         if p.returncode:
@@ -298,7 +306,7 @@ class LinuxWireGuard:
                 channel.bind((0,0))
                 port=channel.getsockname()[0]
                 request=struct.pack('=IHHII',16+len(body),16,0x605,sequence,port)+body
-                channel.settimeout(5)
+                channel.settimeout(self.command_timeout())
                 channel.sendto(request,(0,0))
                 response,sender=channel.recvfrom(65536)
                 if sender[0]!=0 or len(response)<20:
@@ -531,6 +539,7 @@ class Executor:
 
     def rollback(self, data, row):
         self.driver.deadline=None
+        self.driver.command_deadline=time.monotonic()+60
         self.save(data,row,'rolling-back')
         try:
             if row.get('configuredFingerprint') is not None and self.driver.owned(row['authorization']['operation'],row['owner']) and self.driver.fingerprint(row['authorization']['operation'])!=row['configuredFingerprint']:
@@ -541,6 +550,8 @@ class Executor:
         except Exception as error:
             row['diagnostic']='rollback: '+safe_diagnostic(error)
             self.save(data,row,'rollback-failed')
+        finally:
+            self.driver.command_deadline=None
 
     def recover(self):
         # Restart is an uncertainty boundary. Roll back *all* unconfirmed work immediately, even

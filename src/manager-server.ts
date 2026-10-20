@@ -2372,7 +2372,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     if (networkExecutionMatch) {
       if(req.method==="GET"&&networkExecutionMatch[1]==="status") {
         if(!opts.networkRegistryFile) return send(res,503,{error:"execution ledger unavailable"});
-        try {return send(res,200,new NetworkRegistryStore(opts.networkRegistryFile).executionStatus());}
+        try {const status=new NetworkRegistryStore(opts.networkRegistryFile).executionStatus();return send(res,200,{...status,capacity:{used:status.records.length,limit:256,remaining:256-status.records.length},fenceReason:status.fence?'authenticated terminal settlement required':null});}
         catch {return send(res,409,{error:"execution ledger unavailable or legacy reconciliation required"});}
       }
       if (!opts.networkExecutionTargets?.length || !opts.networkVerifierKeys?.length || !opts.networkRegistryFile || !opts.artifactSigning || !opts.networkObservationsDir) return send(res, 503, { error: "network execution issuance disabled" });

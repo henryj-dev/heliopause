@@ -120,9 +120,17 @@ def setup(path,mutate=False,continuous=False):
 
 
 def start(path,fault='',production=False):
+    if production and not os.path.exists(path+'/relay-ready'):
+        if not os.path.exists(path+'/pki'):setup_manager(path)
+        log=open(path+'/relay.log','ab',buffering=0)
+        relay=subprocess.Popen(['ip','netns','exec','p6-verifier','python3','scripts/network-transaction-lab/relay.py',path],stdout=log,stderr=log)
+        processes.append((relay,log));wait_for(lambda:os.path.exists(path+'/relay-ready') or relay.poll() is not None)
+        assert relay.poll() is None
     args=['python3','agent/heliopause-pull.py','--network-executor','--config',path+'/config.json','--state-dir',path+'/state'] if production else ['python3','scripts/network-transaction-lab/worker.py',path+'/config.json',path+'/state',fault]
     log=open(path+'/worker.log','ab',buffering=0)
     env={**os.environ,'HELIOPAUSE_STATE_FILE':path+'/firewall-state.json','HELIOPAUSE_WRITER_LOCK':path+'/writer.lock','HELIOPAUSE_NETWORK_EXECUTOR_CONFIG':path+'/config.json','HELIOPAUSE_NETWORK_EXECUTOR_STATE_DIR':path+'/state'}
+    if production:
+        env.update({'HELIOPAUSE_RELAY_URL':'https://192.0.2.1:8444','HELIOPAUSE_CA_FILE':path+'/pki/ca.pem','HELIOPAUSE_CERT_FILE':path+'/pki/gateway.pem','HELIOPAUSE_KEY_FILE':path+'/pki/gateway.key','HELIOPAUSE_TARGET':'lab','HELIOPAUSE_HOST_ID':'gateway','HELIOPAUSE_MANAGER_SIGNING_KEYS_DIR':path+'/manager','HELIOPAUSE_BREAK_GLASS_KEYS_DIR':path+'/verifier','HELIOPAUSE_INTERVAL_SEC':'1','HELIOPAUSE_NETWORK_DISCOVERY':'1','HELIOPAUSE_NETWORK_DISCOVERY_BUDGET':'5'})
     p=subprocess.Popen(['ip','netns','exec','p6-gw']+args,stdout=log,stderr=log,env=env)
     processes.append((p,log));return p
 
@@ -416,7 +424,11 @@ def consecutive(kind):
                 assert open(path+'/secrets/'+secret+'.key','rb').read().strip() not in data
             assert b'PRIVATE KEY-----' not in data
         assert journal['transactions'][second['transactionId']]['acceptedAt']>first['rollbackAt']
-        evidence={'firstState':terminal['state'],'firstAgentPid':original_pid,'secondAgentPid':agent.pid,'managerRestarts':manager_restarts,'firstRollbackAt':first['rollbackAt'],'secondAcceptedAt':journal['transactions'][second['transactionId']]['acceptedAt'],'settledRecords':len(final['records']),'registryRevision':second['registryRevision']}
+        beats=[json.loads(line) for line in open(path+'/relay-events.jsonl') if json.loads(line)['path']=='/heartbeat']
+        gaps=[b['at']-a['at'] for a,b in zip(beats,beats[1:])]
+        assert len(beats)>=5 and gaps and max(gaps)<3, (len(beats),gaps)
+        assert any(json.loads(line)['path']=='/network/observations' for line in open(path+'/relay-events.jsonl'))
+        evidence={'heartbeatCount':len(beats),'heartbeatMaxGapSeconds':max(gaps),'firstState':terminal['state'],'firstAgentPid':original_pid,'secondAgentPid':agent.pid,'managerRestarts':manager_restarts,'firstRollbackAt':first['rollbackAt'],'secondAcceptedAt':journal['transactions'][second['transactionId']]['acceptedAt'],'settledRecords':len(final['records']),'registryRevision':second['registryRevision']}
         stop(agent);stop(manager)
         return evidence
 
