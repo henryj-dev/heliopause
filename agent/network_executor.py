@@ -621,7 +621,11 @@ class Executor:
             if len(canonical(data).encode())>6*1024*1024:
                 raise ValueError('transaction journal capacity reached')
             started_mono=time.monotonic()
-            before,paths=self.driver.preflight(a['operation'],self.config['protectedAddresses'])
+            self.driver.command_deadline=started_mono+(a['expiresAt']-now)/1000
+            try:
+                before,paths=self.driver.preflight(a['operation'],self.config['protectedAddresses'])
+            finally:
+                self.driver.command_deadline=None
             if digest(before)!=a['localPrecondition']:
                 raise ValueError('local precondition changed: replan and reapprove')
             fresh_now=int(time.time()*1000)

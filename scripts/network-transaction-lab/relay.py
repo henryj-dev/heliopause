@@ -31,6 +31,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(200 if data else 503);self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
 server=http.server.ThreadingHTTPServer(('192.0.2.1',8444),Handler)
 context=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);context.load_cert_chain(path+'/pki/manager.pem',path+'/pki/manager.key')
+context.minimum_version=ssl.TLSVersion.TLSv1_2
 context.load_verify_locations(path+'/pki/ca.pem');context.verify_mode=ssl.CERT_REQUIRED
 server.socket=context.wrap_socket(server.socket,server_side=True)
 with open(path+'/relay-ready','w') as stream:stream.write('ready')

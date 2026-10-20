@@ -141,6 +141,31 @@ class Lifecycle(unittest.TestCase):
         report=n.read_json(self.path+'/lifecycle-status.json')
         self.assertGreater(report['heartbeat']['lastSuccess'],0);self.assertGreater(report['discovery']['lastFailure'],0)
         self.assertNotIn('secrets',n.canonical(report));self.assertNotIn(self.path,n.canonical(report))
+    def test_actual_heartbeat_loop_defers_new_policy_and_survives_nonobject_reply(self):
+        agent=n.crypto_helpers(self.path);agent.STATE_FILE=self.path+'/entry-firewall.json'
+        owner=lifecycle.Lifecycle(agent);owner.active={'kind':'network','transactionId':'fixture'}
+        agent._lifecycle=owner
+        replies=iter([{'schemaVersion':agent.SCHEMA_VERSION,'generation':'deferred-policy','gate':{'open':True}},[]])
+        count=[]
+        def heartbeat(_):
+            count.append(time.monotonic())
+            if len(count)==2:agent._stop.set()
+            return next(replies)
+        with __import__('contextlib').ExitStack() as stack:
+            for name in ['RELAY_URL','CA_FILE','CERT_FILE','KEY_FILE','TARGET','MANAGER_SIGNING_KEYS_DIR','BREAK_GLASS_KEYS_DIR']:
+                stack.enter_context(patch.object(agent,name,'https://fixture.example.invalid' if name=='RELAY_URL' else 'fixture'))
+            for name in ['backfill_current_authorization','_boot_restore','monitor_loop','sleep_interval']:
+                stack.enter_context(patch.object(agent,name))
+            stack.enter_context(patch.object(agent,'load_artifact_trust',return_value={'managerKeyIds':[],'breakGlassKeyIds':[],'trustDigest':'fixture'}))
+            stack.enter_context(patch.object(agent,'build_heartbeat',return_value={}))
+            stack.enter_context(patch.object(agent,'post_heartbeat',side_effect=heartbeat))
+            stack.enter_context(patch.object(owner,'start'))
+            stack.enter_context(patch.object(agent.signal,'signal'))
+            stack.enter_context(patch.object(agent.threading,'Thread'))
+            self.assertEqual(agent.main(),0)
+        self.assertEqual(len(count),2)
+        self.assertEqual(n.read_json(agent.STATE_FILE)['lastRefusal']['generation'],'deferred-policy')
+        self.assertEqual(n.read_json(agent.STATE_FILE)['generation'],None)
     def test_integrated_entry_requires_independent_protected_management(self):
         for addresses in [[],['0.0.0.0'],['192.0.2.1']*17]:
             with self.assertRaises(ValueError):

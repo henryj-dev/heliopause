@@ -507,7 +507,13 @@ def integrated(kind):
                 await_state(path,{'rolled-back'});assert not exists() and agent.pid!=pid
             elif kind=='integrated-network-busy':
                 n.atomic(path+'/wanted.json',{'generation':'deferred-firewall'})
-                wait_for(lambda:os.path.exists(path+'/firewall-state.json') and bool(n.read_json(path+'/firewall-state.json').get('lastRefusal')))
+                try:
+                    wait_for(lambda:os.path.exists(path+'/firewall-state.json') and bool(n.read_json(path+'/firewall-state.json').get('lastRefusal')))
+                except Exception:
+                    print('Busy Agent log: '+open(path+'/worker.log').read()[-5000:],flush=True)
+                    print('Busy lifecycle: '+open(path+'/lifecycle-status.json').read(),flush=True)
+                    print('Busy Relay events: '+str(relay_events(path)),flush=True)
+                    raise
                 assert not os.path.exists(path+'/artifact-entered')
                 n.atomic(path+'/malformed.json',[])
                 before=len(relay_events(path));wait_for(lambda:len(relay_events(path))>=before+3)
