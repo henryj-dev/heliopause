@@ -5722,6 +5722,8 @@ def run_writer_mode():
                 raise RuntimeError("invalid network writer locator")
             previous = Executor(read_json(locator["config"]), locator["stateDir"])
             previous.recover()
+            try: previous.publish_results()
+            except Exception: pass  # Local reporting cannot suppress recovery or writer exclusion.
             if any(row["state"] not in TERMINAL for row in previous.load()["transactions"].values()):
                 raise RuntimeError("network rollback debt prevents writer switch")
         if network_mode:
@@ -5756,6 +5758,8 @@ def run_writer_mode():
             config_path = os.environ.get("HELIOPAUSE_NETWORK_EXECUTOR_CONFIG", "/etc/heliopause/network-executor.json")
             executor = Executor(read_json(config_path), network_dir)
             executor.recover()
+            try: executor.publish_results()
+            except Exception: pass
             if any(row["state"] not in TERMINAL for row in executor.load()["transactions"].values()):
                 raise RuntimeError("network rollback debt prevents firewall writer mode")
         try:

@@ -21,7 +21,7 @@ let server: Awaited<ReturnType<typeof startManager>>["server"];
 before(async () => {
   const ssl = (...args: string[]) => execFileSync("openssl", args, { cwd: dir, stdio: "pipe" });
   ssl("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", "ca.key", "-out", "ca.pem", "-days", "1", "-subj", "/CN=network-test-ca");
-  for (const name of ["server", "reader", "writer", "host"]) {
+  for (const name of ["server", "reader", "writer", "host", "gateway"]) {
     ssl("req", "-newkey", "rsa:2048", "-nodes", "-keyout", `${name}.key`, "-out", `${name}.csr`, "-subj", `/CN=${name}`);
     writeFileSync(join(dir, "leaf.ext"), `extendedKeyUsage=${name === "server" ? "serverAuth" : "clientAuth"}\n${name === "server" ? "subjectAltName=IP:127.0.0.1\n" : ""}`);
     ssl("x509", "-req", "-in", `${name}.csr`, "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial", "-out", `${name}.pem`, "-days", "1", "-extfile", "leaf.ext");
@@ -29,7 +29,7 @@ before(async () => {
   // Load fixture credentials into TLS contexts once; request options carry only
   // opaque TLS state, while JSON request bodies remain independent of file data.
   clientAgents.set("none", new Agent({ secureContext: createSecureContext({ ca: read("ca.pem") }), keepAlive: false, maxCachedSessions: 0 }));
-  for (const name of ["reader", "writer", "host"]) {
+  for (const name of ["reader", "writer", "host", "gateway"]) {
     clientAgents.set(name, new Agent({ secureContext: createSecureContext({ ca: read("ca.pem"), cert: read(`${name}.pem`), key: read(`${name}.key`) }), keepAlive: false, maxCachedSessions: 0 }));
   }
   writeFileSync(join(dir, "operator-writer.pem"), read("writer.pem"));
@@ -158,7 +158,7 @@ test('execution endpoints normalize /api paths and default to disabled', async (
 });
 
 test('mTLS network execution goes through distinct approval, fenced authorization and verifier confirm', async () => {
-  const { generateKeyPairSync } = await import('node:crypto');
+  const { generateKeyPairSync, X509Certificate } = await import('node:crypto');
   const { NetworkRegistryStore } = await import('./network-registry.ts');
   const { buildNetworkChangeSet } = await import('./network-change-set.ts');
   const { networkLabInput } = await import('../examples/network-lab.ts');
@@ -173,6 +173,7 @@ test('mTLS network execution goes through distinct approval, fenced authorizatio
   }
   const registryFile=join(dir,'execution-registry.json'),observationsDir=join(dir,'execution-observations');
   const registry=new NetworkRegistryStore(registryFile).mutate(0,'fixture',{action:'replace',resources:input.registry.resources});
+  new NetworkRegistryStore(registryFile).initializeExecutions();
   const now=Date.now(),at=new Date(now).toISOString(),report=structuredClone(input.observations[0]!.report);
   report.startedAt=at;report.completedAt=at;
   for(const c of Object.values(report.observations)){c.startedAt=at;c.completedAt=at;}
@@ -181,8 +182,9 @@ test('mTLS network execution goes through distinct approval, fenced authorizatio
   const target={source:'example',host:'gateway',nodeId:'n0'};
   const review=buildNetworkChangeSet({id:'execution-review',registry,expectedRegistryRevision:1,now,observations:[observation],bindings:[{...target,siteId:'s0'}]});
   const operation={driver:'linux-wireguard-v1',interfaceId:'wg0',interfaceName:'hpcccccccccccc',address:'198.51.100.1/32',mtu:1420,listenPort:51820,secretRef:'local',publicKey:Buffer.alloc(32,1).toString('base64'),peers:[{publicKey:Buffer.alloc(32,2).toString('base64'),endpoint:'203.0.113.2:51820',allowedIps:['198.51.100.2/32']}],routes:['198.51.100.2/32']};
-  const draft={schemaVersion:1,transactionId:'c'.repeat(32),target,registryRevision:1,resources:registry.resources.map(r=>({id:r.id,generation:r.generation})),desiredDigest:review.desiredDigest,reviewHash:review.contentHash,artifactHash:networkDigest(operation),observation:{digest:networkDigest(observation),collectedAt:now,maxAgeMs:10000},localPrecondition:'a'.repeat(64),operation,issuedAt:now,expiresAt:now+10000,rollbackAt:now+20000};
-  const manager=await startManager({port:0,hostname:'127.0.0.1',relays:[{name:'example',url:'https://127.0.0.1:1',pkiDir:dir}],tls:{certFile:join(dir,'server.pem'),keyFile:join(dir,'server.key'),caFile:join(dir,'ca.pem')},operatorCNs:['reader','writer'],writerCNs:['reader','writer'],networkRegistryFile:registryFile,networkObservationsDir:observationsDir,networkExecutionTargets:[target],networkVerifierKeys:[verifierKey.publicKey],artifactSigning:{privateKey:managerKey.privateKey},log:()=>{}});
+  const draft={schemaVersion:2,journalId:'e'.repeat(32),transactionId:'c'.repeat(32),target,registryRevision:1,resources:registry.resources.map(r=>({id:r.id,generation:r.generation})),desiredDigest:review.desiredDigest,reviewHash:review.contentHash,artifactHash:networkDigest(operation),observation:{digest:networkDigest(observation),collectedAt:now,maxAgeMs:10000},localPrecondition:'a'.repeat(64),operation,issuedAt:now,expiresAt:now+10000,rollbackAt:now+20000};
+  const options={port:0,hostname:'127.0.0.1',relays:[{name:'example',url:'https://127.0.0.1:1',pkiDir:dir}],tls:{certFile:join(dir,'server.pem'),keyFile:join(dir,'server.key'),caFile:join(dir,'ca.pem')},operatorCNs:['reader','writer'],writerCNs:['reader','writer'],networkRegistryFile:registryFile,networkObservationsDir:observationsDir,networkExecutionTargets:[{...target,journalId:'e'.repeat(32),certificateSha256:createHash('sha256').update(new X509Certificate(read('gateway.pem')).raw).digest('hex')}],networkVerifierKeys:[verifierKey.publicKey],artifactSigning:{privateKey:managerKey.privateKey},log:()=>{}};
+  let manager=await startManager(options);
   const previousPort=port;port=(manager.server.address() as {port:number}).port;
   try {
     const proposal=await call('/api/network/execution/propose','POST','writer',{draft});
@@ -193,12 +195,38 @@ test('mTLS network execution goes through distinct approval, fenced authorizatio
     assert.equal((await call('/api/network/execution/approve','POST','reader',{hash})).status,200);
     const issued=await call('/api/network/execution/authorize','POST','writer',{hash});assert.equal(issued.status,200,JSON.stringify(issued.body));
     assert.throws(()=>new NetworkRegistryStore(registryFile).mutate(1,'fixture',{action:'replace',resources:registry.resources}),/fence/);
+    await new Promise<void>(resolve=>manager.server.close(()=>resolve()));
+    manager=await startManager(options);port=(manager.server.address() as {port:number}).port;
+    const retried=await call('/api/network/execution/authorize','POST','writer',{hash});
+    assert.equal(retried.status,200);assert.deepEqual(retried.body.envelope,issued.body.envelope);
+    assert.equal((await call('/api/network/execution/status')).body.records[0].state,'issued');
     const a=JSON.parse(Buffer.from(issued.body.envelope.payload,'base64url').toString());
     const checks=Object.fromEntries(['interface','address','route','handshake','fib','forward','reverse','management','protected'].map(k=>[k,true]));
     const receipt=signNetworkMessage(NETWORK_VERIFY_DOMAIN,{transactionId:a.transactionId,authorizationHash:networkDigest(a),artifactHash:a.artifactHash,observedAt:Date.now(),expiresAt:Date.now()+3000,nonce:'d'.repeat(32),checks},verifierKey.privateKey);
     const bad={...receipt,signature:'A'.repeat(86)};
     assert.equal((await call('/api/network/execution/confirm','POST','writer',{hash,verification:bad})).status,400);
     const confirmed=await call('/api/network/execution/confirm','POST','writer',{hash,verification:receipt});assert.equal(confirmed.status,200,JSON.stringify(confirmed.body));
-    assert.equal((await call('/api/network/execution/confirm','POST','writer',{hash,verification:receipt})).status,404);
+    assert.equal((await call('/api/network/execution/confirm','POST','writer',{hash,verification:receipt})).status,200);
+    await new Promise<void>(resolve=>manager.server.close(()=>resolve()));
+    manager=await startManager(options);port=(manager.server.address() as {port:number}).port;
+    const retryConfirm=await call('/api/network/execution/confirm','POST','writer',{hash,verification:receipt});
+    assert.deepEqual(retryConfirm.body.envelope,confirmed.body.envelope);
+    assert.equal((await call('/api/network/execution/status')).body.records[0].state,'confirm-issued');
+    const result:any={schemaVersion:1,domain:'heliopause-network-terminal-mtls-v1',transactionId:a.transactionId,fenceId:a.transactionId,target,journalId:a.journalId,authorizationHash:networkDigest(a),artifactHash:a.artifactHash,registryRevision:a.registryRevision,state:'confirmed',sequence:1,proof:{confirmationHash:networkDigest(JSON.parse(Buffer.from(confirmed.body.envelope.payload,'base64url').toString())),verificationHash:networkDigest(JSON.parse(Buffer.from(receipt.payload,'base64url').toString()))}};
+    result.stateHash=networkDigest(result);
+    for(const identity of ['none','writer','host']) assert.equal((await call('/api/network/execution/terminal','POST',identity,result)).status,403);
+    assert.equal((await call('/api/network/execution/terminal','POST','gateway',result,{origin:'https://untrusted.example.invalid'})).status,403);
+    const forged={...result,artifactHash:'f'.repeat(64)};
+    assert.equal((await call('/api/network/execution/terminal','POST','gateway',forged)).status,409);
+    assert.ok((await call('/api/network/execution/status')).body.fence);
+    // Report settlement stays enabled after new issuance is disabled and Manager restarts.
+    await new Promise<void>(resolve=>manager.server.close(()=>resolve()));
+    manager=await startManager({...options,artifactSigning:undefined,networkVerifierKeys:undefined});port=(manager.server.address() as {port:number}).port;
+    assert.equal((await call('/api/network/execution/terminal','POST','gateway',result)).status,200);
+    assert.equal((await call('/api/network/execution/terminal','POST','gateway',result)).body.duplicate,true);
+    const settled=await call('/api/network/execution/status');
+    assert.equal(settled.body.fence,null);assert.equal(settled.body.records[0].state,'settled');
+    assert.doesNotThrow(()=>new NetworkRegistryStore(registryFile).mutate(1,'fixture',{action:'update',id:'s0',resource:{...registry.resources.find(r=>r.id==='s0'),owner:'next'}}));
+
   } finally {port=previousPort;await new Promise<void>(resolve=>manager.server.close(()=>resolve()));}
 });

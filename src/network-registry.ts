@@ -1,9 +1,12 @@
 /** Persistent desired inventory only. Nothing in this store authorizes a network apply. */
 import { createHash } from "node:crypto";
-import { mkdirSync, existsSync } from "node:fs";
+import { mkdirSync, existsSync, openSync, closeSync, fsyncSync, constants } from "node:fs";
 import { dirname } from "node:path";
+import { withNetworkRegistryLock } from './network-registry-lock.ts';
+import { validateExecutionState, type NetworkExecutionState, type NetworkExecutionRecord } from './network-execution-state.ts';
+import type { NetworkSignedEnvelope } from './network-execution.ts';
 import { cidrRange } from "./nft.ts";
-import { atomicWriteFile, readBoundedStoreFile, withFileLock } from "./json-store.ts";
+import { atomicWriteFile, readBoundedStoreFile } from "./json-store.ts";
 import { validateNetworkInventory, type NetworkInventoryIssue, type NetworkInventoryResource, type NetworkManagement } from "./network-inventory.ts";
 
 export const MAX_NETWORK_REGISTRY_RESOURCES = 512;
@@ -18,7 +21,8 @@ export interface NetworkRegistryRevision {
   changes: Array<{ id: string; before?: string; after?: string }>;
 }
 export interface NetworkRegistryDocument {
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
+  execution?: NetworkExecutionState;
   revision: number;
   resources: NetworkInventoryResource[];
   /** Deleted identities cannot be recreated to bypass an ownership-transfer refusal. */
@@ -89,11 +93,13 @@ export class NetworkRegistryStore {
     }
     try {
       const doc: unknown = JSON.parse(text);
-      if (!object(doc) || doc.schemaVersion !== 1 || !Number.isSafeInteger(doc.revision) || Number(doc.revision) < 0 ||
+      if (!object(doc) || (doc.schemaVersion !== 1 && doc.schemaVersion !== 2) || !Number.isSafeInteger(doc.revision) || Number(doc.revision) < 0 ||
           !Array.isArray(doc.ownershipClaims) || doc.ownershipClaims.length > 4096 || doc.ownershipClaims.some(c => !object(c) || typeof c.key !== "string" || !/^[a-f0-9]{64}$/.test(c.key) || validateNetworkInventory([{ id: "claim", kind: "site", owner: "registry", generation: 1, management: c.management }]).length) ||
           !Array.isArray(doc.retiredIds) || doc.retiredIds.length > 4096 || doc.retiredIds.some(id => typeof id !== "string") ||
           !Array.isArray(doc.history) || doc.history.length > HISTORY_LIMIT ||
           (doc.revision === 0 ? doc.updatedAt !== null || doc.updatedBy !== null : typeof doc.updatedAt !== "string" || typeof doc.updatedBy !== "string")) throw new Error();
+      if(doc.schemaVersion===2) validateExecutionState(doc.execution as NetworkExecutionState);
+      else if(doc.execution!==undefined) throw new Error('execution requires Registry schema2');
       validateResources(doc.resources);
       if (new Set(doc.retiredIds).size !== doc.retiredIds.length || doc.resources.some(r => (doc.retiredIds as unknown[]).includes(r.id))) throw new Error();
       if (doc.revision === 0 && (doc.resources.length || doc.history.length)) throw new Error();
@@ -116,18 +122,65 @@ export class NetworkRegistryStore {
     } catch { throw fail("network registry document is invalid; refusing to overwrite", 500); }
   }
 
-  /** An offline Agent cannot check latest Registry state. Keep all mutations fenced until an
-   * authenticated operator reconciles a terminal Agent result, including after issuer crashes.
-   * No automatic expiry: a clock change must not revive a stale execution authorization. */
-  fenceExecution<T>(revision: number, transactionId: string, issue: (doc: NetworkRegistryDocument) => T): T {
-    return withFileLock(this.path, 500, "network registry", fail, () => {
-      if (existsSync(this.path + ".execution-fence")) throw fail("network execution fence requires reconciliation", 409);
-      const doc = this.read();
-      if (doc.revision !== revision) throw fail("registry revision conflict", 409);
-      // Return no authorization until the Registry fence is durably installed.
-      const result = issue(doc);
-      atomicWriteFile(this.path + ".execution-fence", JSON.stringify({ schemaVersion: 1, transactionId, revision }));
+  /** Explicit one-time migration, not an unlock. Old unresolved sidecars are never adopted. */
+  initializeExecutions(): void {
+    withNetworkRegistryLock(this.path,fail,()=>{
+      if(existsSync(this.path+'.execution-fence')) throw fail('legacy execution fence requires reconciliation',409);
+      const doc=this.read();
+      if(doc.schemaVersion===2) return;
+      if(doc.revision===0) throw fail('initialize Registry inventory first',409);
+      doc.schemaVersion=2;doc.execution={schemaVersion:1,nextSequence:1,fence:null,records:[]};
+      this.writeExecution(doc);
+    });
+  }
+
+  private requireExecution(doc:NetworkRegistryDocument):NetworkExecutionState {
+    if(existsSync(this.path+'.execution-fence')||doc.schemaVersion!==2||!doc.execution) throw fail('execution ledger unavailable or legacy fence unresolved',409);
+    return doc.execution;
+  }
+
+  executionStatus(): NetworkExecutionState {
+    return withNetworkRegistryLock(this.path,fail,()=>{
+      const state=this.requireExecution(this.read());
+      // Reconcile an earlier rename followed by an uncertain directory-fsync error before any
+      // cached authorization can leave this process (including an operator status response).
+      const fd=openSync(this.path,constants.O_RDONLY|constants.O_NOFOLLOW);
+      try {fsyncSync(fd);} finally {closeSync(fd);}
+      const dir=openSync(dirname(this.path),'r');
+      try {fsyncSync(dir);} finally {closeSync(dir);}
+      return state;
+    });
+  }
+
+  private writeExecution(doc:NetworkRegistryDocument):void {
+    validateExecutionState(doc.execution!);
+    const text=JSON.stringify(doc);
+    if(Buffer.byteLength(text)>MAX_DOCUMENT_BYTES) throw fail('execution ledger capacity exceeded',413);
+    atomicWriteFile(this.path,text);
+  }
+
+  executionTransaction<T>(body:(state:NetworkExecutionState,doc:NetworkRegistryDocument)=>T):T {
+    return withNetworkRegistryLock(this.path,fail,()=>{
+      const doc=this.read();this.requireExecution(doc);
+      const result=body(doc.execution!,doc);
+      this.writeExecution(doc);
       return result;
+    });
+  }
+
+  /** One durable Registry replace installs both the exact authorization and its current fence. */
+  fenceExecution(revision:number,transactionId:string,issue:(doc:NetworkRegistryDocument)=>NetworkSignedEnvelope,by:string):NetworkSignedEnvelope {
+    return withNetworkRegistryLock(this.path,fail,()=>{
+      const doc=this.read();this.requireExecution(doc);
+      const state=doc.execution!;
+      if(state.fence) throw fail('network execution fence requires settlement',409);
+      if(state.records.length>=256||state.records.some(r=>r.transactionId===transactionId)) throw fail('execution replay/capacity refusal',409);
+      if(doc.revision!==revision) throw fail('registry revision conflict',409);
+      const envelope=issue(doc),a=JSON.parse(Buffer.from(envelope.payload,'base64url').toString());
+      const record:NetworkExecutionRecord={sequence:state.nextSequence++,transactionId,fenceId:transactionId,planHash:a.approval.planHash,authorization:envelope,authorizationHash:digest(a),target:a.target,journalId:a.journalId,registryRevision:revision,artifactHash:a.artifactHash,issuedAt:a.issuedAt,issuedBy:by,state:'issued',audit:[{action:'issued',actor:by,at:Date.now()}]};
+      state.records.push(record);state.fence={transactionId,fenceId:transactionId,authorizationHash:record.authorizationHash,registryRevision:revision};
+      this.writeExecution(doc);
+      return envelope;
     });
   }
 
@@ -136,9 +189,10 @@ export class NetworkRegistryStore {
     if (!Number.isSafeInteger(expectedRevision) || Number(expectedRevision) < 0) throw fail("expectedRevision must be a nonnegative safe integer");
     if (typeof actor !== "string" || !actor.trim() || actor.length > 256) throw fail("authenticated actor is required");
     const input = JSON.parse(boundedJson(mutation)) as NetworkRegistryMutation;
-    return withFileLock(this.path, 500, "network registry", fail, () => {
+    return withNetworkRegistryLock(this.path, fail, () => {
       if (existsSync(this.path + ".execution-fence")) throw fail("network execution fence requires reconciliation", 409);
       const current = this.read();
+      if(current.execution?.fence) throw fail("network execution fence requires settlement",409);
       if (current.revision !== expectedRevision) throw fail(`registry revision conflict: current revision is ${current.revision}`, 409);
       const before = new Map(current.resources.map(r => [r.id, r]));
       let candidate: unknown[];
@@ -199,7 +253,7 @@ export class NetworkRegistryStore {
       const revision = current.revision + 1;
       const retiredIds = [...current.retiredIds, ...[...before.keys()].filter(id => !after.has(id))];
       if (retiredIds.length > 4096) throw fail("retired identity capacity exceeded", 409);
-      const doc: NetworkRegistryDocument = { schemaVersion: 1, revision, resources, retiredIds, ownershipClaims: [...ownershipClaims].map(([key, management]) => ({ key, management })), updatedAt: at, updatedBy: actor,
+      const doc: NetworkRegistryDocument = { schemaVersion: current.schemaVersion, ...(current.execution?{execution:current.execution}:{}), revision, resources, retiredIds, ownershipClaims: [...ownershipClaims].map(([key, management]) => ({ key, management })), updatedAt: at, updatedBy: actor,
         history: [...current.history, { revision, actor, at, action: input.action, changes }].slice(-HISTORY_LIMIT) };
       const serialized = JSON.stringify(doc);
       if (Buffer.byteLength(serialized) > MAX_DOCUMENT_BYTES) throw fail("registry history exceeds size limit", 413);

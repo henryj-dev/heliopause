@@ -27,10 +27,11 @@ if(action==='keys') {
     {...base,id:'wg-new',kind:'interface',nodeId:'gateway',networkId:'backbone',name:device,mtu:1400},
     ...['192.0.2.130/32','198.51.100.6/32'].map((destination,i)=>({...base,id:'route'+i,kind:'route',interfaceId:'wg-new',routingDomainId:'domain',destination,table:254,nextHop:null,protocol:'static',metric:42760}))];
   const registry=store.mutate(0,'lab-authority',{action:'replace',resources});
+  store.initializeExecutions();
   const observation={source:'lab',host:'gateway',receivedAt:at,report:{schemaVersion:1 as const,collectionId:'00000000-0000-4000-8000-000000000006',startedAt:at,completedAt:at,observations:{links:{status:'success' as const,startedAt:at,completedAt:at,data:facts.snapshot.links.map((l:any)=>({ifname:l.name,ifindex:l.index,mtu:l.mtu}))},addresses:{status:'success' as const,startedAt:at,completedAt:at,data:[]},routes4:{status:'success' as const,startedAt:at,completedAt:at,data:facts.snapshot.routes}},capabilities:{links:{available:true,status:'success' as const},addresses:{available:true,status:'success' as const},routes4:{available:true,status:'success' as const}}}};
   const review=buildNetworkChangeSet({id:'execution-review',registry,expectedRegistryRevision:registry.revision,now,observations:[observation],bindings:[{source:'lab',host:'gateway',nodeId:'gateway',siteId:'site'}]});
   const operation={driver:'linux-wireguard-v1' as const,interfaceId:'wg-new',interfaceName:device,address:'192.0.2.129/32',mtu:1400,listenPort:51820,secretRef:'gateway',publicKey:facts.publicKey,peers:[{publicKey:facts.peerPublicKey,endpoint:'203.0.113.2:51820',allowedIps:['192.0.2.130/32','198.51.100.6/32']}],routes:['192.0.2.130/32','198.51.100.6/32']};
-  const draft:NetworkExecutionDraft={schemaVersion:1,transactionId,target:{source:'lab',host:'gateway',nodeId:'gateway'},registryRevision:registry.revision,resources:registry.resources.map(r=>({id:r.id,generation:r.generation})),desiredDigest:review.desiredDigest,reviewHash:review.contentHash,artifactHash:networkDigest(operation),observation:{digest:networkDigest(observation),collectedAt:now,maxAgeMs:30000},localPrecondition:networkDigest(facts.snapshot),operation,issuedAt:now,expiresAt:now+5000,rollbackAt:now+(facts.timeoutMs??12000)};
+  const draft:NetworkExecutionDraft={schemaVersion:2,journalId:facts.journalId,transactionId,target:{source:'lab',host:'gateway',nodeId:'gateway'},registryRevision:registry.revision,resources:registry.resources.map(r=>({id:r.id,generation:r.generation})),desiredDigest:review.desiredDigest,reviewHash:review.contentHash,artifactHash:networkDigest(operation),observation:{digest:networkDigest(observation),collectedAt:now,maxAgeMs:30000},localPrecondition:networkDigest(facts.snapshot),operation,issuedAt:now,expiresAt:now+5000,rollbackAt:now+(facts.timeoutMs??12000)};
   const approvals=emptyApprovals(),hash=networkExecutionHash(draft);
   propose(approvals,{hash,generation:draft.transactionId,summary:{hosts:[{host:'gateway',stage:'gateway',ruleCount:1,rulesetHash:draft.artifactHash}]},by:'alice',now:new Date(now)});
   approve(approvals,{hash,by:'bob',now:new Date(now)});
@@ -55,7 +56,7 @@ if(action==='keys') {
     if(kind==='hash') a.artifactHash='0'.repeat(64);
     if(kind==='approval') a.approval.approvedBy=a.approval.proposedBy;
     a.approval.planHash='sha256:'+networkDigest(Object.fromEntries(Object.entries(a).filter(([k])=>k!=='approval')));
-    save('request-tampered.json',signNetworkMessage('heliopause-network-execution-v1',a,createPrivateKey(readFileSync(join(dir,'manager.key')))));process.exit(0);
+    save('request-tampered.json',signNetworkMessage('heliopause-network-execution-v2',a,createPrivateKey(readFileSync(join(dir,'manager.key')))));process.exit(0);
   }
   save('request-tampered.json',env);
 } else throw new Error('unsupported lab action');

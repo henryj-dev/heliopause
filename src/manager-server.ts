@@ -1,5 +1,6 @@
+import { issueDurableNetworkConfirm, settleNetworkExecution } from './network-execution-settlement.ts';
 import { buildNetworkChangeSet } from './network-change-set.ts';
-import { authorizeNetworkExecution, confirmNetworkExecution, networkExecutionHash, type NetworkSignedEnvelope, type NetworkExecutionDraft } from './network-execution.ts';
+import { authorizeNetworkExecution, validateNetworkExecutionDraft, networkExecutionHash, type NetworkSignedEnvelope, type NetworkExecutionDraft } from './network-execution.ts';
 import { networkDigest } from './network-canonical.ts';
 // The manager's HTTP surface (H26): reads the whole site, and is the ordinary way a generation gets
 // published.
@@ -277,6 +278,7 @@ export function republishRefusal(input: {
 }
 
 export const API_ROUTES: ReadonlySet<string> = new Set([
+  "/network/execution/terminal",
   "/site",
   "/certificates",
   "/authz",
@@ -321,7 +323,7 @@ export const API_ROUTES: ReadonlySet<string> = new Set([
  * fleet agent fetches its own certificate from there, through a name in stardust's SNI allowlist.
  */
 export const API_ROUTE_PATTERNS: readonly RegExp[] = [
-  /^\/network\/execution\/(?:propose|approve|authorize|confirm|review)$/,
+  /^\/network\/execution\/(?:propose|approve|authorize|confirm|review|status)$/,
   /^\/network\/inventory\/[^/]+$/,
   /^\/network\/observations\/[^/]+\/[^/]+$/,
   /^\/plans\/[^/]+\/changes$/,
@@ -428,7 +430,7 @@ export interface ManagerOptions {
   networkRegistryFile?: string;
   /** Separate opt-in writer issuance; identities are deployment trust, never request claims. */
   networkVerifierKeys?: readonly KeyObject[];
-  networkExecutionTargets?: readonly { source: string; host: string; nodeId: string }[];
+  networkExecutionTargets?: readonly { source: string; host: string; nodeId: string; journalId: string; certificateSha256: string }[];
   /** Per-relay cached observations, separate from desired state. */
   networkObservationsDir?: string;
   port: number;
@@ -1400,6 +1402,8 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     throw new Error("artifact signing authorizationTtlSec must be an integer between 900 and 604800");
   }
   if (opts.artifactSigning) artifactSigningKeyId(createPublicKey(opts.artifactSigning.privateKey));
+  const terminalPins=opts.networkExecutionTargets??[];
+  if(opts.networkExecutionTargets?.some(t=>!/^[a-f0-9]{32}$/.test(t.journalId))||terminalPins.some(t=>!/^[a-f0-9]{64}$/.test(t.certificateSha256!))||new Set(terminalPins.map(t=>t.certificateSha256)).size!==terminalPins.length) throw new Error("invalid or ambiguous network Agent identity pins");
   if (opts.artifactSigning && opts.networkExecutionTargets?.length && opts.networkVerifierKeys?.some(k => artifactSigningKeyId(k) === artifactSigningKeyId(createPublicKey(opts.artifactSigning!.privateKey)))) throw new Error("network verifier signing keys must be independent");
   if (opts.tls.public && opts.tls.public.serverNames.length === 0) {
     throw new Error("public serverNames must contain at least one exact DNS name");
@@ -1582,7 +1586,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
   const approvals = emptyApprovals();
   const networkApprovals = emptyApprovals();
   const networkDrafts = new Map<string, NetworkExecutionDraft>();
-  const networkIssued = new Map<string, NetworkSignedEnvelope>();
+
   function networkEvidence(draft: NetworkExecutionDraft) {
     if (!opts.networkRegistryFile || !opts.networkObservationsDir || !opts.relays.some(r => r.name === draft.target.source)) throw new Error("execution evidence unavailable");
     const registry = new NetworkRegistryStore(opts.networkRegistryFile).read();
@@ -2064,6 +2068,20 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       return send(res, 401, { error: "client certificate has been revoked" });
     }
 
+    if (url.pathname === "/network/execution/terminal") {
+      // Machine-only direct mTLS. Operator sessions and Relay assertions cannot settle a fence.
+      if(req.method!=="POST") return send(res,405,{error:"method not allowed"});
+      if(!opts.networkRegistryFile) return send(res,503,{error:"execution ledger unavailable"});
+      const socket=req.socket as TLSSocket, cert=socket.getPeerCertificate();
+      const fingerprint=cert.raw?createHash("sha256").update(cert.raw).digest("hex"):null;
+      const agent=opts.networkExecutionTargets?.find(t=>t.host===cn&&t.certificateSha256===fingerprint);
+      if(!socket.authorized||!cert.ext_key_usage?.includes([1,3,6,1,5,5,7,3,2].join('.'))||!cn||!agent||req.headers.cookie||req.headers.authorization||req.headers.origin||req.headers["sec-fetch-site"]) return send(res,403,{error:"direct pinned Agent mTLS required"});
+      try {
+        const result=JSON.parse((await readNetworkRegistryBody(req)).toString("utf8"));
+        return send(res,200,settleNetworkExecution(new NetworkRegistryStore(opts.networkRegistryFile),result,agent,cn));
+      } catch(e) {return send(res,e instanceof NetworkRegistryError?e.statusCode:400,{error:e instanceof NetworkRegistryError?e.message:"terminal result refused"});}
+    }
+
     // Bootstrap agents have no certificate yet; their one credential is a host-scoped bearer token.
     // These two routes therefore run before operator authentication and expose only that token's CSR.
     if (opts.enrollment && req.method === "POST" && url.pathname === "/infra/node-csrs") {
@@ -2350,8 +2368,13 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     // One boolean, one place. Certificates read the live allowlist; sessions carry the decision
     // taken at login — see `Principal.canWrite` for why that is stated rather than hidden.
     const mayWrite = principal.canWrite;
-    const networkExecutionMatch = /^\/network\/execution\/(propose|approve|authorize|confirm|review)$/.exec(url.pathname);
+    const networkExecutionMatch = /^\/network\/execution\/(propose|approve|authorize|confirm|review|status)$/.exec(url.pathname);
     if (networkExecutionMatch) {
+      if(req.method==="GET"&&networkExecutionMatch[1]==="status") {
+        if(!opts.networkRegistryFile) return send(res,503,{error:"execution ledger unavailable"});
+        try {return send(res,200,new NetworkRegistryStore(opts.networkRegistryFile).executionStatus());}
+        catch {return send(res,409,{error:"execution ledger unavailable or legacy reconciliation required"});}
+      }
       if (!opts.networkExecutionTargets?.length || !opts.networkVerifierKeys?.length || !opts.networkRegistryFile || !opts.artifactSigning || !opts.networkObservationsDir) return send(res, 503, { error: "network execution issuance disabled" });
       if (req.method === "GET" && networkExecutionMatch[1] === "review") {
         const draft = networkDrafts.get(url.searchParams.get("hash") ?? "");
@@ -2367,7 +2390,8 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         const action = networkExecutionMatch[1];
         if (action === "propose") {
           const draft = body.draft as NetworkExecutionDraft;
-          if (!draft || !opts.networkExecutionTargets.some(t => t.source === draft.target?.source && t.host === draft.target?.host && t.nodeId === draft.target?.nodeId)) return send(res, 403, { error: "untrusted execution identity" });
+          validateNetworkExecutionDraft(draft);
+          if (!draft || !opts.networkExecutionTargets.some(t => t.source === draft.target?.source && t.host === draft.target?.host && t.nodeId === draft.target?.nodeId && t.journalId === draft.journalId)) return send(res, 403, { error: "untrusted execution identity" });
           // Reconstruct the target keys rather than rely on request object key ordering.
           const evidence = networkEvidence(draft);
           const hash = networkExecutionHash(draft);
@@ -2379,11 +2403,12 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         if ((await requireOtp(principal, body, res, url.pathname)) === "answered") return;
         const hash = String(body.hash ?? "");
         if (action === "confirm") {
-          const issued = networkIssued.get(hash);
-          if (!issued) return send(res, 404, { error: "no issued execution; allow local rollback" });
-          const envelope = confirmNetworkExecution(issued, body.verification, opts.networkVerifierKeys, opts.artifactSigning.privateKey, now().getTime());
-          networkIssued.delete(hash);
+          const envelope = issueDurableNetworkConfirm(new NetworkRegistryStore(opts.networkRegistryFile),hash,body.verification,opts.networkVerifierKeys,opts.artifactSigning.privateKey,who,now().getTime());
           return send(res, 200, { envelope });
+        }
+        if(action==="authorize") {
+          const prior=new NetworkRegistryStore(opts.networkRegistryFile).executionStatus().records.find(r=>r.planHash===hash);
+          if(prior) return send(res,200,{envelope:prior.authorization,replayed:true,state:prior.state});
         }
         const draft = networkDrafts.get(hash);
         if (!draft) return send(res, 404, { error: "re-propose network execution" });
@@ -2396,7 +2421,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         if (action === "authorize") {
           const evidence = networkEvidence(draft);
           const envelope = authorizeNetworkExecution(new NetworkRegistryStore(opts.networkRegistryFile), networkApprovals, draft, who, opts.artifactSigning.privateKey, evidence, now());
-          networkIssued.set(hash, envelope);
+
           networkDrafts.delete(hash);
           return send(res, 200, { envelope });
         }

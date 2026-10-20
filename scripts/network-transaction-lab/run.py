@@ -65,6 +65,7 @@ def setup(path,mutate=False):
     run('ip','route','add','198.51.100.6/32','via','198.51.100.1',ns='p6-client')
     run('ip','route','add','198.51.100.2/32','via','198.51.100.5',ns='p6-workload')
     os.mkdir(path+'/secrets',0o700);os.mkdir(path+'/state',0o700)
+    journal_id=n.initialize_journal(path+'/state')
     public={}
     for name in ['gateway','peer']:
         secret=run('wg','genkey')
@@ -87,8 +88,8 @@ def setup(path,mutate=False):
         wait_for(settled)
     # Observe through the same driver reader in the actual gateway namespace.
     out=run('python3','-c',"import sys,json;sys.path.insert(0,'/source/agent');import network_executor as n;print(n.canonical(n.LinuxWireGuard('/unused').snapshot()))",ns='p6-gw')
-    n.atomic(path+'/facts.json',{'snapshot':json.loads(out),'publicKey':public['gateway'],'peerPublicKey':public['peer'],'mutateRegistry':mutate})
-    cfg={'enabled':True,'identity':{'source':'lab','host':'gateway','nodeId':'gateway'},'managerKeys':path+'/manager','verifierKeys':path+'/verifier','secrets':path+'/secrets','protectedAddresses':['192.0.2.1']}
+    n.atomic(path+'/facts.json',{'snapshot':json.loads(out),'journalId':journal_id,'publicKey':public['gateway'],'peerPublicKey':public['peer'],'mutateRegistry':mutate})
+    cfg={'enabled':True,'journalId':journal_id,'identity':{'source':'lab','host':'gateway','nodeId':'gateway'},'managerKeys':path+'/manager','verifierKeys':path+'/verifier','secrets':path+'/secrets','protectedAddresses':['192.0.2.1']}
     n.atomic(path+'/config.json',cfg)
     if mutate:
         assert not authority('issue',path,ok=False)
