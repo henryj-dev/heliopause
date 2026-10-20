@@ -82,6 +82,9 @@ def ping(i, j, offset=2):
 
 def all_paths(primary=True):
     for i in range(4):
+        interface = 'wg0' if primary else 'cf0'
+        stamps=ns(i,'wg','show',interface,'latest-handshakes').stdout.splitlines()
+        assert len(stamps)==3 and all(int(row.split()[1])>0 for row in stamps), 'missing authenticated WG handshake'
         for j in range(4):
             if i == j:
                 continue
@@ -238,6 +241,7 @@ def management():
     for i in range(4):
         local = json.loads(ns(i, 'ip', '-j', 'addr', 'show', 'dev', 'mgmt0').stdout)
         assert local[0]['addr_info'][0]['local'] == f'198.51.100.{129+i}'
+        command('ip','netns','exec','client'+str(i),'ping','-n','-q','-c','1','-W','1',f'198.51.100.{129+i}')
         for j in range(4):
             if i != j:
                 assert not routes_for_prefix(i, f'198.51.100.{129+j}/32')
@@ -290,6 +294,8 @@ def assert_origins():
 def main():
     assert sys.platform == 'linux' and os.geteuid() == 0
     assert Path('/.dockerenv').exists(), 'lab is container-only'
+    initial_links=json.loads(command('ip','-j','link','show').stdout)
+    assert {link['ifname'] for link in initial_links} == {'lo'}, 'lab requires a fresh --network none container; refuse existing or host networking'
     bundle = json.loads((RESULTS/'input.json').read_text())
     record('FRR parser accepts exact compiled templates', lambda: syntax(bundle))
     record('isolated namespaces and compiler-fed WireGuard setup', lambda: setup(bundle))

@@ -153,3 +153,9 @@ test('malformed policy input is a compiler rejection, not a fallback to legacy p
     assert.equal(compileFrr({registry:f.registry,expectedRegistryRevision:1,spec:f.frr[0],prefixPolicy:prefixPolicy as any}).ok,false);
   }
 });
+test('the shared policy cannot authorize a management prefix by relabeling it infrastructure',()=>{
+  const f=networkLabInput();const n=f.registry.resources.find(r=>r.id==='lan0')!;Object.assign(n,{purpose:'management'});
+  assert.ok(validatePrefixPolicy(f.registry.resources,f.prefixPolicy!).some(e=>e.includes('management prefix export forbidden')));
+  assert.equal(compileWireGuard({registry:f.registry,expectedRegistryRevision:1,spec:f.wireguard,prefixPolicy:f.prefixPolicy}).ok,false);
+  assert.equal(compileFrr({registry:f.registry,expectedRegistryRevision:1,spec:f.frr[0],prefixPolicy:f.prefixPolicy}).ok,false);
+});
