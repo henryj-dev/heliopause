@@ -1,0 +1,23 @@
+name: isolated network transactions
+on:
+  pull_request:
+    paths:
+      - 'agent/**'
+      - 'src/network-*.ts'
+      - 'src/manager-server.ts'
+      - 'scripts/network-transaction-lab/**'
+      - '.github/workflows/network-transactions.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  transactions:
+    name: WireGuard durable transaction kernel lab
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - run: scripts/network-transaction-lab/run.sh

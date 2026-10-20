@@ -373,3 +373,5 @@ export { compileFrr, type FrrSpec, type FrrPeerSpec, type FrrCompilation } from 
 
 export { buildNetworkChangeSet, type NetworkChangeSetInput, type NetworkChangeSet, type NetworkChangeOperation } from "./network-change-set.ts";
 export { validatePrefixPolicy, type NetworkPrefixPolicy, type PrefixPermission } from "./network-prefix-policy.ts";
+
+export { authorizeNetworkExecution, networkExecutionHash, type NetworkExecutionDraft, type NetworkWireGuardOperation, type NetworkSignedEnvelope } from "./network-execution.ts";

@@ -1,0 +1,18 @@
+[Unit]
+Description=Heliopause experimental single-gateway network executor
+After=network.target
+# The shared Agent process lock refuses concurrent writer modes without stopping the owner.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/heliopause/agent.env
+ExecStart=/usr/bin/python3 /opt/heliopause/agent/heliopause-pull.py --network-executor --config /etc/heliopause/network-executor.json --state-dir /var/lib/heliopause/network-executor
+Restart=always
+RestartSec=1
+UMask=0077
+User=root
+# No NetworkManager profile or reboot reapply is installed by this service.
+
+[Install]
+WantedBy=multi-user.target
