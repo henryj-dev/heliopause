@@ -3926,6 +3926,9 @@ def _save_state_unlocked(st):
     tmp = None
     try:
         os.makedirs(directory, mode=0o700, exist_ok=True)
+        if _lifecycle is not None and not os.path.exists(STATE_FILE + ".required"):
+            if not _write_private_json(STATE_FILE + ".required", {"required": True}):
+                return False
         fd, tmp = tempfile.mkstemp(prefix=f".{os.path.basename(STATE_FILE)}.", suffix=".tmp", dir=directory)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             fd = None  # ownership transferred to the file object
@@ -5712,6 +5715,12 @@ def main():
         st = load_state()
         if _lifecycle is not None:
             _lifecycle.heartbeat(True)
+            try:
+                st = _lifecycle.firewall_state()
+            except Exception:
+                _lifecycle.error("firewall-journal", "firewall-journal-unreadable")
+                sleep_interval()
+                continue
         if _lifecycle is None or _has_live_commitment(st):
             handle_reply_safely(st, reply)
         elif _lifecycle.begin_firewall():

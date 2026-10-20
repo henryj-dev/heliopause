@@ -524,6 +524,14 @@ def integrated(kind):
             assert promised<=rolled_at<promised+3, (promised,rolled_at)
             assert not run('nft','list','table','inet','heliopause',ns='p6-gw',ok=False)
         elif kind=='integrated-command-timeout':
+            tx=n.read_json(path+'/decoded.json')['transactionId']
+            def stalled_status():
+                filename=path+'/lifecycle-status.json'
+                if not os.path.exists(filename):return False
+                status=n.read_json(filename)
+                return (status.get('activeWriter') or {}).get('transactionId')==tx and status['heartbeat'].get('lastSuccess')
+            wait_for(stalled_status,5)
+            stall_observed_at=time.time()
             await_state(path,{'rolled-back'},16)
             assert not exists() and any('timed out' in h.get('diagnostic','') for h in [row(path)])
         else:
@@ -578,6 +586,7 @@ def integrated(kind):
         assert report['mode']=='integrated'
         assert report['heartbeat'].get('lastSuccess'),report
         evidence={'firstAgentPid':pid,'finalAgentPid':agent.pid,'heartbeatCount':len(beats),'heartbeatMaxGapSeconds':max(gaps),'heartbeatGapLimitSeconds':allowed,'heartbeatLastSuccess':report['heartbeat'].get('lastSuccess'),'heartbeatLastFailure':report['heartbeat'].get('lastFailure')}
+        if kind=='integrated-command-timeout':evidence['commandStallObservedAt']=stall_observed_at
         if kind=='integrated-firewall-watchdog':evidence.update({'rollbackDeadline':promised,'rollbackObservedAt':rolled_at,'rollbackLatenessSeconds':rolled_at-promised})
         agent.terminate();agent.wait(timeout=8)
         return evidence

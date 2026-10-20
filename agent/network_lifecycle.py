@@ -19,6 +19,7 @@ class Lifecycle:
         self.errors = {}
         self.seen = {}
         self.thread = None
+        self.status_thread = None
         self.worker_fd = None
         self.observations = {}
         self.last_observation = float('-inf')
@@ -66,7 +67,13 @@ class Lifecycle:
             for field, kind in [('pendingBackup', dict), ('pendingRoutes', list), ('workloadApplied', list)]:
                 if doc.get(field) is not None and not isinstance(doc[field], kind):
                     raise ValueError('firewall recovery material invalid')
+            backup=doc.get('pendingBackup')
+            if backup is not None and (set(backup)!={'elements'} or backup['elements'] is not None and not isinstance(backup['elements'],list)):
+                raise ValueError('firewall backup shape invalid')
             if not os.path.exists(marker):atomic(marker,{'required':True})
+            defaults=getattr(self.agent,'_EMPTY_STATE',None)
+            if defaults is not None:
+                return {key:doc.get(key,value) for key,value in defaults.items()}
         elif os.path.exists(marker):
             raise ValueError('required firewall journal missing')
         return self.agent.load_state()
@@ -245,11 +252,18 @@ class Lifecycle:
         self.publish()
 
     def start(self):
+        def status_loop():
+            while not self.agent._stop.is_set():
+                self.write_status()
+                self.agent._stop.wait(1)
+        self.status_thread=threading.Thread(target=status_loop,name='agent-status',daemon=True)
+        self.status_thread.start()
+        if not self.executor or self.worker_fd is None:
+            return
         def loop():
             while not self.agent._stop.is_set():
                 try:
                     self.step()
-                    self.write_status()
                 except Exception:
                     self.error('network-worker', 'network-worker-step-failed')
                 self.agent._stop.wait(.25)
@@ -266,6 +280,7 @@ class Lifecycle:
         with self.status_lock:
             result = copy.deepcopy(self.snapshot)
             result['errors'] = dict(self.errors)
+            result['reportedAt'] = time.time()
         with self.gate:
             result['activeWriter'] = copy.deepcopy(self.active)
         try:
@@ -291,6 +306,8 @@ class Lifecycle:
         # Never overlap shutdown recovery with a still-running apply. Process death preserves debt.
         if self.thread:
             self.thread.join()
+        if self.status_thread:
+            self.status_thread.join(timeout=2)
         self.recover_firewall(settle=True)
         if self.executor and self.worker_fd is not None:
             try:

@@ -46,6 +46,7 @@ class Lifecycle(unittest.TestCase):
     def cleanup(self):
         self.agent._stop.set()
         if self.l.thread:self.l.thread.join(timeout=2)
+        if self.l.status_thread:self.l.status_thread.join(timeout=2)
         if self.l.worker_fd is not None:os.close(self.l.worker_fd);self.l.worker_fd=None
     def request(self,filename='request.json'):n.atomic(self.path+'/'+filename,{'fixture':True})
     def test_firewall_admission_precedes_any_network_write(self):
@@ -98,7 +99,7 @@ class Lifecycle(unittest.TestCase):
         self.assertFalse(self.l.begin_firewall())
         self.assertEqual(n.read_json(self.agent.STATE_FILE)['state'],'garbage')
     def test_unknown_state_and_corrupt_recovery_material_fail_closed(self):
-        for bad in [{'state':'garbage'},{'state':'confirmed'},{'state':'pending','generation':'g','pendingRoutes':'invalid'}]:
+        for bad in [{'state':'garbage'},{'state':'confirmed'},{'state':'pending','generation':'g','pendingRoutes':'invalid'},{'state':'pending','generation':'g','pendingBackup':{}},{'state':'pending','generation':'g','pendingBackup':{'elements':{}}}]:
             n.atomic(self.agent.STATE_FILE,bad)
             self.l.recover_firewall()
             self.assertFalse(self.l.begin_firewall())
@@ -133,6 +134,38 @@ class Lifecycle(unittest.TestCase):
                 self.assertLess(max(b-a for a,b in zip(stamps,stamps[1:])),.1)
                 self.assertFalse(self.l.begin_firewall())
         finally:release.set();timer.join()
+    def test_first_firewall_write_persists_required_marker_before_journal(self):
+        agent=n.crypto_helpers(self.path);agent.STATE_FILE=self.path+'/first-write.json'
+        agent._lifecycle=lifecycle.Lifecycle(agent)
+        replaced=[];original=os.replace
+        def replace(source,destination):
+            replaced.append(destination);return original(source,destination)
+        with patch.object(os,'replace',side_effect=replace):
+            self.assertTrue(agent.save_state(dict(agent._EMPTY_STATE)))
+        self.assertEqual(replaced,[agent.STATE_FILE+'.required',agent.STATE_FILE])
+        os.unlink(agent.STATE_FILE)
+        self.assertFalse(agent._lifecycle.begin_firewall())
+    def test_status_file_remains_live_during_a_blocked_writer(self):
+        entered=threading.Event();release=threading.Event()
+        def accept(_):
+            self.executor.current_transaction='status-fixture';self.l.network_event('created')
+            entered.set();release.wait(5);return 'awaiting-verification'
+        self.executor.accept.side_effect=accept;self.request();self.l.start()
+        self.assertTrue(entered.wait(1))
+        try:
+            self.l.heartbeat(True)
+            deadline=time.monotonic()+2
+            status={}
+            while time.monotonic()<deadline:
+                if not os.path.exists(self.path+'/lifecycle-status.json'):
+                    time.sleep(.02);continue
+                status=n.read_json(self.path+'/lifecycle-status.json')
+                if (status.get('activeWriter') or {}).get('transactionId')=='status-fixture' and status['heartbeat'].get('lastSuccess'):break
+                time.sleep(.02)
+            self.assertEqual(status['activeWriter']['transactionId'],'status-fixture')
+            self.assertGreater(status['reportedAt'],status['heartbeat']['lastSuccess'])
+            self.assertFalse(self.l.begin_firewall())
+        finally:release.set()
     def test_missing_outbox_does_not_suppress_tick_or_recovery(self):
         self.executor.publish_results=Mock(side_effect=OSError('disk'))
         self.l.step();self.executor.tick.assert_called()
