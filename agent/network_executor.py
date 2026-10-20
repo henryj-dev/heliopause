@@ -46,6 +46,11 @@ def safe_diagnostic(error):
     return str(error)[:160] if type(error) in {ValueError, RuntimeError} else type(error).__name__
 
 
+def owner_group(owner):
+    # IFLA_GROUP is installed by rtnl_create_link before registration (unlike IFLA_IFALIAS).
+    return 0x80000000 | (int.from_bytes(hashlib.sha256(owner.encode()).digest()[:4],'big') & 0x7fffffff)
+
+
 def integer(value, low, high):
     return type(value) is int and low <= value <= high
 
@@ -189,7 +194,7 @@ class LinuxWireGuard:
         return p.stdout.decode().strip()
 
     def ip(self, *args):
-        return json.loads(self.run(['ip', '-j'] + list(args)))
+        return json.loads(self.run(['ip', '-j'] + (['-N'] if 'link' in args else []) + list(args)))
 
     def snapshot(self):
         links = self.ip('-d', 'link', 'show')
@@ -197,7 +202,7 @@ class LinuxWireGuard:
         routes = self.ip('-4', 'route', 'show', 'table', 'all')
         rules = self.ip('-4', 'rule', 'show')
         # Exclude counters, lifetimes and link operational status; preserve configured identity.
-        return {'links': sorted([{'name': x['ifname'], 'index': x['ifindex'], 'mtu': x['mtu'], 'master': x.get('master'), 'alias': x.get('ifalias',x.get('alias')), 'kind': x.get('linkinfo', {}).get('info_kind')} for x in links], key=lambda x:x['name']),
+        return {'links': sorted([{'name': x['ifname'], 'index': x['ifindex'], 'mtu': x['mtu'], 'master': x.get('master'), 'alias': x.get('ifalias',x.get('alias')), 'kind': x.get('linkinfo', {}).get('info_kind'), 'group':x.get('group')} for x in links], key=lambda x:x['name']),
                 'addresses': sorted([{'name': x['ifname'], 'addresses': sorted([a['local']+'/'+str(a['prefixlen']) for a in x.get('addr_info', [])])} for x in addresses], key=lambda x:x['name']),
                 'routes': sorted([{k:v for k,v in r.items() if k not in {'expires', 'cache', 'flags'}} for r in routes], key=canonical), 'rules': rules,
                 'routes6':sorted([{k:v for k,v in r.items() if k not in {'expires','cache','flags'}} for r in self.ip('-6','route','show','table','all')],key=canonical),
@@ -261,7 +266,7 @@ class LinuxWireGuard:
             raise
 
     def create(self, op, owner):
-        self.run(['ip', 'link', 'add', 'name', op['interfaceName'], 'type', 'wireguard'])
+        self.run(['ip', 'link', 'add', 'name', op['interfaceName'], 'group', str(owner_group(owner)), 'mtu', str(op['mtu']), 'type', 'wireguard'])
         self.run(['ip', 'link', 'set', 'dev', op['interfaceName'], 'alias', owner])
 
     def configure(self, op):
@@ -288,13 +293,13 @@ class LinuxWireGuard:
         link = matches[0]
         alias=link.get('ifalias',link.get('alias'))
         transaction=owner.split(':')[1]
-        if op['interfaceName']!='hp'+transaction[:12] or alias not in {None,owner} or link.get('linkinfo', {}).get('info_kind') != 'wireguard':
+        if str(link.get('group'))!=str(owner_group(owner)) or op['interfaceName']!='hp'+transaction[:12] or alias not in {None,owner} or link.get('linkinfo', {}).get('info_kind') != 'wireguard':
             raise ValueError('interface ownership conflict')
         # A root writer replacing a configuration must not have its objects deleted by rollback.
         public = self.run(['wg', 'show', op['interfaceName'], 'public-key'])
         if public not in {'', '(none)', op['publicKey']}:
             raise ValueError('key ownership conflict')
-        if link['mtu'] not in {1420, op['mtu']} or self.run(['wg','show',op['interfaceName'],'listen-port']) not in {'0',str(op['listenPort'])}:
+        if link['mtu'] != op['mtu'] or self.run(['wg','show',op['interfaceName'],'listen-port']) not in {'0',str(op['listenPort'])}:
             raise ValueError('link configuration ownership conflict')
         endpoints=self.run(['wg','show',op['interfaceName'],'endpoints'])
         for line in endpoints.splitlines():
@@ -304,7 +309,7 @@ class LinuxWireGuard:
         if self.ip('-6','address','show','dev',op['interfaceName'])[0].get('addr_info') or self.ip('-6','route','show','table','all','dev',op['interfaceName']):
             raise ValueError('IPv6 ownership conflict')
         peers = self.run(['wg', 'show', op['interfaceName'], 'peers']).split()
-        if alias is None and (public not in {'','(none)'} or peers or self.run(['wg','show',op['interfaceName'],'listen-port'])!='0' or any(row.get('addr_info') for row in self.ip('address','show','dev',op['interfaceName']))):
+        if alias is None and ('UP' in link.get('flags',[]) or public not in {'','(none)'} or peers or self.run(['wg','show',op['interfaceName'],'listen-port'])!='0' or any(row.get('addr_info') for row in self.ip('address','show','dev',op['interfaceName']))):
             raise ValueError('untagged interface is not an empty interrupted create')
         if not set(peers).issubset({p['publicKey'] for p in op['peers']}):
             raise ValueError('peer ownership conflict')
@@ -320,6 +325,8 @@ class LinuxWireGuard:
         if any(line.split()[1]!='(none)' for line in self.run(['wg','show',op['interfaceName'],'preshared-keys']).splitlines()):
             raise ValueError('PSK ownership conflict')
         current = self.ip('-4', 'route', 'show', 'table', 'all')
+        if alias is None and any(r.get('dev')==op['interfaceName'] for r in current):
+            raise ValueError('untagged interrupted create has unexpected routes')
         for r in current:
             dst=r.get('dst')
             normalized=dst+'/32' if dst and '/' not in dst and dst!='default' else dst
@@ -336,7 +343,7 @@ class LinuxWireGuard:
     def fingerprint(self, op):
         dev=op['interfaceName']
         link=self.ip('-d','link','show','dev',dev)[0]
-        return {'index':link['ifindex'],'mtu':link['mtu'],'alias':link.get('ifalias',link.get('alias')),
+        return {'index':link['ifindex'],'mtu':link['mtu'],'alias':link.get('ifalias',link.get('alias')),'group':link.get('group'),
                 'addresses':sorted(a['local']+'/'+str(a['prefixlen']) for a in self.ip('address','show','dev',dev)[0].get('addr_info',[])),
                 'publicKey':self.run(['wg','show',dev,'public-key']),
                 'listenPort':self.run(['wg','show',dev,'listen-port']),

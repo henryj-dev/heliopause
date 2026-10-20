@@ -173,7 +173,7 @@ class Ownership(unittest.TestCase):
         self.op=authorization()['operation']
         self.owner='heliopause:'+('a'*32)+':owner'
         self.routes=[{'dst':'192.0.2.130','dev':'hpaaaaaaaaaaaa','protocol':'static','scope':'link','metric':42760}]
-        self.link={'ifindex':3,'ifname':'hpaaaaaaaaaaaa','mtu':1400,'ifalias':self.owner,'linkinfo':{'info_kind':'wireguard'}}
+        self.link={'ifindex':3,'ifname':'hpaaaaaaaaaaaa','mtu':1400,'ifalias':self.owner,'group':n.owner_group(self.owner),'linkinfo':{'info_kind':'wireguard'}}
         self.driver=n.LinuxWireGuard('/unused')
         self.psk='(none)'
         self.public=PUB;self.port='51820';self.peers=PEER
@@ -193,6 +193,9 @@ class Ownership(unittest.TestCase):
     def test_untagged_empty_interrupted_create_owned_by_transaction_name(self):
         self.link.pop('ifalias');self.public='(none)';self.port='0';self.peers='';self.addresses=[];self.routes=[]
         self.assertTrue(self.driver.owned(self.op,self.owner))
+    def test_foreign_same_name_default_group_is_preserved(self):
+        self.link['group']=0
+        with self.assertRaises(ValueError): self.driver.owned(self.op,self.owner)
     def test_untagged_nonempty_interface_is_preserved(self):
         self.link.pop('ifalias')
         with self.assertRaises(ValueError): self.driver.owned(self.op,self.owner)

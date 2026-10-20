@@ -163,8 +163,10 @@ def scenario(kind):
             code="import sys;sys.path.insert(0,'/source/agent');import network_executor as n;e=n.Executor(n.read_json(sys.argv[1]),sys.argv[2]);n.atomic=lambda *a:(_ for _ in ()).throw(OSError('disk full'));e.accept(n.read_json(sys.argv[2]+'/request.json'))"
             assert not run('python3','-c',code,path+'/config.json',path+'/state',ns='p6-gw',ok=False)
             assert not exists();return
-        fault={'fail-created':'fail-created','fail-routes':'fail-routes','crash-before-alias':'raw-create','crash-partial-routes':'first-route','crash-apply':'created','crash-rollback':'rolling-back','crash-after-remove':'removed'}.get(kind,'')
+        fault={'fail-created':'fail-created','fail-routes':'fail-routes','foreign-create':'foreign-create','crash-before-alias':'raw-create','crash-partial-routes':'first-route','crash-apply':'created','crash-rollback':'rolling-back','crash-after-remove':'removed'}.get(kind,'')
         p=start(path,fault,production=kind in {'normal','writer-conflict','graceful-stop'})
+        if kind=='foreign-create':
+            await_state(path,{'rollback-failed'});assert exists();stop(p);return
         if kind in {'fail-created','fail-routes'}:
             await_state(path,{'rolled-back'});assert not exists();stop(p);return
         if kind in {'crash-apply','crash-before-alias','crash-partial-routes'}:
@@ -248,7 +250,7 @@ def scenario(kind):
         await_state(path,{'rolled-back'},15);assert not exists();stop(p)
 
 
-cases=['normal','signature','target','expiry','hash','approval','registry-changed','local-changed','duplicate','prepare-failed','fail-created','fail-routes','management-failed','asymmetric','blackhole','absent-verifier','lost-confirm','forged-verifier','crash-apply','crash-before-alias','crash-partial-routes','crash-wait','crash-rollback','crash-after-remove','foreign-writer','rollback-command-failed','peer-route-loss','secret-redaction','disabled-recovery','writer-conflict','graceful-stop']
+cases=['normal','signature','target','expiry','hash','approval','registry-changed','local-changed','duplicate','prepare-failed','fail-created','fail-routes','management-failed','asymmetric','blackhole','absent-verifier','lost-confirm','forged-verifier','crash-apply','crash-before-alias','crash-partial-routes','crash-wait','crash-rollback','crash-after-remove','foreign-writer','rollback-command-failed','peer-route-loss','secret-redaction','disabled-recovery','writer-conflict','graceful-stop','foreign-create']
 for case in cases:
     started=time.monotonic()
     try:
@@ -262,5 +264,5 @@ for case in cases:
         for p,log in processes: stop(p);log.close()
         processes.clear()
         for ns in NAMES: run('ip','netns','del',ns,ok=False)
-assert len(results)==31
+assert len(results)==32
 print(json.dumps({'kind':'network-transaction-kernel-report','passed':len(results),'failed':0,'skipped':0,'hostRebootVerified':False,'backend':n.DRIVER,'scenarios':results}),flush=True)

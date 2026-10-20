@@ -21,9 +21,11 @@ def event(point):
 
 # Same process lock, recovery and loop as the production entry point, with an observer hook only.
 executor=n.Executor(config,state,event=event)
-if fault in {'first-route','raw-create'}:
+if fault in {'first-route','raw-create','foreign-create'}:
     original=executor.driver.run
     def first_route(args,*a,**kw):
+        if fault=='foreign-create' and args[:3]==['ip','link','add']:
+            original(['ip','link','add','name',args[4],'type','wireguard'])
         result=original(args,*a,**kw)
         if (fault=='first-route' and args[:3]==['ip','route','add']) or (fault=='raw-create' and args[:3]==['ip','link','add']):
             n.atomic(state+'/barrier.json',{'point':'first-route'})
