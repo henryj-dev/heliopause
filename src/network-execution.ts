@@ -1,7 +1,7 @@
 import type { NetworkObservationRecord } from './network-observation.ts';
 import type { NetworkChangeSet } from './network-change-set.ts';
 /** Single-host writer authorization. NetworkChangeSet remains review-only. */
-import { sign, createPublicKey, type KeyObject } from 'node:crypto';
+import { sign, verify, createPublicKey, type KeyObject } from 'node:crypto';
 import { artifactSigningKeyId } from './artifact-signature.ts';
 import { canonicalNetworkJson, networkDigest } from './network-canonical.ts';
 import { claimForPublish, settle, type ApprovalState } from './approval.ts';
@@ -59,4 +59,17 @@ export function authorizeNetworkExecution(store: NetworkRegistryStore, approvals
     settle(approvals,hash);
     return envelope;
   });
+}
+
+/** Explicit confirm issuance after the original approval was consumed, using an independent ring. */
+export function confirmNetworkExecution(authorization: NetworkSignedEnvelope, receipt: NetworkSignedEnvelope, verifierKeys: readonly KeyObject[], managerKey: KeyObject, now=Date.now()): NetworkSignedEnvelope {
+  const a=JSON.parse(Buffer.from(authorization.payload,'base64url').toString());
+  if(receipt.version!=='heliopause-ed25519-v1'||receipt.algorithm!=='Ed25519'||receipt.payload.length>180000||receipt.signature.length!==86) throw new Error('invalid verifier envelope');
+  const publicKey=verifierKeys.find(k=>artifactSigningKeyId(k)===receipt.keyId);
+  const bytes=Buffer.from(receipt.payload,'base64url');
+  if(!publicKey||!verify(null,Buffer.concat([frame(NETWORK_VERIFY_DOMAIN),frame(receipt.keyId),frame(bytes.toString())]),publicKey,Buffer.from(receipt.signature,'base64url'))) throw new Error('untrusted verifier signature');
+  const v=JSON.parse(bytes.toString());
+  const checks=['interface','address','route','handshake','fib','forward','reverse','management','protected'];
+  if(canonicalNetworkJson(v)!==bytes.toString()||v.transactionId!==a.transactionId||v.authorizationHash!==networkDigest(a)||v.artifactHash!==a.artifactHash||!Number.isSafeInteger(v.observedAt)||v.observedAt<a.issuedAt||v.observedAt>now||now-v.observedAt>10000||!Number.isSafeInteger(v.expiresAt)||v.expiresAt<=now||v.expiresAt>a.rollbackAt||now>=a.rollbackAt||!v.checks||Object.keys(v.checks).length!==checks.length||checks.some(c=>v.checks[c]!==true)||!/^[a-f0-9]{32}$/.test(v.nonce)) throw new Error('independent verification failed or expired');
+  return signNetworkMessage(NETWORK_CONFIRM_DOMAIN,{transactionId:a.transactionId,authorizationHash:networkDigest(a),artifactHash:a.artifactHash,expiresAt:Math.min(v.expiresAt,a.rollbackAt),verification:receipt},managerKey);
 }

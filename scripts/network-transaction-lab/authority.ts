@@ -1,12 +1,12 @@
 /** Lab authority uses the same Registry, review builder, approval state machine and issuer as Manager. */
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import { createPrivateKey, generateKeyPairSync, randomBytes } from 'node:crypto';
+import { createPrivateKey, createPublicKey, generateKeyPairSync, randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import { NetworkRegistryStore } from '../../src/network-registry.ts';
 import { buildNetworkChangeSet } from '../../src/network-change-set.ts';
 import { networkDigest } from '../../src/network-canonical.ts';
 import { emptyApprovals, propose, approve } from '../../src/approval.ts';
-import { authorizeNetworkExecution, networkExecutionHash, signNetworkMessage, NETWORK_CONFIRM_DOMAIN, NETWORK_VERIFY_DOMAIN, type NetworkExecutionDraft } from '../../src/network-execution.ts';
+import { authorizeNetworkExecution, confirmNetworkExecution, networkExecutionHash, signNetworkMessage, NETWORK_CONFIRM_DOMAIN, NETWORK_VERIFY_DOMAIN, type NetworkExecutionDraft } from '../../src/network-execution.ts';
 const [action,dir]=process.argv.slice(2) as [string,string];
 const read=(name:string)=>JSON.parse(readFileSync(join(dir,name),'utf8'));
 const save=(name:string,v:unknown)=>writeFileSync(join(dir,name),JSON.stringify(v),{mode:0o600});
@@ -42,7 +42,10 @@ if(action==='keys') {
   save('receipt.json',signNetworkMessage(NETWORK_VERIFY_DOMAIN,{transactionId:a.transactionId,authorizationHash:networkDigest(a),artifactHash:a.artifactHash,observedAt:now,expiresAt:Math.min(now+5000,a.rollbackAt-1),nonce:randomBytes(16).toString('hex'),checks:result},createPrivateKey(readFileSync(join(dir,'verifier.key')))));
 } else if(action==='confirm') {
   const envelope=read('authorization.json'),a=JSON.parse(Buffer.from(envelope.payload,'base64url').toString()),now=Date.now();
-  save('confirmation.json',signNetworkMessage(NETWORK_CONFIRM_DOMAIN,{transactionId:a.transactionId,authorizationHash:networkDigest(a),artifactHash:a.artifactHash,expiresAt:Math.min(now+5000,a.rollbackAt-1),verification:read('receipt.json')},createPrivateKey(readFileSync(join(dir,'manager.key')))));
+  save('confirmation.json',confirmNetworkExecution(envelope,read('receipt.json'),[createPublicKey(readFileSync(join(dir,'verifier/public.pem')))],createPrivateKey(readFileSync(join(dir,'manager.key'))),now));
+} else if(action==='unsafe-confirm') {
+  const envelope=read('authorization.json'),a=JSON.parse(Buffer.from(envelope.payload,'base64url').toString());
+  save('confirmation.json',signNetworkMessage(NETWORK_CONFIRM_DOMAIN,{transactionId:a.transactionId,authorizationHash:networkDigest(a),artifactHash:a.artifactHash,expiresAt:Math.min(Date.now()+5000,a.rollbackAt-1),verification:read('receipt.json')},createPrivateKey(readFileSync(join(dir,'manager.key')))));
 } else if(action==='tamper') {
   const env=read('authorization.json'),a=JSON.parse(Buffer.from(env.payload,'base64url').toString()),kind=process.argv[4];
   if(kind==='signature') env.signature='A'.repeat(86);

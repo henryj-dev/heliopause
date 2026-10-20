@@ -95,6 +95,14 @@ class Transactions(unittest.TestCase):
         self.a['localPrecondition']='e'*64;self.reapprove()
         with self.assertRaises(ValueError): self.e.accept(self.a)
         self.assertNotIn('create',self.driver.calls)
+    def test_expiry_during_preflight_changes_nothing(self):
+        clock=[time.time()]
+        def preflight(*args):
+            clock[0]=(self.a['expiresAt']+1)/1000
+            return {'before':True},{'management':True}
+        with patch.object(n.time,'time',side_effect=lambda:clock[0]),patch.object(self.driver,'preflight',side_effect=preflight):
+            with self.assertRaises(ValueError): self.e.accept(self.a)
+        self.assertNotIn('create',self.driver.calls)
     def test_duplicate_does_not_apply_twice(self):
         self.e.accept(self.a);self.e.accept(copy.deepcopy(self.a))
         self.assertEqual(self.driver.calls.count('create'),1)

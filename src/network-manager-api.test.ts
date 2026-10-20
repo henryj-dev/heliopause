@@ -149,3 +149,10 @@ test("real authenticated Agent upload reaches Manager cache and survives Manager
     if (!relayClosed) await new Promise<void>(resolve => relay.server.close(() => resolve()));
   }
 });
+
+test('execution endpoints normalize /api paths and default to disabled', async () => {
+  for (const action of ['propose','approve','authorize','confirm']) {
+    assert.equal((await call('/api/network/execution/'+action,'POST','writer',{})).status,503);
+    assert.equal((await call('/network/execution/'+action,'POST','writer',{})).status,503);
+  }
+});

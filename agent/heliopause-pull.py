@@ -5699,8 +5699,57 @@ def main():
     return 0
 
 
+def run_writer_mode():
+    """One process owns both writer lifecycles; mode switches settle previous rollback debt first."""
+    import fcntl
+    directory = os.path.dirname(STATE_FILE)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    lock_path = os.environ.get("HELIOPAUSE_WRITER_LOCK", os.path.join(directory, "writer.lock"))
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        log("another Agent writer owns this gateway")
+        return 2
+    network_mode = sys.argv[1:2] == ["--network-executor"]
+    try:
+        if network_mode:
+            # Existing helper graph is used only when an actual local firewall journal exists.
+            # Do not stop its service to acquire the lock; the other service remains responsible.
+            if os.path.exists(STATE_FILE):
+                from network_executor import read_json
+                read_json(STATE_FILE)  # unreadable/corrupt must not become an empty state
+                recover_commitment()
+                recover_workload_commitment()
+                reconcile_recovered_commitments()
+                st = load_state()
+                for generation in {st.get("generation"), st.get("workloadGeneration")} - {None}:
+                    if _has_live_commitment(load_state()):
+                        rollback_generation("settling before network writer mode", generation)
+                if _has_live_commitment(load_state()):
+                    raise RuntimeError("firewall rollback debt prevents network writer mode")
+            from network_executor import main as network_main
+            return network_main(sys.argv[2:])
+        network_dir = os.environ.get("HELIOPAUSE_NETWORK_EXECUTOR_STATE_DIR", "/var/lib/heliopause/network-executor")
+        if os.path.exists(os.path.join(network_dir, "transactions.json")):
+            from network_executor import Executor, read_json, TERMINAL
+            config_path = os.environ.get("HELIOPAUSE_NETWORK_EXECUTOR_CONFIG", "/etc/heliopause/network-executor.json")
+            executor = Executor(read_json(config_path), network_dir)
+            executor.recover()
+            if any(row["state"] not in TERMINAL for row in executor.load()["transactions"].values()):
+                raise RuntimeError("network rollback debt prevents firewall writer mode")
+        try:
+            return main()
+        finally:
+            # A graceful stop must not abandon its watchdog before a different mode can start.
+            st = load_state()
+            for generation in {st.get("generation"), st.get("workloadGeneration")} - {None}:
+                if _has_live_commitment(load_state()):
+                    rollback_generation("Agent writer stopping", generation)
+    finally:
+        os.close(fd)
+
+
 if __name__ == "__main__":
-    if sys.argv[1:2] == ["--network-executor"]:
-        from network_executor import main as network_main
-        sys.exit(network_main(sys.argv[2:]))
-    sys.exit(main())
+    sys.exit(run_writer_mode())

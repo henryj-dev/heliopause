@@ -1,5 +1,5 @@
 import { buildNetworkChangeSet } from './network-change-set.ts';
-import { authorizeNetworkExecution, networkExecutionHash, type NetworkExecutionDraft } from './network-execution.ts';
+import { authorizeNetworkExecution, confirmNetworkExecution, networkExecutionHash, type NetworkSignedEnvelope, type NetworkExecutionDraft } from './network-execution.ts';
 import { networkDigest } from './network-canonical.ts';
 // The manager's HTTP surface (H26): reads the whole site, and is the ordinary way a generation gets
 // published.
@@ -427,6 +427,7 @@ export interface ManagerOptions {
   /** Opt-in local desired inventory store; never a configuration writer. */
   networkRegistryFile?: string;
   /** Separate opt-in writer issuance; identities are deployment trust, never request claims. */
+  networkVerifierKeys?: readonly KeyObject[];
   networkExecutionTargets?: readonly { source: string; host: string; nodeId: string }[];
   /** Per-relay cached observations, separate from desired state. */
   networkObservationsDir?: string;
@@ -1580,6 +1581,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
   const approvals = emptyApprovals();
   const networkApprovals = emptyApprovals();
   const networkDrafts = new Map<string, NetworkExecutionDraft>();
+  const networkIssued = new Map<string, NetworkSignedEnvelope>();
   /** Plan hash → the bundle to push. Beside the plan, not inside it — see `POST /plan`. */
   const bundles = new Map<string, PlanBundle>();
   /** Plan hash → relay name. Stored at proposal so publishing cannot redirect the push. */
@@ -2335,7 +2337,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     // taken at login — see `Principal.canWrite` for why that is stated rather than hidden.
     const mayWrite = principal.canWrite;
     if (url.pathname.startsWith("/network/execution/")) {
-      if (!opts.networkExecutionTargets?.length || !opts.networkRegistryFile || !opts.artifactSigning || !opts.networkObservationsDir) return send(res, 503, { error: "network execution issuance disabled" });
+      if (!opts.networkExecutionTargets?.length || !opts.networkVerifierKeys?.length || !opts.networkRegistryFile || !opts.artifactSigning || !opts.networkObservationsDir) return send(res, 503, { error: "network execution issuance disabled" });
       if (req.method !== "POST") return send(res, 405, { error: "method not allowed" });
       if (!mayWrite) return refuseWrite(res, who, url.pathname, principal.via);
       if (crossSiteRequest(req)) return send(res, 403, { error: "cross-site execution refused" });
@@ -2353,7 +2355,15 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
           return send(res, 201, { hash, plan, draft });
         }
         if ((await requireOtp(principal, body, res, url.pathname)) === "answered") return;
-        const hash = String(body.hash ?? ""), draft = networkDrafts.get(hash);
+        const hash = String(body.hash ?? "");
+        if (action === "confirm") {
+          const issued = networkIssued.get(hash);
+          if (!issued) return send(res, 404, { error: "no issued execution; allow local rollback" });
+          const envelope = confirmNetworkExecution(issued, body.verification, opts.networkVerifierKeys, opts.artifactSigning.privateKey, now().getTime());
+          networkIssued.delete(hash);
+          return send(res, 200, { envelope });
+        }
+        const draft = networkDrafts.get(hash);
         if (!draft) return send(res, 404, { error: "re-propose network execution" });
         if (action === "approve") {
           const aka = alsoKnownAsFor(principal);
@@ -2368,6 +2378,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
           const observation = cache.get(draft.target.host, source.name);
           if (!observation || networkDigest(observation) !== draft.observation.digest || Date.parse(observation.report.completedAt) !== draft.observation.collectedAt || observationFreshness(observation, now().getTime(), draft.observation.maxAgeMs) !== "fresh") return send(res, 409, { error: "observation changed: replan" });
           const envelope = authorizeNetworkExecution(new NetworkRegistryStore(opts.networkRegistryFile), networkApprovals, draft, who, opts.artifactSigning.privateKey, { observation, review: buildNetworkChangeSet({ id: "execution-review", registry: new NetworkRegistryStore(opts.networkRegistryFile).read(), expectedRegistryRevision: draft.registryRevision, now: draft.observation.collectedAt, observations: [observation], bindings: [{ ...draft.target, siteId: new NetworkRegistryStore(opts.networkRegistryFile).read().resources.flatMap(r => r.id === draft.target.nodeId && r.kind === "node" ? [r.siteId] : [])[0] ?? "" }] }) }, now());
+          networkIssued.set(hash, envelope);
           networkDrafts.delete(hash);
           return send(res, 200, { envelope });
         }

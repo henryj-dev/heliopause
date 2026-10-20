@@ -114,13 +114,19 @@ def row(path):
 def state(path): return row(path).get('state')
 def exists(): return any(x['ifname']=='hp6test' for x in ip('p6-gw','link','show'))
 def await_state(path,wanted,seconds=7):
-    wait_for(lambda:state(path) in wanted,seconds)
+    try:
+        wait_for(lambda:state(path) in wanted,seconds)
+    except Exception:
+        print('Agent diagnostic: '+open(path+'/worker.log').read()[-4000:],flush=True)
+        print('Agent state: '+str(state(path)),flush=True)
+        if os.path.exists(path+'/state/response.json'): print(n.read_json(path+'/state/response.json'),flush=True)
+        raise
 
 
 def verify_and_confirm(path):
     run('python3','scripts/network-transaction-lab/verifier.py',path,ns='p6-verifier')
     checks=n.read_json(path+'/verification.json')
-    authority('confirm',path)
+    authority('confirm' if all(checks.values()) else 'unsafe-confirm',path)
     shutil.copyfile(path+'/confirmation.json',path+'/state/confirm.json')
     return checks
 
@@ -149,13 +155,17 @@ def scenario(kind):
             assert not run('python3','-c',code,path+'/config.json',path+'/state',ns='p6-gw',ok=False)
             assert not exists();return
         fault={'fail-created':'fail-created','fail-routes':'fail-routes','crash-apply':'created','crash-rollback':'rolling-back','crash-after-remove':'removed'}.get(kind,'')
-        p=start(path,fault,production=kind=='normal')
+        p=start(path,fault,production=kind in {'normal','writer-conflict'})
         if kind in {'fail-created','fail-routes'}:
             await_state(path,{'rolled-back'});assert not exists();stop(p);return
         if kind=='crash-apply':
             wait_for(lambda:os.path.exists(path+'/state/barrier.json'));assert exists();stop(p)
             p=start(path);await_state(path,{'rolled-back'});assert not exists();stop(p);return
         await_state(path,{'awaiting-verification'})
+        if kind=='writer-conflict':
+            second=start(path,production=True);second.wait(timeout=4)
+            assert second.returncode!=0 and p.poll() is None and exists()
+            stop(p);return
         if kind=='duplicate':
             index=ip('p6-gw','link','show','dev','hp6test')[0]['ifindex']
             code="import sys;sys.path.insert(0,'/source/agent');import network_executor as n;e=n.Executor(n.read_json(sys.argv[1]),sys.argv[2]);assert e.accept(n.read_json(sys.argv[2]+'/request.json'))=='awaiting-verification'"
@@ -202,7 +212,8 @@ def scenario(kind):
         if kind=='forged-verifier':
             run('python3','scripts/network-transaction-lab/verifier.py',path,ns='p6-verifier')
             r=n.read_json(path+'/receipt.json');r['signature']='A'*86;n.atomic(path+'/receipt.json',r)
-            authority('confirm',path);shutil.copyfile(path+'/confirmation.json',path+'/state/confirm.json')
+            assert not authority('confirm',path,ok=False)
+            authority('unsafe-confirm',path);shutil.copyfile(path+'/confirmation.json',path+'/state/confirm.json')
             wait_for(lambda:n.read_json(path+'/state/response.json')['state']=='rejected')
         if kind=='lost-confirm':
             run('python3','scripts/network-transaction-lab/verifier.py',path,ns='p6-verifier')
@@ -216,7 +227,7 @@ def scenario(kind):
         await_state(path,{'rolled-back'},15);assert not exists();stop(p)
 
 
-cases=['normal','signature','target','expiry','hash','approval','registry-changed','local-changed','duplicate','prepare-failed','fail-created','fail-routes','management-failed','asymmetric','blackhole','absent-verifier','lost-confirm','forged-verifier','crash-apply','crash-wait','crash-rollback','crash-after-remove','foreign-writer','rollback-command-failed','peer-route-loss','secret-redaction','disabled-recovery']
+cases=['normal','signature','target','expiry','hash','approval','registry-changed','local-changed','duplicate','prepare-failed','fail-created','fail-routes','management-failed','asymmetric','blackhole','absent-verifier','lost-confirm','forged-verifier','crash-apply','crash-wait','crash-rollback','crash-after-remove','foreign-writer','rollback-command-failed','peer-route-loss','secret-redaction','disabled-recovery','writer-conflict']
 for case in cases:
     started=time.monotonic()
     try:
@@ -230,5 +241,5 @@ for case in cases:
         for p,log in processes: stop(p);log.close()
         processes.clear()
         for ns in NAMES: run('ip','netns','del',ns,ok=False)
-assert len(results)==27
+assert len(results)==28
 print(json.dumps({'kind':'network-transaction-kernel-report','passed':len(results),'failed':0,'skipped':0,'hostRebootVerified':False,'backend':n.DRIVER,'scenarios':results}),flush=True)
