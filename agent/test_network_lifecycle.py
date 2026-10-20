@@ -112,6 +112,12 @@ class Lifecycle(unittest.TestCase):
     def test_confirm_is_separate_from_heartbeat(self):
         self.l.heartbeat(True);self.executor.confirm.assert_not_called()
         self.request('confirm.json');self.l.step();self.executor.confirm.assert_called_once()
+    def test_cancellation_works_while_firewall_busy_and_new_execution_disabled(self):
+        self.l.enabled=False;self.l.active={'kind':'firewall','transactionId':None}
+        self.executor.cancel=Mock(return_value='cancelled-before-accept')
+        self.request('cancel.json');self.l.step()
+        self.executor.cancel.assert_called_once();self.executor.accept.assert_not_called()
+        self.assertEqual(self.l.report()['activeWriter']['kind'],'firewall')
     def test_hung_network_action_does_not_block_production_firewall_rollback(self):
         entered=threading.Event();release=threading.Event();restores=[]
         def accept(_):entered.set();release.wait(2);return 'awaiting-verification'
@@ -176,7 +182,7 @@ class Lifecycle(unittest.TestCase):
         self.executor.data['transactions']={'tx':{'state':'confirmed','authorization':{'operation':{}},'owner':'fixture'}}
         self.executor.driver.owned.return_value=False;self.l.refresh()
         report=self.l.report()['network']
-        self.assertEqual(report['ledger'],{'used':1,'limit':1024,'remaining':1023})
+        self.assertEqual(report['ledger']['used'],1);self.assertEqual(report['ledger']['remaining'],1023);self.assertGreater(report['ledger']['bytes'],0);self.assertEqual(report['ledger']['byteLimit'],8*1024*1024);self.assertEqual(report['ledger']['admissionByteLimit'],6*1024*1024)
         self.assertEqual(report['confirmedKernel']['tx']['state'],'absent-or-drifted')
         self.assertEqual(report['transactions'][0]['state'],'confirmed')
     def test_rollback_failed_remains_active(self):

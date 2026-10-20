@@ -151,7 +151,7 @@ test("real authenticated Agent upload reaches Manager cache and survives Manager
 });
 
 test('execution endpoints normalize /api paths and default to disabled', async () => {
-  for (const action of ['propose','approve','authorize','confirm']) {
+  for (const action of ['propose','approve','authorize','confirm','cancel']) {
     assert.equal((await call('/api/network/execution/'+action,'POST','writer',{})).status,503);
     assert.equal((await call('/network/execution/'+action,'POST','writer',{})).status,503);
   }
@@ -201,7 +201,7 @@ test('mTLS network execution goes through distinct approval, fenced authorizatio
     assert.equal(retried.status,200);assert.deepEqual(retried.body.envelope,issued.body.envelope);
     const status=(await call('/api/network/execution/status')).body;
     assert.equal(status.records[0].state,'issued');
-    assert.deepEqual(status.capacity,{used:1,limit:256,remaining:255});
+    assert.equal(status.capacity.used,1);assert.equal(status.capacity.limit,256);assert.equal(status.capacity.remaining,255);assert.ok(status.capacity.bytes>0);assert.equal(status.capacity.byteLimit,4*1024*1024);assert.equal(status.capacity.issuanceByteLimit,3*1024*1024);
     assert.equal(status.fenceReason,'authenticated terminal settlement required');
     const a=JSON.parse(Buffer.from(issued.body.envelope.payload,'base64url').toString());
     const checks=Object.fromEntries(['interface','address','route','handshake','fib','forward','reverse','management','protected'].map(k=>[k,true]));
@@ -242,6 +242,28 @@ test('mTLS network execution goes through distinct approval, fenced authorizatio
     const settled=await call('/api/network/execution/status');
     assert.equal(settled.body.fence,null);assert.equal(settled.body.records[0].state,'settled');
     assert.doesNotThrow(()=>new NetworkRegistryStore(registryFile).mutate(1,'fixture',{action:'update',id:'s0',resource:{...registry.resources.find(r=>r.id==='s0'),owner:'next'}}));
+    // Cancellation remains available without observation/verifier issuance, with the same RBAC/CSRF.
+    const store=new NetworkRegistryStore(registryFile),next={...a,registryRevision:2,transactionId:'d'.repeat(32)};
+    store.fenceExecution(2,next.transactionId,()=>signNetworkMessage('heliopause-network-execution-v2',next,managerKey.privateKey),'writer');
+    await new Promise<void>(resolve=>manager.server.close(()=>resolve()));
+    manager=await startManager({...options,writerCNs:['writer'],networkVerifierKeys:undefined,networkObservationsDir:undefined});port=(manager.server.address() as {port:number}).port;
+    const cancelBody={transactionId:next.transactionId,authorizationHash:networkDigest(next)};
+    assert.equal((await call('/api/network/execution/cancel','POST','reader',cancelBody)).status,403);
+    assert.equal((await call('/api/network/execution/cancel','POST','writer',cancelBody,{origin:'https://untrusted.example.invalid'})).status,403);
+    assert.equal((await call('/api/network/execution/cancel','POST','writer',{...cancelBody,authorizationHash:'0'.repeat(64)})).status,404);
+    const cancellation=await call('/api/network/execution/cancel','POST','writer',cancelBody);assert.equal(cancellation.status,200,JSON.stringify(cancellation.body));
+    const cancelPayload=JSON.parse(Buffer.from(cancellation.body.envelope.payload,'base64url').toString());
+    assert.equal(cancelPayload.requestedBy,'writer');assert.equal((await call('/api/network/execution/status')).body.records[1].cancelStatus,'requested');
+    await new Promise<void>(resolve=>manager.server.close(()=>resolve()));
+    manager=await startManager({...options,writerCNs:['writer'],networkVerifierKeys:undefined,networkObservationsDir:undefined});port=(manager.server.address() as {port:number}).port;
+    assert.deepEqual((await call('/api/network/execution/cancel','POST','writer',cancelBody)).body.envelope,cancellation.body.envelope);
+    const cancelled:any={schemaVersion:2,domain:'heliopause-network-cancellation-mtls-v1',transactionId:next.transactionId,fenceId:next.transactionId,target,journalId:next.journalId,authorizationHash:networkDigest(next),artifactHash:next.artifactHash,registryRevision:2,state:'cancelled-before-accept',sequence:2,proof:{cancellationHash:networkDigest(cancelPayload),acceptancePrevented:true}};
+    cancelled.stateHash=networkDigest(cancelled);
+    assert.equal((await call('/api/network/execution/terminal','POST','writer',cancelled)).status,403);
+    assert.equal((await call('/api/network/execution/terminal','POST','gateway',cancelled)).status,200);
+    assert.equal((await call('/api/network/execution/terminal','POST','gateway',cancelled)).body.duplicate,true);
+    assert.equal((await call('/api/network/execution/status')).body.fence,null);
+
 
   } finally {port=previousPort;await new Promise<void>(resolve=>manager.server.close(()=>resolve()));}
 });

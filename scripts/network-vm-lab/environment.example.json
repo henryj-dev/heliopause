@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "status": "blocked-no-disposable-vm",
+  "osFamily": "Rocky Linux 10",
+  "osVersion": null,
+  "architecture": null,
+  "networkManagerActive": null,
+  "networkManagerVersion": null,
+  "image": {"url": null, "sha256": null, "checksumSignatureVerified": false},
+  "hypervisor": {"name": null, "version": null},
+  "roles": ["gateway", "fixed-peer", "verifier", "client", "workload"],
+  "isolatedNetworks": [
+    {"name": "hp9-management", "endpoints": ["gateway", "verifier"], "forwarding": false},
+    {"name": "hp9-underlay", "endpoints": ["gateway", "fixed-peer"], "forwarding": false},
+    {"name": "hp9-client", "endpoints": ["gateway", "client"], "forwarding": false},
+    {"name": "hp9-workload", "endpoints": ["fixed-peer", "workload"], "forwarding": false}
+  ],
+  "operationalCredentialsMounted": false,
+  "hostRebootVerified": false,
+  "bootReports": []
+}

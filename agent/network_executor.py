@@ -23,10 +23,12 @@ import time
 
 EXECUTION = 'heliopause-network-execution-v2'
 TERMINAL_DOMAIN = 'heliopause-network-terminal-mtls-v1'
+CANCEL = 'heliopause-network-cancel-v1'
+CANCELLATION_RESULT_DOMAIN = 'heliopause-network-cancellation-mtls-v1'
 CONFIRM = 'heliopause-network-confirm-v1'
 VERIFY = 'heliopause-network-verification-v1'
 DRIVER = 'linux-wireguard-v1'
-TERMINAL = {'confirmed', 'rolled-back'}
+TERMINAL = {'confirmed', 'rolled-back', 'cancelled-before-accept'}
 CHECKS = ['interface', 'address', 'route', 'handshake', 'fib', 'forward', 'reverse', 'management', 'protected']
 
 
@@ -515,6 +517,19 @@ class Executor:
                 result=row.get('terminalResult',{});committed={k:v for k,v in result.items() if k!='stateHash'}
                 if result.get('state')!=row['state'] or result.get('authorizationHash')!=digest(row['authorization']) or result.get('stateHash')!=digest(committed):raise ValueError('invalid terminal journal commitment')
                 terminal.append(result.get('sequence'))
+                if row['state']=='cancelled-before-accept':
+                    self.cancellation_binding(row.get('cancellation'),row['authorization'])
+                    if any(k in row for k in ('before','paths','owner','acceptedAt','mono')) or result.get('schemaVersion')!=2 or result.get('domain')!=CANCELLATION_RESULT_DOMAIN or result.get('proof')!={'cancellationHash':digest(row.get('cancellation')),'acceptancePrevented':True}:
+                        raise ValueError('invalid never-accepted cancellation commitment')
+                    self.cancellation_result_binding(result,row['authorization'])
+            if ('cancelRequested' in row)!=('cancellationResponse' in row):raise ValueError('orphan accepted cancellation commitment')
+            if row.get('cancelRequested') is not None:
+                response=row.get('cancellationResponse',{})
+                self.cancellation_result_binding(response,row['authorization'])
+                if row['cancelRequested'] is not True or response.get('state')!='cancellation-rejected' or response.get('authorizationHash')!=digest(row['authorization']) or response.get('stateHash')!=digest({k:v for k,v in response.items() if k!='stateHash'}):
+                    raise ValueError('invalid accepted cancellation commitment')
+                exact(response['proof'],'cancellationHash acceptedState')
+                if not re.fullmatch(r'[a-f0-9]{64}',str(response['proof']['cancellationHash'])) or response['proof']['acceptedState'] not in {'prepared','applying','awaiting-verification','awaiting-confirm','rolling-back','rollback-failed'}:raise ValueError('invalid accepted cancellation evidence')
         if sorted(terminal)!=list(range(1,data['terminalSequence']+1)):
             raise ValueError('terminal replay sequence missing')
         return data
@@ -530,8 +545,9 @@ class Executor:
         if row and state in TERMINAL and data['schemaVersion']==2:
             data['terminalSequence']+=1
             a=row['authorization']
-            proof={'confirmationHash':digest(row['confirmation']),'verificationHash':digest(row['verification'])} if state=='confirmed' else {'removalVerified':True}
+            proof={'confirmationHash':digest(row['confirmation']),'verificationHash':digest(row['verification'])} if state=='confirmed' else {'cancellationHash':digest(row['cancellation']),'acceptancePrevented':True} if state=='cancelled-before-accept' else {'removalVerified':True}
             result={'schemaVersion':1,'domain':TERMINAL_DOMAIN,'transactionId':a['transactionId'],'fenceId':a['transactionId'],'target':a['target'],'journalId':data['journalId'],'authorizationHash':digest(a),'artifactHash':a['artifactHash'],'registryRevision':a['registryRevision'],'state':state,'sequence':data['terminalSequence'],'proof':proof}
+            if state=='cancelled-before-accept':result.update(schemaVersion=2,domain=CANCELLATION_RESULT_DOMAIN)
             row['terminalResult']={**result,'stateHash':digest(result)}
         if row and state in TERMINAL:
             row['authorizationHash']=digest(row['authorization'])
@@ -614,6 +630,7 @@ class Executor:
             if prior:
                 if digest(prior['authorization'])!=digest(a):
                     raise ValueError('transaction identity reused with different content')
+                if prior['state']=='cancelled-before-accept':raise ValueError('authority permanently cancelled before acceptance')
                 return prior['state']
             if now<data['lastClock']:
                 raise ValueError('clock moved behind durable replay watermark')
@@ -666,6 +683,54 @@ class Executor:
                 self.rollback(data,row)
             return row['state']
 
+    def cancellation_binding(self,c,a):
+        exact(c,'schemaVersion transactionId fenceId target journalId authorizationHash artifactHash registryRevision requestedAt requestedBy authorization')
+        if c['schemaVersion']!=1 or a['schemaVersion']!=2 or c['target']!=self.config['identity'] or c['journalId']!=self.config.get('journalId') or not re.fullmatch(r'[a-f0-9]{32}',str(c['transactionId'])) or not integer(c['requestedAt'],1,2**53-1) or not name(c['requestedBy']):
+            raise ValueError('cancellation identity/schema mismatch')
+        for k in ('transactionId','target','journalId','artifactHash','registryRevision'):
+            if c[k]!=a[k]:raise ValueError('cancellation authorization binding mismatch')
+        if c['fenceId']!=a['transactionId'] or c['authorizationHash']!=digest(a) or digest(a['operation'])!=a['artifactHash']:
+            raise ValueError('cancellation commitment mismatch')
+
+    def cancellation_result_binding(self,result,a):
+        exact(result,'schemaVersion domain transactionId fenceId target journalId authorizationHash artifactHash registryRevision state sequence stateHash proof')
+        if result['schemaVersion']!=2 or result['domain']!=CANCELLATION_RESULT_DOMAIN or result['authorizationHash']!=digest(a) or result['fenceId']!=a['transactionId'] or not integer(result['sequence'],1,1024):raise ValueError('invalid cancellation result')
+        for k in ('transactionId','target','journalId','artifactHash','registryRevision'):
+            if result[k]!=a[k]:raise ValueError('cancellation result binding mismatch')
+
+    def cancel(self,envelope):
+        # Ledger-only: safe while firewall is busy or new network execution is disabled.
+        # Accepted work is marked for the existing tick/ownership-checked undo, never relabelled.
+        with self.locked():
+            c=verify(envelope,CANCEL,self.config['managerKeys'],self.provider)
+            exact(c,'schemaVersion transactionId fenceId target journalId authorizationHash artifactHash registryRevision requestedAt requestedBy authorization')
+            a=verify(c['authorization'],EXECUTION,self.config['managerKeys'],self.provider)
+            exact(a,'schemaVersion journalId transactionId target registryRevision resources desiredDigest reviewHash artifactHash observation localPrecondition operation issuedAt expiresAt rollbackAt approval')
+            self.cancellation_binding(c,a)
+            data=self.load()
+            if data['schemaVersion']!=2 or data['journalId']!=c['journalId']:raise ValueError('cancellation journal binding mismatch')
+            row=data['transactions'].get(c['transactionId'])
+            if row:
+                if digest(row['authorization'])!=c['authorizationHash']:raise ValueError('transaction identity reused')
+                if row['state'] in TERMINAL:
+                    if row['state']=='cancelled-before-accept' and digest(row['cancellation'])!=digest(c):raise ValueError('conflicting cancellation')
+                    return row['state']
+                if row.get('cancellationResponse'):
+                    if row['cancellationResponse']['proof']['cancellationHash']!=digest(c):raise ValueError('conflicting accepted cancellation')
+                    return 'cancellation-rejected'
+                response={'schemaVersion':2,'domain':CANCELLATION_RESULT_DOMAIN,'transactionId':a['transactionId'],'fenceId':c['fenceId'],'target':a['target'],'journalId':data['journalId'],'authorizationHash':digest(a),'artifactHash':a['artifactHash'],'registryRevision':a['registryRevision'],'state':'cancellation-rejected','sequence':list(data['transactions']).index(a['transactionId'])+1,'proof':{'cancellationHash':digest(c),'acceptedState':row['state']}}
+                row['cancelRequested']=True;row['cancellationResponse']={**response,'stateHash':digest(response)}
+                self.save(data)
+                return 'cancellation-rejected'
+            if len(data['transactions'])>=1024 or len(canonical(data).encode())>6*1024*1024:raise ValueError('cancellation replay ledger capacity reached')
+            row={'authorization':a,'cancellation':c,'state':'cancelled-before-accept','history':[]}
+            data['transactions'][a['transactionId']]=row
+            data['acceptedSequence']+=1  # Historical name: counts reserved replay identities, not proof of apply.
+            if len(canonical(data).encode())>6*1024*1024:raise ValueError('prospective cancellation exceeds reserved journal capacity')
+            self.event('before-cancel-save')
+            self.save(data,row,'cancelled-before-accept')
+            return row['state']
+
     def confirm(self,envelope):
         with self.locked():
             data=self.load()
@@ -677,6 +742,7 @@ class Executor:
                 return 'confirmed'
             if not row or row['state'] not in {'awaiting-verification','awaiting-confirm'}:
                 raise ValueError('no confirmable transaction')
+            if row.get('cancelRequested'):raise ValueError('cancellation requested; local rollback required')
             a=row['authorization']
             now=int(time.time()*1000)
             if now<a['issuedAt'] or now>=min(c['expiresAt'],a['rollbackAt']) or c['authorizationHash']!=digest(a) or c['artifactHash']!=a['artifactHash']:
@@ -707,7 +773,7 @@ class Executor:
             fd=os.open(self.directory,os.O_RDONLY|os.O_DIRECTORY)
             try:os.fsync(fd)
             finally:os.close(fd)
-            return [row['terminalResult'] for row in data['transactions'].values() if row['state'] in TERMINAL]
+            return [row['terminalResult'] if row['state'] in TERMINAL else row['cancellationResponse'] for row in data['transactions'].values() if row['state'] in TERMINAL or row.get('cancellationResponse')]
 
     def publish_results(self):
         # Protected local outbox only. A separate read-only courier owns all network I/O.
@@ -722,7 +788,7 @@ class Executor:
                     continue
                 a=row['authorization']
                 elapsed=time.monotonic()-row['mono']
-                if row['state']=='rollback-failed' or now<data['lastClock'] or now>=a['rollbackAt'] or elapsed*1000>=a['rollbackAt']-row['acceptedAt']:
+                if row.get('cancelRequested') or row['state']=='rollback-failed' or now<data['lastClock'] or now>=a['rollbackAt'] or elapsed*1000>=a['rollbackAt']-row['acceptedAt']:
                     self.rollback(data,row)
             data['lastClock']=max(now,data['lastClock'])
             self.save(data)

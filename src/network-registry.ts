@@ -1,6 +1,6 @@
 /** Persistent desired inventory only. Nothing in this store authorizes a network apply. */
 import { createHash } from "node:crypto";
-import { mkdirSync, existsSync, openSync, closeSync, fsyncSync, constants } from "node:fs";
+import { mkdirSync, existsSync, openSync, closeSync, fsyncSync, fstatSync, constants } from "node:fs";
 import { dirname } from "node:path";
 import { withNetworkRegistryLock } from './network-registry-lock.ts';
 import { NETWORK_EXECUTION_CAPACITY, validateExecutionState, type NetworkExecutionState, type NetworkExecutionRecord } from './network-execution-state.ts';
@@ -11,7 +11,8 @@ import { validateNetworkInventory, type NetworkInventoryIssue, type NetworkInven
 
 export const MAX_NETWORK_REGISTRY_RESOURCES = 512;
 export const MAX_NETWORK_REGISTRY_INPUT_BYTES = 512 * 1024;
-const MAX_DOCUMENT_BYTES = 4 * 1024 * 1024;
+export const MAX_NETWORK_REGISTRY_BYTES = 4 * 1024 * 1024;
+const MAX_DOCUMENT_BYTES = MAX_NETWORK_REGISTRY_BYTES;
 const HISTORY_LIMIT = 256;
 export interface NetworkRegistryRevision {
   revision: number;
@@ -140,15 +141,20 @@ export class NetworkRegistryStore {
   }
 
   executionStatus(): NetworkExecutionState {
+    return this.executionSnapshot().execution;
+  }
+
+  executionSnapshot():{execution:NetworkExecutionState;storage:{bytes:number;byteLimit:number;issuanceByteLimit:number;remainingBytes:number}} {
     return withNetworkRegistryLock(this.path,fail,()=>{
       const state=this.requireExecution(this.read());
       // Reconcile an earlier rename followed by an uncertain directory-fsync error before any
       // cached authorization can leave this process (including an operator status response).
       const fd=openSync(this.path,constants.O_RDONLY|constants.O_NOFOLLOW);
-      try {fsyncSync(fd);} finally {closeSync(fd);}
+      let bytes:number;
+      try {fsyncSync(fd);bytes=fstatSync(fd).size;} finally {closeSync(fd);}
       const dir=openSync(dirname(this.path),'r');
       try {fsyncSync(dir);} finally {closeSync(dir);}
-      return state;
+      return {execution:state,storage:{bytes,byteLimit:MAX_DOCUMENT_BYTES,issuanceByteLimit:3*1024*1024,remainingBytes:MAX_DOCUMENT_BYTES-bytes}};
     });
   }
 
@@ -177,8 +183,12 @@ export class NetworkRegistryStore {
       if(state.records.length>=NETWORK_EXECUTION_CAPACITY||state.records.some(r=>r.transactionId===transactionId)) throw fail('execution replay/capacity refusal',409);
       if(doc.revision!==revision) throw fail('registry revision conflict',409);
       const envelope=issue(doc),a=JSON.parse(Buffer.from(envelope.payload,'base64url').toString());
+      // Reserve bounded room for cancellation (which embeds the original envelope), result and
+      // audit updates. Existing legacy oversized records fail closed; nothing is pruned.
+      if(Buffer.from(envelope.payload,'base64url').length>64*1024) throw fail('execution authority payload capacity exceeded',413);
       const record:NetworkExecutionRecord={sequence:state.nextSequence++,transactionId,fenceId:transactionId,planHash:a.approval.planHash,authorization:envelope,authorizationHash:digest(a),target:a.target,journalId:a.journalId,registryRevision:revision,artifactHash:a.artifactHash,issuedAt:a.issuedAt,issuedBy:by,state:'issued',audit:[{action:'issued',actor:by,at:Date.now()}]};
       state.records.push(record);state.fence={transactionId,fenceId:transactionId,authorizationHash:record.authorizationHash,registryRevision:revision};
+      if(Buffer.byteLength(JSON.stringify(doc))>3*1024*1024) throw fail('execution storage recovery reserve required',413);
       this.writeExecution(doc);
       return envelope;
     });

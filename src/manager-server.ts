@@ -1,4 +1,5 @@
 import { NETWORK_EXECUTION_CAPACITY } from './network-execution-state.ts';
+import { issueDurableNetworkCancellation } from './network-execution-cancellation.ts';
 import { issueDurableNetworkConfirm, settleNetworkExecution } from './network-execution-settlement.ts';
 import { buildNetworkChangeSet } from './network-change-set.ts';
 import { authorizeNetworkExecution, validateNetworkExecutionDraft, networkExecutionHash, type NetworkSignedEnvelope, type NetworkExecutionDraft } from './network-execution.ts';
@@ -324,7 +325,7 @@ export const API_ROUTES: ReadonlySet<string> = new Set([
  * fleet agent fetches its own certificate from there, through a name in stardust's SNI allowlist.
  */
 export const API_ROUTE_PATTERNS: readonly RegExp[] = [
-  /^\/network\/execution\/(?:propose|approve|authorize|confirm|review|status)$/,
+  /^\/network\/execution\/(?:propose|approve|authorize|confirm|cancel|review|status)$/,
   /^\/network\/inventory\/[^/]+$/,
   /^\/network\/observations\/[^/]+\/[^/]+$/,
   /^\/plans\/[^/]+\/changes$/,
@@ -2369,12 +2370,27 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     // One boolean, one place. Certificates read the live allowlist; sessions carry the decision
     // taken at login — see `Principal.canWrite` for why that is stated rather than hidden.
     const mayWrite = principal.canWrite;
-    const networkExecutionMatch = /^\/network\/execution\/(propose|approve|authorize|confirm|review|status)$/.exec(url.pathname);
+    const networkExecutionMatch = /^\/network\/execution\/(propose|approve|authorize|confirm|cancel|review|status)$/.exec(url.pathname);
     if (networkExecutionMatch) {
       if(req.method==="GET"&&networkExecutionMatch[1]==="status") {
         if(!opts.networkRegistryFile) return send(res,503,{error:"execution ledger unavailable"});
-        try {const status=new NetworkRegistryStore(opts.networkRegistryFile).executionStatus();return send(res,200,{...status,capacity:{used:status.records.length,limit:NETWORK_EXECUTION_CAPACITY,remaining:NETWORK_EXECUTION_CAPACITY-status.records.length},fenceReason:status.fence?'authenticated terminal settlement required':null});}
+        try {const snapshot=new NetworkRegistryStore(opts.networkRegistryFile).executionSnapshot(),status=snapshot.execution;
+          const current=status.records.find(r=>r.transactionId===status.fence?.transactionId);
+          const fenceReason=!status.fence?null:current?.cancelStatus==='accepted-recovery-required'?'accepted execution requires verified rollback':current?.cancelStatus==='requested'?'Agent cancellation acknowledgment required':'authenticated terminal settlement required';
+          return send(res,200,{...status,capacity:{used:status.records.length,limit:NETWORK_EXECUTION_CAPACITY,remaining:NETWORK_EXECUTION_CAPACITY-status.records.length,...snapshot.storage},fenceReason});}
         catch {return send(res,409,{error:"execution ledger unavailable or legacy reconciliation required"});}
+      }
+      if(networkExecutionMatch[1]==="cancel") {
+        if(req.method!=="POST") return send(res,405,{error:"method not allowed"});
+        if(!mayWrite) return refuseWrite(res,who,url.pathname,principal.via);
+        if(crossSiteRequest(req)) return send(res,403,{error:"cross-site execution refused"});
+        if(!opts.networkRegistryFile||!opts.artifactSigning) return send(res,503,{error:"cancellation signing unavailable"});
+        try {
+          const body=JSON.parse((await readNetworkRegistryBody(req)).toString("utf8"));
+          if((await requireOtp(principal,body,res,url.pathname))==="answered") return;
+          const envelope=issueDurableNetworkCancellation(new NetworkRegistryStore(opts.networkRegistryFile),body.transactionId,body.authorizationHash,opts.artifactSigning.privateKey,who,now().getTime());
+          return send(res,200,{envelope});
+        } catch(e) {return send(res,e instanceof NetworkRegistryError?e.statusCode:400,{error:"exact execution cancellation refused"});}
       }
       if (!opts.networkExecutionTargets?.length || !opts.networkVerifierKeys?.length || !opts.networkRegistryFile || !opts.artifactSigning || !opts.networkObservationsDir) return send(res, 503, { error: "network execution issuance disabled" });
       if (req.method === "GET" && networkExecutionMatch[1] === "review") {

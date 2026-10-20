@@ -162,7 +162,7 @@ test('post-rename directory fsync failure cannot expose a cached authority until
   }finally{rmSync(f.dir,{recursive:true,force:true});}
 });
 
-test('full Manager ledger still settles its active fence and refuses a new issue before signing',()=>{
+test('full Manager ledger still cancels and settles its active fence and refuses new issuance',()=>{
   const f=issued();try {
     const terminal=f.result();
     f.store.executionTransaction(state=>{
@@ -178,10 +178,114 @@ test('full Manager ledger still settles its active fence and refuses a new issue
       state.records=[...archived,{...active,sequence:256}];state.nextSequence=257;
     });
     assert.equal(f.store.executionStatus().records.length,256);
-    assert.equal(settleNetworkExecution(f.store,terminal,f.agent,'agent').settled,true);
+    assert.equal(settleNetworkExecution(f.store,cancelled(f),f.agent,'agent').settled,true);
     assert.equal(f.store.executionStatus().fence,null);
     let signed=false;
     assert.throws(()=>f.store.fenceExecution(1,'f'.repeat(32),()=>{signed=true;throw new Error('must not sign');},'alice'),/capacity/);
     assert.equal(signed,false);assert.equal(f.store.executionStatus().records.length,256);
   } finally {f.cleanup();}
+});
+
+// Pre-accept cancellation shares the production Registry transaction and direct-mTLS verifier.
+import { issueDurableNetworkCancellation, cancellationHash } from './network-execution-cancellation.ts';
+import { NETWORK_CANCELLATION_RESULT_DOMAIN } from './network-execution-state.ts';
+function cancelled(f:ReturnType<typeof issued>,state:'cancelled-before-accept'|'cancellation-rejected'='cancelled-before-accept'):NetworkTerminalResult {
+  const envelope=issueDurableNetworkCancellation(f.store,f.a.transactionId,networkDigest(f.a),f.key.privateKey,'alice');
+  const body:NetworkTerminalResult={...f.result(),schemaVersion:2,domain:NETWORK_CANCELLATION_RESULT_DOMAIN,state,proof:state==='cancelled-before-accept'?{cancellationHash:cancellationHash(envelope),acceptancePrevented:true as const}:{cancellationHash:cancellationHash(envelope),acceptedState:'awaiting-verification'}};
+  const {stateHash,...committed}=body;return {...committed,stateHash:networkDigest(committed)};
+}
+test('preaccept cancellation is durable, distinct and idempotently settles after original expiry',()=>{
+  const f=issued();try {
+    const r=cancelled(f),envelope=f.store.executionStatus().records[0]!.cancellation!;
+    const recovered=new NetworkRegistryStore(f.store.path);
+    assert.deepEqual(issueDurableNetworkCancellation(recovered,f.a.transactionId,networkDigest(f.a),f.key.privateKey,'bob',f.a.rollbackAt+9999),envelope);
+    assert.equal(recovered.executionStatus().records[0]!.cancelStatus,'requested');assert.ok(recovered.executionStatus().fence);
+    assert.equal(settleNetworkExecution(recovered,r,f.agent,'gateway',f.a.rollbackAt+9999).settled,true);
+    assert.equal(settleNetworkExecution(recovered,r,f.agent,'gateway').duplicate,true);
+    assert.equal(recovered.executionStatus().records[0]!.cancelStatus,'settled');assert.equal(recovered.executionStatus().fence,null);
+    assert.equal(recovered.mutate(1,'alice',{action:'update',id:'s0',resource:{...f.registry.resources.find(r=>r.id==='s0'),owner:'next'}}).revision,2);
+  }finally{f.cleanup();}
+});
+for(const field of ['transactionId','authorizationHash','artifactHash','journalId','target','fenceId','registryRevision','schemaVersion','domain','proof'] as const)test(`cancelled result tampered ${field} preserves fence`,()=>{
+  const f=issued();try {
+    const r:any=cancelled(f);r[field]=field==='target'?{...r.target,host:'wrong'}:field==='proof'?{cancellationHash:'0'.repeat(64),acceptancePrevented:true}:typeof r[field]==='number'?r[field]+1:'wrong';
+    const {stateHash,...body}=r;r.stateHash=networkDigest(body);
+    assert.throws(()=>settleNetworkExecution(f.store,r,f.agent,'gateway'));
+    assert.ok(f.store.executionStatus().fence);
+  }finally{f.cleanup();}
+});
+test('accepted cancellation receipt is diagnostic, blocks confirm and never releases fence',()=>{
+  const f=issued();try {
+    const c=f.confirm();const r=cancelled(f,'cancellation-rejected');
+    assert.deepEqual(settleNetworkExecution(f.store,r,f.agent,'gateway'),{settled:false,recorded:true,duplicate:false});
+    const count=f.store.executionStatus().records[0]!.audit.length;
+    assert.equal(settleNetworkExecution(f.store,r,f.agent,'gateway').duplicate,true);
+    assert.equal(f.store.executionStatus().records[0]!.audit.length,count);
+    assert.ok(f.store.executionStatus().fence);assert.equal(f.store.executionStatus().records[0]!.cancelStatus,'accepted-recovery-required');
+    assert.throws(()=>issueDurableNetworkConfirm(f.store,networkExecutionHash(f.draft),c.receipt,[c.verifier.publicKey],f.key.privateKey,'alice'),/cancellation/);
+    assert.throws(()=>settleNetworkExecution(f.store,cancelled(f),f.agent,'gateway'),/never-accepted/);
+    assert.equal(settleNetworkExecution(f.store,f.result(),f.agent,'gateway').settled,true);
+  }finally{f.cleanup();}
+});
+test('never-accepted terminal and accepted diagnostic conflict in either arrival order',()=>{
+  const f=issued();try {
+    const r=cancelled(f);settleNetworkExecution(f.store,r,f.agent,'gateway');
+    assert.throws(()=>settleNetworkExecution(f.store,cancelled(f,'cancellation-rejected'),f.agent,'gateway'),/conflicts/);
+    assert.equal(f.store.executionStatus().records[0]!.result!.state,'cancelled-before-accept');
+  }finally{f.cleanup();}
+});
+test('old cancellation cannot clear a later execution fence',()=>{
+  const f=issued();try {
+    const r=cancelled(f);settleNetworkExecution(f.store,r,f.agent,'gateway');
+    const a={...f.a,transactionId:'b'.repeat(32)};
+    f.store.fenceExecution(1,a.transactionId,()=>signNetworkMessage(NETWORK_EXECUTION_DOMAIN,a,f.key.privateKey),'alice');
+    assert.equal(settleNetworkExecution(f.store,r,f.agent,'gateway').duplicate,true);
+    assert.equal(f.store.executionStatus().fence!.transactionId,a.transactionId);
+    assert.throws(()=>issueDurableNetworkCancellation(f.store,a.transactionId,'0'.repeat(64),f.key.privateKey,'alice'));
+  }finally{f.cleanup();}
+});
+for(const point of ['before-commit','after-commit'] as const)test(`cancel settlement SIGKILL ${point} recovers atomically in a new Manager process`,()=>{
+  const f=issued();try {
+    const r=cancelled(f);
+    const p=child(`import fs from 'node:fs';import {syncBuiltinESMExports} from 'node:module';import {NetworkRegistryStore} from ${JSON.stringify(registryUrl)};import {settleNetworkExecution} from ${JSON.stringify(settlementUrl)};
+      const path=${JSON.stringify(f.store.path)},rename=fs.renameSync;
+      fs.renameSync=(from,to)=>{if(String(to)===path){if(${JSON.stringify(point)}==='before-commit')process.kill(process.pid,'SIGKILL');rename(from,to);process.kill(process.pid,'SIGKILL');}else rename(from,to)};
+      syncBuiltinESMExports();settleNetworkExecution(new NetworkRegistryStore(path),${JSON.stringify(r)},${JSON.stringify(f.agent)},'gateway');`);
+    assert.equal(p.signal,'SIGKILL',p.stderr);
+    assert.equal(Boolean(new NetworkRegistryStore(f.store.path).executionStatus().fence),point==='before-commit');
+    assert.equal(settleNetworkExecution(f.store,r,f.agent,'gateway').settled,true);
+  }finally{f.cleanup();}
+});
+test('cancel issuance rejects oversized legacy payload and invalid principal before caching',()=>{
+  const f=issued();try {
+    assert.throws(()=>issueDurableNetworkCancellation(f.store,f.a.transactionId,networkDigest(f.a),f.key.privateKey,'bad actor'));
+    assert.equal(f.store.executionStatus().records[0]!.cancellation,undefined);
+    const doc=JSON.parse(readFileSync(f.store.path,'utf8')),record=doc.execution.records[0];
+    const a={...f.a,legacyPadding:'x'.repeat(110000)};record.authorization=signNetworkMessage(NETWORK_EXECUTION_DOMAIN,a,f.key.privateKey);record.authorizationHash=networkDigest(a);doc.execution.fence.authorizationHash=record.authorizationHash;writeFileSync(f.store.path,JSON.stringify(doc));
+    assert.throws(()=>issueDurableNetworkCancellation(f.store,f.a.transactionId,record.authorizationHash,f.key.privateKey,'alice'),/payload limit/);
+    assert.equal(f.store.executionStatus().records[0]!.cancellation,undefined);assert.ok(f.store.executionStatus().fence);
+  }finally{f.cleanup();}
+});
+for(const damage of ['status','orphan-response-hash','response-hash'] as const)test(`damaged cancellation ${damage} cannot settle`,()=>{
+  const f=issued();try {
+    const r=cancelled(f,'cancellation-rejected');settleNetworkExecution(f.store,r,f.agent,'gateway');
+    const doc=JSON.parse(readFileSync(f.store.path,'utf8')),record=doc.execution.records[0];
+    if(damage==='status')delete record.cancellationResponse;
+    else if(damage==='orphan-response-hash')delete record.cancellationResponse;
+    else record.cancellationResponseHash='0'.repeat(64);
+    writeFileSync(f.store.path,JSON.stringify(doc));assert.throws(()=>f.store.executionStatus());assert.throws(()=>settleNetworkExecution(f.store,r,f.agent,'gateway'));
+  }finally{f.cleanup();}
+});
+
+test('new issuance reserves recovery bytes and rejects an oversized authority without installing a fence',()=>{
+  const f=issued();try {
+    settleNetworkExecution(f.store,f.result(),f.agent,'gateway');
+    const next={...f.a,transactionId:'b'.repeat(32)};
+    assert.throws(()=>f.store.fenceExecution(1,next.transactionId,()=>signNetworkMessage(NETWORK_EXECUTION_DOMAIN,{...next,padding:'x'.repeat(70000)},f.key.privateKey),'alice'),/payload capacity/);
+    assert.equal(f.store.executionStatus().fence,null);
+    const doc=JSON.parse(readFileSync(f.store.path,'utf8'));doc.execution.records[0].audit[0].reason='x'.repeat(3*1024*1024);writeFileSync(f.store.path,JSON.stringify(doc));
+    const before=readFileSync(f.store.path,'utf8');
+    assert.throws(()=>f.store.fenceExecution(1,next.transactionId,()=>signNetworkMessage(NETWORK_EXECUTION_DOMAIN,next,f.key.privateKey),'alice'),/recovery reserve/);
+    assert.equal(readFileSync(f.store.path,'utf8'),before);assert.equal(f.store.executionStatus().fence,null);
+  }finally{f.cleanup();}
 });

@@ -50,9 +50,14 @@ def deliver(config, directory):
         request=urllib.request.Request(settings['url'],data=payload,headers={'Content-Type':'application/json'},method='POST')
         with opener.open(request,timeout=2) as response:
             body=response.read(4097)
-            if len(body)>4096 or json.loads(body).get('settled') is not True:raise ValueError('terminal result not settled')
-        ack[stamp]=True
-        atomic(os.path.join(directory,'terminal-acks.json'),ack)
+            reply=json.loads(body)
+            rejection=result.get('state')=='cancellation-rejected'
+            if len(body)>4096 or (reply.get('recorded') is not True or reply.get('settled') is not False if rejection else reply.get('settled') is not True):raise ValueError('execution result not acknowledged')
+        # Diagnostic receipts may be superseded by a terminal result; never consume a second
+        # terminal ack slot for the same replay identity. Manager deduplicates their retries.
+        if not rejection:
+            ack[stamp]=True
+            atomic(os.path.join(directory,'terminal-acks.json'),ack)
         sent+=1
         if sent>=16:break
     return sent

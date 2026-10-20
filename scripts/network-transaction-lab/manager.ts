@@ -13,8 +13,9 @@ const manager=await startManager({hostname:'192.0.2.1',port:8443,relays:[],
   artifactSigning:{privateKey:createPrivateKey(readFileSync(join(dir,'manager.key')))},
   networkVerifierKeys:[createPublicKey(readFileSync(join(dir,'verifier/public.pem')))],log:()=>{}});
 manager.server.prependListener('request',(req,res)=>{
-  if(req.url==='/api/network/execution/terminal'&&existsSync(join(dir,'drop-terminal-response'))) {
-    unlinkSync(join(dir,'drop-terminal-response'));
+  const marker=req.url==='/api/network/execution/cancel'?'drop-cancel-response':'drop-terminal-response';
+  if(['/api/network/execution/terminal','/api/network/execution/cancel'].includes(req.url??'')&&existsSync(join(dir,marker))) {
+    unlinkSync(join(dir,marker));
     res.end=(()=>{process.kill(process.pid,'SIGKILL');return res;}) as typeof res.end;
   }
 });
