@@ -191,6 +191,7 @@ class Lifecycle(unittest.TestCase):
     def test_actual_heartbeat_loop_defers_new_policy_and_survives_nonobject_reply(self):
         agent=n.crypto_helpers(self.path);agent.STATE_FILE=self.path+'/entry-firewall.json'
         owner=lifecycle.Lifecycle(agent);owner.active={'kind':'network','transactionId':'fixture'}
+        owner.error('network-configuration','network-configuration-invalid')
         agent._lifecycle=owner
         replies=iter([{'schemaVersion':agent.SCHEMA_VERSION,'generation':'deferred-policy','gate':{'open':True}},[]])
         count=[]
@@ -201,7 +202,8 @@ class Lifecycle(unittest.TestCase):
         with __import__('contextlib').ExitStack() as stack:
             for name in ['RELAY_URL','CA_FILE','CERT_FILE','KEY_FILE','TARGET','MANAGER_SIGNING_KEYS_DIR','BREAK_GLASS_KEYS_DIR']:
                 stack.enter_context(patch.object(agent,name,'https://fixture.example.invalid' if name=='RELAY_URL' else 'fixture'))
-            for name in ['backfill_current_authorization','_boot_restore','monitor_loop','sleep_interval']:
+            boot=stack.enter_context(patch.object(agent,'_boot_restore'))
+            for name in ['backfill_current_authorization','monitor_loop','sleep_interval']:
                 stack.enter_context(patch.object(agent,name))
             stack.enter_context(patch.object(agent,'load_artifact_trust',return_value={'managerKeyIds':[],'breakGlassKeyIds':[],'trustDigest':'fixture'}))
             stack.enter_context(patch.object(agent,'build_heartbeat',return_value={}))
@@ -210,6 +212,7 @@ class Lifecycle(unittest.TestCase):
             stack.enter_context(patch.object(agent.signal,'signal'))
             stack.enter_context(patch.object(agent.threading,'Thread'))
             self.assertEqual(agent.main(),0)
+        boot.assert_called_once()
         self.assertEqual(len(count),2)
         self.assertEqual(n.read_json(agent.STATE_FILE)['lastRefusal']['generation'],'deferred-policy')
         self.assertEqual(n.read_json(agent.STATE_FILE)['generation'],None)
@@ -217,6 +220,30 @@ class Lifecycle(unittest.TestCase):
         for addresses in [[],['0.0.0.0'],['192.0.2.1']*17]:
             with self.assertRaises(ValueError):
                 lifecycle.Lifecycle(self.agent,{'protectedAddresses':addresses},self.path,True)
+    def test_actual_entry_preserves_invalid_firewall_before_authorization_backfill(self):
+        agent=n.crypto_helpers(self.path);agent.STATE_FILE=self.path+'/invalid-entry.json'
+        n.atomic(agent.STATE_FILE,{'state':'confirmed','generation':'old','pendingBackup':{},'authorizationWatermark':{'fixture':True}})
+        before=open(agent.STATE_FILE,'rb').read()
+        owner=lifecycle.Lifecycle(agent);agent._lifecycle=owner
+        def heartbeat(_):agent._stop.set();return {}
+        with __import__('contextlib').ExitStack() as stack:
+            for name in ['RELAY_URL','CA_FILE','CERT_FILE','KEY_FILE','TARGET','MANAGER_SIGNING_KEYS_DIR','BREAK_GLASS_KEYS_DIR']:
+                stack.enter_context(patch.object(agent,name,'https://fixture.example.invalid' if name=='RELAY_URL' else 'fixture'))
+            backfill=stack.enter_context(patch.object(agent,'backfill_current_authorization'))
+            boot=stack.enter_context(patch.object(agent,'_boot_restore'))
+            for name in ['monitor_loop','sleep_interval']:
+                stack.enter_context(patch.object(agent,name))
+            stack.enter_context(patch.object(agent,'load_artifact_trust',return_value={'managerKeyIds':[],'breakGlassKeyIds':[],'trustDigest':'fixture'}))
+            stack.enter_context(patch.object(agent,'build_heartbeat',return_value={}))
+            stack.enter_context(patch.object(agent,'post_heartbeat',side_effect=heartbeat))
+            stack.enter_context(patch.object(owner,'start'))
+            stack.enter_context(patch.object(agent.signal,'signal'))
+            stack.enter_context(patch.object(agent.threading,'Thread'))
+            self.assertEqual(agent.main(),0)
+        backfill.assert_not_called()
+        boot.assert_not_called()
+        self.assertEqual(open(agent.STATE_FILE,'rb').read(),before)
+        self.assertEqual(owner.report()['recoveryDebt']['firewall'],'unknown')
     def test_legacy_network_cli_execs_the_canonical_agent_owner(self):
         with patch.object(n.os,'execv') as execute:
             n.main(['--config',self.path+'/config.json','--state-dir',self.path])

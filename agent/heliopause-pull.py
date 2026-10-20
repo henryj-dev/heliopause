@@ -5644,7 +5644,15 @@ def main():
     # So this runs first only because it is cheap and reads settled state. **If a recovery path ever
     # produces `confirmed`, this call has to move below it** — that is the invariant to check, not
     # the position.
-    backfill_current_authorization()
+    backfill_allowed = True
+    if _lifecycle is not None:
+        try:
+            _lifecycle.firewall_state()
+        except Exception:
+            _lifecycle.error('firewall-journal', 'firewall-journal-unreadable')
+            backfill_allowed = False
+    if backfill_allowed:
+        backfill_current_authorization()
     if _lifecycle is None:
         recover_commitment()
     # Same reasoning for the workload half, and it needs its own call because the two commitments have
@@ -5656,7 +5664,7 @@ def main():
     # After the commitment recoveries (they handle prepared/pending/rollback-failed; the restore acts
     # only on `confirmed`), and before the monitor
     # starts, so the restore is not observed as a change this agent did not make. Writes no state.
-    if _lifecycle is None or not _lifecycle.blocked():
+    if backfill_allowed:
         _boot_restore()
     if _lifecycle is not None:
         _lifecycle.start()
