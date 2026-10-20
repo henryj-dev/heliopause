@@ -18,11 +18,11 @@ if (compiler === "--help") {
     const input: unknown = JSON.parse(readBoundedStoreFile(path, 8 * 1024 * 1024));
     if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("compiler input must be an object");
     const value = input as Record<string, unknown>;
-    const allowed = compiler === "wireguard" ? ["registry", "expectedRegistryRevision", "spec", "previous"] : ["registry", "expectedRegistryRevision", "spec"];
+    const allowed = compiler === "wireguard" ? ["registry", "expectedRegistryRevision", "spec", "previous", "prefixPolicy"] : ["registry", "expectedRegistryRevision", "spec", "prefixPolicy"];
     if (Object.keys(value).some(k => !allowed.includes(k))) throw new Error("unknown compiler input field");
     if (!value.registry || typeof value.registry !== "object" || Array.isArray(value.registry) || !Array.isArray((value.registry as Record<string, unknown>).resources)) throw new Error("compiler registry is required");
     const args = value as unknown as { registry: Pick<NetworkRegistryDocument, "revision" | "resources">; expectedRegistryRevision: number; spec: unknown; previous?: unknown };
-    const result = compiler === "wireguard" ? compileWireGuard(args) : compileFrr(args);
+    const result = compiler === "wireguard" ? compileWireGuard({ ...args, prefixPolicy: value.prefixPolicy as import("../src/network-prefix-policy.ts").NetworkPrefixPolicy | undefined }) : compileFrr({ ...args, prefixPolicy: value.prefixPolicy as import("../src/network-prefix-policy.ts").NetworkPrefixPolicy | undefined });
     console.log(JSON.stringify(result, null, 2));
     if (!result.ok) process.exitCode = 2;
   } catch (error) {

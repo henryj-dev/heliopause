@@ -1,3 +1,4 @@
+import { compareNetworkText } from "./network-canonical.ts";
 /** Offline proposal only. This format is never an agent command or signed policy bundle. */
 import { validateNetworkObservation } from "./network-observation.ts";
 import { networkDigest } from "./network-canonical.ts";
@@ -39,7 +40,7 @@ export function buildNetworkPlan(input: NetworkPlanInput): NetworkPlan {
   if (typeof input.id !== "string" || !input.id.trim() || input.id.length > 256) throw new Error("plan id is required");
   if (!Number.isSafeInteger(input.expectedRegistryRevision) || input.expectedRegistryRevision < 0) throw new Error("expected registry revision is required");
   if (!Number.isFinite(input.now)) throw new Error("explicit evaluation clock is required");
-  const resources = [...input.registry.resources].sort((a, b) => a.id.localeCompare(b.id));
+  const resources = [...input.registry.resources].sort((a, b) => compareNetworkText(a.id, b.id));
   const blockers: NetworkPlanBlocker[] = [];
   const block = (resourceId: string, code: string, reason: string) => blockers.push({ resourceId, code, reason });
   const issues = validateNetworkInventory(resources);
@@ -64,7 +65,7 @@ export function buildNetworkPlan(input: NetworkPlanInput): NetworkPlan {
     if (!dependency || typeof dependency.resourceId !== "string" || typeof dependency.dependsOn !== "string") { block("", "invalid-dependency", "dependency requires resourceId and dependsOn"); continue; }
     edge(dependency.resourceId, dependency.dependsOn);
   }
-  const dependencies = [...edges.values()].sort((a,b) => a.resourceId.localeCompare(b.resourceId) || a.dependsOn.localeCompare(b.dependsOn));
+  const dependencies = [...edges.values()].sort((a,b) => compareNetworkText(a.resourceId, b.resourceId) || compareNetworkText(a.dependsOn, b.dependsOn));
   const pending = new Set(ids); const order: string[] = [];
   while (pending.size) {
     const ready = [...pending].filter(id => dependencies.filter(e => e.resourceId === id).every(e => ids.has(e.dependsOn) && !pending.has(e.dependsOn))).sort();
@@ -91,13 +92,13 @@ export function buildNetworkPlan(input: NetworkPlanInput): NetworkPlan {
       for (const [collector, value] of Object.entries(report.capabilities)) capabilities.push({ source: observation.source ?? "", host: observation.host, collector, available: value.available });
     } catch { /* Invalid records provide no capability evidence. */ }
   }
-  capabilities.sort((a,b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+  capabilities.sort((a,b) => compareNetworkText(JSON.stringify(a), JSON.stringify(b)));
   for (const proposal of proposals) block(proposal.resourceId, "writer-capability-unavailable", "observation collectors do not establish an available configuration writer");
   block("", "management-reachability-unknown", "independent management connectivity has not been verified");
   block("", "gateway-reachability-unknown", "gateway connectivity has not been independently verified");
   const desired = resources.map(resource => ({ resourceId: resource.id, generation: resource.generation, digest: networkDigest(resource) }));
-  const bindings = [...input.bindings].sort((a,b) => networkDigest(a).localeCompare(networkDigest(b)));
-  blockers.sort((a,b) => a.resourceId.localeCompare(b.resourceId) || a.code.localeCompare(b.code) || a.reason.localeCompare(b.reason));
+  const bindings = [...input.bindings].sort((a,b) => compareNetworkText(networkDigest(a), networkDigest(b)));
+  blockers.sort((a,b) => compareNetworkText(a.resourceId, b.resourceId) || compareNetworkText(a.code, b.code) || compareNetworkText(a.reason, b.reason));
   const content = { schemaVersion: 1 as const, kind: "network-plan" as const, mode: "dry-run" as const, executable: false as const, evaluatedAt: input.now, registryRevision: input.registry.revision, expectedRegistryRevision: input.expectedRegistryRevision, desired, desiredDigest: networkDigest(desired), bindings, evidence: matching.evidence, matchingDigest: matching.digest, capabilities, dependencies, order, proposals, blockers, preconditions: { executionImplemented: false as const, managementReachability: "unknown" as const, gatewayReachability: "unknown" as const, approvals: "absent" as const, rollback: "unavailable" as const } };
   return { ...content, id: input.id, contentHash: networkDigest(content) };
 }
