@@ -168,7 +168,7 @@ test('mTLS network execution goes through distinct approval, fenced authorizatio
   const input=networkLabInput();
   for(const r of input.registry.resources) if(r.management.mode==='managed') {
     r.management.driver='wg-quick';
-    if(r.kind==='interface'&&r.id==='wg0')r.name='hp6test';
+    if(r.kind==='interface'&&r.id==='wg0')r.name='hpcccccccccccc';
     if(r.kind==='route'&&r.interfaceId==='wg0'){r.protocol='static';r.metric=42760;}
   }
   const registryFile=join(dir,'execution-registry.json'),observationsDir=join(dir,'execution-observations');
@@ -180,7 +180,7 @@ test('mTLS network execution goes through distinct approval, fenced authorizatio
   const observation=cache.put('gateway',report,{source:'example',relayReceivedAt:at});
   const target={source:'example',host:'gateway',nodeId:'n0'};
   const review=buildNetworkChangeSet({id:'execution-review',registry,expectedRegistryRevision:1,now,observations:[observation],bindings:[{...target,siteId:'s0'}]});
-  const operation={driver:'linux-wireguard-v1',interfaceId:'wg0',interfaceName:'hp6test',address:'198.51.100.1/32',mtu:1420,listenPort:51820,secretRef:'local',publicKey:Buffer.alloc(32,1).toString('base64'),peers:[{publicKey:Buffer.alloc(32,2).toString('base64'),endpoint:'203.0.113.2:51820',allowedIps:['198.51.100.2/32']}],routes:['198.51.100.2/32']};
+  const operation={driver:'linux-wireguard-v1',interfaceId:'wg0',interfaceName:'hpcccccccccccc',address:'198.51.100.1/32',mtu:1420,listenPort:51820,secretRef:'local',publicKey:Buffer.alloc(32,1).toString('base64'),peers:[{publicKey:Buffer.alloc(32,2).toString('base64'),endpoint:'203.0.113.2:51820',allowedIps:['198.51.100.2/32']}],routes:['198.51.100.2/32']};
   const draft={schemaVersion:1,transactionId:'c'.repeat(32),target,registryRevision:1,resources:registry.resources.map(r=>({id:r.id,generation:r.generation})),desiredDigest:review.desiredDigest,reviewHash:review.contentHash,artifactHash:networkDigest(operation),observation:{digest:networkDigest(observation),collectedAt:now,maxAgeMs:10000},localPrecondition:'a'.repeat(64),operation,issuedAt:now,expiresAt:now+10000,rollbackAt:now+20000};
   const manager=await startManager({port:0,hostname:'127.0.0.1',relays:[{name:'example',url:'https://127.0.0.1:1',pkiDir:dir}],tls:{certFile:join(dir,'server.pem'),keyFile:join(dir,'server.key'),caFile:join(dir,'ca.pem')},operatorCNs:['reader','writer'],writerCNs:['reader','writer'],networkRegistryFile:registryFile,networkObservationsDir:observationsDir,networkExecutionTargets:[target],networkVerifierKeys:[verifierKey.publicKey],artifactSigning:{privateKey:managerKey.privateKey},log:()=>{}});
   const previousPort=port;port=(manager.server.address() as {port:number}).port;

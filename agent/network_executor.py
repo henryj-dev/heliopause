@@ -139,7 +139,7 @@ def key(value):
 
 def validate_operation(op):
     exact(op, 'driver interfaceId interfaceName address mtu listenPort secretRef publicKey peers routes')
-    if op['driver'] != DRIVER or not name(op['interfaceId']) or not re.fullmatch(r'hp[a-z0-9]{1,12}', str(op['interfaceName'])) or not name(op['secretRef']) or not key(op['publicKey']) or not integer(op['mtu'], 1280, 1500) or not integer(op['listenPort'], 1024, 65535):
+    if op['driver'] != DRIVER or not name(op['interfaceId']) or not re.fullmatch(r'hp[a-z0-9]{1,13}', str(op['interfaceName'])) or not name(op['secretRef']) or not key(op['publicKey']) or not integer(op['mtu'], 1280, 1500) or not integer(op['listenPort'], 1024, 65535):
         raise ValueError('unsupported WireGuard operation')
     address = host(op['address'])
     if not isinstance(op['peers'], list) or not 1 <= len(op['peers']) <= 8 or not isinstance(op['routes'], list) or not 1 <= len(op['routes']) <= 16:
@@ -261,7 +261,8 @@ class LinuxWireGuard:
             raise
 
     def create(self, op, owner):
-        self.run(['ip', 'link', 'add', 'name', op['interfaceName'], 'alias', owner, 'type', 'wireguard'])
+        self.run(['ip', 'link', 'add', 'name', op['interfaceName'], 'type', 'wireguard'])
+        self.run(['ip', 'link', 'set', 'dev', op['interfaceName'], 'alias', owner])
 
     def configure(self, op):
         dev = op['interfaceName']
@@ -285,7 +286,9 @@ class LinuxWireGuard:
         if not matches:
             return False
         link = matches[0]
-        if link.get('ifalias',link.get('alias')) != owner or link.get('linkinfo', {}).get('info_kind') != 'wireguard':
+        alias=link.get('ifalias',link.get('alias'))
+        transaction=owner.split(':')[1]
+        if op['interfaceName']!='hp'+transaction[:12] or alias not in {None,owner} or link.get('linkinfo', {}).get('info_kind') != 'wireguard':
             raise ValueError('interface ownership conflict')
         # A root writer replacing a configuration must not have its objects deleted by rollback.
         public = self.run(['wg', 'show', op['interfaceName'], 'public-key'])
@@ -301,6 +304,8 @@ class LinuxWireGuard:
         if self.ip('-6','address','show','dev',op['interfaceName'])[0].get('addr_info') or self.ip('-6','route','show','table','all','dev',op['interfaceName']):
             raise ValueError('IPv6 ownership conflict')
         peers = self.run(['wg', 'show', op['interfaceName'], 'peers']).split()
+        if alias is None and (public not in {'','(none)'} or peers or self.run(['wg','show',op['interfaceName'],'listen-port'])!='0' or any(row.get('addr_info') for row in self.ip('address','show','dev',op['interfaceName']))):
+            raise ValueError('untagged interface is not an empty interrupted create')
         if not set(peers).issubset({p['publicKey'] for p in op['peers']}):
             raise ValueError('peer ownership conflict')
         allowed = self.run(['wg', 'show', op['interfaceName'], 'allowed-ips'])
@@ -473,6 +478,8 @@ class Executor:
             if not isinstance(e['digest'],str) or not re.fullmatch(r'[a-f0-9]{64}',e['digest']) or not integer(e['maxAgeMs'],1,600000) or not integer(e['collectedAt'],now-e['maxAgeMs'],now):
                 raise ValueError('stale observation')
             validate_operation(a['operation'])
+            if a['operation']['interfaceName']!='hp'+a['transactionId'][:12]:
+                raise ValueError('interface name must bind unique transaction identity')
             if digest(a['operation'])!=a['artifactHash']:
                 raise ValueError('artifact hash mismatch')
             data=self.load()

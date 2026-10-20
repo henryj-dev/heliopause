@@ -48,8 +48,8 @@ class Fake:
 
 def authorization():
     now=int(time.time()*1000)
-    op={'driver':n.DRIVER,'interfaceId':'wg-new','interfaceName':'hp6test','address':'192.0.2.129/32','mtu':1400,'listenPort':51820,'secretRef':'test','publicKey':PUB,'peers':[{'publicKey':PEER,'endpoint':'203.0.113.2:51820','allowedIps':['192.0.2.130/32']}],'routes':['192.0.2.130/32']}
-    a={'schemaVersion':1,'transactionId':os.urandom(16).hex(),'target':{'source':'lab','host':'gateway','nodeId':'gateway'},'registryRevision':1,'resources':[{'id':'wg-new','generation':1}], 'desiredDigest':'a'*64,'reviewHash':'b'*64,'artifactHash':n.digest(op),'observation':{'digest':'c'*64,'collectedAt':now,'maxAgeMs':10000},'localPrecondition':n.digest({'before':True}),'operation':op,'issuedAt':now,'expiresAt':now+5000,'rollbackAt':now+10000}
+    op={'driver':n.DRIVER,'interfaceId':'wg-new','interfaceName':'hpaaaaaaaaaaaa','address':'192.0.2.129/32','mtu':1400,'listenPort':51820,'secretRef':'test','publicKey':PUB,'peers':[{'publicKey':PEER,'endpoint':'203.0.113.2:51820','allowedIps':['192.0.2.130/32']}],'routes':['192.0.2.130/32']}
+    a={'schemaVersion':1,'transactionId':'a'*32,'target':{'source':'lab','host':'gateway','nodeId':'gateway'},'registryRevision':1,'resources':[{'id':'wg-new','generation':1}], 'desiredDigest':'a'*64,'reviewHash':'b'*64,'artifactHash':n.digest(op),'observation':{'digest':'c'*64,'collectedAt':now,'maxAgeMs':10000},'localPrecondition':n.digest({'before':True}),'operation':op,'issuedAt':now,'expiresAt':now+5000,'rollbackAt':now+10000}
     a['approval']={'mode':'two-person','proposedBy':'alice','approvedBy':'bob','approvedAt':now,'planHash':'sha256:'+n.digest(a)}
     return a
 
@@ -171,9 +171,9 @@ class Transactions(unittest.TestCase):
 class Ownership(unittest.TestCase):
     def setUp(self):
         self.op=authorization()['operation']
-        self.owner='heliopause:owner'
-        self.routes=[{'dst':'192.0.2.130','dev':'hp6test','protocol':'static','scope':'link','metric':42760}]
-        self.link={'ifindex':3,'ifname':'hp6test','mtu':1400,'ifalias':self.owner,'linkinfo':{'info_kind':'wireguard'}}
+        self.owner='heliopause:'+('a'*32)+':owner'
+        self.routes=[{'dst':'192.0.2.130','dev':'hpaaaaaaaaaaaa','protocol':'static','scope':'link','metric':42760}]
+        self.link={'ifindex':3,'ifname':'hpaaaaaaaaaaaa','mtu':1400,'ifalias':self.owner,'linkinfo':{'info_kind':'wireguard'}}
         self.driver=n.LinuxWireGuard('/unused')
         self.psk='(none)'
         self.v6=[]
@@ -198,7 +198,7 @@ class Ownership(unittest.TestCase):
         self.routes[0]['table']=100
         with self.assertRaises(ValueError): self.driver.owned(self.op,self.owner)
     def test_foreign_kernel_route_preserved(self):
-        self.routes.append({'dst':'192.0.2.140','dev':'hp6test','protocol':'kernel'})
+        self.routes.append({'dst':'192.0.2.140','dev':'hpaaaaaaaaaaaa','protocol':'kernel'})
         with self.assertRaises(ValueError): self.driver.owned(self.op,self.owner)
     def test_foreign_psk_preserved(self):
         self.psk='opaque-foreign-secret'

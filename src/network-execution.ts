@@ -44,6 +44,7 @@ export function authorizeNetworkExecution(store: NetworkRegistryStore, approvals
   if(!plan.approval || plan.approval.solo || plan.proposedBy===plan.approval.by) throw new Error('network execution requires two-person approval');
   const at=now.getTime();
   if(draft.schemaVersion!==1 || !/^[a-f0-9]{32}$/.test(draft.transactionId) || draft.issuedAt>at || at-draft.issuedAt>30000 || draft.expiresAt<=at || draft.expiresAt-draft.issuedAt>60000 || draft.rollbackAt<=draft.expiresAt || draft.rollbackAt-draft.issuedAt>180000) throw new Error('invalid execution validity window');
+  if(draft.operation.interfaceName!=='hp'+draft.transactionId.slice(0,12)) throw new Error('interface name must bind transaction identity');
   if(draft.artifactHash!==networkDigest(draft.operation)) throw new Error('artifact hash mismatch');
   if(draft.observation.maxAgeMs<1 || draft.observation.maxAgeMs>600000 || draft.observation.collectedAt>at || at-draft.observation.collectedAt>draft.observation.maxAgeMs) throw new Error('stale observation');
   return store.fenceExecution(draft.registryRevision,draft.transactionId,registry=>{

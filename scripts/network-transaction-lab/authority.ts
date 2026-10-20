@@ -17,20 +17,20 @@ if(action==='keys') {
     writeFileSync(join(dir,kind,'public.pem'),pair.publicKey.export({format:'pem',type:'spki'}),{mode:0o600});
   }
 } else if(action==='issue') {
-  const facts=read('facts.json'),now=Date.now(),at=new Date(now).toISOString();
+  const facts=read('facts.json'),now=Date.now(),at=new Date(now).toISOString(),transactionId=randomBytes(16).toString('hex'),device='hp'+transactionId.slice(0,12);
   const management={mode:'managed',provider:'wireguard',driver:'wg-quick'};
   const base={owner:'lab',generation:1,management};
   const store=new NetworkRegistryStore(join(dir,'registry.json'));
   const resources=[{...base,id:'site',kind:'site'},{...base,id:'gateway',kind:'node',siteId:'site'}, {...base,id:'domain',kind:'routing-domain',name:'global',isolation:'global'},
     {...base,id:'backbone',kind:'network',scope:'overlay',siteIds:['site'],routingDomainId:'domain',purpose:'backbone'},
     {...base,id:'subnet',kind:'subnet',networkId:'backbone',cidr:'192.0.2.128/28'},
-    {...base,id:'wg-new',kind:'interface',nodeId:'gateway',networkId:'backbone',name:'hp6test',mtu:1400},
+    {...base,id:'wg-new',kind:'interface',nodeId:'gateway',networkId:'backbone',name:device,mtu:1400},
     ...['192.0.2.130/32','198.51.100.6/32'].map((destination,i)=>({...base,id:'route'+i,kind:'route',interfaceId:'wg-new',routingDomainId:'domain',destination,table:254,nextHop:null,protocol:'static',metric:42760}))];
   const registry=store.mutate(0,'lab-authority',{action:'replace',resources});
   const observation={source:'lab',host:'gateway',receivedAt:at,report:{schemaVersion:1 as const,collectionId:'00000000-0000-4000-8000-000000000006',startedAt:at,completedAt:at,observations:{links:{status:'success' as const,startedAt:at,completedAt:at,data:facts.snapshot.links.map((l:any)=>({ifname:l.name,ifindex:l.index,mtu:l.mtu}))},addresses:{status:'success' as const,startedAt:at,completedAt:at,data:[]},routes4:{status:'success' as const,startedAt:at,completedAt:at,data:facts.snapshot.routes}},capabilities:{links:{available:true,status:'success' as const},addresses:{available:true,status:'success' as const},routes4:{available:true,status:'success' as const}}}};
   const review=buildNetworkChangeSet({id:'execution-review',registry,expectedRegistryRevision:registry.revision,now,observations:[observation],bindings:[{source:'lab',host:'gateway',nodeId:'gateway',siteId:'site'}]});
-  const operation={driver:'linux-wireguard-v1' as const,interfaceId:'wg-new',interfaceName:'hp6test',address:'192.0.2.129/32',mtu:1400,listenPort:51820,secretRef:'gateway',publicKey:facts.publicKey,peers:[{publicKey:facts.peerPublicKey,endpoint:'203.0.113.2:51820',allowedIps:['192.0.2.130/32','198.51.100.6/32']}],routes:['192.0.2.130/32','198.51.100.6/32']};
-  const draft:NetworkExecutionDraft={schemaVersion:1,transactionId:randomBytes(16).toString('hex'),target:{source:'lab',host:'gateway',nodeId:'gateway'},registryRevision:registry.revision,resources:registry.resources.map(r=>({id:r.id,generation:r.generation})),desiredDigest:review.desiredDigest,reviewHash:review.contentHash,artifactHash:networkDigest(operation),observation:{digest:networkDigest(observation),collectedAt:now,maxAgeMs:30000},localPrecondition:networkDigest(facts.snapshot),operation,issuedAt:now,expiresAt:now+5000,rollbackAt:now+(facts.timeoutMs??12000)};
+  const operation={driver:'linux-wireguard-v1' as const,interfaceId:'wg-new',interfaceName:device,address:'192.0.2.129/32',mtu:1400,listenPort:51820,secretRef:'gateway',publicKey:facts.publicKey,peers:[{publicKey:facts.peerPublicKey,endpoint:'203.0.113.2:51820',allowedIps:['192.0.2.130/32','198.51.100.6/32']}],routes:['192.0.2.130/32','198.51.100.6/32']};
+  const draft:NetworkExecutionDraft={schemaVersion:1,transactionId,target:{source:'lab',host:'gateway',nodeId:'gateway'},registryRevision:registry.revision,resources:registry.resources.map(r=>({id:r.id,generation:r.generation})),desiredDigest:review.desiredDigest,reviewHash:review.contentHash,artifactHash:networkDigest(operation),observation:{digest:networkDigest(observation),collectedAt:now,maxAgeMs:30000},localPrecondition:networkDigest(facts.snapshot),operation,issuedAt:now,expiresAt:now+5000,rollbackAt:now+(facts.timeoutMs??12000)};
   const approvals=emptyApprovals(),hash=networkExecutionHash(draft);
   propose(approvals,{hash,generation:draft.transactionId,summary:{hosts:[{host:'gateway',stage:'gateway',ruleCount:1,rulesetHash:draft.artifactHash}]},by:'alice',now:new Date(now)});
   approve(approvals,{hash,by:'bob',now:new Date(now)});

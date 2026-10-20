@@ -14,12 +14,12 @@ import { networkLabInput } from '../examples/network-lab.ts';
 function fixture() {
   const dir=mkdtempSync(join(tmpdir(),'hp-execution-')),store=new NetworkRegistryStore(join(dir,'registry.json'));
   const input=networkLabInput();
-  for (const r of input.registry.resources) if (r.management.mode==='managed') { r.management.driver='wg-quick'; if(r.kind==='interface'&&r.id==='wg0')r.name='hp6test'; if(r.kind==='route'&&r.interfaceId==='wg0'){r.protocol='static';r.metric=42760;} }
+  for (const r of input.registry.resources) if (r.management.mode==='managed') { r.management.driver='wg-quick'; if(r.kind==='interface'&&r.id==='wg0')r.name='hpaaaaaaaaaaaa'; if(r.kind==='route'&&r.interfaceId==='wg0'){r.protocol='static';r.metric=42760;} }
   const registry=store.mutate(0,'alice',{action:'replace',resources:input.registry.resources});
   const now=Date.now();
   const observation=structuredClone(input.observations[0]!);observation.receivedAt=new Date(now).toISOString();observation.report.completedAt=observation.receivedAt;
   const review=buildNetworkChangeSet({...input,wireguard:undefined,frr:undefined,registry,now});
-  const operation={driver:'linux-wireguard-v1' as const,interfaceId:'wg0',interfaceName:'hp6test',address:'198.51.100.1/32',mtu:1420,listenPort:51820,secretRef:'local',publicKey:Buffer.alloc(32,1).toString('base64'),peers:[{publicKey:Buffer.alloc(32,2).toString('base64'),endpoint:'203.0.113.2:51820',allowedIps:['198.51.100.2/32']}],routes:['198.51.100.2/32']};
+  const operation={driver:'linux-wireguard-v1' as const,interfaceId:'wg0',interfaceName:'hpaaaaaaaaaaaa',address:'198.51.100.1/32',mtu:1420,listenPort:51820,secretRef:'local',publicKey:Buffer.alloc(32,1).toString('base64'),peers:[{publicKey:Buffer.alloc(32,2).toString('base64'),endpoint:'203.0.113.2:51820',allowedIps:['198.51.100.2/32']}],routes:['198.51.100.2/32']};
   const draft:NetworkExecutionDraft={schemaVersion:1,transactionId:'a'.repeat(32),target:{source:'lab-relay',host:'lab-host-0',nodeId:'n0'},registryRevision:1,resources:registry.resources.map(r=>({id:r.id,generation:r.generation})),desiredDigest:review.desiredDigest,reviewHash:review.contentHash,artifactHash:networkDigest(operation),observation:{digest:networkDigest(observation),collectedAt:now,maxAgeMs:10000},localPrecondition:'b'.repeat(64),operation,issuedAt:now,expiresAt:now+10000,rollbackAt:now+20000};
   const approvals=emptyApprovals(),key=generateKeyPairSync('ed25519');
   const proposeDraft=()=>propose(approvals,{hash:networkExecutionHash(draft),generation:draft.transactionId,summary:{hosts:[]},by:'alice',now:new Date(now)});

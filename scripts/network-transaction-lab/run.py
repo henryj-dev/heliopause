@@ -31,6 +31,7 @@ if os.geteuid()!=0 or sys.platform!='linux' or [x['ifname'] for x in ip(None,'li
 NAMES=['p6-gw','p6-peer','p6-client','p6-workload','p6-verifier']
 results=[]
 processes=[]
+DEV=None
 
 
 def wait_for(test,seconds=6):
@@ -88,6 +89,8 @@ def setup(path,mutate=False):
     authority('issue',path)
     envelope=n.read_json(path+'/authorization.json')
     a=json.loads(base64.urlsafe_b64decode(envelope['payload']+'=='))
+    global DEV
+    DEV=a['operation']['interfaceName']
     n.atomic(path+'/decoded.json',a)
     shutil.copyfile(path+'/authorization.json',path+'/state/request.json')
     os.chmod(path+'/state/request.json',0o600)
@@ -113,7 +116,7 @@ def row(path):
 
 
 def state(path): return row(path).get('state')
-def exists(): return any(x['ifname']=='hp6test' for x in ip('p6-gw','link','show'))
+def exists(): return any(x['ifname']==DEV for x in ip('p6-gw','link','show'))
 def await_state(path,wanted,seconds=7):
     try:
         wait_for(lambda:state(path) in wanted,seconds)
@@ -157,13 +160,13 @@ def scenario(kind):
             code="import sys;sys.path.insert(0,'/source/agent');import network_executor as n;e=n.Executor(n.read_json(sys.argv[1]),sys.argv[2]);n.atomic=lambda *a:(_ for _ in ()).throw(OSError('disk full'));e.accept(n.read_json(sys.argv[2]+'/request.json'))"
             assert not run('python3','-c',code,path+'/config.json',path+'/state',ns='p6-gw',ok=False)
             assert not exists();return
-        fault={'fail-created':'fail-created','fail-routes':'fail-routes','crash-partial-routes':'first-route','crash-apply':'created','crash-rollback':'rolling-back','crash-after-remove':'removed'}.get(kind,'')
+        fault={'fail-created':'fail-created','fail-routes':'fail-routes','crash-before-alias':'raw-create','crash-partial-routes':'first-route','crash-apply':'created','crash-rollback':'rolling-back','crash-after-remove':'removed'}.get(kind,'')
         p=start(path,fault,production=kind in {'normal','writer-conflict','graceful-stop'})
         if kind in {'fail-created','fail-routes'}:
             await_state(path,{'rolled-back'});assert not exists();stop(p);return
-        if kind in {'crash-apply','crash-partial-routes'}:
+        if kind in {'crash-apply','crash-before-alias','crash-partial-routes'}:
             wait_for(lambda:os.path.exists(path+'/state/barrier.json'));assert exists()
-            if kind=='crash-partial-routes': assert len([r for r in ip('p6-gw','-4','route','show') if r.get('dev')=='hp6test'])==1
+            if kind=='crash-partial-routes': assert len([r for r in ip('p6-gw','-4','route','show') if r.get('dev')==DEV])==1
             stop(p)
             p=start(path);await_state(path,{'rolled-back'});assert not exists();stop(p);return
         await_state(path,{'awaiting-verification'})
@@ -175,10 +178,10 @@ def scenario(kind):
             assert second.returncode!=0 and p.poll() is None and exists()
             stop(p);return
         if kind=='duplicate':
-            index=ip('p6-gw','link','show','dev','hp6test')[0]['ifindex']
+            index=ip('p6-gw','link','show','dev',DEV)[0]['ifindex']
             code="import sys;sys.path.insert(0,'/source/agent');import network_executor as n;e=n.Executor(n.read_json(sys.argv[1]),sys.argv[2]);assert e.accept(n.read_json(sys.argv[2]+'/request.json'))=='awaiting-verification'"
             run('python3','-c',code,path+'/config.json',path+'/state',ns='p6-gw')
-            assert ip('p6-gw','link','show','dev','hp6test')[0]['ifindex']==index
+            assert ip('p6-gw','link','show','dev',DEV)[0]['ifindex']==index
         if kind in {'normal','duplicate','secret-redaction'}:
             checks=verify_and_confirm(path);assert all(checks.values()),checks
             await_state(path,{'confirmed'});assert exists();stop(p)
@@ -195,7 +198,7 @@ def scenario(kind):
             n.atomic(path+'/config.json',cfg)
             p=start(path);await_state(path,{'rolled-back'});assert row(path)['authorization']['rollbackAt']==deadline and not exists();stop(p);return
         if kind=='foreign-writer':
-            run('ip','address','add','192.0.2.140/32','dev','hp6test',ns='p6-gw')
+            run('ip','address','add','192.0.2.140/32','dev',DEV,ns='p6-gw')
             stop(p);p=start(path);await_state(path,{'rollback-failed'});assert exists();assert 'rollback' in row(path)['diagnostic'];stop(p);return
         if kind=='rollback-command-failed':
             stop(p)
@@ -203,12 +206,12 @@ def scenario(kind):
             run('python3','-c',code,path+'/config.json',path+'/state',ns='p6-gw');assert state(path)=='rollback-failed' and exists()
             p=start(path);await_state(path,{'rolled-back'});assert not exists();stop(p);return
         if kind=='peer-route-loss':
-            run('ip','link','set','hp6test','down',ns='p6-gw');run('ip','link','set','hp6test','up',ns='p6-gw')
+            run('ip','link','set',DEV,'down',ns='p6-gw');run('ip','link','set',DEV,'up',ns='p6-gw')
             # Explicitly measure the post-up routes; if this kernel retained them, inject their loss.
             # The Agent must refuse confirm and undo the unconfirmed interface, not infer recovery
             # from link-up or install routes outside its authorized apply path.
             for dst in n.read_json(path+'/decoded.json')['operation']['routes']:
-                run('ip','route','del',dst,'dev','hp6test',ns='p6-gw',ok=False)
+                run('ip','route','del',dst,'dev',DEV,ns='p6-gw',ok=False)
             assert not run('ping','-c','1','-W','1','198.51.100.6',ns='p6-client',ok=False)
             checks=verify_and_confirm(path)
             assert not checks['route'] and not checks['fib']
@@ -217,7 +220,7 @@ def scenario(kind):
             assert run('ping','-c','1','-W','2','192.0.2.130',ns='p6-gw',ok=False)
         if kind=='management-failed': dropped('p6-gw','input','iifname "mgmt"')
         if kind=='asymmetric': dropped('p6-peer','forward','ip saddr 198.51.100.6')
-        if kind=='blackhole': dropped('p6-gw','forward','oifname "hp6test"')
+        if kind=='blackhole': dropped('p6-gw','forward','oifname \"'+DEV+'\"')
         if kind in {'management-failed','asymmetric','blackhole'}:
             checks=verify_and_confirm(path)
             assert not all(checks.values())
@@ -242,7 +245,7 @@ def scenario(kind):
         await_state(path,{'rolled-back'},15);assert not exists();stop(p)
 
 
-cases=['normal','signature','target','expiry','hash','approval','registry-changed','local-changed','duplicate','prepare-failed','fail-created','fail-routes','management-failed','asymmetric','blackhole','absent-verifier','lost-confirm','forged-verifier','crash-apply','crash-partial-routes','crash-wait','crash-rollback','crash-after-remove','foreign-writer','rollback-command-failed','peer-route-loss','secret-redaction','disabled-recovery','writer-conflict','graceful-stop']
+cases=['normal','signature','target','expiry','hash','approval','registry-changed','local-changed','duplicate','prepare-failed','fail-created','fail-routes','management-failed','asymmetric','blackhole','absent-verifier','lost-confirm','forged-verifier','crash-apply','crash-before-alias','crash-partial-routes','crash-wait','crash-rollback','crash-after-remove','foreign-writer','rollback-command-failed','peer-route-loss','secret-redaction','disabled-recovery','writer-conflict','graceful-stop']
 for case in cases:
     started=time.monotonic()
     try:
@@ -256,5 +259,5 @@ for case in cases:
         for p,log in processes: stop(p);log.close()
         processes.clear()
         for ns in NAMES: run('ip','netns','del',ns,ok=False)
-assert len(results)==30
+assert len(results)==31
 print(json.dumps({'kind':'network-transaction-kernel-report','passed':len(results),'failed':0,'skipped':0,'hostRebootVerified':False,'backend':n.DRIVER,'scenarios':results}),flush=True)
