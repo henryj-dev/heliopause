@@ -41,15 +41,22 @@ class Lifecycle:
         # Legacy load_state projects malformed storage to a default. Admission may not do that.
         if os.path.exists(self.agent.STATE_FILE):
             doc = read_json(self.agent.STATE_FILE)
-            if not isinstance(doc, dict) or not isinstance(doc.get('state'), str):
+            allowed = {'none', 'unsupported', 'prepared', 'pending', 'confirmed', 'rolled-back', 'rollback-failed', 'rollback-incident'}
+            if not isinstance(doc, dict) or doc.get('state') not in allowed or doc.get('workloadState') not in allowed | {None}:
                 raise ValueError('firewall journal invalid')
+            for state_key, generation_key in [('state', 'generation'), ('workloadState', 'workloadGeneration')]:
+                if doc.get(state_key) in DEBT | {'confirmed'} and not isinstance(doc.get(generation_key), str):
+                    raise ValueError('firewall commitment identity invalid')
+            for field, kind in [('pendingBackup', dict), ('pendingRoutes', list), ('workloadApplied', list)]:
+                if doc.get(field) is not None and not isinstance(doc[field], kind):
+                    raise ValueError('firewall recovery material invalid')
         return self.agent.load_state()
 
     def firewall_debt(self):
         st = self.firewall_state()
         return self.agent._has_live_commitment(st) or st.get('state') in DEBT or st.get('workloadState') in DEBT
 
-    def recover_firewall(self):
+    def recover_firewall(self, settle=False):
         # Each recovery is attempted even if a different journal/helper fails.
         for name in ['recover_commitment', 'recover_workload_commitment', 'reconcile_recovered_commitments']:
             try:
@@ -60,18 +67,24 @@ class Lifecycle:
         try:
             st = self.firewall_state()
             for generation in {st.get('generation'), st.get('workloadGeneration')} - {None}:
-                if self.firewall_debt():
+                if settle and self.firewall_debt():
                     self.agent.rollback_generation('integrated lifecycle recovery', generation)
         except Exception:
             self.error('firewall-journal', 'firewall-journal-unreadable')
 
     def recover(self):
-        self.recover_firewall()
+        self.recover_firewall(settle=True)
         if self.executor:
             try:
                 import fcntl
-                self.worker_fd = os.open(os.path.join(self.directory, 'worker.lock'), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-                fcntl.flock(self.worker_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if self.worker_fd is None:
+                    fd = os.open(os.path.join(self.directory, 'worker.lock'), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except Exception:
+                        os.close(fd)
+                        raise
+                    self.worker_fd = fd
                 self.executor.recover()
                 self.refresh()
             except Exception:
@@ -89,6 +102,13 @@ class Lifecycle:
                 return False
             self.active = {'kind': 'firewall', 'transactionId': None, 'startedAt': time.time()}
             return True
+
+    def defer_firewall(self, generation):
+        try:
+            self.firewall_state()
+            self.agent._record_refusal(generation, 'writer busy or recovery unresolved; policy not applied')
+        except Exception:
+            self.error('firewall-journal', 'firewall-journal-unreadable')
 
     def end_firewall(self):
         with self.gate:
@@ -132,9 +152,11 @@ class Lifecycle:
             self.snapshot['network'] = {'state': 'recovery-debt' if pending else 'idle',
                 'transactions': [{'transactionId': tx, 'state': row['state']} for tx, row in rows.items()],
                 'ledger': {'used': len(rows), 'limit': 1024, 'remaining': 1024-len(rows)},
-                'confirmedKernel': observed, 'observedAt': time.time()}
+                'confirmedKernel': copy.deepcopy(observed), 'observedAt': time.time()}
 
     def publish(self):
+        if self.worker_fd is None:
+            return
         try:
             self.executor.publish_results()
             results = read_json(os.path.join(self.directory, 'terminal-results.json'))
@@ -213,7 +235,7 @@ class Lifecycle:
         with self.gate:
             result['activeWriter'] = copy.deepcopy(self.active)
         try:
-            st = self.agent.load_state()
+            st = self.firewall_state()
             result['recoveryDebt'] = {'firewall': st.get('state') in DEBT,
                                      'workload': st.get('workloadState') in DEBT,
                                      'network': result['network']['state'] == 'recovery-debt'}
@@ -235,7 +257,7 @@ class Lifecycle:
         # Never overlap shutdown recovery with a still-running apply. Process death preserves debt.
         if self.thread:
             self.thread.join()
-        self.recover_firewall()
+        self.recover_firewall(settle=True)
         if self.executor and self.worker_fd is not None:
             try:
                 self.executor.recover()

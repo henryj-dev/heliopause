@@ -1,6 +1,8 @@
 /** Lab authority uses the same Registry, review builder, approval state machine and issuer as Manager. */
+import { signHostArtifactAuthorization } from '../../src/artifact-signature.ts';
+import { SCHEMA_VERSION } from '../../src/protocol.ts';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import { createPrivateKey, createPublicKey, generateKeyPairSync, randomBytes } from 'node:crypto';
+import { createPrivateKey, createPublicKey, generateKeyPairSync, randomBytes, createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { issueDurableNetworkConfirm } from '../../src/network-execution-settlement.ts';
 import { NetworkRegistryStore } from '../../src/network-registry.ts';
@@ -17,6 +19,13 @@ if(action==='keys') {
     writeFileSync(join(dir,kind+'.key'),pair.privateKey.export({format:'pem',type:'pkcs8'}),{mode:0o600});
     writeFileSync(join(dir,kind,'public.pem'),pair.publicKey.export({format:'pem',type:'spki'}),{mode:0o600});
   }
+} else if(action==='firewall') {
+  const now=new Date(),generation='lab-firewall-'+randomBytes(8).toString('hex');
+  const ruleset=JSON.stringify({nftables:[{add:{table:{family:'inet',name:'heliopause'}}}]});
+  const entry={stage:'gateway' as const,rulesetHash:'sha256:'+createHash('sha256').update(ruleset).digest('hex'),confirmTimeoutSec:90,mustContain:[]};
+  const bundle={manifest:{generation,issuedAt:now.toISOString(),schemaVersion:SCHEMA_VERSION,hosts:{gateway:entry}},rulesets:{gateway:ruleset},workload:{}};
+  save('firewall-envelope.json',signHostArtifactAuthorization({target:'lab',bundle,host:'gateway',authorizedAt:now,expiresAt:new Date(+now+15*60*1000),authorizationMode:'two-person'},createPrivateKey(readFileSync(join(dir,'manager.key')))));
+  save('wanted.json',{generation});
 } else if(action==='issue'||action==='next') {
   const second=action==='next';
   const facts=read(second?'facts-next.json':'facts.json'),now=Date.now(),at=new Date(now).toISOString(),transactionId=randomBytes(16).toString('hex'),device='hp'+transactionId.slice(0,12);

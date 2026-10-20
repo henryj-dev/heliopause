@@ -3887,7 +3887,11 @@ _EMPTY_STATE = {
 }
 
 
+_state_read_problem = False
+
+
 def _load_state_unlocked():
+    global _state_read_problem
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             saved = json.load(f)
@@ -3896,10 +3900,13 @@ def _load_state_unlocked():
     except (OSError, ValueError) as e:
         # Reporting `none` here would be a lie that reads as "this host was never configured",
         # and would invite a re-apply of something already live. Say the state is unreadable.
-        log(f"state file unreadable ({e}) — reporting unknown")
+        if not _state_read_problem:
+            log("state file unreadable — reporting unknown; new writer admission blocked")
+        _state_read_problem = True
         st = dict(_EMPTY_STATE)
         st["detail"] = f"state file unreadable: {e}"
         return st
+    _state_read_problem = False
     st = dict(_EMPTY_STATE)
     st.update({k: saved.get(k, v) for k, v in _EMPTY_STATE.items()})
     return st
@@ -5644,7 +5651,7 @@ def main():
     # After the commitment recoveries (they handle prepared/pending/rollback-failed; the restore acts
     # only on `confirmed`), and before the monitor
     # starts, so the restore is not observed as a change this agent did not make. Writes no state.
-    if _lifecycle is None or not _lifecycle.errors:
+    if _lifecycle is None or not _lifecycle.blocked():
         _boot_restore()
     if _lifecycle is not None:
         _lifecycle.start()
@@ -5710,8 +5717,8 @@ def main():
                 handle_reply_safely(st, reply)
             finally:
                 _lifecycle.end_firewall()
-        elif reply.get("generation") and reply.get("generation") != st.get("generation"):
-            _record_refusal(reply["generation"], "writer busy or recovery unresolved; policy not applied")
+        elif isinstance(reply, dict) and reply.get("generation") and reply.get("generation") != st.get("generation"):
+            _lifecycle.defer_firewall(reply["generation"])
         if _has_live_commitment(load_state()):
             continue
         sleep_interval()

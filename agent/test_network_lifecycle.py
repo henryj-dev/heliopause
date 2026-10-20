@@ -77,6 +77,20 @@ class Lifecycle(unittest.TestCase):
         self.l.recover_firewall()
         self.agent.recover_workload_commitment.assert_called()
         self.agent.reconcile_recovered_commitments.assert_called()
+    def test_held_worker_flock_never_ticks_or_recovers_another_owner(self):
+        other_executor=Executor(self.path)
+        other_executor.publish_results=Mock()
+        other=lifecycle.Lifecycle(self.agent,directory=self.path,executor=other_executor)
+        other.recover();other.step();other.close()
+        self.assertIsNone(other.worker_fd)
+        other_executor.tick.assert_not_called();other_executor.recover.assert_not_called();other_executor.publish_results.assert_not_called()
+    def test_unknown_state_and_corrupt_recovery_material_fail_closed(self):
+        for bad in [{'state':'garbage'},{'state':'confirmed'},{'state':'pending','generation':'g','pendingRoutes':'invalid'}]:
+            n.atomic(self.agent.STATE_FILE,bad)
+            self.l.recover_firewall()
+            self.assertFalse(self.l.begin_firewall())
+            with self.assertRaises(ValueError):self.l.begin_network()
+            self.assertEqual(self.l.report()['recoveryDebt']['firewall'],'unknown')
     def test_disabled_still_ticks_recovers_and_publishes(self):
         self.l.enabled=False;self.l.recover();self.l.step()
         self.executor.recover.assert_called();self.executor.tick.assert_called()
@@ -84,18 +98,27 @@ class Lifecycle(unittest.TestCase):
     def test_confirm_is_separate_from_heartbeat(self):
         self.l.heartbeat(True);self.executor.confirm.assert_not_called()
         self.request('confirm.json');self.l.step();self.executor.confirm.assert_called_once()
-    def test_hung_network_action_does_not_block_heartbeat_or_firewall_timer(self):
-        entered=threading.Event();release=threading.Event();rolled=threading.Event()
+    def test_hung_network_action_does_not_block_production_firewall_rollback(self):
+        entered=threading.Event();release=threading.Event();restores=[]
         def accept(_):entered.set();release.wait(2);return 'awaiting-verification'
         self.executor.accept.side_effect=accept;self.request();self.l.start()
         self.assertTrue(entered.wait(1))
-        timer=threading.Timer(.03,rolled.set);timer.start()
+        agent=n.crypto_helpers(self.path);agent.STATE_FILE=self.path+'/watchdog.json'
+        state={**agent._EMPTY_STATE,'state':'pending','generation':'watchdog-fixture'}
+        n.atomic(agent.STATE_FILE,state);agent._backup=None
+        def restore(_):restores.append(time.monotonic());return True,'fixture kernel restore'
+        armed=time.monotonic();timer=threading.Timer(.03,agent.rollback,args=('watchdog fixture','watchdog-fixture'))
         stamps=[]
         try:
-            for _ in range(5):
-                self.l.heartbeat(True);stamps.append(time.monotonic());time.sleep(.02)
-            self.assertTrue(rolled.is_set());self.assertLess(max(b-a for a,b in zip(stamps,stamps[1:])),.1)
-            self.assertFalse(self.l.begin_firewall())
+            with patch.object(agent,'_restore',side_effect=restore),patch.object(agent,'_restore_routes',return_value=(True,'no fixture routes')):
+                timer.start()
+                for _ in range(5):
+                    self.l.heartbeat(True);stamps.append(time.monotonic());time.sleep(.02)
+                timer.join(timeout=1)
+                self.assertEqual(n.read_json(agent.STATE_FILE)['state'],'rolled-back')
+                self.assertEqual(len(restores),1);self.assertLess(restores[0]-armed,.2)
+                self.assertLess(max(b-a for a,b in zip(stamps,stamps[1:])),.1)
+                self.assertFalse(self.l.begin_firewall())
         finally:release.set();timer.join()
     def test_missing_outbox_does_not_suppress_tick_or_recovery(self):
         self.executor.publish_results=Mock(side_effect=OSError('disk'))

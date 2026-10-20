@@ -18,13 +18,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         wanted=None
         if os.path.exists(path+'/wanted.json'):
             wanted=json.load(open(path+'/wanted.json'))['generation']
-        response={'schemaVersion':3,'generation':wanted,'gate':{}}
+        response={'schemaVersion':body.get('schemaVersion'),'generation':wanted,'gate':{'open':True}}
+        if os.path.exists(path+'/malformed.json'):response=json.load(open(path+'/malformed.json'))
         data=json.dumps(response).encode()
-        self.send_response(200);self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
+        refused=os.path.exists(path+'/fail-pending') and body.get('applied',{}).get('state')=='pending'
+        self.send_response(503 if refused else 200);self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
     def do_GET(self):
         with open(path+'/artifact-entered','w') as stream:stream.write(str(time.time()))
         if os.path.exists(path+'/hold-artifact'):time.sleep(3)
-        self.send_response(503);self.send_header('Content-Length','0');self.end_headers()
+        filename=path+'/firewall-envelope.json'
+        data=open(filename,'rb').read() if os.path.exists(filename) else b''
+        self.send_response(200 if data else 503);self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
 server=http.server.ThreadingHTTPServer(('192.0.2.1',8444),Handler)
 context=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);context.load_cert_chain(path+'/pki/manager.pem',path+'/pki/manager.key')
 context.load_verify_locations(path+'/pki/ca.pem');context.verify_mode=ssl.CERT_REQUIRED

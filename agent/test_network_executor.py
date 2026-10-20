@@ -477,7 +477,7 @@ class WriterMode(unittest.TestCase):
         with patch.object(self.agent,'main',side_effect=active):self.assertEqual(self.agent.run_writer_mode(),0)
         self.assertIn(('owner-survived',),self.calls)
     def test_old_firewall_debt_settled_before_new_writer(self):
-        n.atomic(self.agent.STATE_FILE,{'state':'pending'})
+        n.atomic(self.agent.STATE_FILE,{'state':'pending','generation':'test-generation'})
         state={'state':'pending','generation':'test-generation','workloadState':None,'workloadGeneration':None}
         def undo(*args):self.calls.append(('undo',));state['state']='rolled-back'
         self.network_args()
