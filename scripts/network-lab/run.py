@@ -199,10 +199,18 @@ def assert_socket(path):
     assert path.exists(), str(path)
 
 
-def failover(primary):
+def failover(primary, bundle):
     started = time.monotonic()
     for i in range(4):
         ns(i, 'ip', 'link', 'set', 'wg0', 'up' if primary else 'down')
+        if primary:
+            # Administrative down deletes these non-persistent kernel routes. Recovery is
+            # interface-up PLUS restoration of the compiler's declared host-route artifacts.
+            # Do not imply that plain link-up is sufficient, or reset BGP to hide the gap.
+            for route in bundle['wireguard']['interfaces'][i]['peerHostRoutes']:
+                ns(i,'ip','route','replace',route['destination'],'dev','wg0')
+    if primary:
+        REPORT['recoveryActions']=['bring native interface up','restore compiler-declared peer host routes deleted by administrative down']
     sent = 0
     lost = 0
     last = None
@@ -253,13 +261,13 @@ def static_shadow():
 
 
 def assert_shadow():
+    best=[p for p in routes(0,1) if p.get('bestpath',{}).get('overall')]
+    assert len(best)==1 and any(n.get('ip')=='198.51.100.2' for n in best[0].get('nexthops',[])), best
     fib = json.loads(ns(0, 'ip', '-j', 'route', 'get', '192.0.2.66').stdout)
     assert fib[0]['dev'] == 'cf0', fib
-    try:
-        selected(0, 1, True)
-    except AssertionError:
-        return
-    raise AssertionError('kernel shadow was not detected')
+    before=transfer(0,'cf0')
+    assert ping(0,1)
+    assert transfer(0,'cf0')>before
 
 
 def leakage():
@@ -267,10 +275,16 @@ def leakage():
     # must refuse them even when a valid local origin route exists in the daemon's RIB.
     ns(0,'ip','route','add','blackhole','192.0.2.48/28')
     ns(0,'vtysh','--vty_socket',str(ROOT/'0'),'-d','bgpd','-c','configure terminal','-c','router bgp 65100','-c','address-family ipv4 unicast','-c','network 198.51.100.129/32','-c','network 192.0.2.48/28')
+    eventually(lambda: assert_origins())
     time.sleep(2)
     for i in range(1,4):
         assert not routes_for_prefix(i,'198.51.100.129/32')
         assert not routes_for_prefix(i,'192.0.2.48/28')
+
+
+def assert_origins():
+    assert routes_for_prefix(0,'198.51.100.129/32'), 'management origin was never installed; leak test did not open the path'
+    assert routes_for_prefix(0,'192.0.2.48/28'), 'service aggregate origin was never installed; leak test did not open the path'
 
 
 def main():
@@ -281,9 +295,9 @@ def main():
     record('isolated namespaces and compiler-fed WireGuard setup', lambda: setup(bundle))
     record('all six neighbors per site established', lambda: eventually(sessions))
     record('all twelve ordered workload paths use native WireGuard with FIB and byte evidence', lambda: eventually(lambda: all_paths(True)))
-    record('primary failure uses secondary tunnel, not Cloudflare emulation', lambda: failover(False))
+    record('primary failure uses secondary tunnel, not Cloudflare emulation', lambda: failover(False,bundle))
     record('management route preserved during outage', management)
-    record('native tunnel recovery returns all paths to primary', lambda: failover(True))
+    record('native tunnel recovery returns all paths to primary', lambda: failover(True,bundle))
     record('static kernel route shadow is detected separately from BGP selection', static_shadow)
     record('management and complete service pool cannot leak through export filters', leakage)
     record('management not advertised and default route not replaced', management)

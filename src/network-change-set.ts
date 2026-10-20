@@ -106,7 +106,8 @@ export function buildNetworkChangeSet(input: NetworkChangeSetInput): NetworkChan
         const underlay=op(`underlay:${g.interfaceId}`,'verify',gateway.nodeId,[g.underlayInterfaceId],domain(rs.get(g.underlayInterfaceId)),'external','verify',null);
         underlay.verification=['Verify every public endpoint uses the independent underlay; reject overlay recursion.'];
         block(g.interfaceId,'underlay-reachability-unverified','declared underlay is not proof of endpoint path or reachability');
-        op(`wireguard:${g.interfaceId}`,'wireguard',gateway.nodeId,[g.gatewayId,g.interfaceId],domain(rs.get(g.interfaceId)),'wireguard','wg-quick',result.artifact.hash);
+        const wgOperation=op(`wireguard:${g.interfaceId}`,'wireguard',gateway.nodeId,[g.gatewayId,g.interfaceId],domain(rs.get(g.interfaceId)),'wireguard','wg-quick',result.artifact.hash);
+        wgOperation.recovery.push('Restore explicit peer host routes after interface recreation or administrative down; link-up alone is insufficient.');
         edge(`wireguard:${g.interfaceId}`,underlay.id);
         for(const remote of wg.gateways.filter(p=>p.gatewayId!==g.gatewayId)) {
           const id=`tunnel:${g.interfaceId}:${remote.interfaceId}`;
@@ -149,6 +150,17 @@ export function buildNetworkChangeSet(input: NetworkChangeSetInput): NetworkChan
         block(peer.interfaceId,'external-overlay-unverified','existing Cloudflare source address and TCP/179 transport must be verified; no interface changes authorized');
       }
       block(peer.interfaceId,'bgp-next-hop-unverified','BGP next hop, source binding and kernel FIB need independent verification');
+      const localBinding=input.bindings.filter(b=>b.nodeId===spec.nodeId);
+      if(localBinding.length===1) {
+        const b=localBinding[0]!;
+        const records=input.observations.filter(r=>r.host===b.host&&r.source===b.source);
+        if(records.length===1 && plan.evidence.some(e=>e.host===b.host&&e.source===b.source)) {
+          const wanted=input.prefixPolicy?.permissions.filter(p=>p.siteId===peer.siteId&&peer.importSubnetIds.includes(p.resourceId)).map(p=>p.prefix)??peer.importSubnetIds.flatMap(id=>{const r=rs.get(id);return r?.kind==='subnet'?[r.cidr]:[];});
+          const collector=records[0]!.report.observations[peer.addressFamily==='ipv4'?'routes4':'routes6'];
+          for(const row of collector?.status==='success'?collector.data??[]:[]) if(typeof row.dst==='string'&&row.dst!=='default'&&(row.table===undefined||row.table===254||row.table==='main')&&row.protocol!=='bgp'&&row.protocol!==186&&wanted.some(p=>prefixContains(p,row.dst as string))) block(spec.nodeId,'observed-route-precedence-unverified','a non-BGP kernel route may shadow an imported prefix; verify FIB and external ownership before any change');
+        }
+      }
+
       for(const subnetId of peer.importSubnetIds) {
         const prefixes=input.prefixPolicy?.permissions.filter(p=>p.resourceId===subnetId).map(p=>p.prefix)??[rs.get(subnetId)].flatMap(r=>r?.kind==='subnet'?[r.cidr]:[]);
         for(const route of input.registry.resources) {

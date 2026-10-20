@@ -142,3 +142,14 @@ test('artifact determinism does not call locale-sensitive comparators',()=>{
   try{String.prototype.localeCompare=function(){throw new Error('locale comparator used');};assert.equal(buildNetworkChangeSet(f).contentHash,expected);}
   finally{String.prototype.localeCompare=original;}
 });
+test('external kernel routes are not rewritten when they may shadow BGP imports',()=>{
+  const f=networkLabInput();f.observations[0]!.report.observations.routes4!.data!.push({dst:'192.0.2.64/27',dev:'cf0',protocol:'static',metric:0});
+  assert.ok(codes(f).includes('observed-route-precedence-unverified'));
+  assert.equal(buildNetworkChangeSet(f).operations.some(o=>o.kind==='route'&&o.resourceIds.includes('cf0')),false);
+});
+test('malformed policy input is a compiler rejection, not a fallback to legacy permissions',()=>{
+  const f=networkLabInput();for(const prefixPolicy of [null,{schemaVersion:1,permissions:null}, {schemaVersion:1,evaluatedAt:f.now,permissions:[null]}]) {
+    assert.equal(compileWireGuard({registry:f.registry,expectedRegistryRevision:1,spec:f.wireguard,prefixPolicy:prefixPolicy as any}).ok,false);
+    assert.equal(compileFrr({registry:f.registry,expectedRegistryRevision:1,spec:f.frr[0],prefixPolicy:prefixPolicy as any}).ok,false);
+  }
+});

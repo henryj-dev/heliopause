@@ -46,7 +46,7 @@ export function compileWireGuard(input: { registry: Pick<NetworkRegistryDocument
   const { registry, expectedRegistryRevision }=input;
   if (!Number.isSafeInteger(expectedRegistryRevision) || expectedRegistryRevision<0 || registry.revision!==expectedRegistryRevision) bad('registry revision mismatch');
   for (const issue of validateNetworkInventory(registry.resources)) bad(`inventory ${issue.resourceId}: ${issue.message}`);
-  if(input.prefixPolicy) for(const e of validatePrefixPolicy(registry.resources,input.prefixPolicy)) bad(e);
+  if(input.prefixPolicy!==undefined) { const policyErrors=validatePrefixPolicy(registry.resources,input.prefixPolicy); if(policyErrors.length) return {ok:false,diagnostics:[...errors,...policyErrors].sort()}; }
   const s=input.spec;
   if (!obj(s) || !keys(s,['schemaVersion','backend','networkId','gateways']) || s.schemaVersion!==1 || s.backend!=='wg-quick' || !str(s.networkId) || !Array.isArray(s.gateways) || s.gateways.length<2 || s.gateways.length>64) return {ok:false,diagnostics:[...errors,'invalid WireGuard spec; only bounded wg-quick full mesh is supported']};
   const resources=new Map(registry.resources.map(r=>[r.id,r])); const network=resources.get(s.networkId);

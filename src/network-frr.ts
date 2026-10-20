@@ -89,7 +89,7 @@ export function compileFrr(input: {
         bad('registry revision mismatch');
     for (const e of validateNetworkInventory(registry.resources))
         bad(`inventory ${e.resourceId}: ${e.message}`);
-    if(input.prefixPolicy) for(const e of validatePrefixPolicy(registry.resources,input.prefixPolicy)) bad(e);
+    if(input.prefixPolicy!==undefined) { const policyErrors=validatePrefixPolicy(registry.resources,input.prefixPolicy); if(policyErrors.length) return {ok:false,diagnostics:[...errors,...policyErrors].sort()}; }
     const s = input.spec;
     if (!obj(s) || !keys(s, ['schemaVersion', 'frrVersion', 'nodeId', 'siteId', 'routerId', 'localAsn', 'exportSubnetIds', 'peers']) || s.schemaVersion !== 1 || !['8.5.6', '10.2.1'].includes(String(s.frrVersion)) || !id(s.nodeId) || !id(s.siteId) || typeof s.routerId !== 'string' || isIP(s.routerId) !== 4 || !asn(s.localAsn) || !ids(s.exportSubnetIds) || !Array.isArray(s.peers) || s.peers.length < 2 || s.peers.length > 128)
         return {
