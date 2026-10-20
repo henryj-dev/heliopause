@@ -195,7 +195,7 @@ class LinuxWireGuard:
             raise RuntimeError('network command unavailable or timed out') from None
         if p.returncode:
             # Never include input, stdout, stderr, secret paths or full argv in error records.
-            raise RuntimeError('network command failed')
+            raise RuntimeError('network command failed: '+args[0]+' '+args[1])
         if len(p.stdout) > 1024*1024:
             raise RuntimeError('network command output exceeds limit')
         return p.stdout.decode().strip()

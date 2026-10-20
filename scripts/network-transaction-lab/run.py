@@ -126,6 +126,7 @@ def await_state(path,wanted,seconds=7):
     except Exception:
         print('Agent diagnostic: '+open(path+'/worker.log').read()[-4000:],flush=True)
         print('Agent state: '+str(state(path)),flush=True)
+        print('Transaction diagnostic: '+str(row(path).get('diagnostic')),flush=True)
         print('Kernel link: '+json.dumps(ip('p6-gw','-d','link','show')),flush=True)
         if os.path.exists(path+'/state/response.json'): print(n.read_json(path+'/state/response.json'),flush=True)
         raise

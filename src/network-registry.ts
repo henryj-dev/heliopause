@@ -124,7 +124,7 @@ export class NetworkRegistryStore {
       if (existsSync(this.path + ".execution-fence")) throw fail("network execution fence requires reconciliation", 409);
       const doc = this.read();
       if (doc.revision !== revision) throw fail("registry revision conflict", 409);
-      // Validation/signing is side-effect-free until the fence has been durably installed.
+      // Return no authorization until the Registry fence is durably installed.
       const result = issue(doc);
       atomicWriteFile(this.path + ".execution-fence", JSON.stringify({ schemaVersion: 1, transactionId, revision }));
       return result;
