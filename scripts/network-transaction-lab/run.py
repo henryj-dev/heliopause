@@ -422,6 +422,8 @@ def consecutive(kind):
 
 
 cases=['normal','signature','target','expiry','hash','approval','registry-changed','local-changed','duplicate','prepare-failed','fail-created','fail-routes','management-failed','asymmetric','blackhole','absent-verifier','lost-confirm','forged-verifier','crash-apply','crash-before-alias','crash-partial-routes','crash-wait','crash-rollback','crash-after-remove','foreign-writer','rollback-command-failed','peer-route-loss','secret-redaction','disabled-recovery','writer-conflict','graceful-stop','foreign-create','consecutive-confirmed','consecutive-rolled-back','consecutive-rollback-failed','consecutive-manager-restart','consecutive-agent-restart','consecutive-delayed-duplicate']
+# New continuity cases run first for useful fail-fast diagnostics; success still requires all38.
+cases.sort(key=lambda name:not name.startswith('consecutive-'))
 for case in cases:
     started=time.monotonic()
     try:
