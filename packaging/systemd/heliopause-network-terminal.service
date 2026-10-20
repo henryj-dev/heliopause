@@ -1,0 +1,14 @@
+[Unit]
+Description=Heliopause direct mTLS terminal result courier
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/heliopause/agent.env
+ExecStart=/usr/bin/python3 /opt/heliopause/agent/network_terminal_delivery.py --config /etc/heliopause/network-executor.json --state-dir /var/lib/heliopause/network-executor
+Restart=always
+RestartSec=2
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

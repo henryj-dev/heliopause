@@ -8,7 +8,7 @@ import { claimForPublish, settle, type ApprovalState } from './approval.ts';
 import { NetworkRegistryStore } from './network-registry.ts';
 import { prefixContains } from './network-prefix-policy.ts';
 
-export const NETWORK_EXECUTION_DOMAIN = 'heliopause-network-execution-v1';
+export const NETWORK_EXECUTION_DOMAIN = 'heliopause-network-execution-v2';
 export const NETWORK_CONFIRM_DOMAIN = 'heliopause-network-confirm-v1';
 export const NETWORK_VERIFY_DOMAIN = 'heliopause-network-verification-v1';
 export interface NetworkWireGuardOperation {
@@ -18,7 +18,7 @@ export interface NetworkWireGuardOperation {
   routes: string[];
 }
 export interface NetworkExecutionDraft {
-  schemaVersion: 1; transactionId: string;
+  schemaVersion: 2; transactionId: string; journalId: string;
   target: { source: string; host: string; nodeId: string };
   registryRevision: number; resources: Array<{ id: string; generation: number }>;
   desiredDigest: string; reviewHash: string; artifactHash: string;
@@ -35,15 +35,22 @@ export function signNetworkMessage(domain: string, payload: unknown, key: KeyObj
   return {version:'heliopause-ed25519-v1',algorithm:'Ed25519',keyId,payload:Buffer.from(bytes).toString('base64url'),signature:sign(null,Buffer.concat([frame(domain),frame(keyId),frame(bytes)]),key).toString('base64url')};
 }
 export const networkExecutionHash = (draft: NetworkExecutionDraft) => 'sha256:'+networkDigest(draft);
+export function validateNetworkExecutionDraft(draft:NetworkExecutionDraft):void {
+  const exact=(value:any,fields:string)=>value&&typeof value==='object'&&!Array.isArray(value)&&Object.keys(value).sort().join(' ')===fields.split(' ').sort().join(' ');
+  if(!exact(draft,'schemaVersion journalId transactionId target registryRevision resources desiredDigest reviewHash artifactHash observation localPrecondition operation issuedAt expiresAt rollbackAt')||!exact(draft.target,'source host nodeId')||!exact(draft.observation,'digest collectedAt maxAgeMs')) throw new Error('unsupported execution fields');
+  const op=draft.operation;
+  if(!exact(op,'driver interfaceId interfaceName address mtu listenPort secretRef publicKey peers routes')||op.driver!=='linux-wireguard-v1'||!Array.isArray(op.peers)||op.peers.length<1||op.peers.length>16||op.peers.some(p=>!exact(p,'publicKey endpoint allowedIps'))||!Array.isArray(op.routes)||op.routes.length>64) throw new Error('unsupported structured driver operation');
+}
 /** Caller supplies authenticated principals to the existing propose/approve APIs first. */
 export function authorizeNetworkExecution(store: NetworkRegistryStore, approvals: ApprovalState, draft: NetworkExecutionDraft, by: string, key: KeyObject, evidence: { observation: NetworkObservationRecord; review: NetworkChangeSet }, now=new Date()): NetworkSignedEnvelope {
+  validateNetworkExecutionDraft(draft);
   const hash=networkExecutionHash(draft);
   if (evidence.observation.host!==draft.target.host || evidence.observation.source!==draft.target.source || networkDigest(evidence.observation)!==draft.observation.digest || Date.parse(evidence.observation.report.completedAt)!==draft.observation.collectedAt || evidence.review.contentHash!==draft.reviewHash || evidence.review.registryRevision!==draft.registryRevision || evidence.review.desiredDigest!==draft.desiredDigest || evidence.review.executable!==false) throw new Error('review/observation commitment mismatch');
   const plan=claimForPublish(approvals,{hash,by,now});
   // This first writer supports two-person policy only; solo/OTP and break-glass stay firewall-only.
   if(!plan.approval || plan.approval.solo || plan.proposedBy===plan.approval.by) throw new Error('network execution requires two-person approval');
   const at=now.getTime();
-  if(draft.schemaVersion!==1 || !/^[a-f0-9]{32}$/.test(draft.transactionId) || draft.issuedAt>at || at-draft.issuedAt>30000 || draft.expiresAt<=at || draft.expiresAt-draft.issuedAt>60000 || draft.rollbackAt<=draft.expiresAt || draft.rollbackAt-draft.issuedAt>180000) throw new Error('invalid execution validity window');
+  if(draft.schemaVersion!==2 || !/^[a-f0-9]{32}$/.test(draft.journalId) || !/^[a-f0-9]{32}$/.test(draft.transactionId) || draft.issuedAt>at || at-draft.issuedAt>30000 || draft.expiresAt<=at || draft.expiresAt-draft.issuedAt>60000 || draft.rollbackAt<=draft.expiresAt || draft.rollbackAt-draft.issuedAt>180000) throw new Error('invalid execution validity window');
   if(draft.operation.interfaceName!=='hp'+draft.transactionId.slice(0,12)) throw new Error('interface name must bind transaction identity');
   if(draft.artifactHash!==networkDigest(draft.operation)) throw new Error('artifact hash mismatch');
   if(draft.observation.maxAgeMs<1 || draft.observation.maxAgeMs>600000 || draft.observation.collectedAt>at || at-draft.observation.collectedAt>draft.observation.maxAgeMs) throw new Error('stale observation');
@@ -59,7 +66,7 @@ export function authorizeNetworkExecution(store: NetworkRegistryStore, approvals
     const envelope=signNetworkMessage(NETWORK_EXECUTION_DOMAIN,{...draft,approval:{mode:'two-person',planHash:hash,proposedBy:plan.proposedBy,approvedBy:plan.approval!.by,approvedAt:Date.parse(plan.approval!.at)}},key);
     settle(approvals,hash);
     return envelope;
-  });
+  },by);
 }
 
 /** Explicit confirm issuance after the original approval was consumed, using an independent ring. */

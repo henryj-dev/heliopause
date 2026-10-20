@@ -21,7 +21,8 @@ import sys
 import tempfile
 import time
 
-EXECUTION = 'heliopause-network-execution-v1'
+EXECUTION = 'heliopause-network-execution-v2'
+TERMINAL_DOMAIN = 'heliopause-network-terminal-mtls-v1'
 CONFIRM = 'heliopause-network-confirm-v1'
 VERIFY = 'heliopause-network-verification-v1'
 DRIVER = 'linux-wireguard-v1'
@@ -433,6 +434,21 @@ class LinuxWireGuard:
         return {'configurationHash':digest(op), 'protectedHash':digest(before)}
 
 
+def initialize_journal(directory):
+    os.makedirs(directory,mode=0o700,exist_ok=True)
+    info=os.lstat(directory)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.geteuid() or info.st_mode&0o077:
+        raise ValueError('journal requires an owned 0700 directory')
+    if os.listdir(directory):
+        raise ValueError('journal initialization requires an empty protected directory')
+    journal_id=os.urandom(16).hex()
+    fd=os.open(os.path.join(directory,'journal-identity.json'),os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+    with os.fdopen(fd,'w') as stream:
+        stream.write(canonical({'journalId':journal_id}));stream.flush();os.fsync(stream.fileno())
+    atomic(os.path.join(directory,'transactions.json'),{'schemaVersion':2,'journalId':journal_id,'terminalSequence':0,'acceptedSequence':0,'transactions':{},'lastClock':0})
+    return journal_id
+
+
 class Executor:
     def __init__(self, config, directory, driver=None, event=None):
         self.config=config
@@ -460,16 +476,40 @@ class Executor:
         try:
             data=read_json(self.path)
         except FileNotFoundError:
-            return {'schemaVersion':1,'transactions':{},'lastClock':0}
-        exact(data,'schemaVersion transactions lastClock')
-        if data['schemaVersion']!=1 or not isinstance(data['transactions'],dict):
-            raise ValueError('invalid transaction journal')
+            raise ValueError('transaction replay journal missing; explicit fresh provisioning required') from None
+        if data.get('schemaVersion')==1:
+            # Legacy journals may only recover existing debt; they cannot authorize schema2 work.
+            exact(data,'schemaVersion transactions lastClock')
+            if not isinstance(data['transactions'],dict):raise ValueError('invalid legacy journal')
+            return data
+        exact(data,'schemaVersion journalId terminalSequence acceptedSequence transactions lastClock')
+        identity=read_json(os.path.join(self.directory,'journal-identity.json'))
+        if data['schemaVersion']!=2 or identity!={'journalId':data['journalId']} or not re.fullmatch(r'[a-f0-9]{32}',str(data['journalId'])) or (self.config.get('journalId') is not None and data['journalId']!=self.config['journalId']) or not integer(data['terminalSequence'],0,1024) or not isinstance(data['transactions'],dict) or len(data['transactions'])>1024 or data['acceptedSequence']!=len(data['transactions']):
+            raise ValueError('invalid transaction replay journal')
+        terminal=[]
+        for transaction,row in data['transactions'].items():
+            if row.get('authorization',{}).get('transactionId')!=transaction or row['authorization'].get('journalId')!=data['journalId'] or row.get('state') not in TERMINAL|{'prepared','applying','awaiting-verification','awaiting-confirm','rolling-back','rollback-failed'}:
+                raise ValueError('invalid journal transaction')
+            if row['state'] in TERMINAL:
+                result=row.get('terminalResult',{});committed={k:v for k,v in result.items() if k!='stateHash'}
+                if result.get('state')!=row['state'] or result.get('authorizationHash')!=digest(row['authorization']) or result.get('stateHash')!=digest(committed):raise ValueError('invalid terminal journal commitment')
+                terminal.append(result.get('sequence'))
+        if sorted(terminal)!=list(range(1,data['terminalSequence']+1)):
+            raise ValueError('terminal replay sequence missing')
         return data
 
     def save(self, data, row=None, state=None):
+        backup=json.loads(canonical(data))
+        transaction=row['authorization']['transactionId'] if row else None
         if state:
             row['state']=state
             row.setdefault('history',[]).append({'state':state,'at':int(time.time()*1000)})
+        if row and state in TERMINAL and data['schemaVersion']==2:
+            data['terminalSequence']+=1
+            a=row['authorization']
+            proof={'confirmationHash':digest(row['confirmation']),'verificationHash':digest(row['verification'])} if state=='confirmed' else {'removalVerified':True}
+            result={'schemaVersion':1,'domain':TERMINAL_DOMAIN,'transactionId':a['transactionId'],'fenceId':a['transactionId'],'target':a['target'],'journalId':data['journalId'],'authorizationHash':digest(a),'artifactHash':a['artifactHash'],'registryRevision':a['registryRevision'],'state':state,'sequence':data['terminalSequence'],'proof':proof}
+            row['terminalResult']={**result,'stateHash':digest(result)}
         if row and state in TERMINAL:
             row['authorizationHash']=digest(row['authorization'])
             row.pop('before',None)
@@ -480,7 +520,12 @@ class Executor:
             item['history']=item.get('history',[])[-16:]
         if len(canonical(data).encode())>8*1024*1024:
             raise ValueError('transaction journal capacity exceeded')
-        atomic(self.path,data)
+        try:atomic(self.path,data)
+        except BaseException:
+            if row is not None and transaction in backup['transactions']:
+                row.clear();row.update(backup['transactions'][transaction]);backup['transactions'][transaction]=row
+            data.clear();data.update(backup)
+            raise
         if state:
             self.event(state)
 
@@ -512,9 +557,9 @@ class Executor:
                 raise ValueError('new network execution disabled')
             independent_trust(self.config,self.provider)
             a=verify(envelope,EXECUTION,self.config['managerKeys'],self.provider)
-            exact(a,'schemaVersion transactionId target registryRevision resources desiredDigest reviewHash artifactHash observation localPrecondition operation issuedAt expiresAt rollbackAt approval')
+            exact(a,'schemaVersion journalId transactionId target registryRevision resources desiredDigest reviewHash artifactHash observation localPrecondition operation issuedAt expiresAt rollbackAt approval')
             now=int(time.time()*1000)
-            if a['schemaVersion']!=1 or not re.fullmatch(r'[a-f0-9]{32}',str(a['transactionId'])) or a['target']!=self.config['identity']:
+            if a['schemaVersion']!=2 or a['journalId']!=self.config.get('journalId') or not re.fullmatch(r'[a-f0-9]{32}',str(a['transactionId'])) or a['target']!=self.config['identity']:
                 raise ValueError('target/schema mismatch')
             if not all(integer(a[k],1,2**53-1) for k in ('issuedAt','expiresAt','rollbackAt')) or not a['issuedAt']<=now<a['expiresAt']<a['rollbackAt'] or a['expiresAt']-a['issuedAt']>60000 or a['rollbackAt']-a['issuedAt']>180000:
                 raise ValueError('expired/invalid execution window')
@@ -538,6 +583,7 @@ class Executor:
             if digest(a['operation'])!=a['artifactHash']:
                 raise ValueError('artifact hash mismatch')
             data=self.load()
+            if data['schemaVersion']!=2 or a['journalId']!=data['journalId']:raise ValueError('journal identity requires fresh approval')
             prior=data['transactions'].get(a['transactionId'])
             if prior:
                 if digest(prior['authorization'])!=digest(a):
@@ -545,6 +591,9 @@ class Executor:
                 return prior['state']
             if now<data['lastClock'] or len(data['transactions'])>=1024 or any(r['state'] not in TERMINAL for r in data['transactions'].values()):
                 raise ValueError('clock/replay capacity or unsettled transaction')
+            # Clear a stale process-local budget only after the durable ledger proves no debt.
+            # This also reconciles a terminal rename whose directory fsync raised afterward.
+            self.driver.deadline=None
             if len(canonical(data).encode())>6*1024*1024:
                 raise ValueError('transaction journal capacity reached')
             started_mono=time.monotonic()
@@ -556,6 +605,7 @@ class Executor:
                 raise ValueError('authorization expired during preflight')
             row={'authorization':a,'state':'prepared','before':before,'paths':paths,'owner':'heliopause:'+a['transactionId']+':'+os.urandom(16).hex(),'acceptedAt':now,'mono':started_mono,'diagnostic':None,'history':[]}
             data['transactions'][a['transactionId']]=row
+            data['acceptedSequence']+=1
             data['lastClock']=now
             if len(canonical(data).encode())>6*1024*1024:
                 raise ValueError('prospective transaction exceeds reserved journal capacity')
@@ -589,6 +639,8 @@ class Executor:
             c=verify(envelope,CONFIRM,self.config['managerKeys'],self.provider)
             exact(c,'transactionId authorizationHash artifactHash expiresAt verification')
             row=data['transactions'].get(c['transactionId'])
+            if row and row['state']=='confirmed' and row.get('terminalResult',{}).get('proof',{}).get('confirmationHash')==digest(c):
+                return 'confirmed'
             if not row or row['state'] not in {'awaiting-verification','awaiting-confirm'}:
                 raise ValueError('no confirmable transaction')
             a=row['authorization']
@@ -608,7 +660,24 @@ class Executor:
                 self.rollback(data,row)
                 raise ValueError('confirmation deadline elapsed')
             self.save(data,row,'confirmed')
+            self.driver.deadline=None
             return row['state']
+
+    def terminal_results(self):
+        with self.locked():
+            data=self.load()
+            if data['schemaVersion']!=2:return []
+            fd=os.open(self.path,os.O_RDONLY|os.O_NOFOLLOW)
+            try:os.fsync(fd)
+            finally:os.close(fd)
+            fd=os.open(self.directory,os.O_RDONLY|os.O_DIRECTORY)
+            try:os.fsync(fd)
+            finally:os.close(fd)
+            return [row['terminalResult'] for row in data['transactions'].values() if row['state'] in TERMINAL]
+
+    def publish_results(self):
+        # Protected local outbox only. A separate read-only courier owns all network I/O.
+        atomic(os.path.join(self.directory,'terminal-results.json'),self.terminal_results())
 
     def tick(self):
         with self.locked():
@@ -628,9 +697,13 @@ class Executor:
 def main(argv=None):
     import argparse
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--config',required=True)
+    parser.add_argument('--config')
+    parser.add_argument('--initialize-journal',action='store_true')
     parser.add_argument('--state-dir',required=True)
     args=parser.parse_args(argv)
+    if args.initialize_journal:
+        print(initialize_journal(args.state_dir));return
+    if not args.config:parser.error('--config required for execution')
     config=read_json(args.config)
     if not config.get('protectedAddresses'):
         raise ValueError('independent protected management addresses required')
@@ -665,9 +738,13 @@ def main(argv=None):
                 except FileNotFoundError:
                     pass
             executor.tick()
+            try:executor.publish_results()
+            except Exception:pass  # Reporting must never delay or suppress local rollback.
             time.sleep(0.25)
     finally:
         executor.recover()
+        try:executor.publish_results()
+        except Exception:pass
 
 
 if __name__=='__main__':

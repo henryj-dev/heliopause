@@ -49,7 +49,7 @@ class Fake:
 def authorization():
     now=int(time.time()*1000)
     op={'driver':n.DRIVER,'interfaceId':'wg-new','interfaceName':'hpaaaaaaaaaaaa','address':'192.0.2.129/32','mtu':1400,'listenPort':51820,'secretRef':'test','publicKey':PUB,'peers':[{'publicKey':PEER,'endpoint':'203.0.113.2:51820','allowedIps':['192.0.2.130/32']}],'routes':['192.0.2.130/32']}
-    a={'schemaVersion':1,'transactionId':'a'*32,'target':{'source':'lab','host':'gateway','nodeId':'gateway'},'registryRevision':1,'resources':[{'id':'wg-new','generation':1}], 'desiredDigest':'a'*64,'reviewHash':'b'*64,'artifactHash':n.digest(op),'observation':{'digest':'c'*64,'collectedAt':now,'maxAgeMs':10000},'localPrecondition':n.digest({'before':True}),'operation':op,'issuedAt':now,'expiresAt':now+5000,'rollbackAt':now+10000}
+    a={'schemaVersion':2,'journalId':'e'*32,'transactionId':'a'*32,'target':{'source':'lab','host':'gateway','nodeId':'gateway'},'registryRevision':1,'resources':[{'id':'wg-new','generation':1}], 'desiredDigest':'a'*64,'reviewHash':'b'*64,'artifactHash':n.digest(op),'observation':{'digest':'c'*64,'collectedAt':now,'maxAgeMs':10000},'localPrecondition':n.digest({'before':True}),'operation':op,'issuedAt':now,'expiresAt':now+5000,'rollbackAt':now+10000}
     a['approval']={'mode':'two-person','proposedBy':'alice','approvedBy':'bob','approvedAt':now,'planHash':'sha256:'+n.digest(a)}
     return a
 
@@ -64,8 +64,10 @@ class Transactions(unittest.TestCase):
         self.patch=patch.object(n,'crypto_helpers',return_value=object());self.patch.start();self.addCleanup(self.patch.stop)
         self.trust=patch.object(n,'independent_trust');self.trust.start();self.addCleanup(self.trust.stop)
         self.decode=patch.object(n,'verify',side_effect=lambda value,*args:value);self.decode.start();self.addCleanup(self.decode.stop)
-        self.driver=Fake();self.a=authorization()
-        self.cfg={'enabled':True,'identity':self.a['target'],'managerKeys':'unused','verifierKeys':'unused','secrets':'unused','protectedAddresses':['192.0.2.1']}
+        journal_id=n.initialize_journal(self.temp.name)
+        self.driver=Fake();self.a=authorization();self.a['journalId']=journal_id
+        self.a['approval']['planHash']='sha256:'+n.digest({k:v for k,v in self.a.items() if k!='approval'})
+        self.cfg={'enabled':True,'journalId':journal_id,'identity':self.a['target'],'managerKeys':'unused','verifierKeys':'unused','secrets':'unused','protectedAddresses':['192.0.2.1']}
         self.e=n.Executor(self.cfg,self.temp.name,self.driver)
     def reapprove(self):
         self.a['approval']['planHash']='sha256:'+n.digest({k:v for k,v in self.a.items() if k!='approval'})
@@ -78,6 +80,111 @@ class Transactions(unittest.TestCase):
         self.assertEqual(self.e.accept(self.a),'awaiting-verification')
         self.assertEqual(self.e.confirm(self.confirmation()),'confirmed')
         self.e.recover();self.assertTrue(self.driver.exists)
+    def test_confirmed_deadline_does_not_poison_next_real_preflight(self):
+        self._two_confirmed_transactions()
+    def test_terminal_rename_then_fsync_error_does_not_poison_next_real_preflight(self):
+        self._two_confirmed_transactions(fsync_error=True)
+    def _two_confirmed_transactions(self,fsync_error=False):
+        # Real Linux preflight/run deadline predicate; only reads, secret lookup and command
+        # boundary are replaced. Writes remain Fake and no host networking is invoked.
+        from types import SimpleNamespace
+        real=n.LinuxWireGuard(self.temp.name)
+        snapshot={'links':[],'routes':[]}
+        real.snapshot=lambda:copy.deepcopy(snapshot)
+        real.route_get=lambda address:{'dev':'underlay'}
+        secret=os.path.join(self.temp.name,'local-secret')
+        with open(secret,'w') as stream:stream.write('test-only')
+        real.secret=lambda op:os.open(secret,os.O_RDONLY)
+        fake=self.driver
+        for method in ['create','configure','routes','fingerprint','verify_local','owned','remove']:
+            setattr(real,method,getattr(fake,method))
+        self.e.driver=real
+        self.a['localPrecondition']=n.digest(snapshot);self.reapprove()
+        with patch.object(n.subprocess,'run',return_value=SimpleNamespace(returncode=0,stdout=b'version')) as command:
+            self.assertEqual(self.e.accept(self.a),'awaiting-verification')
+            if fsync_error:
+                original=n.atomic
+                def installed_then_failed(path,value):
+                    original(path,value)
+                    if any(row.get('state')=='confirmed' for row in value.get('transactions',{}).values()):raise OSError('injected directory fsync failure')
+                with patch.object(n,'atomic',side_effect=installed_then_failed):
+                    with self.assertRaises(OSError):self.e.confirm(self.confirmation())
+                self.assertEqual(self.row()['state'],'confirmed')
+            else:self.assertEqual(self.e.confirm(self.confirmation()),'confirmed')
+            later_wall=time.time()+20;later_mono=time.monotonic()+20
+            with patch.object(n.time,'time',return_value=later_wall),patch.object(n.time,'monotonic',return_value=later_mono):
+                self.a=authorization();self.a['journalId']=self.cfg['journalId'];self.a['transactionId']='b'*32
+                self.a['operation']['interfaceName']='hpbbbbbbbbbbbb'
+                self.a['artifactHash']=n.digest(self.a['operation'])
+                self.a['localPrecondition']=n.digest(snapshot);self.reapprove()
+                self.assertEqual(self.e.accept(self.a),'awaiting-verification')
+                self.assertEqual(self.e.confirm(self.confirmation()),'confirmed')
+            self.assertEqual(command.call_count,2)
+        self.assertEqual(len(self.e.load()['transactions']),2)
+
+    def test_terminal_receipt_is_read_from_durable_confirmation(self):
+        self.e.accept(self.a);c=self.confirmation();self.e.confirm(c)
+        result=self.e.terminal_results()[0]
+        self.assertEqual(result['proof'],{'confirmationHash':n.digest(c),'verificationHash':n.digest(c['verification'])})
+        self.assertEqual(result['authorizationHash'],n.digest(self.a))
+        committed={k:v for k,v in result.items() if k!='stateHash'}
+        self.assertEqual(result['stateHash'],n.digest(committed))
+        self.assertEqual(self.e.confirm(c),'confirmed')
+        self.assertEqual(self.e.terminal_results(),[result])
+    def test_rollback_failure_cannot_emit_success_terminal_and_next_apply_is_refused(self):
+        self.e.accept(self.a);self.driver.fail='remove';self.e.recover()
+        self.assertEqual(self.row()['state'],'rollback-failed');self.assertEqual(self.e.terminal_results(),[])
+        other=copy.deepcopy(self.a);other['transactionId']='b'*32;other['operation']['interfaceName']='hpbbbbbbbbbbbb';other['artifactHash']=n.digest(other['operation']);other['approval']['planHash']='sha256:'+n.digest({k:v for k,v in other.items() if k!='approval'})
+        with self.assertRaises(ValueError):self.e.accept(other)
+        self.driver.fail=None;self.e.recover()
+        self.assertEqual(self.e.terminal_results()[0]['proof'],{'removalVerified':True})
+    def test_disabled_recovery_still_publishes_authenticated_transport_outbox(self):
+        self.e.accept(self.a);self.cfg['enabled']=False;self.e.recover();self.e.publish_results()
+        result=n.read_json(self.temp.name+'/terminal-results.json')[0]
+        self.assertEqual(result['state'],'rolled-back');self.assertEqual(result['journalId'],self.cfg['journalId'])
+    def test_terminal_write_failure_never_publishes_uncommitted_success(self):
+        self.e.accept(self.a);original=n.atomic
+        def fail(path,value):
+            if any(r.get('state')=='confirmed' for r in value.get('transactions',{}).values()):raise OSError('disk full')
+            return original(path,value)
+        with patch.object(n,'atomic',side_effect=fail):
+            with self.assertRaises(OSError):self.e.confirm(self.confirmation())
+        self.assertEqual(self.e.terminal_results(),[])
+        self.e.recover();self.assertEqual(self.e.terminal_results()[0]['state'],'rolled-back')
+    def test_missing_journal_never_reinitializes_replay_state(self):
+        self.e.accept(self.a);os.unlink(self.e.path)
+        with self.assertRaises((ValueError,FileNotFoundError)):self.e.accept(self.a)
+        with self.assertRaises(ValueError):n.initialize_journal(self.temp.name)
+    def test_removed_transaction_is_detected_without_replay_ledger_pruning(self):
+        self.e.accept(self.a);data=self.e.load();data['transactions']={};n.atomic(self.e.path,data)
+        with self.assertRaises(ValueError):self.e.load()
+    def test_fresh_journal_identity_refuses_old_authorization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            identity=n.initialize_journal(directory)
+            cfg={**self.cfg,'journalId':identity};other=n.Executor(cfg,directory,Fake())
+            self.assertNotEqual(identity,self.cfg['journalId'])
+            with self.assertRaises(ValueError):other.accept(self.a)
+            self.assertEqual(other.driver.calls,[])
+    def test_terminal_export_requires_successful_durability_barrier(self):
+        self.e.accept(self.a);self.e.confirm(self.confirmation())
+        with patch.object(n.os,'fsync',side_effect=OSError('injected fsync failure')):
+            with self.assertRaises(OSError):self.e.publish_results()
+        self.assertFalse(os.path.exists(self.temp.name+'/terminal-results.json'))
+        self.e.publish_results();self.assertEqual(len(n.read_json(self.temp.name+'/terminal-results.json')),1)
+
+    def test_terminal_before_outbox_new_process_recovers_reporting(self):
+        self.e.accept(self.a);self.e.confirm(self.confirmation())
+        self.assertFalse(os.path.exists(self.temp.name+'/terminal-results.json'))
+        # New process, disk only. Explicit subprocess boundary allows only this fixed read/export.
+        import subprocess
+        original=__import__('subprocess').Popen
+        code="import sys;sys.path.insert(0,'agent');import network_executor as n;n.crypto_helpers=lambda directory:object();e=n.Executor(n.read_json(sys.argv[1]),sys.argv[2]);e.publish_results()"
+        n.atomic(self.temp.name+'/config.json',self.cfg)
+        process=original([sys.executable,'-c',code,self.temp.name+'/config.json',self.temp.name],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        out,error=process.communicate(timeout=5)
+        self.assertEqual(process.returncode,0,error.decode())
+        self.assertEqual(n.read_json(self.temp.name+'/terminal-results.json')[0]['state'],'confirmed')
+
     def test_overlapping_verifier_trust_is_rejected(self):
         class Provider:
             def _load_artifact_key_dir(self,*args):return [('same-key','manager','unused')]
@@ -177,6 +284,53 @@ class Transactions(unittest.TestCase):
         self.assertEqual(os.stat(self.e.path).st_mode & 0o777,0o600)
         with open(self.e.path) as stream:
             self.assertNotIn('privateKey',stream.read())
+
+
+class TerminalCourier(unittest.TestCase):
+    def setUp(self):
+        import network_terminal_delivery as delivery
+        self.d=delivery;self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
+        self.path=self.temp.name
+        self.cfg={'terminalDelivery':{'url':'https://manager.example.invalid/api/network/execution/terminal','caFile':self.path+'/ca','certFile':self.path+'/cert','keyFile':self.path+'/key'}}
+        for name in ['ca','cert','key']:
+            n.atomic(self.path+'/'+name,{'test':'fixture'})
+        n.atomic(self.path+'/terminal-results.json',[{'transactionId':'a'*32,'state':'confirmed'}])
+        self.ssl=patch.object(delivery.ssl,'create_default_context');self.ssl.start();self.addCleanup(self.ssl.stop)
+        self.network=patch.object(delivery.urllib.request,'build_opener');self.opener=self.network.start().return_value;self.addCleanup(self.network.stop)
+        self.opener.open.return_value.__enter__.return_value.read.return_value=b'{"settled":true}'
+        for module,name in [(n.subprocess,'run'),(n.subprocess,'Popen'),(n.socket,'socket')]:
+            guard=patch.object(module,name,side_effect=AssertionError('escaped courier unit boundary'));guard.start();self.addCleanup(guard.stop)
+    def test_only_direct_https_mtls_delivery_and_ack_deduplication(self):
+        self.assertEqual(self.d.deliver(self.cfg,self.path),1)
+        self.assertEqual(self.d.deliver(self.cfg,self.path),0)
+        self.opener.open.assert_called_once()
+        request=self.opener.open.call_args[0][0]
+        self.assertNotIn('Authorization',request.headers);self.assertNotIn('Cookie',request.headers)
+    def test_transport_loss_does_not_ack_and_can_retry_identical_result(self):
+        self.opener.open.side_effect=OSError('lost response')
+        with self.assertRaises(OSError):self.d.deliver(self.cfg,self.path)
+        self.assertFalse(os.path.exists(self.path+'/terminal-acks.json'))
+        self.opener.open.side_effect=None
+        self.assertEqual(self.d.deliver(self.cfg,self.path),1)
+    def test_unsuccessful_manager_response_never_acknowledges(self):
+        self.opener.open.return_value.__enter__.return_value.read.return_value=b'{"settled":false}'
+        with self.assertRaises(ValueError):self.d.deliver(self.cfg,self.path)
+        self.assertFalse(os.path.exists(self.path+'/terminal-acks.json'))
+    def test_plaintext_credentials_and_redirects_are_refused(self):
+        for url in ['http://manager.example.invalid/api/network/execution/terminal','https://user:password@manager.example.invalid/api/network/execution/terminal','https://manager.example.invalid/api/network/execution/terminal?key=secret']:
+            self.cfg['terminalDelivery']['url']=url
+            with self.assertRaises(ValueError):self.d.deliver(self.cfg,self.path)
+        with self.assertRaises(ValueError):self.d.NoRedirect().redirect_request(None,None,None,None,None,None)
+    def test_private_key_permissions_are_checked_before_transport(self):
+        # Inject insecure metadata without making even a disposable key world-readable.
+        metadata=list(os.stat(self.path+'/key'));metadata[0]=(metadata[0] & ~0o777) | 0o644
+        with patch.object(n.os,'fstat',return_value=os.stat_result(metadata)):
+            with self.assertRaises(ValueError):self.d.deliver(self.cfg,self.path)
+        self.opener.open.assert_not_called()
+    def test_oversized_untrusted_response_is_not_recorded(self):
+        self.opener.open.return_value.__enter__.return_value.read.return_value=b'X'*4097
+        with self.assertRaises(ValueError):self.d.deliver(self.cfg,self.path)
+        self.assertFalse(os.path.exists(self.path+'/terminal-acks.json'))
 
 
 class Ownership(unittest.TestCase):
@@ -290,6 +444,7 @@ class WriterMode(unittest.TestCase):
         class Recovery:
             def __init__(self,cfg,directory): owner.calls.append(('locate',directory))
             def recover(self): owner.calls.append(('recover',))
+            def publish_results(self): owner.calls.append(('publish',))
             def load(self): return {'transactions':{'tx':{'state':'rolled-back' if owner.terminal else 'rollback-failed'}}}
         self.patches=[patch.object(n,'Executor',Recovery),patch.object(n.subprocess,'run',side_effect=AssertionError('unexpected subprocess boundary')),patch.object(n.subprocess,'Popen',side_effect=AssertionError('unexpected child boundary')),patch.dict(os.environ,{'HELIOPAUSE_WRITER_LOCK':self.path+'/writer.lock','HELIOPAUSE_NETWORK_EXECUTOR_STATE_DIR':self.path+'/unused-default'}),patch.object(sys,'argv',['agent'])]
         for p in self.patches:p.start();self.addCleanup(p.stop)
@@ -303,7 +458,7 @@ class WriterMode(unittest.TestCase):
         self.assertEqual(n.read_json(self.path+'/network-writer-locator.json')['stateDir'],self.state)
         sys.argv[:]=['agent']
         self.assertEqual(self.agent.run_writer_mode(),0)
-        self.assertIn(('locate',self.state),self.calls);self.assertIn(('recover',),self.calls)
+        self.assertIn(('locate',self.state),self.calls);self.assertIn(('recover',),self.calls);self.assertIn(('publish',),self.calls)
     def test_unsettled_network_blocks_other_writer(self):
         n.atomic(self.path+'/network-writer-locator.json',{'config':self.config,'stateDir':self.state})
         self.terminal=False

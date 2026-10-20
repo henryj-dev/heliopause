@@ -16,11 +16,12 @@ function fixture() {
   const input=networkLabInput();
   for (const r of input.registry.resources) if (r.management.mode==='managed') { r.management.driver='wg-quick'; if(r.kind==='interface'&&r.id==='wg0')r.name='hpaaaaaaaaaaaa'; if(r.kind==='route'&&r.interfaceId==='wg0'){r.protocol='static';r.metric=42760;} }
   const registry=store.mutate(0,'alice',{action:'replace',resources:input.registry.resources});
+  store.initializeExecutions();
   const now=Date.now();
   const observation=structuredClone(input.observations[0]!);observation.receivedAt=new Date(now).toISOString();observation.report.completedAt=observation.receivedAt;
   const review=buildNetworkChangeSet({...input,wireguard:undefined,frr:undefined,registry,now});
   const operation={driver:'linux-wireguard-v1' as const,interfaceId:'wg0',interfaceName:'hpaaaaaaaaaaaa',address:'198.51.100.1/32',mtu:1420,listenPort:51820,secretRef:'local',publicKey:Buffer.alloc(32,1).toString('base64'),peers:[{publicKey:Buffer.alloc(32,2).toString('base64'),endpoint:'203.0.113.2:51820',allowedIps:['198.51.100.2/32']}],routes:['198.51.100.2/32']};
-  const draft:NetworkExecutionDraft={schemaVersion:1,transactionId:'a'.repeat(32),target:{source:'lab-relay',host:'lab-host-0',nodeId:'n0'},registryRevision:1,resources:registry.resources.map(r=>({id:r.id,generation:r.generation})),desiredDigest:review.desiredDigest,reviewHash:review.contentHash,artifactHash:networkDigest(operation),observation:{digest:networkDigest(observation),collectedAt:now,maxAgeMs:10000},localPrecondition:'b'.repeat(64),operation,issuedAt:now,expiresAt:now+10000,rollbackAt:now+20000};
+  const draft:NetworkExecutionDraft={schemaVersion:2,journalId:'e'.repeat(32),transactionId:'a'.repeat(32),target:{source:'lab-relay',host:'lab-host-0',nodeId:'n0'},registryRevision:1,resources:registry.resources.map(r=>({id:r.id,generation:r.generation})),desiredDigest:review.desiredDigest,reviewHash:review.contentHash,artifactHash:networkDigest(operation),observation:{digest:networkDigest(observation),collectedAt:now,maxAgeMs:10000},localPrecondition:'b'.repeat(64),operation,issuedAt:now,expiresAt:now+10000,rollbackAt:now+20000};
   const approvals=emptyApprovals(),key=generateKeyPairSync('ed25519');
   const proposeDraft=()=>propose(approvals,{hash:networkExecutionHash(draft),generation:draft.transactionId,summary:{hosts:[]},by:'alice',now:new Date(now)});
   const approveDraft=()=>approve(approvals,{hash:networkExecutionHash(draft),by:'bob',now:new Date(now)});
@@ -39,7 +40,7 @@ test('signed execution binds artifact and retains a durable mutation fence acros
     assert.equal(verify(null,Buffer.concat([frame(NETWORK_EXECUTION_DOMAIN),frame(envelope.keyId),frame(payload.toString())]),f.key.publicKey,Buffer.from(envelope.signature,'base64url')),true);
     assert.equal(JSON.parse(payload.toString()).approval.approvedBy,'bob');
     assert.throws(()=>new NetworkRegistryStore(f.store.path).mutate(1,'external',{action:'replace',resources:f.registry.resources}),/fence/);
-    assert.equal(JSON.parse(readFileSync(f.store.path+'.execution-fence','utf8')).transactionId,f.draft.transactionId);
+    assert.equal(f.store.executionStatus().fence!.transactionId,f.draft.transactionId);
     assert.throws(f.issue,/already been published/);
   } finally {rmSync(f.dir,{recursive:true,force:true});}
 });
