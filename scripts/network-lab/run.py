@@ -6,6 +6,7 @@ JSON records measured durations and loss, never a promised failover time.
 import ipaddress
 import json
 import os
+import pwd
 from pathlib import Path
 import signal
 import subprocess
@@ -174,8 +175,9 @@ def setup(bundle):
         for offset in [34,50]:
             command('ip','netns','exec','client'+str(i),'ip','addr','add',f'192.0.2.{i*64+offset}/32','dev','lo')
         directory = ROOT/str(i)
-        directory.mkdir(mode=0o777)
-        os.chmod(directory, 0o777)
+        directory.mkdir(mode=0o750)
+        account=pwd.getpwnam('frr')
+        os.chown(directory,account.pw_uid,account.pw_gid)
         common = ['-i', str(directory/'zebra.pid'), '-z', str(directory/'zserv.api'), '--vty_socket', str(directory)]
         start_daemon(i,'/usr/lib/frr/zebra',directory,'-f','/dev/null',*common)
         eventually(lambda: assert_socket(directory/'zserv.api'), 10)
