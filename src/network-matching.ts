@@ -7,7 +7,7 @@ import type { NetworkRegistryDocument } from "./network-registry.ts";
 
 export interface NetworkIdentityBinding { source: string; host: string; siteId: string; nodeId: string }
 export type NetworkMatchStatus = "matched" | "missing" | "unexpected" | "different" | "unknown" | "stale" | "unsupported";
-export type NetworkObservationClass = "managed-drift" | "external-observation" | "unclaimed-observation" | "unexpected-managed";
+export type NetworkObservationClass = "managed-drift" | "managed-observation" | "external-observation" | "unclaimed-observation" | "unexpected-managed";
 export interface NetworkMatch { classification?: NetworkObservationClass; resourceId: string; status: NetworkMatchStatus; reason: string; management?: NetworkManagement }
 export interface NetworkMatchEvidence { source: string; host: string; collectionId: string; digest: string }
 export interface NetworkMatchingResult { matches: NetworkMatch[]; evidence: NetworkMatchEvidence[]; digest: string }
@@ -74,7 +74,7 @@ export function matchNetworkInventory(input: NetworkMatchingInput): NetworkMatch
     } catch { invalid.add(key); }
   }
   const matches: NetworkMatch[] = [];
-  const add = (r: NetworkInventoryResource, status: NetworkMatchStatus, reason: string) => matches.push({ resourceId: r.id, management: structuredClone(r.management), classification: r.management.mode === "external" ? "external-observation" : "managed-drift", status, reason });
+  const add = (r: NetworkInventoryResource, status: NetworkMatchStatus, reason: string) => matches.push({ resourceId: r.id, management: structuredClone(r.management), classification: r.management.mode === "external" ? "external-observation" : status === "different" || status === "missing" ? "managed-drift" : "managed-observation", status, reason });
   const used = new Set<string>();
   const eligible = new Map<string, NetworkObservationRecord>();
   for (const r of [...registry.resources].sort((a, b) => a.id.localeCompare(b.id))) {

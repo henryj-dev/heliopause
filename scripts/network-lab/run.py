@@ -14,6 +14,7 @@ import tempfile
 import time
 
 ROOT = Path(tempfile.mkdtemp(prefix='hp-network-lab-'))
+ROOT.chmod(0o755)
 RESULTS = Path('/results')
 REPORT = {'schemaVersion': 1, 'scope': 'isolated-synthetic-lab',
           'cloudflareVerified': False, 'kubernetesVerified': False,
@@ -172,7 +173,7 @@ def setup(bundle):
         directory = ROOT/str(i)
         directory.mkdir(mode=0o777)
         os.chmod(directory, 0o777)
-        common = ['-d', '-i', str(directory/'zebra.pid'), '-z', str(directory/'zserv.api'), '--vty_socket', str(directory), '-u', 'root', '-g', 'root']
+        common = ['-d', '-i', str(directory/'zebra.pid'), '-z', str(directory/'zserv.api'), '--vty_socket', str(directory)]
         ns(i, '/usr/lib/frr/zebra', '-f', '/dev/null', *common)
         PROCESSES.append(directory/'zebra.pid')
         eventually(lambda: assert_socket(directory/'zserv.api'), 10)
