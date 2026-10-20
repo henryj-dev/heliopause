@@ -228,6 +228,10 @@ class Ownership(unittest.TestCase):
     def test_foreign_psk_preserved(self):
         self.psk='opaque-foreign-secret'
         with self.assertRaises(ValueError): self.driver.owned(self.op,self.owner)
+    def test_no_ipv6_interface_row_is_empty_not_missing_ipv4_link(self):
+        original=self.driver.ip
+        self.driver.ip=lambda *args: [] if args[0]=='-6' and 'address' in args else original(*args)
+        self.assertTrue(self.driver.owned(self.op,self.owner))
     def test_foreign_ipv6_preserved(self):
         self.v6=[{'local':'2001:db8::1'}]
         with self.assertRaises(ValueError): self.driver.owned(self.op,self.owner)

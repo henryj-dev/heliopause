@@ -346,7 +346,7 @@ class LinuxWireGuard:
             pub, endpoint=line.split()
             if endpoint!=next((p['endpoint'] for p in op['peers'] if p['publicKey']==pub), None):
                 raise ValueError('endpoint ownership conflict')
-        if self.ip('-6','address','show','dev',op['interfaceName'])[0].get('addr_info') or self.ip('-6','route','show','table','all','dev',op['interfaceName']):
+        if any(row.get('addr_info') for row in self.ip('-6','address','show','dev',op['interfaceName'])) or self.ip('-6','route','show','table','all','dev',op['interfaceName']):
             raise ValueError('IPv6 ownership conflict')
         peers = self.run(['wg', 'show', op['interfaceName'], 'peers']).split()
         if alias is None and ('UP' in link.get('flags',[]) or public not in {'','(none)'} or peers or self.run(['wg','show',op['interfaceName'],'listen-port'])!='0' or any(row.get('addr_info') for row in self.ip('address','show','dev',op['interfaceName']))):
