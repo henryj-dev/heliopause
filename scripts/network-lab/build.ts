@@ -19,7 +19,7 @@ const wg=compileWireGuard({registry:input.registry,expectedRegistryRevision:1,sp
 if(!wg.ok)throw new Error(wg.diagnostics.join('; '));
 const frr=input.frr.map(spec=>{const r=compileFrr({registry:input.registry,expectedRegistryRevision:1,spec,prefixPolicy:input.prefixPolicy});if(!r.ok)throw new Error(r.diagnostics.join('; '));return r.artifact;});
 // IPv6+BFD parser coverage is separate from the IPv4 packet-forwarding topology.
-const v6=structuredClone(input),base=v6.registry.resources[0]!;
+const v6=structuredClone(input),base={owner:'lab',generation:1,management:{mode:'managed' as const,provider:'wireguard',driver:'wireguard'}};
 for(const [id,cidr] of [['primary','2001:db8:100::/64'],['secondary','2001:db8:200::/64']]) v6.registry.resources.push({...base,id:`${id}-v6`,kind:'subnet',networkId:id!,cidr:cidr!});
 for(let i=0;i<4;i++) {
   v6.registry.resources.push({...base,id:`infra6-${i}`,kind:'subnet',networkId:`lan${i}`,cidr:`2001:db8:${i+10}::/64`});

@@ -97,7 +97,8 @@ container. The only writable host mount is the chosen result directory.
 Four gateway namespaces and four workload namespaces use documentation address
 ranges. Fresh private keys exist only in ephemeral memory/private temp files and
 are not printed or saved in results. The compiler's templates are used unchanged
-for FRR syntax checks. Lab-specific BGP timers are subsequently configured through
+for FRR syntax checks, including separate IPv6 templates with optional BFD enabled.
+IPv6 packet forwarding and BFD liveness/failover are not exercised by those parser checks. Lab-specific BGP timers are subsequently configured through
 VTY (per-peer keepalive 1s, hold 3s, connect retry 1s). The secondary backbone uses a separate WG interface/port, not Cloudflare.
 
 Checks require six Established peers per gateway, all twelve ordered workload
