@@ -125,13 +125,14 @@ class Lifecycle(unittest.TestCase):
         stamps=[]
         try:
             with patch.object(agent,'_restore',side_effect=restore),patch.object(agent,'_restore_routes',return_value=(True,'no fixture routes')):
-                timer.start()
-                for _ in range(5):
-                    self.l.heartbeat(True);stamps.append(time.monotonic());time.sleep(.02)
-                timer.join(timeout=1)
-                self.assertEqual(n.read_json(agent.STATE_FILE)['state'],'rolled-back')
-                self.assertEqual(len(restores),1);self.assertLess(restores[0]-armed,.2)
-                self.assertLess(max(b-a for a,b in zip(stamps,stamps[1:])),.1)
+                with self.l.gate:
+                    timer.start()
+                    for _ in range(5):
+                        self.l.heartbeat(True);stamps.append(time.monotonic());time.sleep(.02)
+                    timer.join(timeout=1)
+                    self.assertEqual(n.read_json(agent.STATE_FILE)['state'],'rolled-back')
+                    self.assertEqual(len(restores),1);self.assertLess(restores[0]-armed,.2)
+                    self.assertLess(max(b-a for a,b in zip(stamps,stamps[1:])),.1)
                 self.assertFalse(self.l.begin_firewall())
         finally:release.set();timer.join()
     def test_first_firewall_write_persists_required_marker_before_journal(self):

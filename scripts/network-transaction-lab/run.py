@@ -482,7 +482,7 @@ def integrated(kind):
             run('nft','add','table','inet','heliopause',ns='p6-gw')
             n.atomic(path+'/firewall-state.json',{'state':'pending','generation':'recovery-fixture','pendingBackup':{'elements':None},'rollbackAt':time.time()-1})
             with open(path+'/state/transactions.json','w') as stream:stream.write('{')
-        fault={'integrated-crash-apply':'created','integrated-crash-rollback':'rolling-back'}.get(kind,'')
+        fault={'integrated-crash-apply':'created','integrated-crash-rollback':'rolling-back','integrated-discovery-timeout':'discovery-stall'}.get(kind,'')
         agent=start(path,fault=fault,production=True,normal_entry=normal,network_enabled=enabled,extra_env=extra)
         pid=agent.pid
         if kind in {'integrated-crash-apply','integrated-crash-rollback'}:
@@ -547,6 +547,12 @@ def integrated(kind):
                     assert n.read_json(path+'/firewall-state.json')['state']=='rolled-back'
                     assert not run('nft','list','table','inet','heliopause',ns='p6-gw',ok=False)
             elif kind=='integrated-network-busy':
+                bad=n.read_json(path+'/config.json');bad['terminalDelivery']['caFile']=path+'/missing-ca.pem';n.atomic(path+'/courier-config.json',bad)
+                courier_log=open(path+'/courier.log','ab',buffering=0)
+                courier_process=subprocess.Popen(['ip','netns','exec','p6-gw','python3','agent/network_terminal_delivery.py','--config',path+'/courier-config.json','--state-dir',path+'/state'],stdout=courier_log,stderr=courier_log,start_new_session=True)
+                processes.append((courier_process,courier_log))
+                wait_for(lambda:os.path.exists(path+'/state/terminal-delivery-status.json') and n.read_json(path+'/state/terminal-delivery-status.json')['state']=='pending')
+                assert courier_process.poll() is None
                 n.atomic(path+'/wanted.json',{'generation':'deferred-firewall'})
                 try:
                     wait_for(lambda:os.path.exists(path+'/firewall-state.json') and bool(n.read_json(path+'/firewall-state.json').get('lastRefusal')))
@@ -561,6 +567,14 @@ def integrated(kind):
                 assert agent.poll() is None and state(path)=='awaiting-verification'
                 os.unlink(path+'/malformed.json');os.unlink(path+'/wanted.json')
                 await_state(path,{'rolled-back'},16);assert not exists()
+                network_rolled_at=time.time();network_deadline=n.read_json(path+'/decoded.json')['rollbackAt']/1000
+                assert network_deadline<=network_rolled_at<network_deadline+3
+                n.atomic(path+'/courier-config.json',n.read_json(path+'/config.json'))
+                wait_for(lambda:n.read_json(path+'/state/terminal-delivery-status.json')['reason']=='manager-transport-unavailable')
+            elif kind=='integrated-discovery-timeout':
+                wait_for(lambda:n.read_json(path+'/lifecycle-status.json').get('discovery',{}).get('lastFailure'),8)
+                discovery_failed_at=n.read_json(path+'/lifecycle-status.json')['discovery']['lastFailure']
+                assert all(verify_and_confirm(path).values());await_state(path,{'confirmed'})
             elif kind=='integrated-confirmed-missing':
                 assert all(verify_and_confirm(path).values());await_state(path,{'confirmed'})
                 run('ip','link','del',DEV,ns='p6-gw')
@@ -591,13 +605,15 @@ def integrated(kind):
         assert report['heartbeat'].get('lastSuccess'),report
         evidence={'firstAgentPid':pid,'finalAgentPid':agent.pid,'heartbeatCount':len(beats),'heartbeatMaxGapSeconds':max(gaps),'heartbeatGapLimitSeconds':allowed,'heartbeatLastSuccess':report['heartbeat'].get('lastSuccess'),'heartbeatLastFailure':report['heartbeat'].get('lastFailure')}
         if kind=='integrated-command-timeout':evidence['commandStallObservedAt']=stall_observed_at
+        if kind=='integrated-discovery-timeout':evidence['discoveryTimeoutObservedAt']=discovery_failed_at
+        if kind=='integrated-network-busy':evidence.update({'rollbackDeadline':network_deadline,'rollbackObservedAt':network_rolled_at,'rollbackLatenessSeconds':network_rolled_at-network_deadline,'courierFailureObserved':True})
         if kind=='integrated-firewall-watchdog':evidence.update({'rollbackDeadline':promised,'rollbackObservedAt':rolled_at,'rollbackLatenessSeconds':rolled_at-promised})
         agent.terminate();agent.wait(timeout=8)
         return evidence
 
 
 cases=['normal','signature','target','expiry','hash','approval','registry-changed','local-changed','duplicate','prepare-failed','fail-created','fail-routes','management-failed','asymmetric','blackhole','absent-verifier','lost-confirm','forged-verifier','crash-apply','crash-before-alias','crash-partial-routes','crash-wait','crash-rollback','crash-after-remove','foreign-writer','rollback-command-failed','peer-route-loss','secret-redaction','disabled-recovery','writer-conflict','graceful-stop','foreign-create','consecutive-confirmed','consecutive-rolled-back','consecutive-rollback-failed','consecutive-manager-restart','consecutive-agent-restart','consecutive-delayed-duplicate']
-cases += ['integrated-disabled','integrated-disabled-recovery','integrated-network-busy','integrated-firewall-busy','integrated-command-timeout','integrated-firewall-watchdog','integrated-confirmed-missing','integrated-corrupt-network','integrated-corrupt-firewall','integrated-crash-apply','integrated-crash-rollback','integrated-crash-wait','integrated-dual-debt']
+cases += ['integrated-disabled','integrated-disabled-recovery','integrated-network-busy','integrated-firewall-busy','integrated-command-timeout','integrated-firewall-watchdog','integrated-confirmed-missing','integrated-corrupt-network','integrated-corrupt-firewall','integrated-crash-apply','integrated-crash-rollback','integrated-crash-wait','integrated-dual-debt','integrated-discovery-timeout']
 # New continuity cases run first for useful fail-fast diagnostics; success still requires all38.
 cases.sort(key=lambda name:0 if name.startswith('integrated-') else 1 if name.startswith('consecutive-') else 2)
 for case in cases:
@@ -613,5 +629,5 @@ for case in cases:
         for p,log in processes: stop(p);log.close()
         processes.clear()
         for ns in NAMES: run('ip','netns','del',ns,ok=False)
-assert len(results)==51
+assert len(results)==52
 print(json.dumps({'kind':'network-transaction-kernel-report','passed':len(results),'failed':0,'skipped':0,'hostRebootVerified':False,'backend':n.DRIVER,'sourceCommit':os.environ.get('HELIOPAUSE_LAB_SOURCE_COMMIT'),'kernel':platform.release(),'wireguardTools':run('wg','--version'),'iproute2':run('ip','-Version'),'scenarios':results}),flush=True)

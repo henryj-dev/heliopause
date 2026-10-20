@@ -6,6 +6,12 @@ import time
 sys.path.insert(0,'/source/agent')
 import network_executor as n
 path,point=sys.argv[1:3]
+if point=='discovery-stall':
+    import network_discovery_lifecycle as discovery
+    original=discovery.run_once
+    def stalled(stop,command,budget=45):
+        return original(stop,[sys.executable,'/source/scripts/network-transaction-lab/discovery-stall.py'],budget)
+    discovery.run_once=stalled
 Base=n.Executor
 class Observed(Base):
     def __init__(self,config,directory,**kwargs):
