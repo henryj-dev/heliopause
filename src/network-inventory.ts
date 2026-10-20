@@ -67,6 +67,12 @@ export interface InventoryRoute extends NetworkResource {
   /** Explicit table avoids conflating routes in different policy routing tables. */
   table: number;
   routingDomainId?: string;
+  /** Omission leaves the attribute unmanaged; null explicitly selects a direct route. */
+  nextHop?: string | null;
+  metric?: number;
+  preferredSource?: string;
+  routeType?: "unicast";
+  protocol?: "static" | "boot";
 }
 /** Dynamic route candidates are observations, never configuration ownership claims.
  * Protocol/interface identity does not authorize a writer; external management is mandatory. */
@@ -89,6 +95,18 @@ export interface NetworkInventoryIssue { resourceId: string; message: string }
 
 const text = (v: unknown): v is string => typeof v === "string" && v.trim().length > 0;
 const object = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
+const fields: Record<string, string[]> = {
+  site: [], node: ["siteId"], gateway: ["nodeId"],
+  network: ["siteId", "siteIds", "scope", "routingDomainId", "purpose"],
+  subnet: ["networkId", "cidr", "parentSubnetId"],
+  "address-pool": ["subnetId", "cidr", "allocationAuthority", "purpose"],
+  interface: ["nodeId", "networkId", "name", "mtu"],
+  route: ["interfaceId", "destination", "table", "routingDomainId", "nextHop", "metric", "preferredSource", "routeType", "protocol"],
+  "learned-route": ["interfaceId", "routingDomainId", "destination", "table", "protocol", "source", "stage", "nextHop"],
+  "routing-domain": ["name", "isolation", "vrf"], "domain-connection": ["domainIds", "allowManagement"],
+};
+const commonFields = ["id", "kind", "owner", "management", "generation", "observedGeneration"];
+const unknownFields = (v: Record<string, unknown>, allowed: string[]) => Object.keys(v).some(k => !allowed.includes(k));
 const kinds = new Set(["site", "node", "gateway", "network", "subnet", "address-pool", "interface", "route", "routing-domain", "domain-connection", "learned-route"]);
 
 function prefix(value: unknown) {
@@ -120,7 +138,10 @@ export function validateNetworkInventory(input: unknown): NetworkInventoryIssue[
     const validGeneration = Number.isSafeInteger(value.generation) && typeof value.generation === "number" && value.generation >= 1;
     if (!validGeneration) add(id, "generation must be a positive safe integer");
     if (value.observedGeneration !== undefined && (!Number.isSafeInteger(value.observedGeneration) || Number(value.observedGeneration) < 1 || (!validGeneration || Number(value.observedGeneration) > (value.generation as number)))) add(id, "observedGeneration must be positive and no greater than generation");
+    if (typeof value.kind === "string" && fields[value.kind] && unknownFields(value, [...commonFields, ...fields[value.kind]!])) add(id, "unknown resource field");
     const m = value.management;
+    if (object(m) && unknownFields(m, ["mode", "provider", "driver", "adoption"])) add(id, "unknown management field");
+    if (object(m) && object(m.adoption) && unknownFields(m.adoption, ["approvedBy", "source"])) add(id, "unknown adoption field");
     if (!object(m) || !text(m.provider) || typeof m.mode !== "string" || !["external", "managed", "adopted"].includes(m.mode)) {
       add(id, "management requires a mode and provider");
     } else if (m.mode === "external") {
@@ -157,6 +178,7 @@ export function validateNetworkInventory(input: unknown): NetworkInventoryIssue[
     switch (r.kind) {
       case "node": ref(r, "siteId", "site"); break;
       case "routing-domain":
+        if (object(r.vrf) && unknownFields(r.vrf, ["name", "table"])) add(id, "unknown VRF field");
         if (!text(r.name)) add(id, "routing domain name must be nonempty");
         if (typeof r.isolation !== "string" || !["global", "vrf", "external"].includes(r.isolation)) add(id, "invalid routing domain isolation");
         if (r.vrf !== undefined && (!object(r.vrf) || !text(r.vrf.name) || !uint32(r.vrf.table))) add(id, "vrf requires name and positive uint32 table");
@@ -195,6 +217,7 @@ export function validateNetworkInventory(input: unknown): NetworkInventoryIssue[
         if (node && network && !sitesOf(network).includes(node.siteId)) add(id, "interface node and network must belong to the same site or explicit network membership");
         if (!text(r.name)) add(id, "interface name must be nonempty");
         if (r.mtu !== undefined && (!Number.isInteger(r.mtu) || Number(r.mtu) < 68 || Number(r.mtu) > 65535)) add(id, "interface mtu must be an integer between 68 and 65535");
+        if (r.mtu !== undefined && Number(r.mtu) < 1280 && records.some(s => s.kind === "subnet" && s.networkId === r.networkId && typeof s.cidr === "string" && isIP(s.cidr.split("/")[0]!) === 6)) add(id, "IPv6 interface mtu must be at least 1280");
         const key = JSON.stringify([r.nodeId, r.name]);
         if (interfaces.has(key)) add(id, "interface already has an inventory owner");
         interfaces.add(key);
@@ -208,6 +231,13 @@ export function validateNetworkInventory(input: unknown): NetworkInventoryIssue[
           if (network && r.routingDomainId !== network.routingDomainId) add(id, "route routing domain must match its interface network");
           const domain = lookup(r.routingDomainId);
           if (domain && object(domain.vrf) && r.table !== domain.vrf.table) add(id, "route table must match its routing domain VRF binding");
+        }
+        if (r.kind === "route") {
+          const family = typeof r.destination === "string" ? isIP(r.destination.split("/")[0]!) : 0;
+          for (const field of ["nextHop", "preferredSource"]) if (r[field] !== undefined && !(field === "nextHop" && r[field] === null) && (typeof r[field] !== "string" || !family || isIP(r[field] as string) !== family)) add(id, `${field} must match route address family`);
+          if (r.metric !== undefined && (!Number.isSafeInteger(r.metric) || Number(r.metric) < 0 || Number(r.metric) > 4294967295)) add(id, "metric must be uint32");
+          if (r.routeType !== undefined && r.routeType !== "unicast") add(id, "only unicast desired routes are supported");
+          if (r.protocol !== undefined && !["static", "boot"].includes(String(r.protocol))) add(id, "only static or boot desired route protocols are supported");
         }
         if (r.kind === "learned-route") {
           if (!object(r.management) || r.management.mode !== "external") add(id, "learned routes are external observations, not writer claims");

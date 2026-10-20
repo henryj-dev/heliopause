@@ -7,7 +7,8 @@ import type { NetworkRegistryDocument } from "./network-registry.ts";
 
 export interface NetworkIdentityBinding { source: string; host: string; siteId: string; nodeId: string }
 export type NetworkMatchStatus = "matched" | "missing" | "unexpected" | "different" | "unknown" | "stale" | "unsupported";
-export interface NetworkMatch { resourceId: string; status: NetworkMatchStatus; reason: string; management?: NetworkManagement }
+export type NetworkObservationClass = "managed-drift" | "external-observation" | "unclaimed-observation" | "unexpected-managed";
+export interface NetworkMatch { classification?: NetworkObservationClass; resourceId: string; status: NetworkMatchStatus; reason: string; management?: NetworkManagement }
 export interface NetworkMatchEvidence { source: string; host: string; collectionId: string; digest: string }
 export interface NetworkMatchingResult { matches: NetworkMatch[]; evidence: NetworkMatchEvidence[]; digest: string }
 export interface NetworkMatchingInput {
@@ -15,6 +16,8 @@ export interface NetworkMatchingInput {
   observations: readonly NetworkObservationRecord[];
   bindings: readonly NetworkIdentityBinding[];
   now: number;
+  /** Exact caller-supplied inventory scope, never inferred from a protocol or interface prefix. No repair authority. */
+  managedScopes?: readonly { nodeId: string; interfaceNames: readonly string[] }[];
   maxAgeMs?: number;
 }
 const identity = (source: string | undefined, host: string) => JSON.stringify([source, host]);
@@ -42,6 +45,9 @@ export function matchNetworkInventory(input: NetworkMatchingInput): NetworkMatch
   const maxAgeMs = input.maxAgeMs ?? 10 * 60_000;
   if (!Number.isFinite(now) || !Number.isFinite(maxAgeMs) || maxAgeMs < 0 || maxAgeMs > 10 * 60_000) throw new Error("invalid matching clock or freshness limit");
   if (!Number.isSafeInteger(registry.revision) || registry.revision < 0 || validateNetworkInventory(registry.resources).length) throw new Error("invalid matching registry");
+  for (const scope of input.managedScopes ?? []) {
+    if (!scope || !Array.isArray(scope.interfaceNames) || !scope.interfaceNames.every(n => typeof n === "string" && /^[-a-zA-Z0-9_.]{1,15}$/.test(n)) || !registry.resources.some(r => r.id === scope.nodeId && r.kind === "node")) throw new Error("invalid managed observation scope");
+  }
   const byId = new Map(registry.resources.map(r => [r.id, r]));
   const byNode = new Map<string, NetworkIdentityBinding[]>();
   const byIdentity = new Map<string, NetworkIdentityBinding[]>();
@@ -68,7 +74,7 @@ export function matchNetworkInventory(input: NetworkMatchingInput): NetworkMatch
     } catch { invalid.add(key); }
   }
   const matches: NetworkMatch[] = [];
-  const add = (r: NetworkInventoryResource, status: NetworkMatchStatus, reason: string) => matches.push({ resourceId: r.id, management: structuredClone(r.management), status, reason });
+  const add = (r: NetworkInventoryResource, status: NetworkMatchStatus, reason: string) => matches.push({ resourceId: r.id, management: structuredClone(r.management), classification: r.management.mode === "external" ? "external-observation" : "managed-drift", status, reason });
   const used = new Set<string>();
   const eligible = new Map<string, NetworkObservationRecord>();
   for (const r of [...registry.resources].sort((a, b) => a.id.localeCompare(b.id))) {
@@ -111,10 +117,31 @@ export function matchNetworkInventory(input: NetworkMatchingInput): NetworkMatch
     if (candidates.length !== 1) { add(r, "unknown", "multiple observations match the desired identity"); continue; }
     const row = candidates[0]!.row;
     if (r.kind === "route") {
+      const proto = row.protocol === 4 ? "static" : row.protocol === 3 ? "boot" : row.protocol;
+      if (proto !== undefined && !["static", "boot"].includes(String(proto))) {
+        add(r, "unknown", "observed route belongs to an external or unsupported protocol");
+        matches[matches.length - 1]!.classification = "external-observation";
+        continue;
+      }
+      if (row.type !== undefined && row.type !== "unicast") { add(r, "unsupported", "non-unicast observation cannot match a static unicast route"); continue; }
+      const address = (v: unknown) => typeof v === "string" ? prefix(v + (v.includes(":") ? "/128" : "/32")) : v;
+      const attributes: Array<[unknown, unknown, string]> = [
+        [r.nextHop, row.gateway ?? null, "next hop"], [r.metric, row.metric, "metric"],
+        [r.preferredSource, row.prefsrc, "preferred source"], [r.protocol, proto, "protocol"],
+      ];
       if (typeof row.dev !== "string") add(r, "unknown", "route interface is not available");
-      else add(r, row.dev === iface.name ? "matched" : "different", row.dev === iface.name ? "supported route fields match" : "route interface differs");
+      else if (row.dev !== iface.name) add(r, "different", "route interface differs");
+      else {
+        const unmodeled = attributes.find(([desired, observed]) => desired === undefined && observed !== undefined && observed !== null);
+        const absent = attributes.find(([desired, observed]) => desired !== undefined && observed === undefined);
+        const changed = attributes.find(([desired, observed, field]) => desired !== undefined && (field === "next hop" || field === "preferred source" ? address(desired) !== address(observed) : desired !== observed));
+        if (absent) add(r, "unknown", `route ${absent[2]} evidence is absent`);
+        else if (changed) add(r, "different", `route ${changed[2]} differs`);
+        else if (unmodeled) add(r, "unknown", `route ${unmodeled[2]} is not declared; comparison is incomplete`);
+        else add(r, "matched", "declared static route fields match");
+      }
     } else {
-      const mtu = (r as typeof r & { mtu?: number }).mtu;
+      const mtu = r.mtu;
       if (mtu !== undefined && row.mtu === undefined) add(r, "unknown", "interface MTU is not available");
       else add(r, mtu !== undefined && row.mtu !== mtu ? "different" : "matched", mtu !== undefined && row.mtu !== mtu ? "interface MTU differs" : "supported interface fields match");
     }
@@ -124,11 +151,15 @@ export function matchNetworkInventory(input: NetworkMatchingInput): NetworkMatch
     if (collector?.status !== "success" || now - Date.parse(collector.completedAt) > maxAgeMs) continue;
     for (const [index, row] of (collector.data ?? []).entries()) {
       if (used.has(JSON.stringify([key, name, index]))) continue;
-      // Unclaimed telemetry is reported as external and can never confer repair authority.
-      matches.push({ resourceId: `observation:${hash([key, name, row])}`, status: "unexpected", reason: "observed resource has no desired inventory match", management: { mode: "external", provider: record.source! } });
+      const bound = byIdentity.get(key)?.[0];
+      const iface = registry.resources.find(r => r.kind === "interface" && r.nodeId === bound?.nodeId && r.name === (name === "links" ? row.ifname : row.dev));
+      const external = (iface?.management.mode === "external") || (name !== "links" && row.protocol !== undefined && !["static", "boot", 3, 4].includes(row.protocol as string | number));
+      const claimed = !external && input.managedScopes?.some(s => s.nodeId === bound?.nodeId && s.interfaceNames.includes(String(name === "links" ? row.ifname : row.dev)));
+      // Classifications describe evidence, never an automatic delete/repair proposal.
+      matches.push({ classification: external ? "external-observation" : claimed ? "unexpected-managed" : "unclaimed-observation", resourceId: `observation:${hash([key, name, row])}`, status: "unexpected", reason: "observed resource has no desired inventory match", management: { mode: "external", provider: record.source! } });
     }
   }
   matches.sort((a, b) => a.resourceId.localeCompare(b.resourceId) || a.status.localeCompare(b.status) || a.reason.localeCompare(b.reason));
   evidence.sort((a, b) => canonical(a).localeCompare(canonical(b)));
-  return { matches, evidence, digest: hash({ revision: registry.revision, resources: [...registry.resources].sort((a, b) => a.id.localeCompare(b.id)), bindings: [...bindings].sort((a, b) => canonical(a).localeCompare(canonical(b))), matches, evidence }) };
+  return { matches, evidence, digest: hash({ revision: registry.revision, resources: [...registry.resources].sort((a, b) => a.id.localeCompare(b.id)), managedScopes: [...(input.managedScopes ?? [])].map(s => ({...s, interfaceNames: [...s.interfaceNames].sort()})).sort((a,b) => canonical(a).localeCompare(canonical(b))), bindings: [...bindings].sort((a, b) => canonical(a).localeCompare(canonical(b))), matches, evidence }) };
 }

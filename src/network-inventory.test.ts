@@ -173,10 +173,10 @@ test("v2 scenario 5: one interface cannot be claimed by competing drivers", () =
 test("v2 scenario 6: static writer conflicts are distinct from normal learned BGP candidates", () => {
   const data = v2Fixture();
   data[7]!.management = { mode: "managed", provider: "linux", driver: "static" };
-  data.push({ ...data[7]!, id: "frr-writer", kind: "route", interfaceId: "interface", destination: "0.0.0.0/0", table: 254, routingDomainId: "domain", management: { mode: "managed", provider: "linux", driver: "frr" } });
+  data.push({ owner: "team", generation: 1, id: "frr-writer", kind: "route", interfaceId: "interface", destination: "0.0.0.0/0", table: 254, routingDomainId: "domain", management: { mode: "managed", provider: "linux", driver: "frr" } });
   assert.match(messages(data), /already have an inventory owner/);
   data.pop();
-  for (const peer of ["peer-a", "peer-b"]) data.push({ ...data[0]!, id: peer, kind: "learned-route", management: { mode: "external", provider: "frr" }, interfaceId: "interface", routingDomainId: "domain", table: 254, destination: "0.0.0.0/0", protocol: "bgp", source: peer, stage: "learned" });
+  for (const peer of ["peer-a", "peer-b"]) data.push({ owner: "team", generation: 1, id: peer, kind: "learned-route", management: { mode: "external", provider: "frr" }, interfaceId: "interface", routingDomainId: "domain", table: 254, destination: "0.0.0.0/0", protocol: "bgp", source: peer, stage: "learned" });
   assert.deepEqual(validateNetworkInventory(data), []);
   data[data.length - 1]!.management = { mode: "managed", provider: "linux", driver: "frr" };
   assert.match(messages(data), /external observations/);
