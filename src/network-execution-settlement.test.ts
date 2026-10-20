@@ -247,8 +247,10 @@ test('old cancellation cannot clear a later execution fence',()=>{
 for(const point of ['before-commit','after-commit'] as const)test(`cancel settlement SIGKILL ${point} recovers atomically in a new Manager process`,()=>{
   const f=issued();try {
     const r=cancelled(f);
-    const op=point==='before-commit'?`s.executionTransaction(state=>{state.fence=null;process.kill(process.pid,'SIGKILL')})`:`settleNetworkExecution(s,${JSON.stringify(r)},${JSON.stringify(f.agent)},'gateway');process.kill(process.pid,'SIGKILL')`;
-    const p=child(`import {NetworkRegistryStore} from ${JSON.stringify(registryUrl)};import {settleNetworkExecution} from ${JSON.stringify(settlementUrl)};const s=new NetworkRegistryStore(${JSON.stringify(f.store.path)});${op}`);
+    const p=child(`import fs from 'node:fs';import {syncBuiltinESMExports} from 'node:module';import {NetworkRegistryStore} from ${JSON.stringify(registryUrl)};import {settleNetworkExecution} from ${JSON.stringify(settlementUrl)};
+      const path=${JSON.stringify(f.store.path)},rename=fs.renameSync;
+      fs.renameSync=(from,to)=>{if(String(to)===path){if(${JSON.stringify(point)}==='before-commit')process.kill(process.pid,'SIGKILL');rename(from,to);process.kill(process.pid,'SIGKILL');}else rename(from,to)};
+      syncBuiltinESMExports();settleNetworkExecution(new NetworkRegistryStore(path),${JSON.stringify(r)},${JSON.stringify(f.agent)},'gateway');`);
     assert.equal(p.signal,'SIGKILL',p.stderr);
     assert.equal(Boolean(new NetworkRegistryStore(f.store.path).executionStatus().fence),point==='before-commit');
     assert.equal(settleNetworkExecution(f.store,r,f.agent,'gateway').settled,true);
