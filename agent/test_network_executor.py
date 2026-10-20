@@ -201,6 +201,12 @@ class Ownership(unittest.TestCase):
     def test_untagged_empty_interrupted_create_owned_by_transaction_name(self):
         self.link.pop('ifalias');self.public='(none)';self.port='0';self.peers='';self.addresses=[];self.routes=[]
         self.assertTrue(self.driver.owned(self.op,self.owner))
+    def test_signed_numeric_group_matches_exact_kernel_bits(self):
+        self.link['group']=str(n.owner_group(self.owner)-(1<<32))
+        self.assertTrue(self.driver.owned(self.op,self.owner))
+        for invalid in ['foreign',str(n.owner_group(self.owner)+(1<<32)),True]:
+            self.link['group']=invalid
+            with self.assertRaises(ValueError): self.driver.owned(self.op,self.owner)
     def test_foreign_same_name_default_group_is_preserved(self):
         self.link['group']=0
         with self.assertRaises(ValueError): self.driver.owned(self.op,self.owner)
@@ -246,6 +252,7 @@ class NetlinkCreate(unittest.TestCase):
         boundary.assert_called_once()
         length,kind,flags,_,pid=n.struct.unpack_from('=IHHII',channel.request)
         self.assertEqual(length,len(channel.request));self.assertEqual(kind,16);self.assertEqual(flags & 0x600,0x600);self.assertEqual(pid,1234)
+        self.assertEqual(n.struct.unpack_from('=BBHiII',channel.request,16)[-1],0)
         offset=32;attrs={}
         while offset<len(channel.request):
             size,field=n.struct.unpack_from('=HH',channel.request,offset)

@@ -284,7 +284,7 @@ class LinuxWireGuard:
             size=4+len(payload)
             return struct.pack('=HH',size,kind)+payload+b'\0'*((-size)%4)
         attrs=attr(3,dev.encode()+b'\0')+attr(4,struct.pack('=I',mtu))+attr(27,struct.pack('=I',group))+attr(18|0x8000,attr(1,b'wireguard\0'))
-        body=struct.pack('=BBHiII',0,0,0,0,0,0xffffffff)+attrs
+        body=struct.pack('=BBHiII',0,0,0,0,0,0)+attrs
         sequence=int.from_bytes(os.urandom(4),'big') or 1
         try:
             with socket.socket(socket.AF_NETLINK,socket.SOCK_RAW,0) as channel:
@@ -330,7 +330,10 @@ class LinuxWireGuard:
         link = matches[0]
         alias=link.get('ifalias',link.get('alias'))
         transaction=owner.split(':')[1]
-        if str(link.get('group'))!=str(owner_group(owner)) or op['interfaceName']!='hp'+transaction[:12] or alias not in {None,owner} or link.get('linkinfo', {}).get('info_kind') != 'wireguard':
+        group=link.get('group')
+        # iproute2 can render IFLA_GROUP as signed decimal despite its kernel u32 type.
+        group_value=int(group) if type(group) is int or (isinstance(group,str) and re.fullmatch(r'-?[0-9]+',group)) else None
+        if group_value is None or not -(1<<31)<=group_value<(1<<32) or (group_value & 0xffffffff)!=owner_group(owner) or op['interfaceName']!='hp'+transaction[:12] or alias not in {None,owner} or link.get('linkinfo', {}).get('info_kind') != 'wireguard':
             raise ValueError('interface ownership conflict')
         # A root writer replacing a configuration must not have its objects deleted by rollback.
         public = self.run(['wg', 'show', op['interfaceName'], 'public-key'])
