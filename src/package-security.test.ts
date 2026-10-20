@@ -123,7 +123,7 @@ describe("the manager image contains the entry points its deployment starts", ()
    */
   const NOT_IN_IMAGE = [
     // Offline operator tools consume local JSON and do not serve manager requests.
-    "heliopause-network-plan.ts", "heliopause-network-compile.ts",
+    "heliopause-network-plan.ts", "heliopause-network-compile.ts", "heliopause-network-init.ts",
     "heliopause-approve.ts", "heliopause-coverage.ts", "heliopause-devices.ts",
     "heliopause-feed.ts", "heliopause-pki.ts", "heliopause-policy.ts",
     "heliopause-publish.ts", "heliopause-status.ts", "heliopause-ui.ts",
