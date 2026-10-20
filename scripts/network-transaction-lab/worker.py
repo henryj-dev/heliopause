@@ -29,14 +29,14 @@ if os.path.exists(state+'/request.json'):
         result=executor.accept(n.read_json(state+'/request.json'))
         n.atomic(state+'/response.json',{'state':result})
     except Exception as e:
-        n.atomic(state+'/response.json',{'state':'rejected','error':type(e).__name__})
+        n.atomic(state+'/response.json',{'state':'rejected','error':n.safe_diagnostic(e)})
 while True:
     if os.path.exists(state+'/confirm.json'):
         try:
             result=executor.confirm(n.read_json(state+'/confirm.json'))
             n.atomic(state+'/response.json',{'state':result})
         except Exception as e:
-            n.atomic(state+'/response.json',{'state':'rejected','error':type(e).__name__})
+            n.atomic(state+'/response.json',{'state':'rejected','error':n.safe_diagnostic(e)})
         os.unlink(state+'/confirm.json')
     executor.tick()
     time.sleep(0.1)

@@ -39,6 +39,12 @@ def exact(value, required):
         raise ValueError('unsupported or missing fields')
 
 
+def safe_diagnostic(error):
+    # Only our non-interpolated ValueError/RuntimeError messages; never command stderr or decoding
+    # exceptions (which may contain rejected bytes from a malformed secret file).
+    return str(error)[:160] if type(error) in {ValueError, RuntimeError} else type(error).__name__
+
+
 def integer(value, low, high):
     return type(value) is int and low <= value <= high
 
@@ -426,7 +432,7 @@ class Executor:
             self.event('removed')
             self.save(data,row,'rolled-back')
         except Exception as error:
-            row['diagnostic']=type(error).__name__+': rollback command/ownership verification failed'
+            row['diagnostic']='rollback: '+safe_diagnostic(error)
             self.save(data,row,'rollback-failed')
 
     def recover(self):
@@ -504,7 +510,8 @@ class Executor:
                 self.save(data,row,'awaiting-verification')
                 if int(time.time()*1000)>=a['rollbackAt'] or time.monotonic()>=self.driver.deadline:
                     self.rollback(data,row)
-            except Exception:
+            except Exception as error:
+                row['diagnostic']='apply: '+safe_diagnostic(error)
                 self.rollback(data,row)
             return row['state']
 
@@ -581,7 +588,7 @@ def main(argv=None):
                     result=action(read_json(path))
                     atomic(os.path.join(args.state_dir,'response.json'),{'requestHash':stamp,'state':result})
                 except Exception as error:
-                    atomic(os.path.join(args.state_dir,'response.json'),{'requestHash':stamp,'state':'rejected','diagnostic':type(error).__name__})
+                    atomic(os.path.join(args.state_dir,'response.json'),{'requestHash':stamp,'state':'rejected','diagnostic':safe_diagnostic(error)})
             except FileNotFoundError:
                 pass
         executor.tick()
