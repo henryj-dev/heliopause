@@ -327,6 +327,12 @@ class TerminalCourier(unittest.TestCase):
         self.assertFalse(os.path.exists(self.path+'/terminal-acks.json'))
         self.opener.open.side_effect=None
         self.assertEqual(self.d.deliver(self.cfg,self.path),1)
+    def test_nonterminal_cancellation_recording_never_consumes_terminal_ack_capacity(self):
+        n.atomic(self.path+'/terminal-results.json',[{'state':'cancellation-rejected'}])
+        self.opener.open.return_value.__enter__.return_value.read.return_value=b'{"settled":false,"recorded":true}'
+        self.assertEqual(self.d.deliver(self.cfg,self.path),1)
+        self.assertEqual(self.d.deliver(self.cfg,self.path),1)
+        self.assertFalse(os.path.exists(self.path+'/terminal-acks.json'))
     def test_corrupt_acknowledgments_fail_closed_before_delivery(self):
         for ack in [{'a'*64:False},{'not-a-hash':True},{'a'*64:1},[],{format(i,'064x'):True for i in range(1025)}]:
             with self.subTest(ack_type=type(ack).__name__):

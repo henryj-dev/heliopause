@@ -176,7 +176,7 @@ class Lifecycle(unittest.TestCase):
         self.executor.data['transactions']={'tx':{'state':'confirmed','authorization':{'operation':{}},'owner':'fixture'}}
         self.executor.driver.owned.return_value=False;self.l.refresh()
         report=self.l.report()['network']
-        self.assertEqual(report['ledger'],{'used':1,'limit':1024,'remaining':1023})
+        self.assertEqual(report['ledger']['used'],1);self.assertEqual(report['ledger']['remaining'],1023);self.assertGreater(report['ledger']['bytes'],0);self.assertEqual(report['ledger']['byteLimit'],8*1024*1024);self.assertEqual(report['ledger']['admissionByteLimit'],6*1024*1024)
         self.assertEqual(report['confirmedKernel']['tx']['state'],'absent-or-drifted')
         self.assertEqual(report['transactions'][0]['state'],'confirmed')
     def test_rollback_failed_remains_active(self):

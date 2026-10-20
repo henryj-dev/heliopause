@@ -65,7 +65,7 @@ def lab_directory(prefix):
             processes.clear()
 
 
-def setup(path,mutate=False,continuous=False):
+def setup(path,mutate=False,continuous=False,cancel_window=False):
     for ns in NAMES:
         run('ip','netns','add',ns)
         run('ip','link','set','lo','up',ns=ns)
@@ -115,7 +115,7 @@ def setup(path,mutate=False,continuous=False):
         wait_for(settled)
     # Observe through the same driver reader in the actual gateway namespace.
     out=run('python3','-c',"import sys,json;sys.path.insert(0,'/source/agent');import network_executor as n;print(n.canonical(n.LinuxWireGuard('/unused').snapshot()))",ns='p6-gw')
-    n.atomic(path+'/facts.json',{'snapshot':json.loads(out),'journalId':journal_id,'publicKey':public['gateway'],'peerPublicKey':public['peer'],'mutateRegistry':mutate})
+    n.atomic(path+'/facts.json',{'snapshot':json.loads(out),'journalId':journal_id,'publicKey':public['gateway'],'peerPublicKey':public['peer'],'mutateRegistry':mutate,**({'validityMs':30000,'timeoutMs':45000} if cancel_window else {})})
     cfg={'enabled':True,'journalId':journal_id,'identity':{'source':'lab','host':'gateway','nodeId':'gateway'},'managerKeys':path+'/manager','verifierKeys':path+'/verifier','secrets':path+'/secrets','protectedAddresses':['192.0.2.1']}
     n.atomic(path+'/config.json',cfg)
     if mutate:
@@ -612,14 +612,119 @@ def integrated(kind):
         return evidence
 
 
+
+def cancellation_case(kind):
+    global DEV
+    with lab_directory(prefix='hp-cancel-') as path:
+        sequential=kind=='cancel-busy-next'
+        setup(path,continuous=sequential,cancel_window=True);setup_manager(path)
+        first=n.read_json(path+'/decoded.json');first_dev=DEV;original=n.read_json(path+'/authorization.json')
+        accepted=kind in {'cancel-accepted-rollback','cancel-confirmed','cancel-rollback-failed'}
+        if not accepted:os.unlink(path+'/state/request.json')
+        if sequential:
+            authority('firewall',path);open(path+'/hold-artifact','w').close()
+        manager=start_manager(path)
+        fault={'cancel-crash-before':'before-cancel-save','cancel-crash-after':'cancelled-before-accept'}.get(kind,'')
+        agent=start(path,production=True,normal_entry=True,fault=fault,network_enabled=kind!='cancel-expired')
+        first_pid=agent.pid
+        if accepted:
+            await_state(path,{'awaiting-verification'})
+            if kind=='cancel-confirmed':
+                _,confirm=manager_confirm(path);n.atomic(path+'/state/confirm.json',confirm);await_state(path,{'confirmed'})
+            if kind=='cancel-rollback-failed':run('ip','address','add','192.0.2.131/32','dev',DEV,ns='p6-gw')
+        if sequential:
+            wait_for(lambda:os.path.exists(path+'/artifact-entered'))
+            n.atomic(path+'/state/request.json',original)
+            wait_for(lambda:os.path.exists(path+'/state/response.json'))
+            assert n.read_json(path+'/state/response.json')['state']=='rejected'
+            assert not n.read_json(path+'/state/transactions.json')['transactions'] and not exists()
+        if kind=='cancel-expired':wait_for(lambda:time.time()*1000>first['expiresAt']+100,35)
+        body={'transactionId':first['transactionId'],'authorizationHash':n.digest(first)}
+        if kind=='cancel-manager-restart':
+            n.atomic(path+'/api-body.json',body);open(path+'/drop-cancel-response','w').close()
+            assert not run('python3','scripts/network-transaction-lab/api.py',path,'alice','cancel',path+'/api-body.json',ns='p6-gw',ok=False)
+            wait_for(lambda:manager.poll() is not None);manager=start_manager(path)
+        envelope=api(path,'cancel',body)['envelope']
+        assert api(path,'cancel',body)['envelope']==envelope
+        if kind=='cancel-signature':
+            bad={**envelope,'signature':('A' if envelope['signature'][0]!='A' else 'B')+envelope['signature'][1:]}
+            n.atomic(path+'/state/cancel.json',bad)
+            wait_for(lambda:os.path.exists(path+'/state/response.json') and n.read_json(path+'/state/response.json')['requestHash']==n.hashlib.sha256(n.canonical(bad).encode()).hexdigest())
+            assert n.read_json(path+'/state/response.json')['state']=='rejected' and not n.read_json(path+'/state/transactions.json')['transactions'] and not exists()
+        n.atomic(path+'/state/cancel.json',envelope)
+        if fault:
+            wait_for(lambda:os.path.exists(path+'/state/barrier.json'))
+            assert not exists()
+            assert bool(n.read_json(path+'/state/transactions.json')['transactions'])==(kind=='cancel-crash-after')
+            # No success result may leave before its durable transition completes.
+            assert not n.read_json(path+'/state/terminal-results.json')
+            stop(agent);agent=start(path,production=True,normal_entry=True,network_enabled=False)
+            assert agent.pid!=first_pid
+        if kind=='cancel-rollback-failed':
+            await_state(path,{'rollback-failed'})
+            wait_for(lambda:n.read_json(path+'/state/terminal-results.json') and n.read_json(path+'/state/terminal-results.json')[0]['state']=='cancellation-rejected')
+            courier(path)
+            status=api(path,'status');assert status['fence'] and status['records'][0]['cancelStatus']=='accepted-recovery-required'
+            assert not os.path.exists(path+'/state/terminal-acks.json')
+            run('ip','address','del','192.0.2.131/32','dev',DEV,ns='p6-gw')
+        wanted='confirmed' if kind=='cancel-confirmed' else 'rolled-back' if accepted else 'cancelled-before-accept'
+        await_state(path,{wanted})
+        assert exists()==(wanted=='confirmed')
+        wait_for(lambda:os.path.exists(path+'/state/terminal-results.json') and n.read_json(path+'/state/terminal-results.json') and n.read_json(path+'/state/terminal-results.json')[0]['state']==wanted)
+        terminal=n.read_json(path+'/state/terminal-results.json')[0]
+        if kind=='cancel-manager-restart':
+            open(path+'/drop-terminal-response','w').close();courier(path,success=False)
+            wait_for(lambda:manager.poll() is not None);manager=start_manager(path)
+        courier(path)
+        assert api(path,'status')['fence'] is None
+        assert api(path,'terminal',terminal,identity='gateway')['duplicate'] is True
+        if not accepted:
+            if kind not in {'cancel-expired','cancel-manager-restart'}:assert time.time()*1000<first['expiresAt']
+            n.atomic(path+'/state/request.json',original)
+            stamp=n.hashlib.sha256(n.canonical(original).encode()).hexdigest()
+            wait_for(lambda:n.read_json(path+'/state/response.json')['requestHash']==stamp)
+            assert n.read_json(path+'/state/response.json')['state']=='rejected' and not exists()
+            if kind not in {'cancel-expired','cancel-manager-restart','cancel-crash-before','cancel-crash-after','cancel-busy-next'}:
+                assert 'permanently cancelled' in n.read_json(path+'/state/response.json')['diagnostic']
+        second_id=None
+        if sequential:
+            # Let the first firewall generation settle before admitting the next approved network.
+            wait_for(lambda:os.path.exists(path+'/firewall-state.json') and n.read_json(path+'/firewall-state.json')['state']=='confirmed',8)
+            os.unlink(path+'/wanted.json');os.unlink(path+'/hold-artifact')
+            snapshot=json.loads(run('python3','-c',"import sys,json;sys.path.insert(0,'/source/agent');import network_executor as n;print(n.canonical(n.LinuxWireGuard('/unused').snapshot()))",ns='p6-gw'))
+            n.atomic(path+'/facts-next.json',{**n.read_json(path+'/next-keys.json'),'snapshot':snapshot,'journalId':first['journalId']})
+            authority('next',path);second=json.loads(base64.urlsafe_b64decode(n.read_json(path+'/authorization.json')['payload']+'=='));second_id=second['transactionId']
+            n.atomic(path+'/decoded.json',second);DEV=second['operation']['interfaceName']
+            n.atomic(path+'/state/request.json',n.read_json(path+'/authorization.json'))
+            wait_for(lambda:n.read_json(path+'/state/transactions.json')['transactions'].get(second_id,{}).get('state')=='awaiting-verification')
+            # Old delivery competes with the second active transaction, never recreating its link.
+            n.atomic(path+'/state/request.json',original)
+            wait_for(lambda:n.read_json(path+'/state/response.json')['requestHash']==stamp)
+            assert not any(x['ifname']==first_dev for x in ip('p6-gw','link','show'))
+            assert api(path,'terminal',terminal,identity='gateway')['duplicate'] is True
+            assert api(path,'status')['fence']['transactionId']==second_id
+            _,confirm=manager_confirm(path);n.atomic(path+'/state/confirm.json',confirm)
+            wait_for(lambda:n.read_json(path+'/state/transactions.json')['transactions'][second_id]['state']=='confirmed')
+            wait_for(lambda:len(n.read_json(path+'/state/terminal-results.json'))==2);courier(path)
+            assert api(path,'status')['fence'] is None and agent.pid==first_pid
+        def ready():
+            report=n.read_json(path+'/lifecycle-status.json')
+            return report.get('agentPid')==agent.pid and bool(report['heartbeat'].get('lastSuccess'))
+        wait_for(ready)
+        evidence={'firstAgentPid':first_pid,'finalAgentPid':agent.pid,'originalState':wanted,'originalTransactionId':first['transactionId'],'nextTransactionId':second_id,'fenceSettled':True,'journalRecords':len(n.read_json(path+'/state/transactions.json')['transactions'])}
+        agent.terminate();agent.wait(timeout=8)
+        return evidence
+
+
 cases=['normal','signature','target','expiry','hash','approval','registry-changed','local-changed','duplicate','prepare-failed','fail-created','fail-routes','management-failed','asymmetric','blackhole','absent-verifier','lost-confirm','forged-verifier','crash-apply','crash-before-alias','crash-partial-routes','crash-wait','crash-rollback','crash-after-remove','foreign-writer','rollback-command-failed','peer-route-loss','secret-redaction','disabled-recovery','writer-conflict','graceful-stop','foreign-create','consecutive-confirmed','consecutive-rolled-back','consecutive-rollback-failed','consecutive-manager-restart','consecutive-agent-restart','consecutive-delayed-duplicate']
 cases += ['integrated-disabled','integrated-disabled-recovery','integrated-network-busy','integrated-firewall-busy','integrated-command-timeout','integrated-firewall-watchdog','integrated-confirmed-missing','integrated-corrupt-network','integrated-corrupt-firewall','integrated-crash-apply','integrated-crash-rollback','integrated-crash-wait','integrated-dual-debt','integrated-discovery-timeout']
 # New continuity cases run first for useful fail-fast diagnostics; success still requires all38.
-cases.sort(key=lambda name:0 if name.startswith('integrated-') else 1 if name.startswith('consecutive-') else 2)
+cases += ['cancel-before-accept','cancel-busy-next','cancel-expired','cancel-accepted-rollback','cancel-confirmed','cancel-rollback-failed','cancel-signature','cancel-crash-before','cancel-crash-after','cancel-manager-restart']
+cases.sort(key=lambda name:0 if name.startswith('cancel-') else 1 if name.startswith('integrated-') else 2 if name.startswith('consecutive-') else 3)
 for case in cases:
     started=time.monotonic()
     try:
-        evidence=integrated(case) if case.startswith('integrated-') else consecutive(case) if case.startswith('consecutive-') else scenario(case)
+        evidence=cancellation_case(case) if case.startswith('cancel-') else integrated(case) if case.startswith('integrated-') else consecutive(case) if case.startswith('consecutive-') else scenario(case)
         results.append({'name':case,'status':'passed','seconds':round(time.monotonic()-started,2),**({'evidence':evidence} if evidence else {})})
         print('PASS '+case,flush=True)
     except Exception as e:
@@ -629,5 +734,5 @@ for case in cases:
         for p,log in processes: stop(p);log.close()
         processes.clear()
         for ns in NAMES: run('ip','netns','del',ns,ok=False)
-assert len(results)==52
+assert len(results)==62
 print(json.dumps({'kind':'network-transaction-kernel-report','passed':len(results),'failed':0,'skipped':0,'hostRebootVerified':False,'backend':n.DRIVER,'sourceCommit':os.environ.get('HELIOPAUSE_LAB_SOURCE_COMMIT'),'kernel':platform.release(),'wireguardTools':run('wg','--version'),'iproute2':run('ip','-Version'),'scenarios':results}),flush=True)

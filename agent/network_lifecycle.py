@@ -182,7 +182,8 @@ class Lifecycle:
         with self.status_lock:
             self.snapshot['network'] = {'state': 'recovery-debt' if pending else 'idle',
                 'transactions': [{'transactionId': tx, 'state': row['state']} for tx, row in rows.items()],
-                'ledger': {'used': len(rows), 'limit': 1024, 'remaining': 1024-len(rows)},
+                'ledger': {'used': len(rows), 'limit': 1024, 'remaining': 1024-len(rows),
+                           'bytes':len(__import__('network_executor').canonical(data).encode()),'admissionByteLimit':6*1024*1024,'byteLimit':8*1024*1024},
                 'confirmedKernel': copy.deepcopy(observed), 'observedAt': time.time()}
 
     def publish(self):
@@ -221,7 +222,7 @@ class Lifecycle:
             self.refresh()
         except Exception:
             self.error('network-recovery', 'network-journal-or-recovery-unresolved')
-        for filename in ['request.json', 'confirm.json']:
+        for filename in ['cancel.json', 'request.json', 'confirm.json']:
             try:
                 raw = read_file(os.path.join(self.directory, filename))
             except FileNotFoundError:
@@ -236,7 +237,9 @@ class Lifecycle:
                 continue
             self.seen[filename] = delivery
             try:
-                if filename == 'request.json':
+                if filename == 'cancel.json':
+                    result = self.executor.cancel(decode_json(raw))
+                elif filename == 'request.json':
                     self.begin_network()
                     result = self.executor.accept(decode_json(raw))
                 else:
