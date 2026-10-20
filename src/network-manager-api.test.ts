@@ -156,3 +156,49 @@ test('execution endpoints normalize /api paths and default to disabled', async (
     assert.equal((await call('/network/execution/'+action,'POST','writer',{})).status,503);
   }
 });
+
+test('mTLS network execution goes through distinct approval, fenced authorization and verifier confirm', async () => {
+  const { generateKeyPairSync } = await import('node:crypto');
+  const { NetworkRegistryStore } = await import('./network-registry.ts');
+  const { buildNetworkChangeSet } = await import('./network-change-set.ts');
+  const { networkLabInput } = await import('../examples/network-lab.ts');
+  const { networkDigest } = await import('./network-canonical.ts');
+  const { signNetworkMessage, NETWORK_VERIFY_DOMAIN } = await import('./network-execution.ts');
+  const managerKey=generateKeyPairSync('ed25519'),verifierKey=generateKeyPairSync('ed25519');
+  const input=networkLabInput();
+  for(const r of input.registry.resources) if(r.management.mode==='managed') {
+    r.management.driver='wg-quick';
+    if(r.kind==='interface'&&r.id==='wg0')r.name='hp6test';
+    if(r.kind==='route'&&r.interfaceId==='wg0'){r.protocol='static';r.metric=42760;}
+  }
+  const registryFile=join(dir,'execution-registry.json'),observationsDir=join(dir,'execution-observations');
+  const registry=new NetworkRegistryStore(registryFile).mutate(0,'fixture',{action:'replace',resources:input.registry.resources});
+  const now=Date.now(),at=new Date(now).toISOString(),report=structuredClone(input.observations[0]!.report);
+  report.startedAt=at;report.completedAt=at;
+  for(const c of Object.values(report.observations)){c.startedAt=at;c.completedAt=at;}
+  const cache=new NetworkObservationStore(join(observationsDir,createHash('sha256').update('example').digest('hex')),{now:()=>now});
+  const observation=cache.put('gateway',report,{source:'example',relayReceivedAt:at});
+  const target={source:'example',host:'gateway',nodeId:'n0'};
+  const review=buildNetworkChangeSet({id:'execution-review',registry,expectedRegistryRevision:1,now,observations:[observation],bindings:[{...target,siteId:'s0'}]});
+  const operation={driver:'linux-wireguard-v1',interfaceId:'wg0',interfaceName:'hp6test',address:'198.51.100.1/32',mtu:1420,listenPort:51820,secretRef:'local',publicKey:Buffer.alloc(32,1).toString('base64'),peers:[{publicKey:Buffer.alloc(32,2).toString('base64'),endpoint:'203.0.113.2:51820',allowedIps:['198.51.100.2/32']}],routes:['198.51.100.2/32']};
+  const draft={schemaVersion:1,transactionId:'c'.repeat(32),target,registryRevision:1,resources:registry.resources.map(r=>({id:r.id,generation:r.generation})),desiredDigest:review.desiredDigest,reviewHash:review.contentHash,artifactHash:networkDigest(operation),observation:{digest:networkDigest(observation),collectedAt:now,maxAgeMs:10000},localPrecondition:'a'.repeat(64),operation,issuedAt:now,expiresAt:now+10000,rollbackAt:now+20000};
+  const manager=await startManager({port:0,hostname:'127.0.0.1',relays:[{name:'example',url:'https://127.0.0.1:1',pkiDir:dir}],tls:{certFile:join(dir,'server.pem'),keyFile:join(dir,'server.key'),caFile:join(dir,'ca.pem')},operatorCNs:['reader','writer'],writerCNs:['reader','writer'],networkRegistryFile:registryFile,networkObservationsDir:observationsDir,networkExecutionTargets:[target],networkVerifierKeys:[verifierKey.publicKey],artifactSigning:{privateKey:managerKey.privateKey},log:()=>{}});
+  const previousPort=port;port=(manager.server.address() as {port:number}).port;
+  try {
+    const proposal=await call('/api/network/execution/propose','POST','writer',{draft});
+    assert.equal(proposal.status,201,JSON.stringify(proposal.body));const hash=proposal.body.hash;
+    assert.equal((await call('/api/network/execution/review?hash='+encodeURIComponent(hash))).status,200);
+    assert.equal((await call('/api/network/execution/authorize','POST','writer',{hash})).status,403);
+    assert.equal((await call('/api/network/execution/approve','POST','writer',{hash})).status,403);
+    assert.equal((await call('/api/network/execution/approve','POST','reader',{hash})).status,200);
+    const issued=await call('/api/network/execution/authorize','POST','writer',{hash});assert.equal(issued.status,200,JSON.stringify(issued.body));
+    assert.throws(()=>new NetworkRegistryStore(registryFile).mutate(1,'fixture',{action:'replace',resources:registry.resources}),/fence/);
+    const a=JSON.parse(Buffer.from(issued.body.envelope.payload,'base64url').toString());
+    const checks=Object.fromEntries(['interface','address','route','handshake','fib','forward','reverse','management','protected'].map(k=>[k,true]));
+    const receipt=signNetworkMessage(NETWORK_VERIFY_DOMAIN,{transactionId:a.transactionId,authorizationHash:networkDigest(a),artifactHash:a.artifactHash,observedAt:Date.now(),expiresAt:Date.now()+3000,nonce:'d'.repeat(32),checks},verifierKey.privateKey);
+    const bad={...receipt,signature:'A'.repeat(86)};
+    assert.equal((await call('/api/network/execution/confirm','POST','writer',{hash,verification:bad})).status,400);
+    const confirmed=await call('/api/network/execution/confirm','POST','writer',{hash,verification:receipt});assert.equal(confirmed.status,200,JSON.stringify(confirmed.body));
+    assert.equal((await call('/api/network/execution/confirm','POST','writer',{hash,verification:receipt})).status,404);
+  } finally {port=previousPort;await new Promise<void>(resolve=>manager.server.close(()=>resolve()));}
+});

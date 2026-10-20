@@ -1582,6 +1582,19 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
   const networkApprovals = emptyApprovals();
   const networkDrafts = new Map<string, NetworkExecutionDraft>();
   const networkIssued = new Map<string, NetworkSignedEnvelope>();
+  function networkEvidence(draft: NetworkExecutionDraft) {
+    if (!opts.networkRegistryFile || !opts.networkObservationsDir || !opts.relays.some(r => r.name === draft.target.source)) throw new Error("execution evidence unavailable");
+    const registry = new NetworkRegistryStore(opts.networkRegistryFile).read();
+    const cache = new NetworkObservationStore(join(opts.networkObservationsDir, createHash("sha256").update(draft.target.source).digest("hex")));
+    const observation = cache.get(draft.target.host, draft.target.source);
+    if (!observation || networkDigest(observation) !== draft.observation.digest || Date.parse(observation.report.completedAt) !== draft.observation.collectedAt || observationFreshness(observation, now().getTime(), draft.observation.maxAgeMs) !== "fresh") throw new Error("observation changed");
+    const node = registry.resources.find(r => r.id === draft.target.nodeId);
+    if (node?.kind !== "node") throw new Error("target node unavailable");
+    const review = buildNetworkChangeSet({ id: "execution-review", registry, expectedRegistryRevision: draft.registryRevision, now: draft.observation.collectedAt, observations: [observation], bindings: [{ ...draft.target, siteId: node.siteId }] });
+    if (review.contentHash !== draft.reviewHash) throw new Error("review changed");
+    return { observation, review };
+  }
+
   /** Plan hash → the bundle to push. Beside the plan, not inside it — see `POST /plan`. */
   const bundles = new Map<string, PlanBundle>();
   /** Plan hash → relay name. Stored at proposal so publishing cannot redirect the push. */
@@ -2338,6 +2351,12 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     const mayWrite = principal.canWrite;
     if (url.pathname.startsWith("/network/execution/")) {
       if (!opts.networkExecutionTargets?.length || !opts.networkVerifierKeys?.length || !opts.networkRegistryFile || !opts.artifactSigning || !opts.networkObservationsDir) return send(res, 503, { error: "network execution issuance disabled" });
+      if (req.method === "GET" && url.pathname === "/network/execution/review") {
+        const draft = networkDrafts.get(url.searchParams.get("hash") ?? "");
+        if (!draft) return send(res, 404, { error: "network proposal unavailable" });
+        try { return send(res, 200, { draft, review: networkEvidence(draft).review }); }
+        catch { return send(res, 409, { error: "evidence changed; replan" }); }
+      }
       if (req.method !== "POST") return send(res, 405, { error: "method not allowed" });
       if (!mayWrite) return refuseWrite(res, who, url.pathname, principal.via);
       if (crossSiteRequest(req)) return send(res, 403, { error: "cross-site execution refused" });
@@ -2348,11 +2367,12 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
           const draft = body.draft as NetworkExecutionDraft;
           if (!draft || !opts.networkExecutionTargets.some(t => t.source === draft.target?.source && t.host === draft.target?.host && t.nodeId === draft.target?.nodeId)) return send(res, 403, { error: "untrusted execution identity" });
           // Reconstruct the target keys rather than rely on request object key ordering.
+          const evidence = networkEvidence(draft);
           const hash = networkExecutionHash(draft);
           if (networkDrafts.size >= 32) return send(res, 409, { error: "network proposal capacity reached" });
           const plan = propose(networkApprovals, { hash, generation: draft.transactionId, summary: { hosts: [{ host: draft.target.host, stage: "gateway", ruleCount: 1, rulesetHash: draft.artifactHash }] }, by: who, byOtp: otpIdentityOf(principal), now: now() });
           networkDrafts.set(hash, draft);
-          return send(res, 201, { hash, plan, draft });
+          return send(res, 201, { hash, plan, draft, review: evidence.review });
         }
         if ((await requireOtp(principal, body, res, url.pathname)) === "answered") return;
         const hash = String(body.hash ?? "");
@@ -2372,12 +2392,8 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
           return send(res, 200, { hash, plan });
         }
         if (action === "authorize") {
-          const source = opts.relays.find(r => r.name === draft.target.source);
-          if (!source) return send(res, 409, { error: "execution observation source unavailable" });
-          const cache = new NetworkObservationStore(join(opts.networkObservationsDir, createHash("sha256").update(source.name).digest("hex")));
-          const observation = cache.get(draft.target.host, source.name);
-          if (!observation || networkDigest(observation) !== draft.observation.digest || Date.parse(observation.report.completedAt) !== draft.observation.collectedAt || observationFreshness(observation, now().getTime(), draft.observation.maxAgeMs) !== "fresh") return send(res, 409, { error: "observation changed: replan" });
-          const envelope = authorizeNetworkExecution(new NetworkRegistryStore(opts.networkRegistryFile), networkApprovals, draft, who, opts.artifactSigning.privateKey, { observation, review: buildNetworkChangeSet({ id: "execution-review", registry: new NetworkRegistryStore(opts.networkRegistryFile).read(), expectedRegistryRevision: draft.registryRevision, now: draft.observation.collectedAt, observations: [observation], bindings: [{ ...draft.target, siteId: new NetworkRegistryStore(opts.networkRegistryFile).read().resources.flatMap(r => r.id === draft.target.nodeId && r.kind === "node" ? [r.siteId] : [])[0] ?? "" }] }) }, now());
+          const evidence = networkEvidence(draft);
+          const envelope = authorizeNetworkExecution(new NetworkRegistryStore(opts.networkRegistryFile), networkApprovals, draft, who, opts.artifactSigning.privateKey, evidence, now());
           networkIssued.set(hash, envelope);
           networkDrafts.delete(hash);
           return send(res, 200, { envelope });

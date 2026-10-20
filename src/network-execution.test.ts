@@ -54,3 +54,18 @@ for(const change of ['revision','generation','artifact','observation','review','
     f.proposeDraft();f.approveDraft();assert.throws(f.issue);assert.equal(existsSync(f.store.path+'.execution-fence'),false);
   } finally {rmSync(f.dir,{recursive:true,force:true});}
 });
+
+for (const [field,value] of [['protocol','boot'],['metric',123],['nextHop','198.51.100.3']] as const) test(`issuer refuses route desired-state mismatch: ${field}`,()=>{
+  const f=fixture();try {
+    const route=f.registry.resources.find(r=>r.kind==='route'&&r.interfaceId==='wg0')!;
+    (route as any)[field]=value;
+    // Create a fresh Registry/review commitment so this exercises semantic validation, not CAS.
+    const next=f.store.mutate(1,'alice',{action:'update',id:route.id,resource:route});
+    f.draft.registryRevision=next.revision;f.draft.resources=next.resources.map(r=>({id:r.id,generation:r.generation}));
+    const input=networkLabInput();
+    const review=buildNetworkChangeSet({...input,registry:next,expectedRegistryRevision:next.revision,wireguard:undefined,frr:undefined});
+    f.draft.desiredDigest=review.desiredDigest;f.draft.reviewHash=review.contentHash;
+    f.proposeDraft();f.approveDraft();
+    assert.throws(()=>authorizeNetworkExecution(f.store,f.approvals,f.draft,'alice',f.key.privateKey,{observation:f.observation,review},new Date(f.draft.issuedAt)),/host route ownership/);
+  } finally {rmSync(f.dir,{recursive:true,force:true});}
+});
