@@ -319,7 +319,7 @@ class LinuxWireGuard:
             normalized=dst+'/32' if dst and '/' not in dst and dst!='default' else dst
             if r.get('dev')==op['interfaceName']:
                 fields=set(r)-{'dst','dev','protocol','metric','scope','table','type','prefsrc','flags'}
-                local=(normalized==op['address'] and r.get('protocol')=='kernel' and r.get('type')=='local' and r.get('table') in {'local',255} and r.get('scope')=='host')
+                local=(normalized==op['address'] and r.get('protocol')=='kernel' and r.get('type')=='local' and r.get('table') in {'local',255} and r.get('scope')=='host' and not fields and r.get('prefsrc')==op['address'].split('/')[0] and 'metric' not in r)
                 own=(normalized in op['routes'] and r.get('protocol')=='static' and r.get('metric')==42760 and r.get('table','main') in {'main',254} and r.get('type','unicast')=='unicast' and r.get('scope')=='link' and not fields)
                 if not local and not own:
                     raise ValueError('route ownership conflict')
@@ -494,6 +494,8 @@ class Executor:
             row={'authorization':a,'state':'prepared','before':before,'paths':paths,'owner':'heliopause:'+a['transactionId']+':'+os.urandom(16).hex(),'acceptedAt':now,'mono':started_mono,'diagnostic':None,'history':[]}
             data['transactions'][a['transactionId']]=row
             data['lastClock']=now
+            if len(canonical(data).encode())>6*1024*1024:
+                raise ValueError('prospective transaction exceeds reserved journal capacity')
             # Every undo input exists on disk before the first network write.
             self.save(data,row,'prepared')
             try:
@@ -531,7 +533,7 @@ class Executor:
                 raise ValueError('stale/mismatched confirm')
             v=verify(c['verification'],VERIFY,self.config['verifierKeys'],self.provider)
             exact(v,'transactionId authorizationHash artifactHash observedAt expiresAt nonce checks')
-            if v['transactionId']!=a['transactionId'] or v['authorizationHash']!=digest(a) or v['artifactHash']!=a['artifactHash'] or not integer(v['observedAt'],row['acceptedAt'],now) or not integer(v['expiresAt'],now+1,min(now+10000,a['rollbackAt'])) or not re.fullmatch(r'[a-f0-9]{32}',str(v['nonce'])) or v['checks']!={k:True for k in CHECKS}:
+            if v['transactionId']!=a['transactionId'] or v['authorizationHash']!=digest(a) or v['artifactHash']!=a['artifactHash'] or not integer(v['observedAt'],row['acceptedAt'],now) or not integer(v['expiresAt'],now+1,min(now+10000,a['rollbackAt'])) or not re.fullmatch(r'[a-f0-9]{32}',str(v['nonce'])) or v['checks']!={k:True for k in CHECKS} or any(type(value) is not bool for value in v['checks'].values()):
                 raise ValueError('independent verification missing/stale/failed')
             self.driver.verify_local(a['operation'],row['owner'],row['before'],row['paths'])
             self.save(data,row,'awaiting-confirm')

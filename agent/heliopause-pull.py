@@ -5714,6 +5714,25 @@ def run_writer_mode():
         return 2
     network_mode = sys.argv[1:2] == ["--network-executor"]
     try:
+        from network_executor import Executor, read_json, atomic, TERMINAL
+        locator_path = os.path.join(os.path.dirname(lock_path), "network-writer-locator.json")
+        if os.path.exists(locator_path):
+            locator = read_json(locator_path)
+            if set(locator) != {"config", "stateDir"} or not all(isinstance(v, str) and os.path.isabs(v) for v in locator.values()):
+                raise RuntimeError("invalid network writer locator")
+            previous = Executor(read_json(locator["config"]), locator["stateDir"])
+            previous.recover()
+            if any(row["state"] not in TERMINAL for row in previous.load()["transactions"].values()):
+                raise RuntimeError("network rollback debt prevents writer switch")
+        if network_mode:
+            import argparse
+            parser = argparse.ArgumentParser(add_help=False)
+            parser.add_argument("--config", required=True)
+            parser.add_argument("--state-dir", required=True)
+            args, _ = parser.parse_known_args(sys.argv[2:])
+            # Durable locator lets another writer mode find custom-path recovery obligations too.
+            read_json(args.config)
+            atomic(locator_path, {"config": os.path.abspath(args.config), "stateDir": os.path.abspath(args.state_dir)})
         if network_mode:
             # Existing helper graph is used only when an actual local firewall journal exists.
             # Do not stop its service to acquire the lock; the other service remains responsible.
