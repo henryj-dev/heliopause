@@ -176,18 +176,26 @@ class Ownership(unittest.TestCase):
         self.link={'ifindex':3,'ifname':'hpaaaaaaaaaaaa','mtu':1400,'ifalias':self.owner,'linkinfo':{'info_kind':'wireguard'}}
         self.driver=n.LinuxWireGuard('/unused')
         self.psk='(none)'
+        self.public=PUB;self.port='51820';self.peers=PEER
+        self.addresses=[{'family':'inet','local':'192.0.2.129','prefixlen':32}]
         self.v6=[]
         def ip(*args):
             if args[0]=='-6': return [{'addr_info':self.v6}] if 'address' in args else []
             if 'link' in args: return [self.link]
-            if 'address' in args: return [{'addr_info':[{'family':'inet','local':'192.0.2.129','prefixlen':32}]}]
+            if 'address' in args: return [{'addr_info':self.addresses}]
             return self.routes
         def run(args,*unused,**kwargs):
             command=args[-1]
-            return {'public-key':PUB,'listen-port':'51820','endpoints':PEER+'\t203.0.113.2:51820','peers':PEER,'allowed-ips':PEER+'\t192.0.2.130/32','preshared-keys':PEER+'\t'+self.psk}[command]
+            return {'public-key':self.public,'listen-port':self.port,'endpoints':PEER+'\t203.0.113.2:51820' if self.peers else '', 'peers':self.peers,'allowed-ips':PEER+'\t192.0.2.130/32' if self.peers else '', 'preshared-keys':PEER+'\t'+self.psk if self.peers else ''}[command]
         self.driver.ip=ip;self.driver.run=run
         self.guard=patch.object(n.subprocess,'run',side_effect=AssertionError('escaped unit driver boundary'));self.guard.start();self.addCleanup(self.guard.stop)
     def test_expected_owned_shape(self): self.assertTrue(self.driver.owned(self.op,self.owner))
+    def test_untagged_empty_interrupted_create_owned_by_transaction_name(self):
+        self.link.pop('ifalias');self.public='(none)';self.port='0';self.peers='';self.addresses=[];self.routes=[]
+        self.assertTrue(self.driver.owned(self.op,self.owner))
+    def test_untagged_nonempty_interface_is_preserved(self):
+        self.link.pop('ifalias')
+        with self.assertRaises(ValueError): self.driver.owned(self.op,self.owner)
     def test_foreign_gateway_route_preserved(self):
         self.routes[0]['gateway']='192.0.2.131'
         with self.assertRaises(ValueError): self.driver.owned(self.op,self.owner)

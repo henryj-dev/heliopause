@@ -77,6 +77,9 @@ def setup(path,mutate=False):
     for dst in ['192.0.2.129/32','198.51.100.2/32']:
         run('ip','route','add',dst,'dev','fixedwg',ns='p6-peer')
     authority('keys',path)
+    # Wait for address setup before committing the complete protected IPv6 snapshot.
+    for ns in NAMES:
+        wait_for(lambda ns=ns:not any('tentative' in a.get('flags',[]) for x in ip(ns,'-6','address','show') for a in x.get('addr_info',[])))
     # Observe through the same driver reader in the actual gateway namespace.
     out=run('python3','-c',"import sys,json;sys.path.insert(0,'/source/agent');import network_executor as n;print(n.canonical(n.LinuxWireGuard('/unused').snapshot()))",ns='p6-gw')
     n.atomic(path+'/facts.json',{'snapshot':json.loads(out),'publicKey':public['gateway'],'peerPublicKey':public['peer'],'mutateRegistry':mutate})
