@@ -2,6 +2,7 @@
 import base64
 import json
 import os
+import platform
 import shutil
 import signal
 import subprocess
@@ -266,4 +267,4 @@ for case in cases:
         processes.clear()
         for ns in NAMES: run('ip','netns','del',ns,ok=False)
 assert len(results)==32
-print(json.dumps({'kind':'network-transaction-kernel-report','passed':len(results),'failed':0,'skipped':0,'hostRebootVerified':False,'backend':n.DRIVER,'scenarios':results}),flush=True)
+print(json.dumps({'kind':'network-transaction-kernel-report','passed':len(results),'failed':0,'skipped':0,'hostRebootVerified':False,'backend':n.DRIVER,'sourceCommit':os.environ.get('HELIOPAUSE_LAB_SOURCE_COMMIT'),'kernel':platform.release(),'wireguardTools':run('wg','--version'),'iproute2':run('ip','-Version'),'scenarios':results}),flush=True)

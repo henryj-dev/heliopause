@@ -26,7 +26,7 @@ DEV=op['interfaceName']
 links=ip('-d','link','show','dev',DEV)
 addresses=ip('address','show','dev',DEV)
 check={}
-check['interface']=len(links)==1 and links[0].get('linkinfo',{}).get('info_kind')=='wireguard' and links[0]['mtu']==op['mtu']
+check['interface']=len(links)==1 and links[0].get('linkinfo',{}).get('info_kind')=='wireguard' and links[0]['mtu']==op['mtu'] and 'UP' in links[0].get('flags',[])
 check['address']=bool(addresses) and any(a['local']=='192.0.2.129' and a['prefixlen']==32 for a in addresses[0].get('addr_info',[]))
 check['route']=all(any(r.get('dst') in {dst,dst.split('/')[0]} and r.get('dev')==DEV for r in ip('route','show','table','main')) for dst in op['routes'])
 check['fib']=all(any(r.get('dev')==DEV for r in ip('route','get',dst.split('/')[0])) for dst in op['routes'])
