@@ -132,3 +132,13 @@ test('a forged prefix observation reference is blocked by the unified source/dig
   const f=networkLabInput();f.prefixPolicy!.permissions.push({id:'pod',resourceId:'pods0',siteId:'s0',prefix:'192.0.2.32/28',role:'pod',owner:{nodeId:'n0',provider:'native',driver:'frr'},evidence:{...labPrefixEvidence(f),digest:'0'.repeat(64)}});
   assert.ok(codes(f).includes('prefix-evidence-mismatch'));
 });
+test('a fresh envelope does not refresh an old required addresses collector',()=>{
+  const f=networkLabInput(),r=f.observations[0]!.report;
+  const old=new Date(f.now-600001).toISOString();r.startedAt=old;r.observations.addresses!.startedAt=old;r.observations.addresses!.completedAt=old;
+  assert.ok(codes(f).includes('collector-stale'));
+});
+test('artifact determinism does not call locale-sensitive comparators',()=>{
+  const f=networkLabInput(),expected=buildNetworkChangeSet(f).contentHash,original=String.prototype.localeCompare;
+  try{String.prototype.localeCompare=function(){throw new Error('locale comparator used');};assert.equal(buildNetworkChangeSet(f).contentHash,expected);}
+  finally{String.prototype.localeCompare=original;}
+});

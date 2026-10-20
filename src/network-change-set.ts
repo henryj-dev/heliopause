@@ -57,7 +57,11 @@ export function buildNetworkChangeSet(input: NetworkChangeSetInput): NetworkChan
     const ev=plan.evidence.filter(e=>e.source===b.source&&e.host===b.host);
     if(reports.length!==1||ev.length!==1||observationFreshness(reports[0]!,input.now,input.maxAgeMs)!=='fresh') block(nodeId,'observation-unavailable','fresh unambiguous validated observation evidence is required');
     else {
-      for(const collector of ['links','addresses','routes4'] as const) if(reports[0]!.report.observations[collector]?.status!=='success') block(nodeId,'collector-unavailable',`required collector ${collector} is not available`);
+      for(const collector of ['links','addresses','routes4'] as const) {
+        const entry=reports[0]!.report.observations[collector];
+        if(entry?.status!=='success') block(nodeId,'collector-unavailable',`required collector ${collector} is not available`);
+        else if(input.now-Date.parse(entry.completedAt)>(input.maxAgeMs??600000)) block(nodeId,'collector-stale',`required collector ${collector} evidence is stale`);
+      }
     }
     return {nodeId,source:b.source,host:b.host};
   };
@@ -79,7 +83,7 @@ export function buildNetworkChangeSet(input: NetworkChangeSetInput): NetworkChan
       const binding=input.bindings.filter(b=>b.nodeId===p.owner.nodeId&&b.host===e.host&&b.source===e.source);
       const report=input.observations.filter(r=>r.host===e.host&&r.source===e.source&&r.report.collectionId===e.collectionId);
       const commitment=plan.evidence.find(x=>x.digest===e.digest&&x.host===e.host&&x.source===e.source&&x.collectionId===e.collectionId);
-      if(binding.length!==1||report.length!==1||!commitment||observationFreshness(report[0]!,input.now)!=='fresh') block(p.id,'prefix-evidence-mismatch','reachability reference must bind fresh source-scoped observation evidence for the advertising node');
+      if(binding.length!==1||report.length!==1||!commitment||Date.parse(e.observedAt)!==Date.parse(report[0]!.report.completedAt)||observationFreshness(report[0]!,input.now)!=='fresh') block(p.id,'prefix-evidence-mismatch','reachability reference must bind fresh source-scoped observation evidence for the advertising node');
       // A route/collector snapshot does not prove pod, VIP or endpoint packet forwarding.
       block(p.id,'prefix-forwarding-unverified','independent packet forwarding, endpoint readiness and exposure authorization must be verified');
     }

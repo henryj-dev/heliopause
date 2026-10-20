@@ -179,7 +179,9 @@ def setup(bundle):
         common[1] = str(directory/'bgpd.pid')
         start_daemon(i,'/usr/lib/frr/bgpd',directory,'-S','-f',str(ROOT/f'bgp{i}.conf'),*common)
         # Short lab timers are applied only to the lab daemon, not emitted as production defaults.
-        ns(i, 'vtysh', '--vty_socket', str(directory), '-d', 'bgpd', '-c', 'configure terminal', '-c', f'router bgp {65100+i}', '-c', 'timers bgp 1 3')
+        for peer in bundle['input']['frr'][i]['peers']:
+            ns(i,'vtysh','--vty_socket',str(directory),'-d','bgpd','-c','configure terminal','-c',f'router bgp {65100+i}',
+               '-c',f'neighbor {peer["address"]} timers 1 3','-c',f'neighbor {peer["address"]} timers connect 1')
 
 
 def start_daemon(i, executable, directory, *args):
@@ -203,6 +205,7 @@ def failover(primary):
         ns(i, 'ip', 'link', 'set', 'wg0', 'up' if primary else 'down')
     sent = 0
     lost = 0
+    last = None
     first_packet = None
     end = time.monotonic()+75
     while time.monotonic() < end:
@@ -215,11 +218,12 @@ def failover(primary):
             all_paths(primary)
             REPORT['measurements'].append({'scenario': 'recovery' if primary else 'primary-failure',
                 'convergenceMs': round((time.monotonic()-started)*1000, 3), 'sampledPackets': sent,
-                'sampledLostPackets': lost, 'firstSuccessfulProbeMs': None if first_packet is None else round((first_packet-started)*1000, 3)})
+                'sampledLostPackets': lost, 'firstSuccessfulSampleMs': None if first_packet is None else round((first_packet-started)*1000, 3)})
             return
-        except (AssertionError, subprocess.SubprocessError, KeyError, ValueError):
+        except (AssertionError, subprocess.SubprocessError, KeyError, ValueError) as error:
+            last=str(error)
             time.sleep(0.25)
-    raise AssertionError('failover/recovery forwarding did not converge')
+    raise AssertionError('failover/recovery forwarding did not converge: '+str(last))
 
 
 def management():
@@ -298,6 +302,12 @@ except Exception as error:
         REPORT['failure'] = str(error)[:4000]
 finally:
     if not REPORT.get('passed'):
+        REPORT['diagnostics']={}
+        for i in range(4):
+            try:
+                REPORT['diagnostics'][str(i)]={'bgp':vty(i,'show bgp ipv4 unicast summary json'), 'fib':json.loads(ns(i,'ip','-j','route','show').stdout)}
+            except (subprocess.SubprocessError,ValueError):
+                pass
         REPORT['daemonLogs'] = {str(log.relative_to(ROOT)): log.read_text()[-4000:] for _,log in PROCESSES if log.exists()}
     for proc,_ in reversed(PROCESSES):
         proc.terminate()
