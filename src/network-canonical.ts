@@ -43,3 +43,6 @@ export function canonicalNetworkJson(value: unknown): string {
   return visit(value, 0);
 }
 export const networkDigest = (value: unknown): string => createHash("sha256").update(canonicalNetworkJson(value)).digest("hex");
+
+/** Binary ordering keeps artifact hashes independent of the process locale. */
+export const compareNetworkText = (a: string, b: string): number => a < b ? -1 : a > b ? 1 : 0;

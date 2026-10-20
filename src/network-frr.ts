@@ -1,3 +1,4 @@
+import { compareNetworkText } from "./network-canonical.ts";
 /** Pure conservative FRR template compiler. Never invokes FRR or mutates an interface. */
 import { normalizePrefixPolicy, validatePrefixPolicy, permittedPrefix, type NetworkPrefixPolicy } from './network-prefix-policy.ts';
 import { isIP } from 'node:net';
@@ -196,7 +197,7 @@ export function compileFrr(input: {
         return {
             ok: false, diagnostics: [...new Set(errors)].sort()
         };
-    peers.sort((a, b) => a.address.localeCompare(b.address));
+    peers.sort((a, b) => compareNetworkText(a.address, b.address));
     const lines = ['! INCOMPLETE DRY-RUN TEMPLATE. Not authorized for execution.'];
     peers.forEach((p, i) => {
         const family = p.addressFamily === 'ipv4' ? 'ip' : 'ip6', cmd = family === 'ip' ? 'ip' : 'ipv6', ins = prefixes(p.importSubnetIds, p.siteId, family), outs = exports.filter(x => cidrRange(x)!.family === family);
@@ -223,7 +224,7 @@ export function compileFrr(input: {
     }
     const body = {
         schemaVersion: 1 as const, kind: 'frr-compilation' as const, mode: 'dry-run' as const, executable: false as const, registryRevision: registry.revision, inputDigest: networkDigest({
-            ...(input.prefixPolicy?{prefixPolicy:normalizePrefixPolicy(input.prefixPolicy)}:{}), resources: [...registry.resources].sort((a, b) => a.id.localeCompare(b.id)), spec: {
+            ...(input.prefixPolicy?{prefixPolicy:normalizePrefixPolicy(input.prefixPolicy)}:{}), resources: [...registry.resources].sort((a, b) => compareNetworkText(a.id, b.id)), spec: {
                 ...spec, exportSubnetIds: [...spec.exportSubnetIds].sort(), peers: peers.map(p => ({
                     ...p, importSubnetIds: [...p.importSubnetIds].sort()
                 }))

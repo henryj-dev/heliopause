@@ -1,3 +1,4 @@
+import { compareNetworkText } from "./network-canonical.ts";
 /** Pure, incomplete WireGuard templates. No key resolution, allocation or host execution. */
 import { normalizePrefixPolicy, validatePrefixPolicy, permittedPrefix, type NetworkPrefixPolicy } from './network-prefix-policy.ts';
 import { networkDigest } from './network-canonical.ts';
@@ -98,14 +99,14 @@ export function compileWireGuard(input: { registry: Pick<NetworkRegistryDocument
     }catch {bad('invalid previous WireGuard compilation');}
   }
   if(errors.length) return {ok:false,diagnostics:errors.sort()};
-  gs.sort((a,b)=>a.gatewayId.localeCompare(b.gatewayId));
+  gs.sort((a,b)=>compareNetworkText(a.gatewayId, b.gatewayId));
   const interfaces=gs.map(g=>{
     const peers=gs.filter(p=>p!==g); const lines=['# INCOMPLETE DRY-RUN TEMPLATE: private key is deliberately absent.','[Interface]',`Address = ${g.address}`,`ListenPort = ${g.listenPort}`,'Table = off',...(g.mtu===undefined?[]:[`MTU = ${g.mtu}`])];
     for(const p of peers) lines.push('','[Peer]',`PublicKey = ${p.publicKey}`,`Endpoint = ${isIP(p.endpoint.address)===6?'['+p.endpoint.address+']':p.endpoint.address}:${p.endpoint.port}`,`AllowedIPs = ${[p.address,...p.allowedPrefixes].sort().join(', ')}`,...(g.persistentKeepalive===undefined?[]:[`PersistentKeepalive = ${g.persistentKeepalive}`]));
     return {gatewayId:g.gatewayId,interfaceId:g.interfaceId,template:lines.join('\n')+'\n',privateKeyRef:{...g.privateKeyRef},peerHostRoutes:peers.map(p=>({destination:p.address,interfaceId:g.interfaceId}))};
   });
   const pairs: Array<[string,string]>=[]; gs.forEach((g,i)=>gs.slice(i+1).forEach(p=>pairs.push([g.gatewayId,p.gatewayId])));
-  const inputEvidenceDigest=networkDigest({registry:{revision:registry.revision,resources:[...registry.resources].sort((a,b)=>a.id.localeCompare(b.id))},...(input.prefixPolicy?{prefixPolicy:normalizePrefixPolicy(input.prefixPolicy)}:{}),spec:{...s,gateways:gs.map(g=>({...g,allowedPrefixes:[...g.allowedPrefixes].sort()}))}});
+  const inputEvidenceDigest=networkDigest({registry:{revision:registry.revision,resources:[...registry.resources].sort((a,b)=>compareNetworkText(a.id, b.id))},...(input.prefixPolicy?{prefixPolicy:normalizePrefixPolicy(input.prefixPolicy)}:{}),spec:{...s,gateways:gs.map(g=>({...g,allowedPrefixes:[...g.allowedPrefixes].sort()}))}});
   const body={schemaVersion:1 as const,kind:'wireguard-compilation' as const,mode:'dry-run' as const,inputEvidenceDigest,backend:'wg-quick' as const,executable:false as const,registryRevision:registry.revision,networkId:s.networkId,preconditions:['Resolve keys locally through approved secret provider.','Verify independent underlay endpoint reachability and explicit host routes.','No allocation, execution, persistence, approval or recovery is provided.'],pairs,interfaces};
   const artifact:WireGuardCompilation={...body,hash:networkDigest(body)};
   if(old!==undefined) {

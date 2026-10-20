@@ -1,3 +1,4 @@
+import { compareNetworkText } from "./network-canonical.ts";
 /** Composition boundary only. No transport, secrets, runtime writer or approval authority. */
 import { buildNetworkPlan, type NetworkPlanInput, type NetworkPlanBlocker, type NetworkDependency } from './network-planner.ts';
 import { compileWireGuard, type WireGuardCompilation, type WireGuardSpec } from './network-wireguard.ts';
@@ -182,11 +183,11 @@ export function buildNetworkChangeSet(input: NetworkChangeSetInput): NetworkChan
   for(const d of input.operationDependencies??[]) edge(d.resourceId,d.dependsOn);
   const ids=new Set(operations.map(o=>o.id));
   if(ids.size!==operations.length) block('','duplicate-operation','duplicate operation identity');
-  const uniqueEdges=[...new Map(dependencies.map(d=>[canonicalNetworkJson(d),d])).values()].sort((a,b)=>canonicalNetworkJson(a).localeCompare(canonicalNetworkJson(b)));
+  const uniqueEdges=[...new Map(dependencies.map(d=>[canonicalNetworkJson(d),d])).values()].sort((a,b)=>compareNetworkText(canonicalNetworkJson(a), canonicalNetworkJson(b)));
   for(const d of uniqueEdges) if(!ids.has(d.resourceId)||!ids.has(d.dependsOn)) block(d.resourceId,'missing-operation-dependency','operation dependency is absent');
   const pending=new Set(ids),order:string[]=[];
   while(pending.size){const ready=[...pending].filter(id=>uniqueEdges.filter(d=>d.resourceId===id).every(d=>ids.has(d.dependsOn)&&!pending.has(d.dependsOn))).sort();if(!ready.length){block('','operation-cycle','operation graph has a cycle or unresolved dependency');break;}for(const id of ready){order.push(id);pending.delete(id);}}
   const warnings=['Dry-run artifacts are not signed execution bundles.','Secondary lab tunnels do not reproduce Cloudflare Mesh or WARP behavior.','Observation evidence and declarative exposure references do not confer execution authority.'];
-  const body={schemaVersion:1 as const,kind:'network-change-set' as const,mode:'dry-run' as const,executable:false as const,registryRevision:plan.registryRevision,desiredDigest:plan.desiredDigest,resources:plan.desired,observationEvidence:plan.evidence,capabilityEvidence:plan.capabilities,matchingDigest:plan.matchingDigest,artifacts:artifacts.sort((a,b)=>a.targetId.localeCompare(b.targetId)),operations:operations.sort((a,b)=>a.id.localeCompare(b.id)),dependencies:uniqueEdges,order,blockers:[...new Map(blockers.map(b=>[canonicalNetworkJson(b),b])).values()].sort((a,b)=>canonicalNetworkJson(a).localeCompare(canonicalNetworkJson(b))),warnings};
+  const body={schemaVersion:1 as const,kind:'network-change-set' as const,mode:'dry-run' as const,executable:false as const,registryRevision:plan.registryRevision,desiredDigest:plan.desiredDigest,resources:plan.desired,observationEvidence:plan.evidence,capabilityEvidence:plan.capabilities,matchingDigest:plan.matchingDigest,artifacts:artifacts.sort((a,b)=>compareNetworkText(a.targetId, b.targetId)),operations:operations.sort((a,b)=>compareNetworkText(a.id, b.id)),dependencies:uniqueEdges,order,blockers:[...new Map(blockers.map(b=>[canonicalNetworkJson(b),b])).values()].sort((a,b)=>compareNetworkText(canonicalNetworkJson(a), canonicalNetworkJson(b))),warnings};
   return {...body,id:input.id,...(input.generatedAt===undefined?{}:{generatedAt:input.generatedAt}),contentHash:networkDigest(body)};
 }

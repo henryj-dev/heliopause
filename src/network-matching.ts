@@ -1,3 +1,4 @@
+import { compareNetworkText } from "./network-canonical.ts";
 /** Pure inventory comparison. Bindings must be supplied by a trusted caller, never inferred from telemetry. */
 import { canonicalNetworkJson as canonical, networkDigest as hash } from "./network-canonical.ts";
 import { cidrRange } from "./nft.ts";
@@ -77,7 +78,7 @@ export function matchNetworkInventory(input: NetworkMatchingInput): NetworkMatch
   const add = (r: NetworkInventoryResource, status: NetworkMatchStatus, reason: string) => matches.push({ resourceId: r.id, management: structuredClone(r.management), classification: r.management.mode === "external" ? "external-observation" : status === "different" || status === "missing" ? "managed-drift" : "managed-observation", status, reason });
   const used = new Set<string>();
   const eligible = new Map<string, NetworkObservationRecord>();
-  for (const r of [...registry.resources].sort((a, b) => a.id.localeCompare(b.id))) {
+  for (const r of [...registry.resources].sort((a, b) => compareNetworkText(a.id, b.id))) {
     if (r.kind !== "interface" && r.kind !== "route") { add(r, "unsupported", "resource has no supported declarative observation comparison"); continue; }
     const iface = r.kind === "interface" ? r : byId.get(r.interfaceId);
     if (iface?.kind !== "interface") throw new Error("invalid interface reference");
@@ -159,7 +160,7 @@ export function matchNetworkInventory(input: NetworkMatchingInput): NetworkMatch
       matches.push({ classification: external ? "external-observation" : claimed ? "unexpected-managed" : "unclaimed-observation", resourceId: `observation:${hash([key, name, row])}`, status: "unexpected", reason: "observed resource has no desired inventory match", management: { mode: "external", provider: record.source! } });
     }
   }
-  matches.sort((a, b) => a.resourceId.localeCompare(b.resourceId) || a.status.localeCompare(b.status) || a.reason.localeCompare(b.reason));
-  evidence.sort((a, b) => canonical(a).localeCompare(canonical(b)));
-  return { matches, evidence, digest: hash({ revision: registry.revision, resources: [...registry.resources].sort((a, b) => a.id.localeCompare(b.id)), managedScopes: [...(input.managedScopes ?? [])].map(s => ({...s, interfaceNames: [...s.interfaceNames].sort()})).sort((a,b) => canonical(a).localeCompare(canonical(b))), bindings: [...bindings].sort((a, b) => canonical(a).localeCompare(canonical(b))), matches, evidence }) };
+  matches.sort((a, b) => compareNetworkText(a.resourceId, b.resourceId) || compareNetworkText(a.status, b.status) || compareNetworkText(a.reason, b.reason));
+  evidence.sort((a, b) => compareNetworkText(canonical(a), canonical(b)));
+  return { matches, evidence, digest: hash({ revision: registry.revision, resources: [...registry.resources].sort((a, b) => compareNetworkText(a.id, b.id)), managedScopes: [...(input.managedScopes ?? [])].map(s => ({...s, interfaceNames: [...s.interfaceNames].sort()})).sort((a,b) => compareNetworkText(canonical(a), canonical(b))), bindings: [...bindings].sort((a, b) => compareNetworkText(canonical(a), canonical(b))), matches, evidence }) };
 }

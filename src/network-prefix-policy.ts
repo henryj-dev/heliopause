@@ -1,3 +1,4 @@
+import { compareNetworkText } from "./network-canonical.ts";
 /** Declarative export permissions. Evidence references are not authenticated approvals or execution authority. */
 import { isIP } from 'node:net';
 import { cidrRange } from './nft.ts';
@@ -24,7 +25,7 @@ const text = (v: unknown): v is string => typeof v === 'string' && /^[a-zA-Z0-9_
 const obj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 const exact = (v: Record<string, unknown>, keys: string[]) => Object.keys(v).every(k => keys.includes(k));
 export function normalizePrefixPolicy(policy: NetworkPrefixPolicy): NetworkPrefixPolicy {
-  return { ...policy, permissions: [...policy.permissions].sort((a,b) => canonicalNetworkJson(a).localeCompare(canonicalNetworkJson(b))) };
+  return { ...policy, permissions: [...policy.permissions].sort((a,b) => compareNetworkText(canonicalNetworkJson(a), canonicalNetworkJson(b))) };
 }
 export function validatePrefixPolicy(resources: NetworkInventoryResource[], policy: NetworkPrefixPolicy): string[] {
   const errors = new Set<string>(); const bad = (s: string) => errors.add(s);

@@ -173,15 +173,24 @@ def setup(bundle):
         directory = ROOT/str(i)
         directory.mkdir(mode=0o777)
         os.chmod(directory, 0o777)
-        common = ['-d', '-i', str(directory/'zebra.pid'), '-z', str(directory/'zserv.api'), '--vty_socket', str(directory)]
-        ns(i, '/usr/lib/frr/zebra', '-f', '/dev/null', *common)
-        PROCESSES.append(directory/'zebra.pid')
+        common = ['-i', str(directory/'zebra.pid'), '-z', str(directory/'zserv.api'), '--vty_socket', str(directory)]
+        start_daemon(i,'/usr/lib/frr/zebra',directory,'-f','/dev/null',*common)
         eventually(lambda: assert_socket(directory/'zserv.api'), 10)
-        common[2] = str(directory/'bgpd.pid')
-        ns(i, '/usr/lib/frr/bgpd', '-S', '-f', str(ROOT/f'bgp{i}.conf'), *common)
-        PROCESSES.append(directory/'bgpd.pid')
+        common[1] = str(directory/'bgpd.pid')
+        start_daemon(i,'/usr/lib/frr/bgpd',directory,'-S','-f',str(ROOT/f'bgp{i}.conf'),*common)
         # Short lab timers are applied only to the lab daemon, not emitted as production defaults.
         ns(i, 'vtysh', '--vty_socket', str(directory), '-d', 'bgpd', '-c', 'configure terminal', '-c', f'router bgp {65100+i}', '-c', 'timers bgp 1 3')
+
+
+def start_daemon(i, executable, directory, *args):
+    log = directory/(Path(executable).name+'.log')
+    with log.open('w') as stream:
+        proc = subprocess.Popen(['ip','netns','exec','site'+str(i),executable,*args], stdout=stream, stderr=stream)
+    PROCESSES.append((proc,log))
+    def ready():
+        assert proc.poll() is None, log.read_text()[-4000:]
+        assert (directory/(Path(executable).name+'.vty')).exists(), log.read_text()[-4000:]
+    eventually(ready,20)
 
 
 def assert_socket(path):
@@ -288,11 +297,10 @@ except Exception as error:
     else:
         REPORT['failure'] = str(error)[:4000]
 finally:
-    for pidfile in reversed(PROCESSES):
-        try:
-            os.kill(int(pidfile.read_text()), signal.SIGTERM)
-        except (OSError, ValueError):
-            pass
+    if not REPORT.get('passed'):
+        REPORT['daemonLogs'] = {str(log.relative_to(ROOT)): log.read_text()[-4000:] for _,log in PROCESSES if log.exists()}
+    for proc,_ in reversed(PROCESSES):
+        proc.terminate()
     (RESULTS/'report.json').write_text(json.dumps(REPORT, indent=2)+'\n')
     print(json.dumps(REPORT, indent=2))
     # The container dies next; no namespace deletion runs against the host.
