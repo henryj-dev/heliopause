@@ -183,7 +183,9 @@ def scenario(kind):
             return
         if kind in {'crash-wait','disabled-recovery'}:
             deadline=row(path)['authorization']['rollbackAt'];stop(p)
-            cfg=n.read_json(path+'/config.json');cfg['enabled']=False;n.atomic(path+'/config.json',cfg)
+            cfg=n.read_json(path+'/config.json')
+            if kind=='disabled-recovery': cfg['enabled']=False
+            n.atomic(path+'/config.json',cfg)
             p=start(path);await_state(path,{'rolled-back'});assert row(path)['authorization']['rollbackAt']==deadline and not exists();stop(p);return
         if kind=='foreign-writer':
             run('ip','address','add','192.0.2.140/32','dev','hp6test',ns='p6-gw')

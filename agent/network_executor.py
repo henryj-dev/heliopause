@@ -320,7 +320,7 @@ class LinuxWireGuard:
             if r.get('dev')==op['interfaceName']:
                 fields=set(r)-{'dst','dev','protocol','metric','scope','table','type','prefsrc','flags'}
                 local=(normalized==op['address'] and r.get('protocol')=='kernel' and r.get('type')=='local' and r.get('table') in {'local',255} and r.get('scope')=='host' and not fields and r.get('prefsrc')==op['address'].split('/')[0] and 'metric' not in r)
-                own=(normalized in op['routes'] and r.get('protocol')=='static' and r.get('metric')==42760 and r.get('table','main') in {'main',254} and r.get('type','unicast')=='unicast' and r.get('scope')=='link' and not fields)
+                own=(normalized in op['routes'] and r.get('protocol')=='static' and r.get('metric')==42760 and r.get('table','main') in {'main',254} and r.get('type','unicast')=='unicast' and r.get('scope')=='link' and 'prefsrc' not in r and set(r.get('flags',[])).issubset({'linkdown'}) and not fields)
                 if not local and not own:
                     raise ValueError('route ownership conflict')
             elif normalized in op['routes']:

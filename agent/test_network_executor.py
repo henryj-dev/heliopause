@@ -191,6 +191,9 @@ class Ownership(unittest.TestCase):
     def test_foreign_gateway_route_preserved(self):
         self.routes[0]['gateway']='192.0.2.131'
         with self.assertRaises(ValueError): self.driver.owned(self.op,self.owner)
+    def test_foreign_preferred_source_preserved(self):
+        self.routes[0]['prefsrc']='192.0.2.2'
+        with self.assertRaises(ValueError): self.driver.owned(self.op,self.owner)
     def test_foreign_table_preserved(self):
         self.routes[0]['table']=100
         with self.assertRaises(ValueError): self.driver.owned(self.op,self.owner)
