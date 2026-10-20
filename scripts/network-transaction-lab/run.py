@@ -80,7 +80,11 @@ def setup(path,mutate=False):
     authority('keys',path)
     # Wait for address setup before committing the complete protected IPv6 snapshot.
     for ns in NAMES:
-        wait_for(lambda ns=ns:not any('tentative' in a.get('flags',[]) for x in ip(ns,'-6','address','show') for a in x.get('addr_info',[])))
+        def settled(ns=ns):
+            addresses=ip(ns,'-6','address','show')
+            routes=ip(ns,'-6','route','show','table','local')
+            return all(not a.get('tentative',False) and 'tentative' not in a.get('flags',[]) and any(r.get('type')=='local' and r.get('dev')==x['ifname'] and r.get('dst','').removesuffix('/128')==a['local'] for r in routes) for x in addresses for a in x.get('addr_info',[]))
+        wait_for(settled)
     # Observe through the same driver reader in the actual gateway namespace.
     out=run('python3','-c',"import sys,json;sys.path.insert(0,'/source/agent');import network_executor as n;print(n.canonical(n.LinuxWireGuard('/unused').snapshot()))",ns='p6-gw')
     n.atomic(path+'/facts.json',{'snapshot':json.loads(out),'publicKey':public['gateway'],'peerPublicKey':public['peer'],'mutateRegistry':mutate})
