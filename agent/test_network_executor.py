@@ -204,4 +204,65 @@ class Ownership(unittest.TestCase):
         with self.assertRaises(ValueError): self.driver.owned(self.op,self.owner)
 
 
+class WriterMode(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
+        self.path=self.temp.name
+        self.agent=n.crypto_helpers(self.path)
+        self.agent.STATE_FILE=self.path+'/firewall.json'
+        self.config=self.path+'/custom-config.json';n.atomic(self.config,{})
+        self.state=self.path+'/custom-state'
+        self.calls=[];self.terminal=True
+        owner=self
+        class Recovery:
+            def __init__(self,cfg,directory): owner.calls.append(('locate',directory))
+            def recover(self): owner.calls.append(('recover',))
+            def load(self): return {'transactions':{'tx':{'state':'rolled-back' if owner.terminal else 'rollback-failed'}}}
+        self.patches=[patch.object(n,'Executor',Recovery),patch.object(n.subprocess,'run',side_effect=AssertionError('unexpected subprocess boundary')),patch.object(n.subprocess,'Popen',side_effect=AssertionError('unexpected child boundary')),patch.dict(os.environ,{'HELIOPAUSE_WRITER_LOCK':self.path+'/writer.lock','HELIOPAUSE_NETWORK_EXECUTOR_STATE_DIR':self.path+'/unused-default'}),patch.object(sys,'argv',['agent'])]
+        for p in self.patches:p.start();self.addCleanup(p.stop)
+        self.agent.main=lambda:0
+    def network_args(self):
+        sys.argv[:]=['agent','--network-executor','--config',self.config,'--state-dir',self.state]
+    def test_custom_locator_recovered_by_other_mode(self):
+        self.network_args()
+        with patch.object(n,'main',return_value=0) as enter:
+            self.assertEqual(self.agent.run_writer_mode(),0);enter.assert_called_once()
+        self.assertEqual(n.read_json(self.path+'/network-writer-locator.json')['stateDir'],self.state)
+        sys.argv[:]=['agent']
+        self.assertEqual(self.agent.run_writer_mode(),0)
+        self.assertIn(('locate',self.state),self.calls);self.assertIn(('recover',),self.calls)
+    def test_unsettled_network_blocks_other_writer(self):
+        n.atomic(self.path+'/network-writer-locator.json',{'config':self.config,'stateDir':self.state})
+        self.terminal=False
+        with patch.object(self.agent,'main',return_value=0) as enter:
+            with self.assertRaises(RuntimeError):self.agent.run_writer_mode()
+            enter.assert_not_called()
+        self.assertIn(('recover',),self.calls)
+    def test_live_writer_lock_preserves_owner(self):
+        self.network_args()
+        def active(*args):
+            self.assertEqual(self.agent.run_writer_mode(),2)
+            self.calls.append(('owner-survived',));return 0
+        with patch.object(n,'main',side_effect=active):self.assertEqual(self.agent.run_writer_mode(),0)
+        self.assertIn(('owner-survived',),self.calls)
+    def test_old_firewall_debt_settled_before_new_writer(self):
+        n.atomic(self.agent.STATE_FILE,{})
+        state={'state':'pending','generation':'test-generation','workloadState':None,'workloadGeneration':None}
+        def undo(*args):self.calls.append(('undo',));state['state']='rolled-back'
+        self.network_args()
+        # Explicit legacy recovery entry points are the boundary; their nft/ip/kubectl children
+        # cannot escape because both subprocess entry points are fatal guards above.
+        with patch.object(self.agent,'load_state',side_effect=lambda:dict(state)),patch.object(self.agent,'recover_commitment') as host,patch.object(self.agent,'recover_workload_commitment') as workload,patch.object(self.agent,'reconcile_recovered_commitments') as reconcile,patch.object(self.agent,'rollback_generation',side_effect=undo),patch.object(n,'main',return_value=0) as enter:
+            self.assertEqual(self.agent.run_writer_mode(),0)
+            host.assert_called_once();workload.assert_called_once();reconcile.assert_called_once();enter.assert_called_once()
+        self.assertIn(('undo',),self.calls)
+    def test_graceful_stop_settles_firewall_watchdog_debt(self):
+        state={'state':'confirmed','generation':'test-generation','workloadState':None,'workloadGeneration':None}
+        def run():state['state']='pending';return 0
+        def undo(*args):self.calls.append(('stop-undo',));state['state']='rolled-back'
+        self.agent.main=run
+        with patch.object(self.agent,'load_state',side_effect=lambda:dict(state)),patch.object(self.agent,'rollback_generation',side_effect=undo):self.assertEqual(self.agent.run_writer_mode(),0)
+        self.assertIn(('stop-undo',),self.calls)
+
+
 if __name__=='__main__': unittest.main()

@@ -28,6 +28,7 @@ describe("published package attack surface", () => {
     assert.equal(index.includes('from "./agent.ts"'), false);
     assert.equal(pkg.files?.includes("agent"), false, "the package must allowlist safe agent entry points");
     assert.ok(pkg.files?.includes("agent/heliopause-pull.py"));
+    assert.ok(pkg.files?.includes("agent/network_executor.py"));
     assert.ok(pkg.files?.includes("agent/heliopause-enroll.py"));
   });
 
