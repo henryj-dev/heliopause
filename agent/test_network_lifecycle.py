@@ -54,6 +54,11 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual(n.read_json(self.path+'/response.json')['state'],'rejected')
         self.assertEqual(self.l.report()['activeWriter']['kind'],'firewall')
         self.l.end_firewall();self.assertIsNone(self.l.report()['activeWriter'])
+    def test_explicit_identical_redelivery_revalidates_after_busy_without_a_queue(self):
+        self.assertTrue(self.l.begin_firewall());self.request();self.l.step()
+        self.executor.accept.assert_not_called();self.l.end_firewall()
+        self.l.step();self.executor.accept.assert_not_called()
+        self.request();self.l.step();self.executor.accept.assert_called_once()
     def test_network_admission_blocks_new_firewall_and_has_no_queue(self):
         self.l.begin_network();self.assertFalse(self.l.begin_firewall())
         with self.assertRaises(ValueError):self.l.begin_network()

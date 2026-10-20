@@ -4,7 +4,7 @@ import hashlib
 import os
 import threading
 import time
-from network_executor import Executor, TERMINAL, atomic, read_file, read_json, safe_diagnostic, validate_execution_config
+from network_executor import Executor, TERMINAL, atomic, read_file, read_json, decode_json, safe_diagnostic, validate_execution_config
 
 DEBT = {'prepared', 'pending', 'rollback-failed', 'rollback-incident'}
 
@@ -222,15 +222,17 @@ class Lifecycle:
                 self.error('network-mailbox', 'network-mailbox-unreadable')
                 continue
             stamp = hashlib.sha256(raw).hexdigest()
-            if self.seen.get(filename) == stamp:
+            info=os.stat(os.path.join(self.directory,filename),follow_symlinks=False)
+            delivery=(stamp,info.st_ino,info.st_mtime_ns)
+            if self.seen.get(filename) == delivery:
                 continue
-            self.seen[filename] = stamp
+            self.seen[filename] = delivery
             try:
                 if filename == 'request.json':
                     self.begin_network()
-                    result = self.executor.accept(read_json(os.path.join(self.directory, filename)))
+                    result = self.executor.accept(decode_json(raw))
                 else:
-                    result = self.executor.confirm(read_json(os.path.join(self.directory, filename)))
+                    result = self.executor.confirm(decode_json(raw))
                 response = {'requestHash': stamp, 'state': result}
             except Exception as error:
                 response = {'requestHash': stamp, 'state': 'rejected', 'diagnostic': safe_diagnostic(error)}

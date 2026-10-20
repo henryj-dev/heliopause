@@ -80,7 +80,7 @@ def read_file(path, maximum=8*1024*1024, secret=False):
         return data
 
 
-def read_json(path):
+def decode_json(raw):
     def pairs(items):
         result = {}
         for k, v in items:
@@ -88,7 +88,11 @@ def read_json(path):
                 raise ValueError('duplicate key')
             result[k] = v
         return result
-    return json.loads(read_file(path), object_pairs_hook=pairs, parse_constant=lambda _: (_ for _ in ()).throw(ValueError('nonfinite JSON')))
+    return json.loads(raw, object_pairs_hook=pairs, parse_constant=lambda _: (_ for _ in ()).throw(ValueError('nonfinite JSON')))
+
+
+def read_json(path):
+    return decode_json(read_file(path))
 
 
 def atomic(path, value):
