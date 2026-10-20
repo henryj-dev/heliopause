@@ -1,0 +1,12 @@
+import {writeFileSync} from 'node:fs';
+import {networkLabInput} from '../../examples/network-lab.ts';
+import {buildNetworkChangeSet} from '../../src/network-change-set.ts';
+import {compileWireGuard} from '../../src/network-wireguard.ts';
+import {compileFrr} from '../../src/network-frr.ts';
+const input=networkLabInput();
+const version=process.argv[3];if(version!=='8.5.6'&&version!=='10.2.1')throw new Error('explicit supported FRR version required');
+for(const spec of input.frr) spec.frrVersion=version;
+const wg=compileWireGuard({registry:input.registry,expectedRegistryRevision:1,spec:input.wireguard,prefixPolicy:input.prefixPolicy});
+if(!wg.ok)throw new Error(wg.diagnostics.join('; '));
+const frr=input.frr.map(spec=>{const r=compileFrr({registry:input.registry,expectedRegistryRevision:1,spec,prefixPolicy:input.prefixPolicy});if(!r.ok)throw new Error(r.diagnostics.join('; '));return r.artifact;});
+writeFileSync(process.argv[2]!,JSON.stringify({input,wireguard:wg.artifact,frr,changeSet:buildNetworkChangeSet(input)},null,2));
