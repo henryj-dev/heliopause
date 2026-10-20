@@ -180,11 +180,14 @@ def setup(bundle):
         start_daemon(i,'/usr/lib/frr/zebra',directory,'-f','/dev/null',*common)
         eventually(lambda: assert_socket(directory/'zserv.api'), 10)
         common[1] = str(directory/'bgpd.pid')
-        start_daemon(i,'/usr/lib/frr/bgpd',directory,'-S','-f',str(ROOT/f'bgp{i}.conf'),*common)
-        # Short lab timers are applied only to the lab daemon, not emitted as production defaults.
+        # Set lab-only timers BEFORE session negotiation. Changing them through VTY after
+        # a session established can leave its old negotiated hold timer in effect.
+        runtime_config=ROOT/f'bgp{i}-lab.conf'
+        timer_lines=[]
         for peer in bundle['input']['frr'][i]['peers']:
-            ns(i,'vtysh','--vty_socket',str(directory),'-d','bgpd','-c','configure terminal','-c',f'router bgp {65100+i}',
-               '-c',f'neighbor {peer["address"]} timers 1 3','-c',f'neighbor {peer["address"]} timers connect 1')
+            timer_lines.extend([f' neighbor {peer["address"]} timers 1 3', f' neighbor {peer["address"]} timers connect 1'])
+        runtime_config.write_text(bundle['frr'][i]['template']+'\n'.join(timer_lines)+'\n')
+        start_daemon(i,'/usr/lib/frr/bgpd',directory,'-S','-f',str(runtime_config),*common)
 
 
 def start_daemon(i, executable, directory, *args):
@@ -291,6 +294,24 @@ def assert_origins():
     assert routes_for_prefix(0,'192.0.2.48/28'), 'service aggregate origin was never installed; leak test did not open the path'
 
 
+def primary_withdrawn():
+    for i in range(4):
+        data=vty(i,'show bgp ipv4 unicast summary json')
+        peers=data.get('ipv4Unicast',data).get('peers',{})
+        for j in range(4):
+            if i==j:
+                continue
+            assert peers.get(f'198.51.100.{j+1}',{}).get('state')!='Established', ('primary session not withdrawn',i,j)
+            assert not any(p.get('valid') and any(n.get('ip')==f'198.51.100.{j+1}' for n in p.get('nexthops',[])) for p in routes(i,j)), ('primary path still valid',i,j)
+
+
+def stable_primary():
+    for _ in range(2):
+        sessions()
+        all_paths(True)
+        time.sleep(1)
+
+
 def main():
     assert sys.platform == 'linux' and os.geteuid() == 0
     assert Path('/.dockerenv').exists(), 'lab is container-only'
@@ -302,8 +323,10 @@ def main():
     record('all six neighbors per site established', lambda: eventually(sessions))
     record('all twelve ordered workload paths use native WireGuard with FIB and byte evidence', lambda: eventually(lambda: all_paths(True)))
     record('primary failure uses secondary tunnel, not Cloudflare emulation', lambda: failover(False,bundle))
+    record('primary BGP sessions and valid paths withdraw during outage', lambda: eventually(primary_withdrawn))
     record('management route preserved during outage', management)
     record('native tunnel recovery returns all paths to primary', lambda: failover(True,bundle))
+    record('primary sessions and forwarding remain stable over two post-recovery samples', stable_primary)
     record('static kernel route shadow is detected separately from BGP selection', static_shadow)
     record('management and complete service pool cannot leak through export filters', leakage)
     record('management not advertised and default route not replaced', management)
@@ -325,7 +348,7 @@ finally:
         REPORT['diagnostics']={}
         for i in range(4):
             try:
-                REPORT['diagnostics'][str(i)]={'bgp':vty(i,'show bgp ipv4 unicast summary json'), 'fib':json.loads(ns(i,'ip','-j','route','show').stdout)}
+                REPORT['diagnostics'][str(i)]={'bgp':vty(i,'show bgp ipv4 unicast summary json'), 'rib':vty(i,'show bgp ipv4 unicast json'), 'fib':json.loads(ns(i,'ip','-j','route','show').stdout)}
             except (subprocess.SubprocessError,ValueError):
                 pass
         REPORT['daemonLogs'] = {str(log.relative_to(ROOT)): log.read_text()[-4000:] for _,log in PROCESSES if log.exists()}

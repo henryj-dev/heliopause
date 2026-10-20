@@ -98,13 +98,15 @@ Four gateway namespaces and four workload namespaces use documentation address
 ranges. Fresh private keys exist only in ephemeral memory/private temp files and
 are not printed or saved in results. The compiler's templates are used unchanged
 for FRR syntax checks, including separate IPv6 templates with optional BFD enabled.
-IPv6 packet forwarding and BFD liveness/failover are not exercised by those parser checks. Lab-specific BGP timers are subsequently configured through
-VTY (per-peer keepalive 1s, hold 3s, connect retry 1s). The secondary backbone uses a separate WG interface/port, not Cloudflare.
+IPv6 packet forwarding and BFD liveness/failover are not exercised by those parser checks. Lab-specific BGP timers are added to a separate runtime configuration BEFORE
+session negotiation (per-peer keepalive 1s, hold 3s, connect retry 1s); parser checks
+continue to consume the exact unmodified compiler templates. The secondary backbone uses a separate WG interface/port, not Cloudflare.
 
 Checks require six Established peers per gateway, all twelve ordered workload
 paths, the chosen BGP next hop, the actual kernel FIB interface, WG transmitted
 byte deltas, and ping success. Primary outage and recovery measure convergence and
-sampled probe losses. A deliberate static route shadow must be detected even when
+sampled probe losses. Recovery starts only after primary BGP sessions/valid paths
+actually withdraw; two post-recovery samples check short-term stability. A deliberate static route shadow must be detected even when
 BGP selected primary. Management addresses, local workload-to-management pings, default routes and export leakage
 are checked. These tests do not establish actual Cloudflare/WARP behavior, CNI
 routing, Kubernetes VIP translation, BFD, asymmetric-policy behavior or production
