@@ -21,17 +21,25 @@ def event(point):
 
 # Same process lock, recovery and loop as the production entry point, with an observer hook only.
 executor=n.Executor(config,state,event=event)
-if fault in {'first-route','raw-create','foreign-create'}:
+if fault=='first-route':
     original=executor.driver.run
     def first_route(args,*a,**kw):
-        if fault=='foreign-create' and args[:3]==['ip','link','add']:
-            original(['ip','link','add','name',args[4],'type','wireguard'])
         result=original(args,*a,**kw)
-        if (fault=='first-route' and args[:3]==['ip','route','add']) or (fault=='raw-create' and args[:3]==['ip','link','add']):
+        if args[:3]==['ip','route','add']:
             n.atomic(state+'/barrier.json',{'point':'first-route'})
             while True: time.sleep(1)
         return result
     executor.driver.run=first_route
+if fault in {'raw-create','foreign-create'}:
+    original_create=executor.driver.create_link
+    def create_link(dev,group,mtu):
+        if fault=='foreign-create':
+            executor.driver.run(['ip','link','add','name',dev,'type','wireguard'])
+        original_create(dev,group,mtu)
+        if fault=='raw-create':
+            n.atomic(state+'/barrier.json',{'point':'raw-create'})
+            while True: time.sleep(1)
+    executor.driver.create_link=create_link
 fd=os.open(state+'/worker.lock',os.O_RDWR|os.O_CREAT,0o600)
 n.fcntl.flock(fd,n.fcntl.LOCK_EX|n.fcntl.LOCK_NB)
 executor.recover()

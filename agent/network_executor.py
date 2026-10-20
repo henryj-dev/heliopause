@@ -13,6 +13,8 @@ import json
 import os
 import re
 import signal
+import socket
+import struct
 import stat
 import subprocess
 import sys
@@ -272,8 +274,36 @@ class LinuxWireGuard:
             os.close(fd)
             raise
 
+    def create_link(self, dev, group, mtu):
+        """One exclusive RTM_NEWLINK installs identity/group/MTU before kernel registration.
+
+        iproute2 6.1 explicitly refuses `group` on `ip link add`, although rtnl_create_link supports
+        IFLA_GROUP. Keep this bounded request specific to creating a new WireGuard device.
+        """
+        def attr(kind, payload):
+            size=4+len(payload)
+            return struct.pack('=HH',size,kind)+payload+b'\0'*((-size)%4)
+        attrs=attr(3,dev.encode()+b'\0')+attr(4,struct.pack('=I',mtu))+attr(27,struct.pack('=I',group))+attr(18|0x8000,attr(1,b'wireguard\0'))
+        body=struct.pack('=BBHiII',0,0,0,0,0,0xffffffff)+attrs
+        sequence=int.from_bytes(os.urandom(4),'big') or 1
+        try:
+            with socket.socket(socket.AF_NETLINK,socket.SOCK_RAW,0) as channel:
+                channel.bind((0,0))
+                port=channel.getsockname()[0]
+                request=struct.pack('=IHHII',16+len(body),16,0x605,sequence,port)+body
+                channel.settimeout(5)
+                channel.sendto(request,(0,0))
+                response,sender=channel.recvfrom(65536)
+                if sender[0]!=0 or len(response)<20:
+                    raise RuntimeError('invalid kernel create acknowledgement')
+                length,kind,_,seq,pid=struct.unpack_from('=IHHII',response)
+                if length<20 or length>len(response) or kind!=2 or seq!=sequence or pid!=port or struct.unpack_from('=i',response,16)[0]!=0:
+                    raise RuntimeError('kernel refused exclusive WireGuard create')
+        except OSError:
+            raise RuntimeError('WireGuard netlink create unavailable or timed out') from None
+
     def create(self, op, owner):
-        self.run(['ip', 'link', 'add', 'name', op['interfaceName'], 'group', str(owner_group(owner)), 'mtu', str(op['mtu']), 'type', 'wireguard'])
+        self.create_link(op['interfaceName'],owner_group(owner),op['mtu'])
         self.run(['ip', 'link', 'set', 'dev', op['interfaceName'], 'alias', owner])
 
     def configure(self, op):
