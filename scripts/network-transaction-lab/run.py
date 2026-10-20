@@ -128,6 +128,8 @@ def await_state(path,wanted,seconds=7):
         print('Agent diagnostic: '+open(path+'/worker.log').read()[-4000:],flush=True)
         print('Agent state: '+str(state(path)),flush=True)
         print('Transaction diagnostic: '+str(row(path).get('diagnostic')),flush=True)
+        print('Protected before: '+json.dumps(row(path).get('before')),flush=True)
+        print('Protected current: '+run('python3','-c',"import sys,json;sys.path.insert(0,'/source/agent');import network_executor as n;print(json.dumps(n.LinuxWireGuard('/unused').snapshot()))",ns='p6-gw'),flush=True)
         print('Kernel link: '+json.dumps(ip('p6-gw','-d','link','show')),flush=True)
         print('Kernel IPv6: '+json.dumps({'addresses':ip('p6-gw','-6','address','show','dev',DEV),'routes':ip('p6-gw','-6','route','show','table','all','dev',DEV)}),flush=True)
         if os.path.exists(path+'/state/response.json'): print(n.read_json(path+'/state/response.json'),flush=True)
