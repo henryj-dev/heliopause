@@ -144,3 +144,20 @@ test('Registry mutation and authenticated settlement serialize across real proce
     assert.equal(f.store.executionStatus().fence,null);assert.ok([1,2].includes(f.store.read().revision));
   }finally{f.cleanup();}
 });
+
+test('post-rename directory fsync failure cannot expose a cached authority until a durable read barrier succeeds',async()=>{
+  const {createRequire,syncBuiltinESMExports}=await import('node:module');
+  const fs=createRequire(import.meta.url)('node:fs');
+  const f=fixture(),original=fs.fsyncSync;
+  try {
+    f.proposeDraft();f.approveDraft();
+    fs.fsyncSync=(fd:number)=>{if(fs.fstatSync(fd).isDirectory())throw new Error('injected directory fsync failure');return original(fd);};syncBuiltinESMExports();
+    assert.throws(f.issue,/directory fsync/);
+    assert.ok(f.store.read().execution!.fence); // installed but uncertainty isn't permission to return it
+    assert.throws(()=>f.store.executionStatus(),/directory fsync/);
+  } finally {fs.fsyncSync=original;syncBuiltinESMExports();}
+  try {
+    const recovered=new NetworkRegistryStore(f.store.path).executionStatus();
+    assert.equal(recovered.records.length,1);assert.equal(recovered.fence!.transactionId,f.draft.transactionId);
+  }finally{rmSync(f.dir,{recursive:true,force:true});}
+});

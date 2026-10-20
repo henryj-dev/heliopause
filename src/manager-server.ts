@@ -2445,7 +2445,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
             return resource ? send(res, 200, { revision: doc.revision, resource }) : send(res, 404, { error: "resource not found" });
           }
           const {execution,...inventory}=doc;
-          return send(res, 200, inventory);
+          return send(res, 200, {...inventory,schemaVersion:1});
         }
         if (!["POST", "PUT", "DELETE"].includes(req.method ?? "") || url.pathname === "/network/revisions" || (req.method === "POST" && pathId !== undefined) || (req.method === "DELETE" && pathId === undefined)) return send(res, 405, { error: "method not allowed" });
         if (crossSiteRequest(req)) return send(res, 403, { error: "cross-site registry writes are refused" });
@@ -2459,7 +2459,8 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
           : pathId === undefined ? { action: "replace" as const, resources: b.resources }
           : { action: "update" as const, id: pathId, resource: b.resource };
         const doc = store.mutate(b.expectedRevision, who, mutation);
-        return send(res, req.method === "POST" ? 201 : 200, doc);
+        const {execution,...inventory}=doc;
+        return send(res, req.method === "POST" ? 201 : 200, {...inventory,schemaVersion:1});
       } catch (e) {
         if (e instanceof NetworkRegistryError) return send(res, e.statusCode, { error: e.message, ...(e.issues ? { issues: e.issues } : {}) });
         if (e instanceof SyntaxError || e instanceof URIError) return send(res, 400, { error: "invalid registry request" });

@@ -165,6 +165,13 @@ class Transactions(unittest.TestCase):
             self.assertNotEqual(identity,self.cfg['journalId'])
             with self.assertRaises(ValueError):other.accept(self.a)
             self.assertEqual(other.driver.calls,[])
+    def test_terminal_export_requires_successful_durability_barrier(self):
+        self.e.accept(self.a);self.e.confirm(self.confirmation())
+        with patch.object(n.os,'fsync',side_effect=OSError('injected fsync failure')):
+            with self.assertRaises(OSError):self.e.publish_results()
+        self.assertFalse(os.path.exists(self.temp.name+'/terminal-results.json'))
+        self.e.publish_results();self.assertEqual(len(n.read_json(self.temp.name+'/terminal-results.json')),1)
+
     def test_terminal_before_outbox_new_process_recovers_reporting(self):
         self.e.accept(self.a);self.e.confirm(self.confirmation())
         self.assertFalse(os.path.exists(self.temp.name+'/terminal-results.json'))
@@ -277,6 +284,51 @@ class Transactions(unittest.TestCase):
         self.assertEqual(os.stat(self.e.path).st_mode & 0o777,0o600)
         with open(self.e.path) as stream:
             self.assertNotIn('privateKey',stream.read())
+
+
+class TerminalCourier(unittest.TestCase):
+    def setUp(self):
+        import network_terminal_delivery as delivery
+        self.d=delivery;self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
+        self.path=self.temp.name
+        self.cfg={'terminalDelivery':{'url':'https://manager.example.invalid/api/network/execution/terminal','caFile':self.path+'/ca','certFile':self.path+'/cert','keyFile':self.path+'/key'}}
+        for name in ['ca','cert','key']:
+            n.atomic(self.path+'/'+name,{'test':'fixture'})
+        n.atomic(self.path+'/terminal-results.json',[{'transactionId':'a'*32,'state':'confirmed'}])
+        self.ssl=patch.object(delivery.ssl,'create_default_context');self.ssl.start();self.addCleanup(self.ssl.stop)
+        self.network=patch.object(delivery.urllib.request,'build_opener');self.opener=self.network.start().return_value;self.addCleanup(self.network.stop)
+        self.opener.open.return_value.__enter__.return_value.read.return_value=b'{"settled":true}'
+        for module,name in [(n.subprocess,'run'),(n.subprocess,'Popen'),(n.socket,'socket')]:
+            guard=patch.object(module,name,side_effect=AssertionError('escaped courier unit boundary'));guard.start();self.addCleanup(guard.stop)
+    def test_only_direct_https_mtls_delivery_and_ack_deduplication(self):
+        self.assertEqual(self.d.deliver(self.cfg,self.path),1)
+        self.assertEqual(self.d.deliver(self.cfg,self.path),0)
+        self.opener.open.assert_called_once()
+        request=self.opener.open.call_args[0][0]
+        self.assertNotIn('Authorization',request.headers);self.assertNotIn('Cookie',request.headers)
+    def test_transport_loss_does_not_ack_and_can_retry_identical_result(self):
+        self.opener.open.side_effect=OSError('lost response')
+        with self.assertRaises(OSError):self.d.deliver(self.cfg,self.path)
+        self.assertFalse(os.path.exists(self.path+'/terminal-acks.json'))
+        self.opener.open.side_effect=None
+        self.assertEqual(self.d.deliver(self.cfg,self.path),1)
+    def test_unsuccessful_manager_response_never_acknowledges(self):
+        self.opener.open.return_value.__enter__.return_value.read.return_value=b'{"settled":false}'
+        with self.assertRaises(ValueError):self.d.deliver(self.cfg,self.path)
+        self.assertFalse(os.path.exists(self.path+'/terminal-acks.json'))
+    def test_plaintext_credentials_and_redirects_are_refused(self):
+        for url in ['http://manager.example.invalid/api/network/execution/terminal','https://user:password@manager.example.invalid/api/network/execution/terminal','https://manager.example.invalid/api/network/execution/terminal?key=secret']:
+            self.cfg['terminalDelivery']['url']=url
+            with self.assertRaises(ValueError):self.d.deliver(self.cfg,self.path)
+        with self.assertRaises(ValueError):self.d.NoRedirect().redirect_request(None,None,None,None,None,None)
+    def test_private_key_permissions_are_checked_before_transport(self):
+        os.chmod(self.path+'/key',0o644)
+        with self.assertRaises(ValueError):self.d.deliver(self.cfg,self.path)
+        self.opener.open.assert_not_called()
+    def test_oversized_untrusted_response_is_not_recorded(self):
+        self.opener.open.return_value.__enter__.return_value.read.return_value=b'X'*4097
+        with self.assertRaises(ValueError):self.d.deliver(self.cfg,self.path)
+        self.assertFalse(os.path.exists(self.path+'/terminal-acks.json'))
 
 
 class Ownership(unittest.TestCase):

@@ -328,7 +328,7 @@ def consecutive(kind):
     global DEV
     with tempfile.TemporaryDirectory(prefix='hp-consecutive-') as path:
         setup(path,continuous=True);setup_manager(path)
-        manager=start_manager(path)
+        manager=start_manager(path);manager_restarts=0
         agent=start(path,production=True);original_pid=agent.pid
         await_state(path,{'awaiting-verification'})
         first=n.read_json(path+'/decoded.json');first_dev=DEV
@@ -338,7 +338,8 @@ def consecutive(kind):
         elif kind=='consecutive-rollback-failed':
             run('ip','address','add','192.0.2.131/32','dev',DEV,ns='p6-gw')
             await_state(path,{'rollback-failed'},16)
-            bad={'transactionId':first['transactionId'],'state':'rollback-failed'}
+            bad={'schemaVersion':1,'domain':n.TERMINAL_DOMAIN,'transactionId':first['transactionId'],'fenceId':first['transactionId'],'target':first['target'],'journalId':first['journalId'],'authorizationHash':n.digest(first),'artifactHash':first['artifactHash'],'registryRevision':first['registryRevision'],'state':'rollback-failed','sequence':1,'proof':{'removalVerified':False}}
+            bad['stateHash']=n.digest(bad)
             api(path,'terminal',bad,identity='gateway',expected=409)
             assert api(path,'status')['fence']['transactionId']==first['transactionId']
             # A new production issuance must fail while debt remains; no ledger/fence is deleted.
@@ -349,7 +350,7 @@ def consecutive(kind):
         else:
             confirm_body,confirmation=manager_confirm(path)
             if kind=='consecutive-manager-restart':
-                stop(manager);manager=start_manager(path)
+                stop(manager);manager=start_manager(path);manager_restarts+=1
                 assert api(path,'confirm',confirm_body)['envelope']==confirmation
             if kind=='consecutive-rolled-back':
                 # The Manager issued confirm, but delivery is lost. Agent must independently undo.
@@ -364,7 +365,7 @@ def consecutive(kind):
         if kind=='consecutive-manager-restart':
             with open(path+'/drop-terminal-response','w') as stream:stream.write('drop')
             courier(path,success=False);wait_for(lambda:manager.poll() is not None)
-            manager=start_manager(path)
+            manager=start_manager(path);manager_restarts+=1
             assert api(path,'status')['fence'] is None
         courier(path)
         settled=api(path,'status')
@@ -389,6 +390,9 @@ def consecutive(kind):
         second=json.loads(base64.urlsafe_b64decode(n.read_json(path+'/authorization.json')['payload']+'=='))
         n.atomic(path+'/decoded.json',second);DEV=second['operation']['interfaceName']
         assert second['transactionId']!=first['transactionId'] and DEV!=first_dev
+        assert second['operation']['address']=='192.0.2.145/32'
+        assert second['operation']['routes']==['192.0.2.146/32','198.51.100.14/32']
+        assert second['operation']['secretRef']=='gateway2' and second['operation']['listenPort']==51821
         n.atomic(path+'/state/request.json',n.read_json(path+'/authorization.json'))
         wait_for(lambda:n.read_json(path+'/state/transactions.json')['transactions'].get(second['transactionId'],{}).get('state')=='awaiting-verification')
         assert agent.poll() is None
@@ -411,15 +415,18 @@ def consecutive(kind):
             for secret in ['gateway','peer','gateway2','peer2']:
                 assert open(path+'/secrets/'+secret+'.key','rb').read().strip() not in data
             assert b'PRIVATE KEY-----' not in data
+        assert journal['transactions'][second['transactionId']]['acceptedAt']>first['rollbackAt']
+        evidence={'firstState':terminal['state'],'firstAgentPid':original_pid,'secondAgentPid':agent.pid,'managerRestarts':manager_restarts,'firstRollbackAt':first['rollbackAt'],'secondAcceptedAt':journal['transactions'][second['transactionId']]['acceptedAt'],'settledRecords':len(final['records']),'registryRevision':second['registryRevision']}
         stop(agent);stop(manager)
+        return evidence
 
 
 cases=['normal','signature','target','expiry','hash','approval','registry-changed','local-changed','duplicate','prepare-failed','fail-created','fail-routes','management-failed','asymmetric','blackhole','absent-verifier','lost-confirm','forged-verifier','crash-apply','crash-before-alias','crash-partial-routes','crash-wait','crash-rollback','crash-after-remove','foreign-writer','rollback-command-failed','peer-route-loss','secret-redaction','disabled-recovery','writer-conflict','graceful-stop','foreign-create','consecutive-confirmed','consecutive-rolled-back','consecutive-rollback-failed','consecutive-manager-restart','consecutive-agent-restart','consecutive-delayed-duplicate']
 for case in cases:
     started=time.monotonic()
     try:
-        consecutive(case) if case.startswith('consecutive-') else scenario(case)
-        results.append({'name':case,'status':'passed','seconds':round(time.monotonic()-started,2)})
+        evidence=consecutive(case) if case.startswith('consecutive-') else scenario(case)
+        results.append({'name':case,'status':'passed','seconds':round(time.monotonic()-started,2),**({'evidence':evidence} if evidence else {})})
         print('PASS '+case,flush=True)
     except Exception as e:
         print('FAIL '+case+': '+str(e),flush=True)

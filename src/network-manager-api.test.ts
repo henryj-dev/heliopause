@@ -219,9 +219,21 @@ test('mTLS network execution goes through distinct approval, fenced authorizatio
     const forged={...result,artifactHash:'f'.repeat(64)};
     assert.equal((await call('/api/network/execution/terminal','POST','gateway',forged)).status,409);
     assert.ok((await call('/api/network/execution/status')).body.fence);
+    const publicInventory=await call('/api/network/inventory');assert.equal(publicInventory.body.schemaVersion,1);assert.equal(publicInventory.body.execution,undefined);
+    // Revocation is checked before the machine endpoint and does not require a Manager restart.
+    const revocations=join(dir,'execution-revocations.json');
+    writeFileSync(revocations,JSON.stringify({schemaVersion:1,revocations:[{fingerprint256:options.networkExecutionTargets[0]!.certificateSha256,subject:null,reason:'test',actor:'fixture',revokedAt:new Date().toISOString()}]}));
+    await new Promise<void>(resolve=>manager.server.close(()=>resolve()));
+    manager=await startManager({...options,revocationFile:revocations});port=(manager.server.address() as {port:number}).port;
+    assert.equal((await call('/api/network/execution/terminal','POST','gateway',result)).status,401);
+    assert.ok(new NetworkRegistryStore(registryFile).executionStatus().fence);
+    writeFileSync(revocations,'{broken');
+    assert.equal((await call('/api/network/execution/terminal','POST','gateway',result)).status,401);
+    assert.ok(new NetworkRegistryStore(registryFile).executionStatus().fence);
+    writeFileSync(revocations,JSON.stringify({schemaVersion:1,revocations:[]}));
     // Report settlement stays enabled after new issuance is disabled and Manager restarts.
     await new Promise<void>(resolve=>manager.server.close(()=>resolve()));
-    manager=await startManager({...options,artifactSigning:undefined,networkVerifierKeys:undefined});port=(manager.server.address() as {port:number}).port;
+    manager=await startManager({...options,revocationFile:revocations,artifactSigning:undefined,networkVerifierKeys:undefined});port=(manager.server.address() as {port:number}).port;
     assert.equal((await call('/api/network/execution/terminal','POST','gateway',result)).status,200);
     assert.equal((await call('/api/network/execution/terminal','POST','gateway',result)).body.duplicate,true);
     const settled=await call('/api/network/execution/status');
