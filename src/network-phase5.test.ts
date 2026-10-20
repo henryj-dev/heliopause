@@ -118,3 +118,17 @@ test('hash changes bind generations, exact observation evidence and advertisemen
   const a=buildNetworkChangeSet(networkLabInput()).contentHash;
   for(const mutate of [(f:ReturnType<typeof networkLabInput>)=>{f.registry.resources[0]!.generation++;},(f:ReturnType<typeof networkLabInput>)=>{f.observations[0]!.report.collectionId='11111111-1111-4111-8111-111111111111';},(f:ReturnType<typeof networkLabInput>)=>{f.prefixPolicy!.permissions.pop();}]){const f=networkLabInput();mutate(f);assert.notEqual(buildNetworkChangeSet(f).contentHash,a);}
 });
+test('FRR cannot mix logical domains in one global writer',()=>{
+  const f=networkLabInput();f.registry.resources.push({id:'rd-other',kind:'routing-domain',name:'other',isolation:'global',owner:'lab',generation:1,management:{mode:'external',provider:'lab'}});
+  const net=f.registry.resources.find(r=>r.id==='secondary')!;Object.assign(net,{routingDomainId:'rd-other'});
+  for(const r of f.registry.resources)if(r.kind==='route'&&r.interfaceId.startsWith('cf'))r.routingDomainId='rd-other';
+  assert.ok(codes(f).includes('frr-compile'));
+});
+test('even a currently matched host route cannot acquire a second writer',()=>{
+  const f=networkLabInput();f.registry.resources.find(r=>r.id==='route-p-0-1')!.management={mode:'managed',provider:'native',driver:'static'};
+  assert.ok(codes(f).includes('route-writer-conflict'));
+});
+test('a forged prefix observation reference is blocked by the unified source/digest binding',()=>{
+  const f=networkLabInput();f.prefixPolicy!.permissions.push({id:'pod',resourceId:'pods0',siteId:'s0',prefix:'192.0.2.32/28',role:'pod',owner:{nodeId:'n0',provider:'native',driver:'frr'},evidence:{...labPrefixEvidence(f),digest:'0'.repeat(64)}});
+  assert.ok(codes(f).includes('prefix-evidence-mismatch'));
+});

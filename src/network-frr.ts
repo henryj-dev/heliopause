@@ -141,6 +141,7 @@ export function compileFrr(input: {
     }
     const exports = prefixes(spec.exportSubnetIds, spec.siteId);
     const peers: FrrPeerSpec[] = [];
+    const routingDomains = new Set<string>();
     const seen = new Set<string>();
     const nodeAsns = new Map<string, number>();
     const asnNodes = new Map<number, string>();
@@ -172,6 +173,7 @@ export function compileFrr(input: {
             bad('peer interface reference mismatch');
         else if (p.backbone === 'primary' ? (iface.management.mode !== 'managed' || !['native', 'wireguard'].includes(iface.management.provider)) : (iface.management.mode !== 'external' || iface.management.provider !== 'cloudflare'))
             bad('backbone ownership mismatch');
+        if(net?.kind==='network' && net.routingDomainId) routingDomains.add(net.routingDomainId);
         const domain = net?.kind === 'network' && net.routingDomainId ? rs.get(net.routingDomainId) : undefined;
         if (domain?.kind !== 'routing-domain' || domain.isolation !== 'global')
             bad('only explicit global routing domain supported');
@@ -184,6 +186,12 @@ export function compileFrr(input: {
     for (const n of new Set(peers.map(p => p.nodeId + '|' + p.addressFamily)))
         if (!peers.some(p => p.nodeId + '|' + p.addressFamily === n && p.backbone === 'primary') || !peers.some(p => p.nodeId + '|' + p.addressFamily === n && p.backbone === 'secondary'))
             bad('each remote node requires both backbones');
+    for(const ref of spec.exportSubnetIds) {
+        const r=rs.get(ref); const sub=r?.kind==='subnet'?r:r?.kind==='address-pool'?rs.get(r.subnetId):undefined;
+        const net=sub?.kind==='subnet'?rs.get(sub.networkId):undefined;
+        if(net?.kind==='network' && net.routingDomainId) routingDomains.add(net.routingDomainId);
+    }
+    if(routingDomains.size!==1) bad('FRR configuration requires one consistent routing domain; multi-domain writers are unsupported');
     if (errors.length)
         return {
             ok: false, diagnostics: [...new Set(errors)].sort()

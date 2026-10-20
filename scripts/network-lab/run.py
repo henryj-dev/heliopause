@@ -74,9 +74,9 @@ def transfer(i, interface):
     return sum(int(row.split()[2]) for row in ns(i, 'wg', 'show', interface, 'transfer').stdout.splitlines() if row)
 
 
-def ping(i, j):
+def ping(i, j, offset=2):
     return command('ip', 'netns', 'exec', 'client'+str(i), 'ping', '-n', '-q',
-                   '-c', '1', '-W', '1', f'192.0.2.{64*j+2}', check=False, timeout=3).returncode == 0
+                   '-c', '1', '-W', '1', f'192.0.2.{64*j+offset}', check=False, timeout=3).returncode == 0
 
 
 def all_paths(primary=True):
@@ -87,7 +87,10 @@ def all_paths(primary=True):
             selected(i, j, primary)
             interface = 'wg0' if primary else 'cf0'
             before = transfer(i, interface)
-            assert ping(i, j), ('workload packet failed', i, j)
+            for offset in [2,34,50]:
+                assert ping(i, j, offset), ('workload/synthetic pod/VIP packet failed', i, j, offset)
+                fib=json.loads(ns(i,'ip','-j','route','get',f'192.0.2.{64*j+offset}').stdout)
+                assert fib[0].get('dev') == interface, fib
             assert transfer(i, interface) > before, ('packet did not use selected tunnel', i, j)
 
 
@@ -162,6 +165,10 @@ def setup(bundle):
             for j in range(4):
                 if i != j:
                     ns(i, 'ip', 'route', 'add', f'198.51.100.{offset+j+1}/32', 'dev', interface)
+        for prefix in [f'192.0.2.{i*64+32}/28',f'192.0.2.{i*64+50}/32']:
+            ns(i,'ip','route','add',prefix,'via',f'192.0.2.{i*64+2}','dev','lan0')
+        for offset in [34,50]:
+            command('ip','netns','exec','client'+str(i),'ip','addr','add',f'192.0.2.{i*64+offset}/32','dev','lo')
         directory = ROOT/str(i)
         directory.mkdir(mode=0o777)
         os.chmod(directory, 0o777)
@@ -241,6 +248,17 @@ def assert_shadow():
     raise AssertionError('kernel shadow was not detected')
 
 
+def leakage():
+    # Deliberately try to originate management and the complete service pool. Export policy
+    # must refuse them even when a valid local origin route exists in the daemon's RIB.
+    ns(0,'ip','route','add','blackhole','192.0.2.48/28')
+    ns(0,'vtysh','--vty_socket',str(ROOT/'0'),'-d','bgpd','-c','configure terminal','-c','router bgp 65100','-c','address-family ipv4 unicast','-c','network 198.51.100.129/32','-c','network 192.0.2.48/28')
+    time.sleep(2)
+    for i in range(1,4):
+        assert not routes_for_prefix(i,'198.51.100.129/32')
+        assert not routes_for_prefix(i,'192.0.2.48/28')
+
+
 def main():
     assert sys.platform == 'linux' and os.geteuid() == 0
     assert Path('/.dockerenv').exists(), 'lab is container-only'
@@ -253,6 +271,7 @@ def main():
     record('management route preserved during outage', management)
     record('native tunnel recovery returns all paths to primary', lambda: failover(True))
     record('static kernel route shadow is detected separately from BGP selection', static_shadow)
+    record('management and complete service pool cannot leak through export filters', leakage)
     record('management not advertised and default route not replaced', management)
     REPORT['passed'] = True
 

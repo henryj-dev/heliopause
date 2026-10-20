@@ -125,8 +125,9 @@ export function buildNetworkChangeSet(input: NetworkChangeSetInput): NetworkChan
     }
     const id=`frr:${spec.nodeId}`;
     artifacts.push({targetId:id,nodeIds:[spec.nodeId],registryRevision:input.registry.revision,desiredDigest:plan.desiredDigest,hash:result.artifact.hash,compilation:result.artifact});
-    op(id,'frr',spec.nodeId,[spec.nodeId,...spec.peers.map(p=>p.interfaceId)],null,'native','frr',result.artifact.hash);
+    op(id,'frr',spec.nodeId,[spec.nodeId,...spec.peers.map(p=>p.interfaceId)],domain(rs.get(spec.peers[0]!.interfaceId)),'native','frr',result.artifact.hash);
     for(const peer of spec.peers) {
+      if(input.prefixPolicy?.permissions.some(p=>p.siteId===peer.siteId&&peer.importSubnetIds.includes(p.resourceId)&&p.owner.nodeId!==peer.nodeId)) block(peer.nodeId,'prefix-origin-mismatch','advertisement owner does not match the BGP origin node');
       if(peer.backbone==='primary') {
         const local=wg?.gateways.find(g=>g.interfaceId===peer.interfaceId);
         const remote=wg?.gateways.find(g=>{const r=rs.get(g.gatewayId);return r?.kind==='gateway'&&r.nodeId===peer.nodeId;});

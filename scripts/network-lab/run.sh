@@ -13,7 +13,7 @@ docker build --build-arg "FRR_VERSION=$version" -t "heliopause-network-lab:$vers
 # daemons and ephemeral private keys live inside a disposable container on a hosted runner.
 # No production credentials, Docker socket, PID namespace, host network or repository write mount.
 docker run --rm --network none --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_ADMIN \
-  --security-opt apparmor=unconfined \
+  --security-opt apparmor=unconfined --security-opt systempaths=unconfined \
   --mount "type=bind,src=$output,dst=/results" \
   --mount "type=bind,src=$(pwd)/scripts/network-lab,dst=/lab,readonly" \
   "heliopause-network-lab:$version"
