@@ -129,6 +129,7 @@ def await_state(path,wanted,seconds=7):
         print('Agent state: '+str(state(path)),flush=True)
         print('Transaction diagnostic: '+str(row(path).get('diagnostic')),flush=True)
         print('Kernel link: '+json.dumps(ip('p6-gw','-d','link','show')),flush=True)
+        print('Kernel IPv6: '+json.dumps({'addresses':ip('p6-gw','-6','address','show','dev',DEV),'routes':ip('p6-gw','-6','route','show','table','all','dev',DEV)}),flush=True)
         if os.path.exists(path+'/state/response.json'): print(n.read_json(path+'/state/response.json'),flush=True)
         raise
 
