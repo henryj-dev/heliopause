@@ -42,7 +42,7 @@ Raw firewall storage is checked for supported state, commitment identity and rec
 | SIGKILL/service stop timeout | durable existing debts, no successful shutdown claim | kernel releases flock; next process recovers before accepting work |
 | Confirmed interface disappears | confirmed history plus separate absent/drifted observation | report discrepancy; do not infer presence, reapply, adopt or delete |
 
-Normal firewall-only startup retains its existing pending-promise recovery/heartbeat confirmation behavior. The original service without the opt-in drop-in keeps its existing configuration. `--network-executor --config ... --state-dir ...` is a compatibility alias for the full persistent Agent and now requires the full firewall Agent environment; it is no longer an isolated replacement loop.
+Normal firewall-only startup retains its existing pending-promise recovery/heartbeat confirmation behavior. The original service without the opt-in drop-in keeps its existing configuration. `--network-executor --config ... --state-dir ...` is a compatibility alias for the full persistent Agent and now requires the full firewall Agent environment; it is no longer an isolated replacement loop. The old `network_executor.py --config ... --state-dir ...` execution spelling execs this same canonical Agent entry in place; only explicit journal initialization stays standalone. Both spellings now require the full Agent environment and compete for the same host lock.
 
 ## Visibility and service transition
 

@@ -738,44 +738,11 @@ def main(argv=None):
     if args.initialize_journal:
         print(initialize_journal(args.state_dir));return
     if not args.config:parser.error('--config required for execution')
-    config=read_json(args.config)
-    validate_execution_config(config)
-    executor=Executor(config,args.state_dir)
-    # Keep a process-wide lock as well as mutation locks; a second worker must not treat live
-    # transactions as crashed and undo another worker's change.
-    fd=os.open(os.path.join(args.state_dir,'worker.lock'),os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)
-    fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
-    executor.recover()
-    stopping=[False]
-    def stop(*_): stopping[0]=True
-    signal.signal(signal.SIGTERM,stop)
-    signal.signal(signal.SIGINT,stop)
-    seen={}
-    try:
-        while not stopping[0]:
-            for filename,action in [('request.json',executor.accept),('confirm.json',executor.confirm)]:
-                path=os.path.join(args.state_dir,filename)
-                try:
-                    raw=read_file(path)
-                    stamp=hashlib.sha256(raw).hexdigest()
-                    if seen.get(filename)==stamp:
-                        continue
-                    seen[filename]=stamp
-                    try:
-                        result=action(read_json(path))
-                        atomic(os.path.join(args.state_dir,'response.json'),{'requestHash':stamp,'state':result})
-                    except Exception as error:
-                        atomic(os.path.join(args.state_dir,'response.json'),{'requestHash':stamp,'state':'rejected','diagnostic':safe_diagnostic(error)})
-                except FileNotFoundError:
-                    pass
-            executor.tick()
-            try:executor.publish_results()
-            except Exception:pass  # Reporting must never delay or suppress local rollback.
-            time.sleep(0.25)
-    finally:
-        executor.recover()
-        try:executor.publish_results()
-        except Exception:pass
+    # Execution has one canonical process owner. Preserve the old CLI spelling, but never
+    # launch a second network-only loop outside the persistent Agent's host writer lock.
+    import sys
+    entry=os.path.join(os.path.dirname(__file__),'heliopause-pull.py')
+    os.execv(sys.executable,[sys.executable,entry,'--network-executor','--config',args.config,'--state-dir',args.state_dir])
 
 
 if __name__=='__main__':

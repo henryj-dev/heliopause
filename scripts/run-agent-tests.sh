@@ -88,6 +88,6 @@ python3 agent/test_network_executor.py 2>&1 | tee "$log"
 check_suite "test_network_executor.py" 62 || rc=1
 
 python3 agent/test_network_lifecycle.py 2>&1 | tee "$log"
-check_suite "test_network_lifecycle.py" 22 || rc=1
+check_suite "test_network_lifecycle.py" 23 || rc=1
 
 exit "$rc"

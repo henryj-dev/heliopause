@@ -216,6 +216,14 @@ class Lifecycle(unittest.TestCase):
         for addresses in [[],['0.0.0.0'],['192.0.2.1']*17]:
             with self.assertRaises(ValueError):
                 lifecycle.Lifecycle(self.agent,{'protectedAddresses':addresses},self.path,True)
+    def test_legacy_network_cli_execs_the_canonical_agent_owner(self):
+        with patch.object(n.os,'execv') as execute:
+            n.main(['--config',self.path+'/config.json','--state-dir',self.path])
+        execute.assert_called_once()
+        executable,args=execute.call_args[0]
+        self.assertEqual(args[0],executable)
+        self.assertTrue(args[1].endswith('/heliopause-pull.py'))
+        self.assertEqual(args[2:5],['--network-executor','--config',self.path+'/config.json'])
     def test_command_budget_caps_timeout_and_fails_closed(self):
         driver=n.LinuxWireGuard('/unused');driver.deadline=time.monotonic()+.1
         self.assertGreater(driver.command_timeout(),0);self.assertLessEqual(driver.command_timeout(),.1)
