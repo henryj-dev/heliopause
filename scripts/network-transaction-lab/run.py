@@ -1,5 +1,6 @@
 """Disposable-kernel acceptance suite. Refuses a container with pre-existing non-loopback links."""
 import base64
+import contextlib
 import json
 import os
 import platform
@@ -50,6 +51,18 @@ def veth(a,dev_a,addr_a,b,dev_b,addr_b):
         run('ip','link','set',old,'name',dev,ns=ns)
         run('ip','address','add',addr,'dev',dev,ns=ns)
         run('ip','link','set',dev,'up',ns=ns)
+
+
+@contextlib.contextmanager
+def lab_directory(prefix):
+    with tempfile.TemporaryDirectory(prefix=prefix) as path:
+        try:
+            yield path
+        finally:
+            # Stop writers before deleting their directory, including on an assertion failure.
+            for process,log in processes:
+                stop(process);log.close()
+            processes.clear()
 
 
 def setup(path,mutate=False,continuous=False):
@@ -135,12 +148,15 @@ def start(path,fault='',production=False,normal_entry=False,network_enabled=True
         env.update({'HELIOPAUSE_RELAY_URL':'https://192.0.2.1:8444','HELIOPAUSE_CA_FILE':path+'/pki/ca.pem','HELIOPAUSE_CERT_FILE':path+'/pki/gateway.pem','HELIOPAUSE_KEY_FILE':path+'/pki/gateway.key','HELIOPAUSE_TARGET':'lab','HELIOPAUSE_HOST_ID':'gateway','HELIOPAUSE_MANAGER_SIGNING_KEYS_DIR':path+'/manager','HELIOPAUSE_BREAK_GLASS_KEYS_DIR':path+'/verifier','HELIOPAUSE_INTERVAL_SEC':'1','HELIOPAUSE_NETWORK_DISCOVERY':'1','HELIOPAUSE_NETWORK_DISCOVERY_BUDGET':'5'})
     env['HELIOPAUSE_NETWORK_EXECUTOR']='1' if network_enabled else '0'
     if extra_env:env.update(extra_env)
-    p=subprocess.Popen(['ip','netns','exec','p6-gw']+args,stdout=log,stderr=log,env=env)
+    p=subprocess.Popen(['ip','netns','exec','p6-gw']+args,stdout=log,stderr=log,env=env,start_new_session=True)
     processes.append((p,log));return p
 
 
 def stop(p):
-    if p.poll() is None: p.kill();p.wait(timeout=5)
+    try:os.killpg(p.pid,signal.SIGKILL)
+    except ProcessLookupError:pass
+    if p.poll() is None:p.kill()
+    p.wait(timeout=5)
 
 
 def row(path):
@@ -182,7 +198,7 @@ def dropped(ns,chain,condition):
 
 
 def scenario(kind):
-    with tempfile.TemporaryDirectory(prefix='hp6-') as path:
+    with lab_directory(prefix='hp6-') as path:
         setup(path,kind=='registry-changed')
         if kind=='registry-changed': return
         if kind in {'signature','target','expiry','hash','approval'}:
@@ -338,7 +354,7 @@ def manager_confirm(path):
 
 def consecutive(kind):
     global DEV
-    with tempfile.TemporaryDirectory(prefix='hp-consecutive-') as path:
+    with lab_directory(prefix='hp-consecutive-') as path:
         setup(path,continuous=True);setup_manager(path)
         manager=start_manager(path);manager_restarts=0
         agent=start(path,production=True);original_pid=agent.pid
@@ -428,6 +444,8 @@ def consecutive(kind):
                 assert open(path+'/secrets/'+secret+'.key','rb').read().strip() not in data
             assert b'PRIVATE KEY-----' not in data
         assert journal['transactions'][second['transactionId']]['acceptedAt']>first['rollbackAt']
+        lifecycle_report=n.read_json(path+'/lifecycle-status.json')
+        assert lifecycle_report['heartbeat'].get('lastSuccess'),lifecycle_report
         beats=[json.loads(line) for line in open(path+'/relay-events.jsonl') if json.loads(line)['path']=='/heartbeat']
         gaps=[b['at']-a['at'] for a,b in zip(beats,beats[1:])]
         assert len(beats)>=5 and gaps and max(gaps)<3, (len(beats),gaps)
@@ -445,7 +463,7 @@ def relay_events(path):
 
 
 def integrated(kind):
-    with tempfile.TemporaryDirectory(prefix='hp-integrated-') as path:
+    with lab_directory(prefix='hp-integrated-') as path:
         setup(path);setup_manager(path)
         extra={};normal=True;enabled=True
         if kind in {'integrated-firewall-busy','integrated-firewall-watchdog'}:
@@ -558,7 +576,8 @@ def integrated(kind):
         assert agent.poll() is None
         report=n.read_json(path+'/lifecycle-status.json')
         assert report['mode']=='integrated'
-        evidence={'firstAgentPid':pid,'finalAgentPid':agent.pid,'heartbeatCount':len(beats),'heartbeatMaxGapSeconds':max(gaps),'heartbeatGapLimitSeconds':allowed}
+        assert report['heartbeat'].get('lastSuccess'),report
+        evidence={'firstAgentPid':pid,'finalAgentPid':agent.pid,'heartbeatCount':len(beats),'heartbeatMaxGapSeconds':max(gaps),'heartbeatGapLimitSeconds':allowed,'heartbeatLastSuccess':report['heartbeat'].get('lastSuccess'),'heartbeatLastFailure':report['heartbeat'].get('lastFailure')}
         if kind=='integrated-firewall-watchdog':evidence.update({'rollbackDeadline':promised,'rollbackObservedAt':rolled_at,'rollbackLatenessSeconds':rolled_at-promised})
         agent.terminate();agent.wait(timeout=8)
         return evidence

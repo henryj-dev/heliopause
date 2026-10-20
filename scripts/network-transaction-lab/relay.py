@@ -9,6 +9,7 @@ import time
 path=sys.argv[1]
 lock=threading.Lock()
 class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version='HTTP/1.1'
     def log_message(self,*args): pass
     def do_POST(self):
         body=json.loads(self.rfile.read(int(self.headers.get('Content-Length','0'))))
