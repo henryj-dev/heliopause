@@ -10,7 +10,7 @@ import {matchNetworkInventory} from './network-matching.ts';
 import {validatePrefixPolicy} from './network-prefix-policy.ts';
 import {compileWireGuard} from './network-wireguard.ts';
 import {compileFrr} from './network-frr.ts';
-import {buildNetworkChangeSet} from './network-change-set.ts';
+import {buildNetworkChangeSet, type NetworkChangeSetInput} from './network-change-set.ts';
 const codes=(input:ReturnType<typeof networkLabInput>)=>buildNetworkChangeSet(input).blockers.map(b=>b.code);
 test('MTU already modeled: IPv6 minimum, omission, bounds and unknown schema fields fail closed',()=>{
   const f=networkLabInput();assert.deepEqual(validateNetworkInventory(f.registry.resources),[]);
@@ -168,4 +168,12 @@ test('IPv6 zone identifiers cannot collapse to equal unsupported route addresses
   report.observations.routes6={status:'success',startedAt:report.startedAt,completedAt:report.completedAt,data:[{dst:'2001:db8:20::/64',dev:'wg0',table:254,protocol:'boot',gateway:'fe80::2%wg0'}]};
   report.capabilities.routes6={available:true,status:'success'};
   assert.equal(matchNetworkInventory(f).matches.find(m=>m.resourceId===r.id)!.status,'unknown');
+});
+
+test('policy commitments remain bound even when no compiler artifacts are requested',()=>{
+  const f:NetworkChangeSetInput={...networkLabInput(),wireguard:undefined,frr:undefined};
+  const a=buildNetworkChangeSet(f);assert.match(a.prefixPolicyDigest!,/^[a-f0-9]{64}$/);
+  f.prefixPolicy!.permissions.reverse();assert.equal(buildNetworkChangeSet(f).contentHash,a.contentHash);
+  const permission=f.prefixPolicy!.permissions.find(p=>p.siteId==='s0')!;permission.prefix='192.0.2.0/28';
+  assert.notEqual(buildNetworkChangeSet(f).contentHash,a.contentHash);
 });

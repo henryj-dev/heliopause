@@ -53,6 +53,8 @@ static/BGP writers, observed non-BGP FIB shadowing, peer host routes, artifact r
 collector availability, graph cycles and missing dependencies are checked.
 
 Binary string ordering avoids process-locale dependence.
+A standalone `prefixPolicyDigest` binds shared export permissions even when no
+compiler artifact is requested or produced.
 Content hashes exclude request IDs and output-only `generatedAt`. The evaluation
 clock still controls freshness decisions. Exact evidence digests deliberately bind
 collector payload bytes/array order; top-level registry, binding, compiler, policy

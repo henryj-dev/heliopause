@@ -4,7 +4,7 @@ import { buildNetworkPlan, type NetworkPlanInput, type NetworkPlanBlocker, type 
 import { compileWireGuard, type WireGuardCompilation, type WireGuardSpec } from './network-wireguard.ts';
 import { compileFrr, type FrrCompilation, type FrrSpec } from './network-frr.ts';
 import { networkDigest, canonicalNetworkJson } from './network-canonical.ts';
-import { hostPrefix, prefixContains, validatePrefixPolicy, type NetworkPrefixPolicy } from './network-prefix-policy.ts';
+import { hostPrefix, prefixContains, normalizePrefixPolicy, validatePrefixPolicy, type NetworkPrefixPolicy } from './network-prefix-policy.ts';
 import { observationFreshness } from './network-observation.ts';
 import type { NetworkInventoryResource } from './network-inventory.ts';
 export interface NetworkChangeSetInput extends NetworkPlanInput {
@@ -25,7 +25,7 @@ export interface NetworkChangeOperation {
 }
 export interface NetworkChangeSet {
   schemaVersion: 1; kind: 'network-change-set'; id: string; generatedAt?: string;
-  mode: 'dry-run'; executable: false; registryRevision: number; desiredDigest: string;
+  mode: 'dry-run'; executable: false; registryRevision: number; desiredDigest: string; prefixPolicyDigest: string | null;
   resources: Array<{ resourceId:string;generation:number;digest:string }>;
   observationEvidence: ReturnType<typeof buildNetworkPlan>['evidence'];
   capabilityEvidence: ReturnType<typeof buildNetworkPlan>['capabilities'];
@@ -204,6 +204,6 @@ export function buildNetworkChangeSet(input: NetworkChangeSetInput): NetworkChan
   const pending=new Set(ids),order:string[]=[];
   while(pending.size){const ready=[...pending].filter(id=>uniqueEdges.filter(d=>d.resourceId===id).every(d=>ids.has(d.dependsOn)&&!pending.has(d.dependsOn))).sort();if(!ready.length){block('','operation-cycle','operation graph has a cycle or unresolved dependency');break;}for(const id of ready){order.push(id);pending.delete(id);}}
   const warnings=['Dry-run artifacts are not signed execution bundles.','Secondary lab tunnels do not reproduce Cloudflare Mesh or WARP behavior.','Observation evidence and declarative exposure references do not confer execution authority.'];
-  const body={schemaVersion:1 as const,kind:'network-change-set' as const,mode:'dry-run' as const,executable:false as const,registryRevision:plan.registryRevision,desiredDigest:plan.desiredDigest,resources:plan.desired,observationEvidence:plan.evidence,capabilityEvidence:plan.capabilities,matchingDigest:plan.matchingDigest,artifacts:artifacts.sort((a,b)=>compareNetworkText(a.targetId, b.targetId)),operations:operations.sort((a,b)=>compareNetworkText(a.id, b.id)),dependencies:uniqueEdges,order,blockers:[...new Map(blockers.map(b=>[canonicalNetworkJson(b),b])).values()].sort((a,b)=>compareNetworkText(canonicalNetworkJson(a), canonicalNetworkJson(b))),warnings};
+  const body={schemaVersion:1 as const,kind:'network-change-set' as const,mode:'dry-run' as const,executable:false as const,registryRevision:plan.registryRevision,desiredDigest:plan.desiredDigest,prefixPolicyDigest:input.prefixPolicy===undefined?null:networkDigest(validatePrefixPolicy(input.registry.resources,input.prefixPolicy).length?input.prefixPolicy:normalizePrefixPolicy(input.prefixPolicy)),resources:plan.desired,observationEvidence:plan.evidence,capabilityEvidence:plan.capabilities,matchingDigest:plan.matchingDigest,artifacts:artifacts.sort((a,b)=>compareNetworkText(a.targetId, b.targetId)),operations:operations.sort((a,b)=>compareNetworkText(a.id, b.id)),dependencies:uniqueEdges,order,blockers:[...new Map(blockers.map(b=>[canonicalNetworkJson(b),b])).values()].sort((a,b)=>compareNetworkText(canonicalNetworkJson(a), canonicalNetworkJson(b))),warnings};
   return {...body,id:input.id,...(input.generatedAt===undefined?{}:{generatedAt:input.generatedAt}),contentHash:networkDigest(body)};
 }
