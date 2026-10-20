@@ -322,8 +322,10 @@ class TerminalCourier(unittest.TestCase):
             with self.assertRaises(ValueError):self.d.deliver(self.cfg,self.path)
         with self.assertRaises(ValueError):self.d.NoRedirect().redirect_request(None,None,None,None,None,None)
     def test_private_key_permissions_are_checked_before_transport(self):
-        os.chmod(self.path+'/key',0o644)
-        with self.assertRaises(ValueError):self.d.deliver(self.cfg,self.path)
+        # Inject insecure metadata without making even a disposable key world-readable.
+        metadata=list(os.stat(self.path+'/key'));metadata[0]=(metadata[0] & ~0o777) | 0o644
+        with patch.object(n.os,'fstat',return_value=os.stat_result(metadata)):
+            with self.assertRaises(ValueError):self.d.deliver(self.cfg,self.path)
         self.opener.open.assert_not_called()
     def test_oversized_untrusted_response_is_not_recorded(self):
         self.opener.open.return_value.__enter__.return_value.read.return_value=b'X'*4097
