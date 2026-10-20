@@ -196,7 +196,7 @@ class LinuxWireGuard:
         routes = self.ip('-4', 'route', 'show', 'table', 'all')
         rules = self.ip('-4', 'rule', 'show')
         # Exclude counters, lifetimes and link operational status; preserve configured identity.
-        return {'links': sorted([{'name': x['ifname'], 'index': x['ifindex'], 'mtu': x['mtu'], 'master': x.get('master'), 'alias': x.get('ifalias'), 'kind': x.get('linkinfo', {}).get('info_kind')} for x in links], key=lambda x:x['name']),
+        return {'links': sorted([{'name': x['ifname'], 'index': x['ifindex'], 'mtu': x['mtu'], 'master': x.get('master'), 'alias': x.get('ifalias',x.get('alias')), 'kind': x.get('linkinfo', {}).get('info_kind')} for x in links], key=lambda x:x['name']),
                 'addresses': sorted([{'name': x['ifname'], 'addresses': sorted([a['local']+'/'+str(a['prefixlen']) for a in x.get('addr_info', [])])} for x in addresses], key=lambda x:x['name']),
                 'routes': sorted([{k:v for k,v in r.items() if k not in {'expires', 'cache', 'flags'}} for r in routes], key=canonical), 'rules': rules,
                 'routes6':sorted([{k:v for k,v in r.items() if k not in {'expires','cache','flags'}} for r in self.ip('-6','route','show','table','all')],key=canonical),
@@ -284,7 +284,7 @@ class LinuxWireGuard:
         if not matches:
             return False
         link = matches[0]
-        if link.get('ifalias') != owner or link.get('linkinfo', {}).get('info_kind') != 'wireguard':
+        if link.get('ifalias',link.get('alias')) != owner or link.get('linkinfo', {}).get('info_kind') != 'wireguard':
             raise ValueError('interface ownership conflict')
         # A root writer replacing a configuration must not have its objects deleted by rollback.
         public = self.run(['wg', 'show', op['interfaceName'], 'public-key'])
@@ -330,7 +330,7 @@ class LinuxWireGuard:
     def fingerprint(self, op):
         dev=op['interfaceName']
         link=self.ip('-d','link','show','dev',dev)[0]
-        return {'index':link['ifindex'],'mtu':link['mtu'],'alias':link.get('ifalias'),
+        return {'index':link['ifindex'],'mtu':link['mtu'],'alias':link.get('ifalias',link.get('alias')),
                 'addresses':sorted(a['local']+'/'+str(a['prefixlen']) for a in self.ip('address','show','dev',dev)[0].get('addr_info',[])),
                 'publicKey':self.run(['wg','show',dev,'public-key']),
                 'listenPort':self.run(['wg','show',dev,'listen-port']),
