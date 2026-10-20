@@ -4,6 +4,7 @@ Cryptographic interoperability and kernel effects are exercised separately by th
 """
 import copy
 import os
+import sys
 import tempfile
 import time
 import unittest

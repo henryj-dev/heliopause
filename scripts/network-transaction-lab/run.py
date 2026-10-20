@@ -96,7 +96,8 @@ def setup(path,mutate=False):
 def start(path,fault='',production=False):
     args=['python3','agent/heliopause-pull.py','--network-executor','--config',path+'/config.json','--state-dir',path+'/state'] if production else ['python3','scripts/network-transaction-lab/worker.py',path+'/config.json',path+'/state',fault]
     log=open(path+'/worker.log','ab',buffering=0)
-    p=subprocess.Popen(['ip','netns','exec','p6-gw']+args,stdout=log,stderr=log)
+    env={**os.environ,'HELIOPAUSE_STATE_FILE':path+'/firewall-state.json','HELIOPAUSE_WRITER_LOCK':path+'/writer.lock','HELIOPAUSE_NETWORK_EXECUTOR_CONFIG':path+'/config.json','HELIOPAUSE_NETWORK_EXECUTOR_STATE_DIR':path+'/state'}
+    p=subprocess.Popen(['ip','netns','exec','p6-gw']+args,stdout=log,stderr=log,env=env)
     processes.append((p,log));return p
 
 
