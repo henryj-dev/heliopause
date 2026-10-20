@@ -227,6 +227,35 @@ class Ownership(unittest.TestCase):
         with self.assertRaises(ValueError): self.driver.owned(self.op,self.owner)
 
 
+class NetlinkCreate(unittest.TestCase):
+    def test_exclusive_create_carries_atomic_identity_group_and_mtu(self):
+        class Channel:
+            request=None
+            def __enter__(self):return self
+            def __exit__(self,*args):pass
+            def bind(self,address):self.address=address
+            def getsockname(self):return (1234,0)
+            def settimeout(self,value):self.timeout=value
+            def sendto(self,request,address):self.request=request
+            def recvfrom(self,size):
+                seq=n.struct.unpack_from('=I',self.request,8)[0]
+                return n.struct.pack('=IHHIIi',20,2,0,seq,1234,0),(0,0)
+        channel=Channel()
+        with patch.object(n.socket,'AF_NETLINK',16,create=True),patch.object(n.socket,'socket',return_value=channel) as boundary:
+            n.LinuxWireGuard('/unused').create_link('hpaaaaaaaaaaaa',0x87654321,1400)
+        boundary.assert_called_once()
+        length,kind,flags,_,pid=n.struct.unpack_from('=IHHII',channel.request)
+        self.assertEqual(length,len(channel.request));self.assertEqual(kind,16);self.assertEqual(flags & 0x600,0x600);self.assertEqual(pid,1234)
+        offset=32;attrs={}
+        while offset<len(channel.request):
+            size,field=n.struct.unpack_from('=HH',channel.request,offset)
+            attrs[field]=channel.request[offset+4:offset+size];offset+=(size+3)&~3
+        self.assertEqual(attrs[3],b'hpaaaaaaaaaaaa\0')
+        self.assertEqual(n.struct.unpack('=I',attrs[27])[0],0x87654321)
+        self.assertEqual(n.struct.unpack('=I',attrs[4])[0],1400)
+        self.assertIn(b'wireguard\0',attrs[18|0x8000])
+
+
 class WriterMode(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)

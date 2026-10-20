@@ -277,7 +277,7 @@ class LinuxWireGuard:
     def create_link(self, dev, group, mtu):
         """One exclusive RTM_NEWLINK installs identity/group/MTU before kernel registration.
 
-        iproute2 6.1 explicitly refuses `group` on `ip link add`, although rtnl_create_link supports
+        The iproute2 6.1 name-form create rejects `group`, although rtnl_create_link supports
         IFLA_GROUP. Keep this bounded request specific to creating a new WireGuard device.
         """
         def attr(kind, payload):
@@ -554,7 +554,7 @@ class Executor:
             try:
                 self.driver.deadline=started_mono+(a['rollbackAt']-now)/1000
                 self.save(data,row,'applying')
-                if int(time.time()*1000)>=a['expiresAt'] or time.monotonic()-started_mono>=(a['expiresAt']-now)/1000:
+                if int(time.time()*1000)<fresh_now or int(time.time()*1000)>=a['expiresAt'] or time.monotonic()-started_mono>=(a['expiresAt']-now)/1000:
                     raise ValueError('authorization expired before first write')
                 self.driver.create(a['operation'],row['owner'])
                 self.event('created')
