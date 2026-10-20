@@ -113,11 +113,12 @@ test('durable confirm survives Manager restart and lost responses without extend
 });
 for(const kind of ['missing-record','missing-execution','missing-file','corrupt'] as const)test(`damaged ${kind} fails closed`,()=>{
   const f=issued();try {
+    const result=f.result();
     const doc=JSON.parse(readFileSync(f.store.path,'utf8'));
     if(kind==='missing-record')doc.execution.records=[];
     if(kind==='missing-execution')delete doc.execution;
     if(kind==='missing-file')unlinkSync(f.store.path);else writeFileSync(f.store.path,kind==='corrupt'?'{broken':JSON.stringify(doc));
-    assert.throws(()=>settleNetworkExecution(f.store,f.result(),f.agent,'agent'));
+    assert.throws(()=>settleNetworkExecution(f.store,result,f.agent,'agent'));
     assert.throws(()=>new NetworkRegistryStore(f.store.path).executionStatus());
   }finally{f.cleanup();}
 });

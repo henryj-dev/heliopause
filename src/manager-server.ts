@@ -2444,7 +2444,8 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
             const resource = doc.resources.find(r => r.id === pathId);
             return resource ? send(res, 200, { revision: doc.revision, resource }) : send(res, 404, { error: "resource not found" });
           }
-          return send(res, 200, doc);
+          const {execution,...inventory}=doc;
+          return send(res, 200, inventory);
         }
         if (!["POST", "PUT", "DELETE"].includes(req.method ?? "") || url.pathname === "/network/revisions" || (req.method === "POST" && pathId !== undefined) || (req.method === "DELETE" && pathId === undefined)) return send(res, 405, { error: "method not allowed" });
         if (crossSiteRequest(req)) return send(res, 403, { error: "cross-site registry writes are refused" });

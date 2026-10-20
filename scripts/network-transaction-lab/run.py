@@ -52,7 +52,7 @@ def veth(a,dev_a,addr_a,b,dev_b,addr_b):
         run('ip','link','set',dev,'up',ns=ns)
 
 
-def setup(path,mutate=False):
+def setup(path,mutate=False,continuous=False):
     for ns in NAMES:
         run('ip','netns','add',ns)
         run('ip','link','set','lo','up',ns=ns)
@@ -64,10 +64,17 @@ def setup(path,mutate=False):
         run('sysctl','-w','net.ipv4.ip_forward=1',ns=ns)
     run('ip','route','add','198.51.100.6/32','via','198.51.100.1',ns='p6-client')
     run('ip','route','add','198.51.100.2/32','via','198.51.100.5',ns='p6-workload')
+    if continuous:
+        run('ip','address','add','198.51.100.10/32','dev','lo',ns='p6-client')
+        run('ip','address','add','198.51.100.14/32','dev','lo',ns='p6-workload')
+        run('ip','route','add','198.51.100.10/32','via','198.51.100.2',ns='p6-gw')
+        run('ip','route','add','198.51.100.14/32','via','198.51.100.6',ns='p6-peer')
+        run('ip','route','add','198.51.100.14/32','via','198.51.100.1',ns='p6-client')
+        run('ip','route','add','198.51.100.10/32','via','198.51.100.5',ns='p6-workload')
     os.mkdir(path+'/secrets',0o700);os.mkdir(path+'/state',0o700)
     journal_id=n.initialize_journal(path+'/state')
     public={}
-    for name in ['gateway','peer']:
+    for name in (['gateway','peer','gateway2','peer2'] if continuous else ['gateway','peer']):
         secret=run('wg','genkey')
         fd=os.open(path+'/secrets/'+name+'.key',os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
         with os.fdopen(fd,'w') as f: f.write(secret+'\n')
@@ -78,6 +85,13 @@ def setup(path,mutate=False):
     run('ip','link','set','fixedwg','mtu','1400','up',ns='p6-peer')
     for dst in ['192.0.2.129/32','198.51.100.2/32']:
         run('ip','route','add',dst,'dev','fixedwg',ns='p6-peer')
+    if continuous:
+        run('ip','link','add','fixedwg2','type','wireguard',ns='p6-peer')
+        run('wg','set','fixedwg2','private-key',path+'/secrets/peer2.key','listen-port','51821','peer',public['gateway2'],'endpoint','203.0.113.1:51821','allowed-ips','192.0.2.145/32,198.51.100.10/32','persistent-keepalive','1',ns='p6-peer')
+        run('ip','address','add','192.0.2.146/32','dev','fixedwg2',ns='p6-peer')
+        run('ip','link','set','fixedwg2','mtu','1400','up',ns='p6-peer')
+        for dst in ['192.0.2.145/32','198.51.100.10/32']:run('ip','route','add',dst,'dev','fixedwg2',ns='p6-peer')
+        n.atomic(path+'/next-keys.json',{'publicKey':public['gateway2'],'peerPublicKey':public['peer2']})
     authority('keys',path)
     # Wait for address setup before committing the complete protected IPv6 snapshot.
     for ns in NAMES:
@@ -260,11 +274,151 @@ def scenario(kind):
         await_state(path,{'rolled-back'},15);assert not exists();stop(p)
 
 
-cases=['normal','signature','target','expiry','hash','approval','registry-changed','local-changed','duplicate','prepare-failed','fail-created','fail-routes','management-failed','asymmetric','blackhole','absent-verifier','lost-confirm','forged-verifier','crash-apply','crash-before-alias','crash-partial-routes','crash-wait','crash-rollback','crash-after-remove','foreign-writer','rollback-command-failed','peer-route-loss','secret-redaction','disabled-recovery','writer-conflict','graceful-stop','foreign-create']
+def setup_manager(path):
+    os.mkdir(path+'/pki',0o700)
+    pki=path+'/pki/'
+    run('openssl','req','-x509','-newkey','ec','-pkeyopt','ec_paramgen_curve:prime256v1','-nodes','-keyout',pki+'ca.key','-out',pki+'ca.pem','-days','1','-subj','/CN=lab-ca')
+    for identity in ['manager','gateway','alice','bob']:
+        run('openssl','req','-newkey','ec','-pkeyopt','ec_paramgen_curve:prime256v1','-nodes','-keyout',pki+identity+'.key','-out',pki+identity+'.csr','-subj','/CN='+identity)
+        os.chmod(pki+identity+'.key',0o600)
+        with open(pki+'leaf.ext','w') as stream:
+            stream.write('basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=critical,'+('serverAuth\nsubjectAltName=IP:192.0.2.1\n' if identity=='manager' else 'clientAuth\n'))
+        run('openssl','x509','-req','-in',pki+identity+'.csr','-CA',pki+'ca.pem','-CAkey',pki+'ca.key','-CAcreateserial','-out',pki+identity+'.pem','-days','1','-extfile',pki+'leaf.ext')
+    cfg=n.read_json(path+'/config.json')
+    cfg['terminalDelivery']={'url':'https://192.0.2.1:8443/api/network/execution/terminal','caFile':pki+'ca.pem','certFile':pki+'gateway.pem','keyFile':pki+'gateway.key'}
+    n.atomic(path+'/config.json',cfg)
+
+
+def start_manager(path):
+    ready=path+'/manager-ready.json'
+    if os.path.exists(ready):os.unlink(ready)
+    log=open(path+'/manager.log','ab',buffering=0)
+    process=subprocess.Popen(['ip','netns','exec','p6-verifier','node','--experimental-strip-types','scripts/network-transaction-lab/manager.ts',path],stdout=log,stderr=log)
+    processes.append((process,log))
+    wait_for(lambda:os.path.exists(ready) or process.poll() is not None)
+    assert process.poll() is None,open(path+'/manager.log').read()[-4000:]
+    return process
+
+
+def api(path,action,body=None,identity='alice',expected=200):
+    filename=path+'/api-body.json'
+    if body is not None:n.atomic(filename,body)
+    args=[path,identity,action]+([filename] if body is not None else [])
+    response=json.loads(run('python3','scripts/network-transaction-lab/api.py',*args,ns='p6-gw'))
+    assert response['status']==expected,response
+    return response['body']
+
+
+def courier(path,success=True):
+    command=['python3','agent/network_terminal_delivery.py','--config',path+'/config.json','--state-dir',path+'/state','--once']
+    assert run(*command,ns='p6-gw',ok=False)==success
+
+
+def manager_confirm(path):
+    run('python3','scripts/network-transaction-lab/verifier.py',path,ns='p6-verifier')
+    assert all(n.read_json(path+'/verification.json').values())
+    a=n.read_json(path+'/decoded.json')
+    body={'hash':a['approval']['planHash'],'verification':n.read_json(path+'/receipt.json')}
+    confirmation=api(path,'confirm',body)['envelope']
+    n.atomic(path+'/confirmation.json',confirmation)
+    return body,confirmation
+
+
+def consecutive(kind):
+    global DEV
+    with tempfile.TemporaryDirectory(prefix='hp-consecutive-') as path:
+        setup(path,continuous=True);setup_manager(path)
+        manager=start_manager(path)
+        agent=start(path,production=True);original_pid=agent.pid
+        await_state(path,{'awaiting-verification'})
+        first=n.read_json(path+'/decoded.json');first_dev=DEV
+        first_request=n.read_json(path+'/authorization.json')
+        if kind=='consecutive-agent-restart':
+            stop(agent);agent=start(path,production=True);await_state(path,{'rolled-back'})
+        elif kind=='consecutive-rollback-failed':
+            run('ip','address','add','192.0.2.131/32','dev',DEV,ns='p6-gw')
+            await_state(path,{'rollback-failed'},16)
+            bad={'transactionId':first['transactionId'],'state':'rollback-failed'}
+            api(path,'terminal',bad,identity='gateway',expected=409)
+            assert api(path,'status')['fence']['transactionId']==first['transactionId']
+            # A new production issuance must fail while debt remains; no ledger/fence is deleted.
+            n.atomic(path+'/facts-next.json',n.read_json(path+'/facts.json'))
+            assert not authority('next',path,ok=False)
+            run('ip','address','del','192.0.2.131/32','dev',DEV,ns='p6-gw')
+            await_state(path,{'rolled-back'},5)
+        else:
+            confirm_body,confirmation=manager_confirm(path)
+            if kind=='consecutive-manager-restart':
+                stop(manager);manager=start_manager(path)
+                assert api(path,'confirm',confirm_body)['envelope']==confirmation
+            if kind=='consecutive-rolled-back':
+                # The Manager issued confirm, but delivery is lost. Agent must independently undo.
+                await_state(path,{'rolled-back'},16)
+            else:
+                n.atomic(path+'/state/confirm.json',confirmation);await_state(path,{'confirmed'})
+                assert exists()
+        wait_for(lambda:os.path.exists(path+'/state/terminal-results.json') and len(n.read_json(path+'/state/terminal-results.json'))==1)
+        terminal=n.read_json(path+'/state/terminal-results.json')[0]
+        if kind in {'consecutive-delayed-duplicate','consecutive-manager-restart'}:
+            wait_for(lambda:time.time()*1000>first['rollbackAt']+100,16)
+        if kind=='consecutive-manager-restart':
+            with open(path+'/drop-terminal-response','w') as stream:stream.write('drop')
+            courier(path,success=False);wait_for(lambda:manager.poll() is not None)
+            manager=start_manager(path)
+            assert api(path,'status')['fence'] is None
+        courier(path)
+        settled=api(path,'status')
+        assert settled['fence'] is None and settled['records'][0]['state']=='settled'
+        assert api(path,'terminal',terminal,identity='gateway')['duplicate'] is True
+        # First rollback deadline really expires before the next execution, with the same live
+        # production process for every case except the explicitly named Agent restart case.
+        wait_for(lambda:time.time()*1000>first['rollbackAt']+100,16)
+        assert agent.poll() is None
+        if kind!='consecutive-agent-restart':assert agent.pid==original_pid
+        late=n.canonical(first_request)+'\n '
+        with open(path+'/state/request.json','w') as stream:stream.write(late)
+        stamp=n.hashlib.sha256(late.encode()).hexdigest()
+        wait_for(lambda:n.read_json(path+'/state/response.json').get('requestHash')==stamp)
+        assert n.read_json(path+'/state/response.json')['state']=='rejected'
+        assert len(n.read_json(path+'/state/transactions.json')['transactions'])==1
+        if first['transactionId'] in n.read_json(path+'/state/transactions.json')['transactions']:
+            assert n.read_json(path+'/state/transactions.json')['transactions'][first['transactionId']]['state']==terminal['state']
+        snapshot=json.loads(run('python3','-c',"import sys,json;sys.path.insert(0,'/source/agent');import network_executor as n;print(json.dumps(n.LinuxWireGuard('/unused').snapshot()))",ns='p6-gw'))
+        facts={**n.read_json(path+'/next-keys.json'),'snapshot':snapshot,'journalId':first['journalId']}
+        n.atomic(path+'/facts-next.json',facts);authority('next',path)
+        second=json.loads(base64.urlsafe_b64decode(n.read_json(path+'/authorization.json')['payload']+'=='))
+        n.atomic(path+'/decoded.json',second);DEV=second['operation']['interfaceName']
+        assert second['transactionId']!=first['transactionId'] and DEV!=first_dev
+        n.atomic(path+'/state/request.json',n.read_json(path+'/authorization.json'))
+        wait_for(lambda:n.read_json(path+'/state/transactions.json')['transactions'].get(second['transactionId'],{}).get('state')=='awaiting-verification')
+        assert agent.poll() is None
+        # Even while a new fence exists, an older authentic duplicate cannot release it.
+        assert api(path,'terminal',terminal,identity='gateway')['duplicate'] is True
+        assert api(path,'status')['fence']['transactionId']==second['transactionId']
+        _,confirmation=manager_confirm(path)
+        n.atomic(path+'/state/confirm.json',confirmation)
+        wait_for(lambda:n.read_json(path+'/state/transactions.json')['transactions'][second['transactionId']]['state']=='confirmed')
+        wait_for(lambda:len(n.read_json(path+'/state/terminal-results.json'))==2)
+        courier(path)
+        final=api(path,'status')
+        assert final['fence'] is None and len(final['records'])==2 and all(r['state']=='settled' for r in final['records'])
+        journal=n.read_json(path+'/state/transactions.json')
+        assert len(journal['transactions'])==2 and journal['terminalSequence']==2
+        assert agent.poll() is None
+        assert any(x['ifname']==first_dev for x in ip('p6-gw','link','show'))==(terminal['state']=='confirmed')
+        for filename in ['worker.log','manager.log','state/terminal-results.json','api-body.json','registry.json']:
+            data=open(path+'/'+filename,'rb').read()
+            for secret in ['gateway','peer','gateway2','peer2']:
+                assert open(path+'/secrets/'+secret+'.key','rb').read().strip() not in data
+            assert b'PRIVATE KEY-----' not in data
+        stop(agent);stop(manager)
+
+
+cases=['normal','signature','target','expiry','hash','approval','registry-changed','local-changed','duplicate','prepare-failed','fail-created','fail-routes','management-failed','asymmetric','blackhole','absent-verifier','lost-confirm','forged-verifier','crash-apply','crash-before-alias','crash-partial-routes','crash-wait','crash-rollback','crash-after-remove','foreign-writer','rollback-command-failed','peer-route-loss','secret-redaction','disabled-recovery','writer-conflict','graceful-stop','foreign-create','consecutive-confirmed','consecutive-rolled-back','consecutive-rollback-failed','consecutive-manager-restart','consecutive-agent-restart','consecutive-delayed-duplicate']
 for case in cases:
     started=time.monotonic()
     try:
-        scenario(case)
+        consecutive(case) if case.startswith('consecutive-') else scenario(case)
         results.append({'name':case,'status':'passed','seconds':round(time.monotonic()-started,2)})
         print('PASS '+case,flush=True)
     except Exception as e:
@@ -274,5 +428,5 @@ for case in cases:
         for p,log in processes: stop(p);log.close()
         processes.clear()
         for ns in NAMES: run('ip','netns','del',ns,ok=False)
-assert len(results)==32
+assert len(results)==38
 print(json.dumps({'kind':'network-transaction-kernel-report','passed':len(results),'failed':0,'skipped':0,'hostRebootVerified':False,'backend':n.DRIVER,'sourceCommit':os.environ.get('HELIOPAUSE_LAB_SOURCE_COMMIT'),'kernel':platform.release(),'wireguardTools':run('wg','--version'),'iproute2':run('ip','-Version'),'scenarios':results}),flush=True)

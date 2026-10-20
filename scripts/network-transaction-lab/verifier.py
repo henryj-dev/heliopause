@@ -27,11 +27,12 @@ links=ip('-d','link','show','dev',DEV)
 addresses=ip('address','show','dev',DEV)
 check={}
 check['interface']=len(links)==1 and links[0].get('linkinfo',{}).get('info_kind')=='wireguard' and links[0]['mtu']==op['mtu'] and 'UP' in links[0].get('flags',[])
-check['address']=bool(addresses) and any(a['local']=='192.0.2.129' and a['prefixlen']==32 for a in addresses[0].get('addr_info',[]))
+check['address']=bool(addresses) and any(a['local']==op['address'].split('/')[0] and a['prefixlen']==32 for a in addresses[0].get('addr_info',[]))
 check['route']=all(any(r.get('dst') in {dst,dst.split('/')[0]} and r.get('dev')==DEV for r in ip('route','show','table','main')) for dst in op['routes'])
 check['fib']=all(any(r.get('dev')==DEV for r in ip('route','get',dst.split('/')[0])) for dst in op['routes'])
-check['forward']=run('p6-client','ping','-n','-c','2','-W','1','198.51.100.6')[0]
-check['reverse']=run('p6-workload','ping','-n','-c','2','-W','1','198.51.100.2')[0]
+source,destination=('198.51.100.10','198.51.100.14') if op['address']=='192.0.2.145/32' else ('198.51.100.2','198.51.100.6')
+check['forward']=run('p6-client','ping','-n','-I',source,'-c','2','-W','1',destination)[0]
+check['reverse']=run('p6-workload','ping','-n','-I',destination,'-c','2','-W','1',source)[0]
 # This process is already in verifier namespace; this ping crosses the management veth.
 check['management']=run(None,'ping','-n','-c','2','-W','1','192.0.2.2')[0]
 ok,handshakes=run('p6-gw','wg','show',DEV,'latest-handshakes')

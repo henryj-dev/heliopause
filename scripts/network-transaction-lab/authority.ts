@@ -2,6 +2,7 @@
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { createPrivateKey, createPublicKey, generateKeyPairSync, randomBytes } from 'node:crypto';
 import { join } from 'node:path';
+import { issueDurableNetworkConfirm } from '../../src/network-execution-settlement.ts';
 import { NetworkRegistryStore } from '../../src/network-registry.ts';
 import { buildNetworkChangeSet } from '../../src/network-change-set.ts';
 import { networkDigest } from '../../src/network-canonical.ts';
@@ -16,21 +17,28 @@ if(action==='keys') {
     writeFileSync(join(dir,kind+'.key'),pair.privateKey.export({format:'pem',type:'pkcs8'}),{mode:0o600});
     writeFileSync(join(dir,kind,'public.pem'),pair.publicKey.export({format:'pem',type:'spki'}),{mode:0o600});
   }
-} else if(action==='issue') {
-  const facts=read('facts.json'),now=Date.now(),at=new Date(now).toISOString(),transactionId=randomBytes(16).toString('hex'),device='hp'+transactionId.slice(0,12);
+} else if(action==='issue'||action==='next') {
+  const second=action==='next';
+  const facts=read(second?'facts-next.json':'facts.json'),now=Date.now(),at=new Date(now).toISOString(),transactionId=randomBytes(16).toString('hex'),device='hp'+transactionId.slice(0,12);
   const management={mode:'managed',provider:'wireguard',driver:'wg-quick'};
   const base={owner:'lab',generation:1,management};
   const store=new NetworkRegistryStore(join(dir,'registry.json'));
-  const resources=[{...base,id:'site',kind:'site'},{...base,id:'gateway',kind:'node',siteId:'site'}, {...base,id:'domain',kind:'routing-domain',name:'global',isolation:'global'},
+  const fresh=[{...base,id:'site',kind:'site'},{...base,id:'gateway',kind:'node',siteId:'site'}, {...base,id:'domain',kind:'routing-domain',name:'global',isolation:'global'},
     {...base,id:'backbone',kind:'network',scope:'overlay',siteIds:['site'],routingDomainId:'domain',purpose:'backbone'},
     {...base,id:'subnet',kind:'subnet',networkId:'backbone',cidr:'192.0.2.128/28'},
     {...base,id:'wg-new',kind:'interface',nodeId:'gateway',networkId:'backbone',name:device,mtu:1400},
     ...['192.0.2.130/32','198.51.100.6/32'].map((destination,i)=>({...base,id:'route'+i,kind:'route',interfaceId:'wg-new',routingDomainId:'domain',destination,table:254,nextHop:null,protocol:'static',metric:42760}))];
-  const registry=store.mutate(0,'lab-authority',{action:'replace',resources});
+  const current=store.read();
+  const resources=second?[...current.resources,
+    {...base,id:'subnet-next',kind:'subnet',networkId:'backbone',cidr:'192.0.2.144/28'},
+    {...base,id:'wg-next',kind:'interface',nodeId:'gateway',networkId:'backbone',name:device,mtu:1400},
+    ...['192.0.2.146/32','198.51.100.14/32'].map((destination,i)=>({...base,id:'route-next'+i,kind:'route',interfaceId:'wg-next',routingDomainId:'domain',destination,table:254,nextHop:null,protocol:'static',metric:42760}))]:fresh;
+  const registry=store.mutate(current.revision,'lab-authority',{action:'replace',resources});
   store.initializeExecutions();
   const observation={source:'lab',host:'gateway',receivedAt:at,report:{schemaVersion:1 as const,collectionId:'00000000-0000-4000-8000-000000000006',startedAt:at,completedAt:at,observations:{links:{status:'success' as const,startedAt:at,completedAt:at,data:facts.snapshot.links.map((l:any)=>({ifname:l.name,ifindex:l.index,mtu:l.mtu}))},addresses:{status:'success' as const,startedAt:at,completedAt:at,data:[]},routes4:{status:'success' as const,startedAt:at,completedAt:at,data:facts.snapshot.routes}},capabilities:{links:{available:true,status:'success' as const},addresses:{available:true,status:'success' as const},routes4:{available:true,status:'success' as const}}}};
   const review=buildNetworkChangeSet({id:'execution-review',registry,expectedRegistryRevision:registry.revision,now,observations:[observation],bindings:[{source:'lab',host:'gateway',nodeId:'gateway',siteId:'site'}]});
   const operation={driver:'linux-wireguard-v1' as const,interfaceId:'wg-new',interfaceName:device,address:'192.0.2.129/32',mtu:1400,listenPort:51820,secretRef:'gateway',publicKey:facts.publicKey,peers:[{publicKey:facts.peerPublicKey,endpoint:'203.0.113.2:51820',allowedIps:['192.0.2.130/32','198.51.100.6/32']}],routes:['192.0.2.130/32','198.51.100.6/32']};
+  if(second) Object.assign(operation,{interfaceId:'wg-next',address:'192.0.2.145/32',listenPort:51821,secretRef:'gateway2',peers:[{publicKey:facts.peerPublicKey,endpoint:'203.0.113.2:51821',allowedIps:['192.0.2.146/32','198.51.100.14/32']}],routes:['192.0.2.146/32','198.51.100.14/32']});
   const draft:NetworkExecutionDraft={schemaVersion:2,journalId:facts.journalId,transactionId,target:{source:'lab',host:'gateway',nodeId:'gateway'},registryRevision:registry.revision,resources:registry.resources.map(r=>({id:r.id,generation:r.generation})),desiredDigest:review.desiredDigest,reviewHash:review.contentHash,artifactHash:networkDigest(operation),observation:{digest:networkDigest(observation),collectedAt:now,maxAgeMs:30000},localPrecondition:networkDigest(facts.snapshot),operation,issuedAt:now,expiresAt:now+5000,rollbackAt:now+(facts.timeoutMs??12000)};
   const approvals=emptyApprovals(),hash=networkExecutionHash(draft);
   propose(approvals,{hash,generation:draft.transactionId,summary:{hosts:[{host:'gateway',stage:'gateway',ruleCount:1,rulesetHash:draft.artifactHash}]},by:'alice',now:new Date(now)});
@@ -43,7 +51,7 @@ if(action==='keys') {
   save('receipt.json',signNetworkMessage(NETWORK_VERIFY_DOMAIN,{transactionId:a.transactionId,authorizationHash:networkDigest(a),artifactHash:a.artifactHash,observedAt:now,expiresAt:Math.min(now+5000,a.rollbackAt-1),nonce:randomBytes(16).toString('hex'),checks:result},createPrivateKey(readFileSync(join(dir,'verifier.key')))));
 } else if(action==='confirm') {
   const envelope=read('authorization.json'),a=JSON.parse(Buffer.from(envelope.payload,'base64url').toString()),now=Date.now();
-  save('confirmation.json',confirmNetworkExecution(envelope,read('receipt.json'),[createPublicKey(readFileSync(join(dir,'verifier/public.pem')))],createPrivateKey(readFileSync(join(dir,'manager.key'))),now));
+  save('confirmation.json',issueDurableNetworkConfirm(new NetworkRegistryStore(join(dir,'registry.json')),a.approval.planHash,read('receipt.json'),[createPublicKey(readFileSync(join(dir,'verifier/public.pem')))],createPrivateKey(readFileSync(join(dir,'manager.key'))),'alice',now));
 } else if(action==='unsafe-confirm') {
   const envelope=read('authorization.json'),a=JSON.parse(Buffer.from(envelope.payload,'base64url').toString());
   save('confirmation.json',signNetworkMessage(NETWORK_CONFIRM_DOMAIN,{transactionId:a.transactionId,authorizationHash:networkDigest(a),artifactHash:a.artifactHash,expiresAt:Math.min(Date.now()+5000,a.rollbackAt-1),verification:read('receipt.json')},createPrivateKey(readFileSync(join(dir,'manager.key')))));
