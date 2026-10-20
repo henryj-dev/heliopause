@@ -32,7 +32,7 @@ def run_once(stop, command, budget=45):
         _terminate(proc)
 
 
-def start_discovery_worker(stop, *, enabled=False, interval=300, budget=45):
+def start_discovery_worker(stop, *, enabled=False, interval=300, budget=45, result=None):
     """Returns immediately; failed attempts wait a full interval before retrying."""
     if not enabled:
         return None
@@ -43,9 +43,12 @@ def start_discovery_worker(stop, *, enabled=False, interval=300, budget=45):
     def loop():
         while not stop.is_set():
             try:
-                run_once(stop, command, budget)
+                ok = run_once(stop, command, budget)
+                if result is not None:
+                    result(ok)
             except (OSError, subprocess.SubprocessError):
-                pass
+                if result is not None:
+                    result(False)
             stop.wait(interval)
 
     thread = threading.Thread(target=loop, name="network-discovery", daemon=True)

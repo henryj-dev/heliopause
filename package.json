@@ -26,6 +26,7 @@
     "!src/test-util.ts",
     "agent/heliopause-pull.py",
     "agent/network_executor.py",
+    "agent/network_lifecycle.py",
     "agent/network_terminal_delivery.py",
     "agent/network_discovery.py",
     "agent/network_discovery_worker.py",

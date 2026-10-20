@@ -1,5 +1,6 @@
 """Disposable-kernel acceptance suite. Refuses a container with pre-existing non-loopback links."""
 import base64
+import contextlib
 import json
 import os
 import platform
@@ -50,6 +51,18 @@ def veth(a,dev_a,addr_a,b,dev_b,addr_b):
         run('ip','link','set',old,'name',dev,ns=ns)
         run('ip','address','add',addr,'dev',dev,ns=ns)
         run('ip','link','set',dev,'up',ns=ns)
+
+
+@contextlib.contextmanager
+def lab_directory(prefix):
+    with tempfile.TemporaryDirectory(prefix=prefix) as path:
+        try:
+            yield path
+        finally:
+            # Stop writers before deleting their directory, including on an assertion failure.
+            for process,log in processes:
+                stop(process);log.close()
+            processes.clear()
 
 
 def setup(path,mutate=False,continuous=False):
@@ -119,16 +132,31 @@ def setup(path,mutate=False,continuous=False):
     os.chmod(path+'/state/request.json',0o600)
 
 
-def start(path,fault='',production=False):
+def start(path,fault='',production=False,normal_entry=False,network_enabled=True,extra_env=None):
+    if production and not os.path.exists(path+'/relay-ready'):
+        if not os.path.exists(path+'/pki'):setup_manager(path)
+        log=open(path+'/relay.log','ab',buffering=0)
+        relay=subprocess.Popen(['ip','netns','exec','p6-verifier','python3','scripts/network-transaction-lab/relay.py',path],stdout=log,stderr=log)
+        processes.append((relay,log));wait_for(lambda:os.path.exists(path+'/relay-ready') or relay.poll() is not None)
+        assert relay.poll() is None
     args=['python3','agent/heliopause-pull.py','--network-executor','--config',path+'/config.json','--state-dir',path+'/state'] if production else ['python3','scripts/network-transaction-lab/worker.py',path+'/config.json',path+'/state',fault]
+    if normal_entry:args=['python3','agent/heliopause-pull.py']
+    if production and fault:args=['python3','scripts/network-transaction-lab/lifecycle-fault-entry.py',path,fault]
     log=open(path+'/worker.log','ab',buffering=0)
     env={**os.environ,'HELIOPAUSE_STATE_FILE':path+'/firewall-state.json','HELIOPAUSE_WRITER_LOCK':path+'/writer.lock','HELIOPAUSE_NETWORK_EXECUTOR_CONFIG':path+'/config.json','HELIOPAUSE_NETWORK_EXECUTOR_STATE_DIR':path+'/state'}
-    p=subprocess.Popen(['ip','netns','exec','p6-gw']+args,stdout=log,stderr=log,env=env)
+    if production:
+        env.update({'HELIOPAUSE_RELAY_URL':'https://192.0.2.1:8444','HELIOPAUSE_CA_FILE':path+'/pki/ca.pem','HELIOPAUSE_CERT_FILE':path+'/pki/gateway.pem','HELIOPAUSE_KEY_FILE':path+'/pki/gateway.key','HELIOPAUSE_TARGET':'lab','HELIOPAUSE_HOST_ID':'gateway','HELIOPAUSE_MANAGER_SIGNING_KEYS_DIR':path+'/manager','HELIOPAUSE_BREAK_GLASS_KEYS_DIR':path+'/verifier','HELIOPAUSE_INTERVAL_SEC':'1','HELIOPAUSE_NETWORK_DISCOVERY':'1','HELIOPAUSE_NETWORK_DISCOVERY_BUDGET':'5'})
+    env['HELIOPAUSE_NETWORK_EXECUTOR']='1' if network_enabled else '0'
+    if extra_env:env.update(extra_env)
+    p=subprocess.Popen(['ip','netns','exec','p6-gw']+args,stdout=log,stderr=log,env=env,start_new_session=True)
     processes.append((p,log));return p
 
 
 def stop(p):
-    if p.poll() is None: p.kill();p.wait(timeout=5)
+    try:os.killpg(p.pid,signal.SIGKILL)
+    except ProcessLookupError:pass
+    if p.poll() is None:p.kill()
+    p.wait(timeout=5)
 
 
 def row(path):
@@ -170,7 +198,7 @@ def dropped(ns,chain,condition):
 
 
 def scenario(kind):
-    with tempfile.TemporaryDirectory(prefix='hp6-') as path:
+    with lab_directory(prefix='hp6-') as path:
         setup(path,kind=='registry-changed')
         if kind=='registry-changed': return
         if kind in {'signature','target','expiry','hash','approval'}:
@@ -326,7 +354,7 @@ def manager_confirm(path):
 
 def consecutive(kind):
     global DEV
-    with tempfile.TemporaryDirectory(prefix='hp-consecutive-') as path:
+    with lab_directory(prefix='hp-consecutive-') as path:
         setup(path,continuous=True);setup_manager(path)
         manager=start_manager(path);manager_restarts=0
         agent=start(path,production=True);original_pid=agent.pid
@@ -416,18 +444,182 @@ def consecutive(kind):
                 assert open(path+'/secrets/'+secret+'.key','rb').read().strip() not in data
             assert b'PRIVATE KEY-----' not in data
         assert journal['transactions'][second['transactionId']]['acceptedAt']>first['rollbackAt']
-        evidence={'firstState':terminal['state'],'firstAgentPid':original_pid,'secondAgentPid':agent.pid,'managerRestarts':manager_restarts,'firstRollbackAt':first['rollbackAt'],'secondAcceptedAt':journal['transactions'][second['transactionId']]['acceptedAt'],'settledRecords':len(final['records']),'registryRevision':second['registryRevision']}
+        lifecycle_report=n.read_json(path+'/lifecycle-status.json')
+        assert lifecycle_report['heartbeat'].get('lastSuccess'),lifecycle_report
+        beats=[json.loads(line) for line in open(path+'/relay-events.jsonl') if json.loads(line)['path']=='/heartbeat']
+        gaps=[b['at']-a['at'] for a,b in zip(beats,beats[1:])]
+        assert len(beats)>=5 and gaps and max(gaps)<3, (len(beats),gaps)
+        assert any(json.loads(line)['path']=='/network/observations' for line in open(path+'/relay-events.jsonl'))
+        evidence={'heartbeatCount':len(beats),'heartbeatMaxGapSeconds':max(gaps),'firstState':terminal['state'],'firstAgentPid':original_pid,'secondAgentPid':agent.pid,'managerRestarts':manager_restarts,'firstRollbackAt':first['rollbackAt'],'secondAcceptedAt':journal['transactions'][second['transactionId']]['acceptedAt'],'settledRecords':len(final['records']),'registryRevision':second['registryRevision']}
         stop(agent);stop(manager)
         return evidence
 
 
+def relay_events(path):
+    filename=path+'/relay-events.jsonl'
+    if not os.path.exists(filename):return []
+    raw=open(filename).read()
+    return [json.loads(line) for line in raw.splitlines() if line] if raw.endswith('\n') else []
+
+
+def integrated(kind):
+    with lab_directory(prefix='hp-integrated-') as path:
+        setup(path);setup_manager(path)
+        extra={};normal=True;enabled=True
+        if kind in {'integrated-firewall-busy','integrated-firewall-watchdog'}:
+            os.unlink(path+'/state/request.json')
+            authority('firewall',path)
+            if kind=='integrated-firewall-busy':open(path+'/hold-artifact','w').close()
+            else:open(path+'/fail-pending','w').close()
+        if kind=='integrated-disabled':enabled=False
+        if kind=='integrated-command-timeout':
+            os.mkdir(path+'/bin',0o700)
+            with open(path+'/bin/wg','w') as stream:
+                stream.write('#!/bin/sh\nif [ "$1" = "set" ]; then sleep 10; fi\nexec /usr/bin/wg "$@"\n')
+            os.chmod(path+'/bin/wg',0o700)
+            extra={'PATH':path+'/bin:'+os.environ['PATH']}
+        if kind=='integrated-corrupt-network':
+            run('nft','add','table','inet','heliopause',ns='p6-gw')
+            n.atomic(path+'/firewall-state.json',{'state':'pending','generation':'recovery-fixture','pendingBackup':{'elements':None},'rollbackAt':time.time()-1})
+            with open(path+'/state/transactions.json','w') as stream:stream.write('{')
+        fault={'integrated-crash-apply':'created','integrated-crash-rollback':'rolling-back','integrated-discovery-timeout':'discovery-stall'}.get(kind,'')
+        agent=start(path,fault=fault,production=True,normal_entry=normal,network_enabled=enabled,extra_env=extra)
+        pid=agent.pid
+        if kind in {'integrated-crash-apply','integrated-crash-rollback'}:
+            wait_for(lambda:os.path.exists(path+'/state/barrier.json'),18)
+            assert exists()
+            before=len(relay_events(path));wait_for(lambda:len(relay_events(path))>=before+2)
+            stop(agent);agent=start(path,production=True,normal_entry=True)
+            await_state(path,{'rolled-back'});assert not exists() and agent.pid!=pid
+        elif kind=='integrated-disabled':
+            wait_for(lambda:os.path.exists(path+'/state/response.json'))
+            assert n.read_json(path+'/state/response.json')['state']=='rejected' and not exists()
+        elif kind=='integrated-corrupt-network':
+            wait_for(lambda:n.read_json(path+'/firewall-state.json')['state']=='rolled-back')
+            assert not run('nft','list','table','inet','heliopause',ns='p6-gw',ok=False)
+            assert open(path+'/state/transactions.json').read()=='{'
+        elif kind=='integrated-firewall-busy':
+            wait_for(lambda:os.path.exists(path+'/artifact-entered'))
+            shutil.copyfile(path+'/authorization.json',path+'/state/request.json')
+            wait_for(lambda:os.path.exists(path+'/state/response.json'))
+            response=n.read_json(path+'/state/response.json')
+            assert response['state']=='rejected' and 'busy' in response['diagnostic']
+            assert not exists() and not n.read_json(path+'/state/transactions.json')['transactions']
+            first=n.read_json(path+'/decoded.json')
+            wait_for(lambda:time.time()*1000>first['expiresAt']+100)
+            os.unlink(path+'/wanted.json');os.unlink(path+'/hold-artifact')
+            # Explicit redelivery after the clash has ended rechecks expiry; no queue extends it.
+            with open(path+'/state/request.json','w') as stream:stream.write(n.canonical(n.read_json(path+'/authorization.json'))+'\n ')
+            wait_for(lambda:'busy' not in n.read_json(path+'/state/response.json').get('diagnostic',''))
+            assert n.read_json(path+'/state/response.json')['state']=='rejected' and not exists()
+        elif kind=='integrated-firewall-watchdog':
+            wait_for(lambda:os.path.exists(path+'/firewall-state.json') and n.read_json(path+'/firewall-state.json')['state']=='pending',10)
+            promised=n.read_json(path+'/firewall-state.json')['rollbackAt']
+            shutil.copyfile(path+'/authorization.json',path+'/state/request.json')
+            wait_for(lambda:os.path.exists(path+'/state/response.json'))
+            assert n.read_json(path+'/state/response.json')['state']=='rejected' and not exists()
+            assert run('nft','list','table','inet','heliopause',ns='p6-gw',ok=False)
+            wait_for(lambda:n.read_json(path+'/firewall-state.json')['state']=='rolled-back',100)
+            rolled_at=time.time()
+            assert promised<=rolled_at<promised+3, (promised,rolled_at)
+            assert not run('nft','list','table','inet','heliopause',ns='p6-gw',ok=False)
+        elif kind=='integrated-command-timeout':
+            tx=n.read_json(path+'/decoded.json')['transactionId']
+            def stalled_status():
+                filename=path+'/lifecycle-status.json'
+                if not os.path.exists(filename):return False
+                status=n.read_json(filename)
+                return (status.get('activeWriter') or {}).get('transactionId')==tx and status['heartbeat'].get('lastSuccess')
+            wait_for(stalled_status,5)
+            stall_observed_at=time.time()
+            await_state(path,{'rolled-back'},16)
+            assert not exists() and any('timed out' in h.get('diagnostic','') for h in [row(path)])
+        else:
+            await_state(path,{'awaiting-verification'})
+            if kind in {'integrated-disabled-recovery','integrated-crash-wait','integrated-dual-debt'}:
+                stop(agent)
+                if kind=='integrated-dual-debt':
+                    run('nft','add','table','inet','heliopause',ns='p6-gw')
+                    n.atomic(path+'/firewall-state.json',{'state':'pending','generation':'dual-recovery','pendingBackup':{'elements':None},'rollbackAt':time.time()-1})
+                agent=start(path,production=True,normal_entry=True,network_enabled=kind!='integrated-disabled-recovery')
+                await_state(path,{'rolled-back'});assert not exists() and agent.pid!=pid
+                if kind=='integrated-dual-debt':
+                    assert n.read_json(path+'/firewall-state.json')['state']=='rolled-back'
+                    assert not run('nft','list','table','inet','heliopause',ns='p6-gw',ok=False)
+            elif kind=='integrated-network-busy':
+                bad=n.read_json(path+'/config.json');bad['terminalDelivery']['caFile']=path+'/missing-ca.pem';n.atomic(path+'/courier-config.json',bad)
+                courier_log=open(path+'/courier.log','ab',buffering=0)
+                courier_process=subprocess.Popen(['ip','netns','exec','p6-gw','python3','agent/network_terminal_delivery.py','--config',path+'/courier-config.json','--state-dir',path+'/state'],stdout=courier_log,stderr=courier_log,start_new_session=True)
+                processes.append((courier_process,courier_log))
+                wait_for(lambda:os.path.exists(path+'/state/terminal-delivery-status.json') and n.read_json(path+'/state/terminal-delivery-status.json')['state']=='pending')
+                assert courier_process.poll() is None
+                n.atomic(path+'/wanted.json',{'generation':'deferred-firewall'})
+                try:
+                    wait_for(lambda:os.path.exists(path+'/firewall-state.json') and bool(n.read_json(path+'/firewall-state.json').get('lastRefusal')))
+                except Exception:
+                    print('Busy Agent log: '+open(path+'/worker.log').read()[-5000:],flush=True)
+                    print('Busy lifecycle: '+open(path+'/lifecycle-status.json').read(),flush=True)
+                    print('Busy Relay events: '+str(relay_events(path)),flush=True)
+                    raise
+                assert not os.path.exists(path+'/artifact-entered')
+                n.atomic(path+'/malformed.json',[])
+                before=len(relay_events(path));wait_for(lambda:len(relay_events(path))>=before+3)
+                assert agent.poll() is None and state(path)=='awaiting-verification'
+                os.unlink(path+'/malformed.json');os.unlink(path+'/wanted.json')
+                await_state(path,{'rolled-back'},16);assert not exists()
+                network_rolled_at=time.time();network_deadline=n.read_json(path+'/decoded.json')['rollbackAt']/1000
+                assert network_deadline<=network_rolled_at<network_deadline+3
+                n.atomic(path+'/courier-config.json',n.read_json(path+'/config.json'))
+                wait_for(lambda:n.read_json(path+'/state/terminal-delivery-status.json')['reason']=='manager-transport-unavailable')
+            elif kind=='integrated-discovery-timeout':
+                wait_for(lambda:n.read_json(path+'/lifecycle-status.json').get('discovery',{}).get('lastFailure'),8)
+                discovery_failed_at=n.read_json(path+'/lifecycle-status.json')['discovery']['lastFailure']
+                assert all(verify_and_confirm(path).values());await_state(path,{'confirmed'})
+            elif kind=='integrated-confirmed-missing':
+                assert all(verify_and_confirm(path).values());await_state(path,{'confirmed'})
+                run('ip','link','del',DEV,ns='p6-gw')
+                tx=n.read_json(path+'/decoded.json')['transactionId']
+                def absent():
+                    report=n.read_json(path+'/lifecycle-status.json')
+                    return report.get('network',{}).get('confirmedKernel',{}).get(tx,{}).get('state')=='absent-or-drifted'
+                wait_for(absent,34)
+                assert state(path)=='confirmed' and not exists()
+            elif kind=='integrated-corrupt-firewall':
+                stop(agent)
+                with open(path+'/firewall-state.json','w') as stream:stream.write('{')
+                agent=start(path,production=True,normal_entry=True)
+                await_state(path,{'rolled-back'});assert not exists()
+                assert open(path+'/firewall-state.json').read()=='{'
+        wait_for(lambda:len([e for e in relay_events(path) if e['path']=='/heartbeat'])>=4,8)
+        events=relay_events(path);beats=[e for e in events if e['path']=='/heartbeat']
+        gaps=[b['at']-a['at'] for a,b in zip(beats,beats[1:])]
+        allowed=6 if kind=='integrated-firewall-watchdog' else 5 if kind=='integrated-firewall-busy' else 3
+        assert max(gaps)<allowed,(kind,gaps)
+        assert agent.poll() is None
+        def current_status():
+            report=n.read_json(path+'/lifecycle-status.json')
+            return report.get('agentPid')==agent.pid and bool(report['heartbeat'].get('lastSuccess'))
+        wait_for(current_status,5)
+        report=n.read_json(path+'/lifecycle-status.json')
+        assert report['mode']=='integrated'
+        assert report['heartbeat'].get('lastSuccess'),report
+        evidence={'firstAgentPid':pid,'finalAgentPid':agent.pid,'heartbeatCount':len(beats),'heartbeatMaxGapSeconds':max(gaps),'heartbeatGapLimitSeconds':allowed,'heartbeatLastSuccess':report['heartbeat'].get('lastSuccess'),'heartbeatLastFailure':report['heartbeat'].get('lastFailure')}
+        if kind=='integrated-command-timeout':evidence['commandStallObservedAt']=stall_observed_at
+        if kind=='integrated-discovery-timeout':evidence['discoveryTimeoutObservedAt']=discovery_failed_at
+        if kind=='integrated-network-busy':evidence.update({'rollbackDeadline':network_deadline,'rollbackObservedAt':network_rolled_at,'rollbackLatenessSeconds':network_rolled_at-network_deadline,'courierFailureObserved':True})
+        if kind=='integrated-firewall-watchdog':evidence.update({'rollbackDeadline':promised,'rollbackObservedAt':rolled_at,'rollbackLatenessSeconds':rolled_at-promised})
+        agent.terminate();agent.wait(timeout=8)
+        return evidence
+
+
 cases=['normal','signature','target','expiry','hash','approval','registry-changed','local-changed','duplicate','prepare-failed','fail-created','fail-routes','management-failed','asymmetric','blackhole','absent-verifier','lost-confirm','forged-verifier','crash-apply','crash-before-alias','crash-partial-routes','crash-wait','crash-rollback','crash-after-remove','foreign-writer','rollback-command-failed','peer-route-loss','secret-redaction','disabled-recovery','writer-conflict','graceful-stop','foreign-create','consecutive-confirmed','consecutive-rolled-back','consecutive-rollback-failed','consecutive-manager-restart','consecutive-agent-restart','consecutive-delayed-duplicate']
+cases += ['integrated-disabled','integrated-disabled-recovery','integrated-network-busy','integrated-firewall-busy','integrated-command-timeout','integrated-firewall-watchdog','integrated-confirmed-missing','integrated-corrupt-network','integrated-corrupt-firewall','integrated-crash-apply','integrated-crash-rollback','integrated-crash-wait','integrated-dual-debt','integrated-discovery-timeout']
 # New continuity cases run first for useful fail-fast diagnostics; success still requires all38.
-cases.sort(key=lambda name:not name.startswith('consecutive-'))
+cases.sort(key=lambda name:0 if name.startswith('integrated-') else 1 if name.startswith('consecutive-') else 2)
 for case in cases:
     started=time.monotonic()
     try:
-        evidence=consecutive(case) if case.startswith('consecutive-') else scenario(case)
+        evidence=integrated(case) if case.startswith('integrated-') else consecutive(case) if case.startswith('consecutive-') else scenario(case)
         results.append({'name':case,'status':'passed','seconds':round(time.monotonic()-started,2),**({'evidence':evidence} if evidence else {})})
         print('PASS '+case,flush=True)
     except Exception as e:
@@ -437,5 +629,5 @@ for case in cases:
         for p,log in processes: stop(p);log.close()
         processes.clear()
         for ns in NAMES: run('ip','netns','del',ns,ok=False)
-assert len(results)==38
+assert len(results)==52
 print(json.dumps({'kind':'network-transaction-kernel-report','passed':len(results),'failed':0,'skipped':0,'hostRebootVerified':False,'backend':n.DRIVER,'sourceCommit':os.environ.get('HELIOPAUSE_LAB_SOURCE_COMMIT'),'kernel':platform.release(),'wireguardTools':run('wg','--version'),'iproute2':run('ip','-Version'),'scenarios':results}),flush=True)

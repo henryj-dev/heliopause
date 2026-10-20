@@ -80,7 +80,7 @@ def read_file(path, maximum=8*1024*1024, secret=False):
         return data
 
 
-def read_json(path):
+def decode_json(raw):
     def pairs(items):
         result = {}
         for k, v in items:
@@ -88,7 +88,11 @@ def read_json(path):
                 raise ValueError('duplicate key')
             result[k] = v
         return result
-    return json.loads(read_file(path), object_pairs_hook=pairs, parse_constant=lambda _: (_ for _ in ()).throw(ValueError('nonfinite JSON')))
+    return json.loads(raw, object_pairs_hook=pairs, parse_constant=lambda _: (_ for _ in ()).throw(ValueError('nonfinite JSON')))
+
+
+def read_json(path):
+    return decode_json(read_file(path))
 
 
 def atomic(path, value):
@@ -194,12 +198,20 @@ class LinuxWireGuard:
     def __init__(self, secrets):
         self.secrets = secrets
         self.deadline = None
+        self.command_deadline = None
+
+    def command_timeout(self):
+        limits = [value-time.monotonic() for value in [self.deadline, self.command_deadline] if value is not None]
+        remaining = min([5] + limits)
+        if remaining <= 0:
+            raise RuntimeError('network operation budget elapsed')
+        return remaining
 
     def run(self, args, data=None, pass_fds=()):
         if self.deadline is not None and time.monotonic()>=self.deadline:
             raise RuntimeError('apply deadline elapsed')
         try:
-            p = subprocess.run(args, input=data, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5, check=False, pass_fds=pass_fds)
+            p = subprocess.run(args, input=data, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=self.command_timeout(), check=False, pass_fds=pass_fds)
         except (OSError, subprocess.TimeoutExpired):
             raise RuntimeError('network command unavailable or timed out') from None
         if p.returncode:
@@ -298,7 +310,7 @@ class LinuxWireGuard:
                 channel.bind((0,0))
                 port=channel.getsockname()[0]
                 request=struct.pack('=IHHII',16+len(body),16,0x605,sequence,port)+body
-                channel.settimeout(5)
+                channel.settimeout(self.command_timeout())
                 channel.sendto(request,(0,0))
                 response,sender=channel.recvfrom(65536)
                 if sender[0]!=0 or len(response)<20:
@@ -449,6 +461,15 @@ def initialize_journal(directory):
     return journal_id
 
 
+def validate_execution_config(config):
+    protected=config.get('protectedAddresses')
+    if not isinstance(protected,list) or not 1<=len(protected)<=16 or len(set(protected))!=len(protected):
+        raise ValueError('one to sixteen independent protected management addresses required')
+    for address in protected:
+        if not isinstance(address,str):raise ValueError('invalid protected management address')
+        host(address+'/32')
+
+
 class Executor:
     def __init__(self, config, directory, driver=None, event=None):
         self.config=config
@@ -501,6 +522,8 @@ class Executor:
     def save(self, data, row=None, state=None):
         backup=json.loads(canonical(data))
         transaction=row['authorization']['transactionId'] if row else None
+        if transaction is not None:
+            self.current_transaction=transaction
         if state:
             row['state']=state
             row.setdefault('history',[]).append({'state':state,'at':int(time.time()*1000)})
@@ -531,6 +554,7 @@ class Executor:
 
     def rollback(self, data, row):
         self.driver.deadline=None
+        self.driver.command_deadline=time.monotonic()+60
         self.save(data,row,'rolling-back')
         try:
             if row.get('configuredFingerprint') is not None and self.driver.owned(row['authorization']['operation'],row['owner']) and self.driver.fingerprint(row['authorization']['operation'])!=row['configuredFingerprint']:
@@ -541,6 +565,8 @@ class Executor:
         except Exception as error:
             row['diagnostic']='rollback: '+safe_diagnostic(error)
             self.save(data,row,'rollback-failed')
+        finally:
+            self.driver.command_deadline=None
 
     def recover(self):
         # Restart is an uncertainty boundary. Roll back *all* unconfirmed work immediately, even
@@ -589,15 +615,23 @@ class Executor:
                 if digest(prior['authorization'])!=digest(a):
                     raise ValueError('transaction identity reused with different content')
                 return prior['state']
-            if now<data['lastClock'] or len(data['transactions'])>=1024 or any(r['state'] not in TERMINAL for r in data['transactions'].values()):
-                raise ValueError('clock/replay capacity or unsettled transaction')
+            if now<data['lastClock']:
+                raise ValueError('clock moved behind durable replay watermark')
+            if len(data['transactions'])>=1024:
+                raise ValueError('transaction replay ledger capacity reached')
+            if any(r['state'] not in TERMINAL for r in data['transactions'].values()):
+                raise ValueError('unsettled network transaction')
             # Clear a stale process-local budget only after the durable ledger proves no debt.
             # This also reconciles a terminal rename whose directory fsync raised afterward.
             self.driver.deadline=None
             if len(canonical(data).encode())>6*1024*1024:
                 raise ValueError('transaction journal capacity reached')
             started_mono=time.monotonic()
-            before,paths=self.driver.preflight(a['operation'],self.config['protectedAddresses'])
+            self.driver.command_deadline=started_mono+(a['expiresAt']-now)/1000
+            try:
+                before,paths=self.driver.preflight(a['operation'],self.config['protectedAddresses'])
+            finally:
+                self.driver.command_deadline=None
             if digest(before)!=a['localPrecondition']:
                 raise ValueError('local precondition changed: replan and reapprove')
             fresh_now=int(time.time()*1000)
@@ -704,47 +738,11 @@ def main(argv=None):
     if args.initialize_journal:
         print(initialize_journal(args.state_dir));return
     if not args.config:parser.error('--config required for execution')
-    config=read_json(args.config)
-    if not config.get('protectedAddresses'):
-        raise ValueError('independent protected management addresses required')
-    for address in config['protectedAddresses']:
-        host(address+'/32')
-    executor=Executor(config,args.state_dir)
-    # Keep a process-wide lock as well as mutation locks; a second worker must not treat live
-    # transactions as crashed and undo another worker's change.
-    fd=os.open(os.path.join(args.state_dir,'worker.lock'),os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)
-    fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
-    executor.recover()
-    stopping=[False]
-    def stop(*_): stopping[0]=True
-    signal.signal(signal.SIGTERM,stop)
-    signal.signal(signal.SIGINT,stop)
-    seen={}
-    try:
-        while not stopping[0]:
-            for filename,action in [('request.json',executor.accept),('confirm.json',executor.confirm)]:
-                path=os.path.join(args.state_dir,filename)
-                try:
-                    raw=read_file(path)
-                    stamp=hashlib.sha256(raw).hexdigest()
-                    if seen.get(filename)==stamp:
-                        continue
-                    seen[filename]=stamp
-                    try:
-                        result=action(read_json(path))
-                        atomic(os.path.join(args.state_dir,'response.json'),{'requestHash':stamp,'state':result})
-                    except Exception as error:
-                        atomic(os.path.join(args.state_dir,'response.json'),{'requestHash':stamp,'state':'rejected','diagnostic':safe_diagnostic(error)})
-                except FileNotFoundError:
-                    pass
-            executor.tick()
-            try:executor.publish_results()
-            except Exception:pass  # Reporting must never delay or suppress local rollback.
-            time.sleep(0.25)
-    finally:
-        executor.recover()
-        try:executor.publish_results()
-        except Exception:pass
+    # Execution has one canonical process owner. Preserve the old CLI spelling, but never
+    # launch a second network-only loop outside the persistent Agent's host writer lock.
+    import sys
+    entry=os.path.join(os.path.dirname(__file__),'heliopause-pull.py')
+    os.execv(sys.executable,[sys.executable,entry,'--network-executor','--config',args.config,'--state-dir',args.state_dir])
 
 
 if __name__=='__main__':

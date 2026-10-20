@@ -1,7 +1,8 @@
 [Unit]
-Description=Heliopause experimental single-gateway network executor
+Description=Heliopause integrated Agent (legacy network entry alias)
 After=network.target
-# The shared Agent process lock refuses concurrent writer modes without stopping the owner.
+# Compatibility alias: requires the full firewall Agent environment and runs heartbeat/monitor.
+# Prefer heliopause-agent.service with its network drop-in; never enable both services.
 StartLimitIntervalSec=0
 
 [Service]
@@ -10,6 +11,7 @@ EnvironmentFile=-/etc/heliopause/agent.env
 ExecStart=/usr/bin/python3 /opt/heliopause/agent/heliopause-pull.py --network-executor --config /etc/heliopause/network-executor.json --state-dir /var/lib/heliopause/network-executor
 Restart=always
 RestartSec=1
+TimeoutStopSec=300s
 UMask=0077
 User=root
 # No NetworkManager profile or reboot reapply is installed by this service.

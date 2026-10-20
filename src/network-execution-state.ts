@@ -1,5 +1,6 @@
 import { networkDigest } from './network-canonical.ts';
 import type { NetworkSignedEnvelope } from './network-execution.ts';
+export const NETWORK_EXECUTION_CAPACITY=256;
 export const NETWORK_TERMINAL_DOMAIN='heliopause-network-terminal-mtls-v1';
 export interface NetworkTarget { source:string;host:string;nodeId:string }
 export interface NetworkTerminalResult {
@@ -23,7 +24,7 @@ export interface NetworkExecutionState {
 }
 const hex=(v:unknown)=>typeof v==='string'&&/^[a-f0-9]{64}$/.test(v);
 export function validateExecutionState(state:NetworkExecutionState):void {
-  if(!state||state.schemaVersion!==1||!Array.isArray(state.records)||state.records.length>256||state.nextSequence!==state.records.length+1) throw new Error('invalid execution ledger');
+  if(!state||state.schemaVersion!==1||!Array.isArray(state.records)||state.records.length>NETWORK_EXECUTION_CAPACITY||state.nextSequence!==state.records.length+1) throw new Error('invalid execution ledger');
   const ids=new Set<string>();
   for(const [index,r] of state.records.entries()) {
     const a=JSON.parse(Buffer.from(r.authorization.payload,'base64url').toString());

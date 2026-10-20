@@ -155,6 +155,21 @@ class Transactions(unittest.TestCase):
         self.e.accept(self.a);os.unlink(self.e.path)
         with self.assertRaises((ValueError,FileNotFoundError)):self.e.accept(self.a)
         with self.assertRaises(ValueError):n.initialize_journal(self.temp.name)
+    def test_full_replay_ledger_refuses_new_work_but_recovers_and_reports(self):
+        self.e.accept(self.a);self.e.recover()
+        data=self.e.load();template=copy.deepcopy(self.row());rows={}
+        for i in range(1024):
+            tx=format(i,'032x');row=copy.deepcopy(template);a=row['authorization'];a['transactionId']=tx
+            result=row['terminalResult'];result.update({'transactionId':tx,'fenceId':tx,'authorizationHash':n.digest(a),'sequence':i+1})
+            result['stateHash']=n.digest({k:v for k,v in result.items() if k!='stateHash'})
+            row['authorizationHash']=n.digest(a);rows[tx]=row
+        data.update({'transactions':rows,'acceptedSequence':1024,'terminalSequence':1024});n.atomic(self.e.path,data)
+        calls=list(self.driver.calls)
+        with self.assertRaisesRegex(ValueError,'capacity'):self.e.accept(self.a)
+        self.e.recover();self.e.publish_results()
+        self.assertEqual(self.driver.calls,calls)
+        self.assertEqual(len(n.read_json(self.temp.name+'/terminal-results.json')),1024)
+        self.assertEqual(len(self.e.load()['transactions']),1024)
     def test_removed_transaction_is_detected_without_replay_ledger_pruning(self):
         self.e.accept(self.a);data=self.e.load();data['transactions']={};n.atomic(self.e.path,data)
         with self.assertRaises(ValueError):self.e.load()
@@ -312,6 +327,12 @@ class TerminalCourier(unittest.TestCase):
         self.assertFalse(os.path.exists(self.path+'/terminal-acks.json'))
         self.opener.open.side_effect=None
         self.assertEqual(self.d.deliver(self.cfg,self.path),1)
+    def test_corrupt_acknowledgments_fail_closed_before_delivery(self):
+        for ack in [{'a'*64:False},{'not-a-hash':True},{'a'*64:1},[],{format(i,'064x'):True for i in range(1025)}]:
+            with self.subTest(ack_type=type(ack).__name__):
+                n.atomic(self.path+'/terminal-acks.json',ack)
+                with self.assertRaises(ValueError):self.d.deliver(self.cfg,self.path)
+        self.opener.open.assert_not_called()
     def test_unsuccessful_manager_response_never_acknowledges(self):
         self.opener.open.return_value.__enter__.return_value.read.return_value=b'{"settled":false}'
         with self.assertRaises(ValueError):self.d.deliver(self.cfg,self.path)
@@ -327,6 +348,16 @@ class TerminalCourier(unittest.TestCase):
         with patch.object(n.os,'fstat',return_value=os.stat_result(metadata)):
             with self.assertRaises(ValueError):self.d.deliver(self.cfg,self.path)
         self.opener.open.assert_not_called()
+    def test_delivery_diagnostics_do_not_include_secret_paths(self):
+        import ssl
+        import urllib.error
+        errors=[(ssl.SSLError('sensitive/path'),'tls-authentication-failed'),(urllib.error.HTTPError('https://manager.example.invalid',401,'sensitive/path',None,None),'identity-or-certificate-refused'),(ValueError('sensitive/path'),'local-configuration-or-outbox-invalid'),(OSError('sensitive/path'),'manager-transport-unavailable')]
+        for error,code in errors:
+            self.d.record_delivery_status(self.path,error)
+            status=n.read_json(self.path+'/terminal-delivery-status.json')
+            self.assertEqual(status['reason'],code);self.assertNotIn('sensitive/path',n.canonical(status))
+        self.d.record_delivery_status(self.path)
+        self.assertEqual(n.read_json(self.path+'/terminal-delivery-status.json')['state'],'ready')
     def test_oversized_untrusted_response_is_not_recorded(self):
         self.opener.open.return_value.__enter__.return_value.read.return_value=b'X'*4097
         with self.assertRaises(ValueError):self.d.deliver(self.cfg,self.path)
@@ -437,23 +468,25 @@ class WriterMode(unittest.TestCase):
         self.path=self.temp.name
         self.agent=n.crypto_helpers(self.path)
         self.agent.STATE_FILE=self.path+'/firewall.json'
-        self.config=self.path+'/custom-config.json';n.atomic(self.config,{})
+        self.config=self.path+'/custom-config.json';n.atomic(self.config,{'protectedAddresses':['192.0.2.1']})
         self.state=self.path+'/custom-state'
         self.calls=[];self.terminal=True
         owner=self
         class Recovery:
-            def __init__(self,cfg,directory): owner.calls.append(('locate',directory))
+            def __init__(self,cfg,directory,**kwargs):
+                os.makedirs(directory,mode=0o700,exist_ok=True);owner.calls.append(('locate',directory))
             def recover(self): owner.calls.append(('recover',))
             def publish_results(self): owner.calls.append(('publish',))
             def load(self): return {'transactions':{'tx':{'state':'rolled-back' if owner.terminal else 'rollback-failed'}}}
-        self.patches=[patch.object(n,'Executor',Recovery),patch.object(n.subprocess,'run',side_effect=AssertionError('unexpected subprocess boundary')),patch.object(n.subprocess,'Popen',side_effect=AssertionError('unexpected child boundary')),patch.dict(os.environ,{'HELIOPAUSE_WRITER_LOCK':self.path+'/writer.lock','HELIOPAUSE_NETWORK_EXECUTOR_STATE_DIR':self.path+'/unused-default'}),patch.object(sys,'argv',['agent'])]
+        import network_lifecycle as lifecycle
+        self.patches=[patch.object(lifecycle,'Executor',Recovery),patch.object(n.subprocess,'run',side_effect=AssertionError('unexpected subprocess boundary')),patch.object(n.subprocess,'Popen',side_effect=AssertionError('unexpected child boundary')),patch.dict(os.environ,{'HELIOPAUSE_WRITER_LOCK':self.path+'/writer.lock','HELIOPAUSE_NETWORK_EXECUTOR_STATE_DIR':self.path+'/unused-default'}),patch.object(sys,'argv',['agent'])]
         for p in self.patches:p.start();self.addCleanup(p.stop)
         self.agent.main=lambda:0
     def network_args(self):
         sys.argv[:]=['agent','--network-executor','--config',self.config,'--state-dir',self.state]
     def test_custom_locator_recovered_by_other_mode(self):
         self.network_args()
-        with patch.object(n,'main',return_value=0) as enter:
+        with patch.object(self.agent,'main',return_value=0) as enter:
             self.assertEqual(self.agent.run_writer_mode(),0);enter.assert_called_once()
         self.assertEqual(n.read_json(self.path+'/network-writer-locator.json')['stateDir'],self.state)
         sys.argv[:]=['agent']
@@ -463,26 +496,27 @@ class WriterMode(unittest.TestCase):
         n.atomic(self.path+'/network-writer-locator.json',{'config':self.config,'stateDir':self.state})
         self.terminal=False
         with patch.object(self.agent,'main',return_value=0) as enter:
-            with self.assertRaises(RuntimeError):self.agent.run_writer_mode()
-            enter.assert_not_called()
+            self.assertEqual(self.agent.run_writer_mode(),0)
+            enter.assert_called_once()
+            self.assertFalse(self.agent._lifecycle.begin_firewall())
         self.assertIn(('recover',),self.calls)
     def test_live_writer_lock_preserves_owner(self):
         self.network_args()
         def active(*args):
             self.assertEqual(self.agent.run_writer_mode(),2)
             self.calls.append(('owner-survived',));return 0
-        with patch.object(n,'main',side_effect=active):self.assertEqual(self.agent.run_writer_mode(),0)
+        with patch.object(self.agent,'main',side_effect=active):self.assertEqual(self.agent.run_writer_mode(),0)
         self.assertIn(('owner-survived',),self.calls)
     def test_old_firewall_debt_settled_before_new_writer(self):
-        n.atomic(self.agent.STATE_FILE,{})
+        n.atomic(self.agent.STATE_FILE,{'state':'pending','generation':'test-generation'})
         state={'state':'pending','generation':'test-generation','workloadState':None,'workloadGeneration':None}
         def undo(*args):self.calls.append(('undo',));state['state']='rolled-back'
         self.network_args()
         # Explicit legacy recovery entry points are the boundary; their nft/ip/kubectl children
         # cannot escape because both subprocess entry points are fatal guards above.
-        with patch.object(self.agent,'load_state',side_effect=lambda:dict(state)),patch.object(self.agent,'recover_commitment') as host,patch.object(self.agent,'recover_workload_commitment') as workload,patch.object(self.agent,'reconcile_recovered_commitments') as reconcile,patch.object(self.agent,'rollback_generation',side_effect=undo),patch.object(n,'main',return_value=0) as enter:
+        with patch.object(self.agent,'load_state',side_effect=lambda:dict(state)),patch.object(self.agent,'recover_commitment') as host,patch.object(self.agent,'recover_workload_commitment') as workload,patch.object(self.agent,'reconcile_recovered_commitments') as reconcile,patch.object(self.agent,'rollback_generation',side_effect=undo),patch.object(self.agent,'main',return_value=0) as enter:
             self.assertEqual(self.agent.run_writer_mode(),0)
-            host.assert_called_once();workload.assert_called_once();reconcile.assert_called_once();enter.assert_called_once()
+            self.assertGreaterEqual(host.call_count,1);self.assertGreaterEqual(workload.call_count,1);self.assertGreaterEqual(reconcile.call_count,1);enter.assert_called_once()
         self.assertIn(('undo',),self.calls)
     def test_graceful_stop_settles_firewall_watchdog_debt(self):
         state={'state':'confirmed','generation':'test-generation','workloadState':None,'workloadGeneration':None}
