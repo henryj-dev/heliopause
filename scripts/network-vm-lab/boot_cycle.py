@@ -7,6 +7,7 @@ This primitive is not a claim that the full thirteen-scenario matrix passed.
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import shlex
@@ -52,6 +53,8 @@ for row in d['transactions'].values():
  try:
   s=p.lstat();profiles.append({'uuid':u,'mode':s.st_mode,'uid':s.st_uid,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()})
  except FileNotFoundError:profiles.append({'uuid':u,'missing':True})
+nm_profiles=r(['nmcli','-t','-f','UUID','connection','show'])
+if nm_profiles.returncode:raise RuntimeError('NM inventory unavailable')
 print(json.dumps({'at':time.time(),'bootId':pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
 'journal':d,'profiles':profiles,
 'lifecycle':optional('/var/lib/heliopause-agent/lifecycle-status.json'),
@@ -60,6 +63,7 @@ print(json.dumps({'at':time.time(),'bootId':pathlib.Path('/proc/sys/kernel/rando
 'delivery':optional('/var/lib/heliopause/network-executor/terminal-delivery-status.json'),
 'kernel':r(['uname','-r']).stdout.decode().strip(),
 'packages':r(['rpm','-q','NetworkManager','NetworkManager-libnm','systemd','python3','iproute','wireguard-tools','nftables']).stdout.decode().splitlines(),
+'nmProfiles':nm_profiles.stdout.decode().splitlines(),
 'nmDevices':r(['nmcli','-t','-f','UUID,TYPE,DEVICE','connection','show','--active']).stdout.decode().splitlines(),
 'service':r(['systemctl','show','heliopause-agent.service','-p','MainPID','-p','ActiveState','-p','SubState','-p','ExecStart','-p','UnitFileState','-p','After','-p','CapabilityBoundingSet','-p','ReadWritePaths']).stdout.decode(),
 'links':json.loads(r(['ip','-j','-d','link','show']).stdout),
@@ -74,7 +78,7 @@ print(json.dumps({'at':time.time(),'bootId':pathlib.Path('/proc/sys/kernel/rando
     def monitor_start(self):
         identity=uuid.uuid4().hex
         unit='heliopause-vm-observer-'+identity
-        self.ssh('peer','sudo','systemd-run','--unit='+unit,'--collect','/usr/bin/python3','/source/scripts/network-vm-lab/monitor.py','--nonce',self.nonce,'--id',identity)
+        self.ssh('peer','sudo','systemd-run','--unit='+unit,'--collect','--property=KillMode=mixed','/usr/bin/python3','/source/scripts/network-vm-lab/monitor.py','--nonce',self.nonce,'--id',identity)
         end=time.monotonic()+30
         while time.monotonic()<end:
             try:
@@ -83,11 +87,21 @@ print(json.dumps({'at':time.time(),'bootId':pathlib.Path('/proc/sys/kernel/rando
             except subprocess.CalledProcessError:time.sleep(.5)
         self.ssh('peer','sudo','systemctl','stop',unit)
         raise TimeoutError('independent monitor did not become ready')
-    def monitor_stop(self, identity, unit):
-        self.ssh('peer','sudo','systemctl','stop',unit)
+    def peer_clock(self):
+        return json.loads(self.ssh('peer','python3','-c',"import json,time;from pathlib import Path;print(json.dumps({'at':time.time(),'bootId':Path('/proc/sys/kernel/random/boot_id').read_text().strip()}))"))
+    def monitor_read(self, identity):
         raw=self.ssh('peer','sudo','head','-c','524288','/var/lib/heliopause-vm-lab/observations/'+identity+'.jsonl')
         if len(raw)>=524288:raise ValueError('packet timeline exceeds evidence bound')
         return [json.loads(line) for line in raw.splitlines()]
+    def monitor_stop(self, identity, unit, recovery_at=None):
+        if recovery_at is not None:
+            end=time.monotonic()+30
+            while time.monotonic()<end:
+                records=self.monitor_read(identity)
+                if sum(row['at']>=recovery_at for row in records)>=3:break
+                time.sleep(.25)
+        self.ssh('peer','sudo','systemctl','stop',unit)
+        return {'samples':self.monitor_read(identity),'stopped':self.peer_clock()}
 
     def power_cut(self):
         pid=int((self.root/'gateway-qemu.pid').read_text())
@@ -122,7 +136,22 @@ def recovery_complete(journal, transaction, boot, expected):
 def removed_profile(after, transaction):
     op=after['journal']['transactions'][transaction]['authorization']['operation'];dev=op['interfaceName']
     current=next(row for row in after['profiles'] if row['uuid']==op['profileUuid'])
-    return current.get('missing') is True and not any(row['ifname']==dev for row in after['links']) and not any(row.get('dev')==dev for row in after['routes']) and not any(line.startswith(op['profileUuid']+':') for line in after.get('nmDevices',[]))
+    return current.get('missing') is True and not any(row['ifname']==dev for row in after['links']) and not any(row.get('dev')==dev for row in after['routes']) and isinstance(after.get('nmProfiles'),list) and op['profileUuid'] not in after['nmProfiles'] and not any(line.startswith(op['profileUuid']+':') for line in after.get('nmDevices',[]))
+
+
+def rollback_progress(before, after, transaction):
+    status=after.get('lifecycle') or {}
+    service=dict(line.split('=',1) for line in after['service'].splitlines() if '=' in line)
+    row=after['journal']['transactions'][transaction];old=before['journal']['transactions'][transaction]
+    return service.get('ActiveState')=='active' and service.get('SubState')=='running' and service.get('MainPID')==str(status.get('agentPid')) and 0<=after['at']-status.get('reportedAt',0)<=10 and bool(row.get('history')) and row['history'][-1].get('state')=='rollback-failed' and row['history'][-1]!=old['history'][-1]
+
+
+def timeline_valid(records, peer_boot, request_at, recovered_at, stopped):
+    if len(records)<3 or stopped['bootId']!=peer_boot:return False
+    required={'at','peerBootId','management','forward','reverse'}
+    if any(set(row)!=required or row['peerBootId']!=peer_boot or type(row['at']) not in {int,float} or not math.isfinite(row['at']) or any(type(row[key]) is not bool for key in ['management','forward','reverse']) for row in records):return False
+    times=[row['at'] for row in records]
+    return times[0]<=request_at and len([value for value in times if value>=recovered_at])>=3 and all(0<b-a<=10 for a,b in zip(times,times[1:])) and 0<=stopped['at']-times[-1]<=10 and stopped['at']-times[0]<900
 
 
 def service_inactive(service):
@@ -165,6 +194,9 @@ def main():
     args.output.parent.mkdir(parents=True,exist_ok=True)
     monitor_id,monitor_unit,ready=lab.monitor_start()
     if ready['peerBootId']!=report['peerBootBefore']:raise ValueError('peer monitor boot mismatch')
+    request_clock=lab.peer_clock()
+    if request_clock['bootId']!=report['peerBootBefore']:raise ValueError('monitor peer changed boot')
+    report['requestPeerAt']=request_clock['at']
     started=time.monotonic();report['requestAt']=time.time()
     try:
         if args.mode=='graceful':
@@ -191,13 +223,13 @@ def main():
             complete=recovery_complete(report['after']['journal'],args.transaction,boot,args.expected)
             if args.expected=='inactive':complete=complete and service_inactive(report['after']['service'])
             if args.expected=='rollback-failed':
-                status=report['after'].get('lifecycle') or {}
-                complete=complete and status.get('agentPid') and 0<=report['after']['at']-status.get('reportedAt',0)<=10
+                complete=complete and rollback_progress(report['before'],report['after'],args.transaction)
             if complete:break
             if time.monotonic()>=end:raise TimeoutError('Agent boot recovery not terminal')
             time.sleep(1)
         if args.expected=='rolled-back' and not removed_profile(report['after'],args.transaction):raise ValueError('rolled-back objects remain')
         if args.expected in {'degraded-unchanged','rollback-failed','inactive'} and not inactive_preserved(report['before'],report['after'],args.transaction):raise ValueError('negative-case profile/kernel preservation failed')
+        report['recoveredPeerAt']=lab.peer_clock()['at']
         report['peerBootAfter']=lab.boot('peer')
         if report['peerBootBefore']!=report['peerBootAfter']:raise ValueError('independent peer rebooted')
         if args.require_confirmed_forwarding:
@@ -222,9 +254,11 @@ def main():
         raise
     finally:
         try:
-            report['packetTimeline']=lab.monitor_stop(monitor_id,monitor_unit)
+            timeline=lab.monitor_stop(monitor_id,monitor_unit,report.get('recoveredPeerAt'))
+            report['packetTimeline']=timeline['samples']
+            report['monitorStopped']=timeline['stopped']
             report['managerAfter']=lab.manager_evidence()
-            if not report['packetTimeline'] or any(row['peerBootId']!=report['peerBootBefore'] for row in report['packetTimeline']):raise ValueError('independent timeline unavailable')
+            if not timeline_valid(report['packetTimeline'],report['peerBootBefore'],report['requestPeerAt'],report.get('recoveredPeerAt',float('inf')),timeline['stopped']):raise ValueError('independent timeline coverage unavailable')
             if args.expected in {'degraded-unchanged','rollback-failed','inactive'} and not all(row['management'] is True and row['forward'] is False and row['reverse'] is False for row in report['packetTimeline'][-3:]):raise ValueError('negative-case independent packet result mismatch')
         except Exception:
             report['passed']=False;report['monitorError']='independent-monitor-unavailable'

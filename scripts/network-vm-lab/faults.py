@@ -46,6 +46,10 @@ def main():
     directory.mkdir(mode=0o700,parents=True,exist_ok=True)
     info=directory.lstat()
     if not stat.S_ISDIR(info.st_mode) or info.st_uid!=0 or stat.S_IMODE(info.st_mode)!=0o700:raise ValueError('protected fault directory required')
+    for parent in [directory,directory.parent,directory.parent.parent,directory.parent.parent.parent]:
+        fd=os.open(parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+        try:os.fsync(fd)
+        finally:os.close(fd)
     metadata=directory/'pending.json'
     profile=Path('/etc/NetworkManager/system-connections')/ProfileStore.basename(op['profileUuid'])
     secret=Path(cfg['secrets'])/(op['secretRef']+'.key')
@@ -78,7 +82,11 @@ def main():
     changed=original.replace(b'mtu=1400\n',b'mtu=1380\n',1) if args.action=='profile-mtu' else None
     if changed==original:raise ValueError('expected lab MTU required')
     n.atomic(str(metadata),{'kind':args.action,'originalHash':sha(original),'faultHash':sha(changed) if changed else None})
-    if args.action.endswith('-missing'):target.unlink()
+    if args.action.endswith('-missing'):
+        target.unlink()
+        fd=os.open(target.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+        try:os.fsync(fd)
+        finally:os.close(fd)
     elif args.action=='profile-mtu':write(target,changed,replace=True)
     else:
         fd=os.open(target,os.O_RDONLY|os.O_NOFOLLOW)
