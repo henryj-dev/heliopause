@@ -28,8 +28,17 @@ CANCELLATION_RESULT_DOMAIN = 'heliopause-network-cancellation-mtls-v1'
 CONFIRM = 'heliopause-network-confirm-v1'
 VERIFY = 'heliopause-network-verification-v1'
 DRIVER = 'linux-wireguard-v1'
+PERSISTENT_DRIVER = 'networkmanager-wireguard-1.56-v1'
 TERMINAL = {'confirmed', 'rolled-back', 'cancelled-before-accept'}
 CHECKS = ['interface', 'address', 'route', 'handshake', 'fib', 'forward', 'reverse', 'management', 'protected']
+
+
+def current_boot_id():
+    with open('/proc/sys/kernel/random/boot_id', 'r', encoding='ascii') as stream:
+        value = stream.read(64).strip()
+    if not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}', value):
+        raise ValueError('boot identity unavailable')
+    return value
 
 
 def canonical(value):
@@ -165,8 +174,13 @@ def key(value):
 
 
 def validate_operation(op):
-    exact(op, 'driver interfaceId interfaceName address mtu listenPort secretRef publicKey peers routes')
-    if op['driver'] != DRIVER or not name(op['interfaceId']) or not re.fullmatch(r'hp[a-z0-9]{1,13}', str(op['interfaceName'])) or not name(op['secretRef']) or not key(op['publicKey']) or not integer(op['mtu'], 1280, 1500) or not integer(op['listenPort'], 1024, 65535):
+    persistent = isinstance(op, dict) and op.get('driver') == PERSISTENT_DRIVER
+    exact(op, 'driver interfaceId interfaceName address mtu listenPort secretRef publicKey peers routes'+(' profileUuid bootPolicy' if persistent else ''))
+    if persistent:
+        from network_nm_profile import profile_uuid, BOOT_POLICY
+        if op['bootPolicy'] != BOOT_POLICY or not isinstance(op['profileUuid'], str) or op['profileUuid'] != profile_uuid(op['profileUuid'].replace('-', '')) or op['interfaceName'] != 'hp'+op['profileUuid'].replace('-', '')[:12]:
+            raise ValueError('persistent profile identity/policy mismatch')
+    if op['driver'] not in {DRIVER, PERSISTENT_DRIVER} or not name(op['interfaceId']) or not re.fullmatch(r'hp[a-z0-9]{1,13}', str(op['interfaceName'])) or not name(op['secretRef']) or not key(op['publicKey']) or not integer(op['mtu'], 1280, 1500) or not integer(op['listenPort'], 1024, 65535):
         raise ValueError('unsupported WireGuard operation')
     address = host(op['address'])
     if not isinstance(op['peers'], list) or not 1 <= len(op['peers']) <= 8 or not isinstance(op['routes'], list) or not 1 <= len(op['routes']) <= 16:
@@ -215,7 +229,7 @@ class LinuxWireGuard:
         try:
             p = subprocess.run(args, input=data, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=self.command_timeout(), check=False, pass_fds=pass_fds)
         except (OSError, subprocess.TimeoutExpired):
-            raise RuntimeError('network command unavailable or timed out') from None
+            raise RuntimeError('network command unavailable or timed out: '+os.path.basename(args[0])+' '+os.path.basename(args[1])) from None
         if p.returncode:
             # Never include input, stdout, stderr, secret paths or full argv in error records.
             raise RuntimeError('network command failed: '+args[0]+' '+args[1])
@@ -343,12 +357,7 @@ class LinuxWireGuard:
         for dst in op['routes']:
             self.run(['ip', 'route', 'add', dst, 'dev', op['interfaceName'], 'proto', 'static', 'metric', '42760'])
 
-    def owned(self, op, owner):
-        links = self.ip('-d', 'link', 'show')
-        matches = [x for x in links if x['ifname'] == op['interfaceName']]
-        if not matches:
-            return False
-        link = matches[0]
+    def ownership_marker(self, link, op, owner):
         alias=link.get('ifalias',link.get('alias'))
         transaction=owner.split(':')[1]
         group=link.get('group')
@@ -356,6 +365,15 @@ class LinuxWireGuard:
         group_value=int(group) if type(group) is int or (isinstance(group,str) and re.fullmatch(r'-?[0-9]+',group)) else None
         if group_value is None or not -(1<<31)<=group_value<(1<<32) or (group_value & 0xffffffff)!=owner_group(owner) or op['interfaceName']!='hp'+transaction[:12] or alias not in {None,owner} or link.get('linkinfo', {}).get('info_kind') != 'wireguard':
             raise ValueError('interface ownership conflict')
+        return alias
+
+    def owned(self, op, owner):
+        links = self.ip('-d', 'link', 'show')
+        matches = [x for x in links if x['ifname'] == op['interfaceName']]
+        if not matches:
+            return False
+        link = matches[0]
+        alias = self.ownership_marker(link, op, owner)
         # A root writer replacing a configuration must not have its objects deleted by rollback.
         public = self.run(['wg', 'show', op['interfaceName'], 'public-key'])
         if public not in {'', '(none)', op['publicKey']}:
@@ -419,9 +437,12 @@ class LinuxWireGuard:
         if any(x['ifname']==op['interfaceName'] for x in self.ip('-d', 'link', 'show')):
             raise RuntimeError('interface removal unverified')
 
-    def verify_local(self, op, owner, before, paths):
+    def verify_presence(self, op, owner):
         if not self.owned(op, owner):
             raise ValueError('interface missing')
+
+    def verify_local(self, op, owner, before, paths):
+        self.verify_presence(op, owner)
         snap=self.snapshot()
         link=next(x for x in snap['links'] if x['name']==op['interfaceName'])
         if link['mtu']!=op['mtu']:
@@ -482,9 +503,24 @@ class Executor:
         if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.geteuid() or info.st_mode & 0o077:
             raise ValueError('state directory must be owned 0700 directory')
         self.provider=crypto_helpers(directory)
+        self.injected_driver = driver is not None
         self.driver=driver or LinuxWireGuard(config['secrets'])
+        self.drivers = {DRIVER: self.driver}
         self.event=event or (lambda _:None)
         self.boot_started=time.monotonic()
+
+    def select_driver(self, operation, row=None):
+        if not self.injected_driver:
+            identity = operation['driver']
+            if identity not in self.drivers:
+                if identity != PERSISTENT_DRIVER:
+                    raise ValueError('unsupported execution driver')
+                from network_nm_wireguard import NetworkManagerWireGuard
+                self.drivers[identity] = NetworkManagerWireGuard(self.config['secrets'])
+            self.driver = self.drivers[identity]
+        if hasattr(self.driver, 'bind'):
+            self.driver.bind(row)
+        return self.driver
 
     @contextlib.contextmanager
     def locked(self):
@@ -569,6 +605,7 @@ class Executor:
             self.event(state)
 
     def rollback(self, data, row):
+        self.select_driver(row['authorization']['operation'], row)
         self.driver.deadline=None
         self.driver.command_deadline=time.monotonic()+60
         self.save(data,row,'rolling-back')
@@ -592,6 +629,126 @@ class Executor:
             for row in data['transactions'].values():
                 if row['state'] not in TERMINAL:
                     self.rollback(data,row)
+
+    def validate_restore_authority(self, row, journal_id):
+        independent_trust(self.config, self.provider)
+        evidence = row.get('restorationAuthority', {})
+        a = verify(evidence.get('authorization'), EXECUTION, self.config['managerKeys'], self.provider)
+        c = verify(evidence.get('confirmation'), CONFIRM, self.config['managerKeys'], self.provider)
+        v = verify(c['verification'], VERIFY, self.config['verifierKeys'], self.provider)
+        validate_operation(a['operation'])
+        at = row.get('confirmedAt')
+        proof = row['terminalResult']['proof']
+        approval = a['approval']
+        draft = {key:value for key,value in a.items() if key != 'approval'}
+        if (a != row['authorization'] or a['target'] != self.config['identity'] or a['journalId'] != journal_id or
+                a['operation']['driver'] != PERSISTENT_DRIVER or a['artifactHash'] != digest(a['operation']) or
+                a['operation']['profileUuid'].replace('-', '') != a['transactionId'] or
+                approval['mode'] != 'two-person' or approval['proposedBy'] == approval['approvedBy'] or
+                approval['planHash'] != 'sha256:'+digest(draft) or
+                not integer(at, a['issuedAt'], a['rollbackAt']-1) or
+                c['transactionId'] != a['transactionId'] or c['authorizationHash'] != digest(a) or c['artifactHash'] != a['artifactHash'] or
+                not integer(c['expiresAt'], at+1, a['rollbackAt']) or
+                v['transactionId'] != a['transactionId'] or v['authorizationHash'] != digest(a) or v['artifactHash'] != a['artifactHash'] or
+                not integer(v['observedAt'], a['issuedAt'], at) or not integer(v['expiresAt'], at+1, a['rollbackAt']) or
+                v['checks'] != {key:True for key in CHECKS} or any(type(value) is not bool for value in v['checks'].values()) or
+                proof != {'confirmationHash':digest(c), 'verificationHash':digest(v)}):
+            raise ValueError('historical restoration authority mismatch')
+
+    def restore_confirmed_boot(self):
+        # Called only at startup, never by tick(), close(), or normal undo recovery.
+        # Profile autoconnect remains false. No past authority is accepted as a new execution.
+        with self.locked():
+            data = self.load()
+            candidates = [row for row in data['transactions'].values() if row['state'] == 'confirmed' and row['authorization']['operation']['driver'] == PERSISTENT_DRIVER]
+            if not candidates:
+                return
+            boot = current_boot_id()
+            deadline = time.monotonic()+120
+            recovery_deadline = deadline+60
+            failed = False
+            for row in candidates:
+                if row.get('bootIdAtConfirm') == boot:
+                    continue
+                previous = row.get('bootRestore', {})
+                if previous.get('bootId') == boot:
+                    if previous.get('state') != 'restored':
+                        failed = True
+                        if previous.get('recovery') in {'rolled-back', 'not-started', 'boot-cleared'}:
+                            continue
+                        if 'plan' not in previous:
+                            previous.update(state='degraded', recovery='not-started', reason='interrupted-before-activation')
+                            self.save(data)
+                            continue
+                        self.select_driver(row['authorization']['operation'], row)
+                        try:
+                            self.driver.command_deadline = recovery_deadline
+                            if time.monotonic() >= recovery_deadline:
+                                raise ValueError('boot recovery budget exhausted')
+                            self.driver.undo_restore(row)
+                            previous['recovery'] = 'rolled-back'
+                        except Exception:
+                            previous['recovery'] = 'rollback-failed'
+                        finally:
+                            self.driver.command_deadline = None
+                            self.save(data)
+                    continue
+                row['bootRestore'] = {'bootId':boot, 'state':'attempting', 'currentConnectivity':'unknown'}
+                self.save(data)
+                plan_persisted = False
+                try:
+                    if time.monotonic() >= deadline:
+                        raise ValueError('boot restoration budget exhausted')
+                    self.validate_restore_authority(row, data['journalId'])
+                    self.select_driver(row['authorization']['operation'], row)
+                    self.driver.deadline = None
+                    self.driver.command_deadline = deadline
+                    # Preparation only reads ownership, secret and fresh boot state. A cold
+                    # NM/libnm timeout may be retried, but never a mutation/activation.
+                    for attempt in range(1,4):
+                        row['bootRestore']['preparationAttempts'] = attempt
+                        try:
+                            row['bootRestore']['plan'] = self.driver.prepare_restore(row, self.config['protectedAddresses'])
+                            break
+                        except RuntimeError as error:
+                            if not str(error).startswith('network command unavailable or timed out:') or attempt==3 or time.monotonic()>=deadline:
+                                raise
+                            row['bootRestore']['preparationDiagnostic'] = safe_diagnostic(error)
+                            self.save(data)
+                    if len(canonical(row['bootRestore']['plan']).encode()) > 1024*1024 or len(canonical(data).encode()) > 7*1024*1024:
+                        raise ValueError('boot undo capacity unavailable')
+                    self.save(data)
+                    plan_persisted = True
+                    self.driver.restore(row, self.config['protectedAddresses'])
+                    plan = row['bootRestore'].pop('plan', None)
+                    if plan is not None:
+                        row['bootRestore']['undoHash'] = digest(plan)
+                    row['bootRestore']['state'] = 'restored'
+                except Exception as error:
+                    row['bootRestore']['diagnostic'] = safe_diagnostic(error)
+                    row['bootRestore']['state'] = 'degraded'
+                    row['bootRestore']['reason'] = 'restoration-unresolved'
+                    if not plan_persisted:
+                        plan = row['bootRestore'].pop('plan', None)
+                        if plan is not None:
+                            row['bootRestore']['undoHash'] = digest(plan)
+                        row['bootRestore']['recovery'] = 'not-started'
+                    elif hasattr(self.driver, 'undo_restore'):
+                        try:
+                            # Undo gets its own budget even when activation exhausted its budget.
+                            self.driver.command_deadline = recovery_deadline
+                            if time.monotonic() >= recovery_deadline:
+                                raise ValueError('boot recovery budget exhausted')
+                            self.driver.undo_restore(row)
+                            row['bootRestore']['recovery'] = 'rolled-back'
+                        except Exception:
+                            row['bootRestore']['recovery'] = 'rollback-failed'
+                    failed = True
+                finally:
+                    self.driver.command_deadline = None
+                    self.save(data)
+            if failed:
+                raise ValueError('confirmed boot restoration unresolved')
 
     def accept(self,envelope):
         with self.locked():
@@ -620,6 +777,7 @@ class Executor:
             if not isinstance(e['digest'],str) or not re.fullmatch(r'[a-f0-9]{64}',e['digest']) or not integer(e['maxAgeMs'],1,600000) or not integer(e['collectedAt'],now-e['maxAgeMs'],now):
                 raise ValueError('stale observation')
             validate_operation(a['operation'])
+            self.select_driver(a['operation'])
             if a['operation']['interfaceName']!='hp'+a['transactionId'][:12]:
                 raise ValueError('interface name must bind unique transaction identity')
             if digest(a['operation'])!=a['artifactHash']:
@@ -636,7 +794,7 @@ class Executor:
                 raise ValueError('clock moved behind durable replay watermark')
             if len(data['transactions'])>=1024:
                 raise ValueError('transaction replay ledger capacity reached')
-            if any(r['state'] not in TERMINAL for r in data['transactions'].values()):
+            if any(r['state'] not in TERMINAL or (r.get('bootRestore', {}).get('recovery') == 'rollback-failed' or r.get('bootRestore', {}).get('state') == 'attempting') for r in data['transactions'].values()):
                 raise ValueError('unsettled network transaction')
             # Clear a stale process-local budget only after the durable ledger proves no debt.
             # This also reconciles a terminal rename whose directory fsync raised afterward.
@@ -660,6 +818,10 @@ class Executor:
             data['lastClock']=now
             if len(canonical(data).encode())>6*1024*1024:
                 raise ValueError('prospective transaction exceeds reserved journal capacity')
+            if a['operation']['driver'] == PERSISTENT_DRIVER:
+                self.select_driver(a['operation'], row)
+                row['persistence'] = self.driver.prepare(row)
+                row['restorationAuthority'] = {'authorization': envelope}
             # Every undo input exists on disk before the first network write.
             self.save(data,row,'prepared')
             try:
@@ -751,10 +913,15 @@ class Executor:
             exact(v,'transactionId authorizationHash artifactHash observedAt expiresAt nonce checks')
             if v['transactionId']!=a['transactionId'] or v['authorizationHash']!=digest(a) or v['artifactHash']!=a['artifactHash'] or not integer(v['observedAt'],row['acceptedAt'],now) or not integer(v['expiresAt'],now+1,min(now+10000,a['rollbackAt'])) or not re.fullmatch(r'[a-f0-9]{32}',str(v['nonce'])) or v['checks']!={k:True for k in CHECKS} or any(type(value) is not bool for value in v['checks'].values()):
                 raise ValueError('independent verification missing/stale/failed')
+            self.select_driver(a['operation'], row)
             self.driver.verify_local(a['operation'],row['owner'],row['before'],row['paths'])
             self.save(data,row,'awaiting-confirm')
             row['verification']=v
             row['confirmation']=c
+            if a['operation']['driver'] == PERSISTENT_DRIVER:
+                row['restorationAuthority']['confirmation'] = envelope
+                row['bootIdAtConfirm'] = current_boot_id()
+                row['confirmedAt'] = int(time.time()*1000)
             final_now=int(time.time()*1000)
             if final_now<data['lastClock'] or final_now>=min(c['expiresAt'],v['expiresAt'],a['rollbackAt']) or (time.monotonic()-row['mono'])*1000>=a['rollbackAt']-row['acceptedAt']:
                 self.rollback(data,row)
@@ -783,6 +950,20 @@ class Executor:
         with self.locked():
             data=self.load()
             now=int(time.time()*1000)
+            debts = [row for row in data['transactions'].values() if row['state'] == 'confirmed' and row.get('bootRestore', {}).get('recovery') == 'rollback-failed']
+            if debts:
+                cursor = getattr(self, 'boot_undo_cursor', 0) % len(debts)
+                self.boot_undo_cursor = cursor+1
+                row = debts[cursor]
+                self.select_driver(row['authorization']['operation'], row)
+                try:
+                    self.driver.command_deadline = time.monotonic()+20
+                    self.driver.undo_restore(row)
+                    row['bootRestore']['recovery'] = 'rolled-back'
+                except Exception:
+                    pass
+                finally:
+                    self.driver.command_deadline = None
             for row in data['transactions'].values():
                 if row['state'] in TERMINAL:
                     continue

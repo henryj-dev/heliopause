@@ -24,6 +24,8 @@ class Executor:
         self.confirm=Mock(return_value='confirmed')
         self.tick=Mock()
         self.recover=Mock()
+        self.restore_confirmed_boot=Mock()
+    def select_driver(self, operation, row=None):return self.driver
     def load(self):return copy.deepcopy(self.data)
     def publish_results(self):n.atomic(self.directory+'/terminal-results.json',[])
 

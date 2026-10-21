@@ -78,6 +78,8 @@ run "@heliopause/web" npm test -w @heliopause/web --if-present
 # being a suite nobody calls (`check-workspace-suites.sh` enforces that).
 run "@heliopause/agent" npm test -w @heliopause/agent --if-present
 run "VM read-only preflight" python3 scripts/network-vm-lab/test_preflight.py
+run "VM independent verifier" python3 scripts/network-vm-lab/test_verifier.py
+run "VM boot report acceptance" python3 scripts/network-vm-lab/test_boot_cycle.py
 
 printf '\n'
 if [ ${#failed[@]} -eq 0 ]; then
