@@ -5755,7 +5755,7 @@ def run_writer_mode():
     """One persistent process/host lock; network work is admitted beside the firewall loop."""
     import fcntl
     from network_lifecycle import Lifecycle
-    from network_executor import read_json, atomic, assert_active_journal
+    from network_executor import read_json, atomic, assert_active_journal, check_admission_epoch
     global _lifecycle
     directory = os.path.dirname(STATE_FILE)
     os.makedirs(directory, mode=0o700, exist_ok=True)
@@ -5792,6 +5792,7 @@ def run_writer_mode():
                     raise ValueError("network path migration requires offline reconciliation")
                 config_path, network_dir = locator["config"], locator["stateDir"]
             if requested or os.path.exists(locator_path) or os.path.exists(os.path.join(network_dir, "transactions.json")):
+                # A known pending/retired transition must not recreate its absent successor.
                 assert_active_journal(network_dir)
                 cfg = read_json(config_path)
                 previous_errors = dict(_lifecycle.errors)
@@ -5799,8 +5800,9 @@ def run_writer_mode():
                 _lifecycle.errors.update(previous_errors)
                 # Existing journals are mandatory even when new acceptance is disabled.
                 _lifecycle.executor.load()
-                atomic(locator_path, {"config": os.path.abspath(config_path), "stateDir": os.path.abspath(network_dir)})
                 _lifecycle.recover()
+                atomic(locator_path, {"config": os.path.abspath(config_path), "stateDir": os.path.abspath(network_dir)})
+                check_admission_epoch(network_dir)
         except Exception:
             _lifecycle.error("network-configuration", "network-binding-or-journal-unavailable")
         try:

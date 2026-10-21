@@ -5,6 +5,9 @@ round trips; these tests replace signature decoding and live kernel absence expl
 """
 import base64
 import copy
+import errno
+import stat
+import sys
 import hashlib
 import json
 import os
@@ -17,6 +20,7 @@ from unittest.mock import patch
 import network_executor as n
 import network_journal_transition as t
 REAL_CRYPTO_HELPERS=n.crypto_helpers
+REAL_EPOCH_PAYLOAD=n.epoch_payload
 from test_network_executor import Fake,authorization
 
 
@@ -36,7 +40,7 @@ class Transition(unittest.TestCase):
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup);self.root=Path(self.temp.name)
         for module,name in [(subprocess,'Popen'),(socket,'socket')]:
             guard=patch.object(module,name,side_effect=AssertionError('escaped transition unit boundary'));guard.start();self.addCleanup(guard.stop)
-        for target,options in [('crypto_helpers',{'return_value':object()}),('verify',{'side_effect':lambda value,*args:value.get('body',value)}),('independent_trust',{'return_value':None})]:
+        for target,options in [('crypto_helpers',{'return_value':object()}),('verify',{'side_effect':lambda value,*args:value.get('body',value)}),('independent_trust',{'return_value':None}),('epoch_payload',{'side_effect':lambda value:value.get('body',value)})]:
             guard=patch.object(n,target,**options);guard.start();self.addCleanup(guard.stop)
         self.state=self.root/'state';self.state.mkdir(mode=0o700);journal=n.initialize_journal(str(self.state));a=authorization();a['journalId']=journal;a['approval']['planHash']='sha256:'+n.digest({k:v for k,v in a.items() if k!='approval'})
         self.cfg={'enabled':True,'journalId':journal,'identity':a['target'],'managerKeys':'unused','verifierKeys':'unused','secrets':'unused','protectedAddresses':['192.0.2.1']}
@@ -115,6 +119,118 @@ class Transition(unittest.TestCase):
             self.assertTrue(result['committed'])
             self.assertEqual(n.read_json(str(self.state/'journal-identity.json')),{'journalId':'e'*32})
         self.assertFalse(list(self.root.glob('.artifact-signature.*')))
+
+    def test_completion_rename_without_parent_fsync_blocks_new_identity(self):
+        from test_network_cancellation import cancellation
+        real_replace=os.replace;real_fsync=os.fsync;armed=False
+        parent_stat=os.stat(self.root)
+        def replace(source,destination):
+            nonlocal armed
+            complete=str(destination)==str(self.state)+'.transition.json' and n.read_json(source).get('phase')=='complete'
+            real_replace(source,destination)
+            if complete:armed=True
+        def fsync(fd):
+            info=os.fstat(fd)
+            if armed and stat.S_ISDIR(info.st_mode) and (info.st_dev,info.st_ino)==(parent_stat.st_dev,parent_stat.st_ino):
+                raise OSError(errno.EIO,'injected completion parent fsync failure')
+            return real_fsync(fd)
+        with patch.object(os,'replace',side_effect=replace),patch.object(os,'fsync',side_effect=fsync):
+            with self.assertRaises(OSError):self.apply()
+            self.assertEqual(n.read_json(str(self.state)+'.transition.json')['phase'],'complete')
+            cfg=n.read_json(str(self.config));executor=n.Executor(cfg,str(self.state),Fake())
+            authority=authorization();authority['journalId']=cfg['journalId']
+            authority['approval']['planHash']='sha256:'+n.digest({k:v for k,v in authority.items() if k!='approval'})
+            before=(self.state/'transactions.json').read_bytes()
+            for operation in [lambda:executor.accept(authority),lambda:executor.cancel(cancellation(authority))]:
+                with self.subTest(operation=operation),self.assertRaises(OSError):operation()
+                self.assertEqual((self.state/'transactions.json').read_bytes(),before)
+        cancel=cancellation(authority)
+        self.assertEqual(executor.cancel(cancel),'cancelled-before-accept')
+        snapshot=(self.state/'transactions.json').read_bytes()
+        with patch.object(os,'fsync',side_effect=fsync):
+            self.assertEqual(executor.cancel(cancel),'cancelled-before-accept')
+            executor.recover();executor.publish_results()
+            with self.assertRaises(OSError):self.apply()
+        self.assertEqual((self.state/'transactions.json').read_bytes(),snapshot)
+        self.assertTrue(self.apply()['duplicate'])
+        self.assertEqual((self.state/'transactions.json').read_bytes(),snapshot)
+
+    def test_startup_pending_transition_does_not_recreate_absent_successor(self):
+        import network_lifecycle
+        def crash(point):
+            if point=='old-preserved':raise RuntimeError('power cut')
+        with self.assertRaises(RuntimeError):self.apply(event=crash)
+        self.assertFalse(self.state.exists())
+        agent=REAL_CRYPTO_HELPERS(str(self.root));agent.STATE_FILE=str(self.root/'firewall.json')
+        environment={'HELIOPAUSE_WRITER_LOCK':str(self.writer),'HELIOPAUSE_NETWORK_EXECUTOR':'1','HELIOPAUSE_NETWORK_EXECUTOR_CONFIG':str(self.config),'HELIOPAUSE_NETWORK_EXECUTOR_STATE_DIR':str(self.state)}
+        with patch.dict(os.environ,environment),patch.object(sys,'argv',['agent']),patch.object(network_lifecycle,'Executor',side_effect=AssertionError('must not create successor')),patch.object(agent,'main',return_value=0),patch.object(subprocess,'run',side_effect=AssertionError('escaped startup subprocess')):
+            self.assertEqual(agent.run_writer_mode(),0)
+        self.assertFalse(self.state.exists())
+        self.assertTrue(self.apply()['committed'])
+
+    def test_startup_missing_marker_still_rolls_back_existing_work(self):
+        import network_lifecycle
+        self.apply();cfg=n.read_json(str(self.config));driver=Fake()
+        executor=n.Executor(cfg,str(self.state),driver)
+        authority=authorization();authority['journalId']=cfg['journalId']
+        authority['approval']['planHash']='sha256:'+n.digest({k:v for k,v in authority.items() if k!='approval'})
+        executor.accept(authority);self.assertTrue(driver.exists)
+        Path(str(self.state)+'.transition.json').unlink()
+        agent=REAL_CRYPTO_HELPERS(str(self.root));agent.STATE_FILE=str(self.root/'firewall.json')
+        def main():
+            self.assertFalse(driver.exists)
+            self.assertEqual(executor.load()['transactions'][authority['transactionId']]['state'],'rolled-back')
+            self.assertIn('network-configuration',agent._lifecycle.report()['errors'])
+            with self.assertRaisesRegex(ValueError,'transition'):
+                n.check_admission_epoch(str(self.state))
+            return 0
+        environment={'HELIOPAUSE_WRITER_LOCK':str(self.writer),'HELIOPAUSE_NETWORK_EXECUTOR':'1','HELIOPAUSE_NETWORK_EXECUTOR_CONFIG':str(self.config),'HELIOPAUSE_NETWORK_EXECUTOR_STATE_DIR':str(self.state)}
+        with patch.dict(os.environ,environment),patch.object(sys,'argv',['agent']),patch.object(network_lifecycle,'Executor',return_value=executor),patch.object(agent,'main',side_effect=main),patch.object(subprocess,'run',side_effect=AssertionError('escaped startup subprocess')):
+            self.assertEqual(agent.run_writer_mode(),0)
+        self.assertTrue((self.state/'terminal-results.json').exists())
+
+    def test_protected_epoch_payload_parser_has_no_trust_lookup(self):
+        value={'synthetic':True,'newJournalId':'e'*32}
+        envelope={'version':'heliopause-ed25519-v1','algorithm':'Ed25519','keyId':'sha256:'+'1'*64,'signature':'A'*86,'payload':base64.urlsafe_b64encode(n.canonical(value).encode()).decode().rstrip('=')}
+        with patch.object(n,'network_trust_keys',side_effect=AssertionError('must not resurrect historical trust')):
+            self.assertEqual(REAL_EPOCH_PAYLOAD(envelope),value)
+            for field,replacement in [('version','old'),('algorithm','RSA'),('keyId','invalid'),('signature','A'*85),('payload',envelope['payload']+'=')]:
+                with self.subTest(field=field),self.assertRaises(ValueError):
+                    REAL_EPOCH_PAYLOAD({**envelope,field:replacement})
+
+    def test_complete_epoch_binds_active_identity_authority_and_receipt(self):
+        self.apply();marker_path=str(self.state)+'.transition.json'
+        original=n.read_json(marker_path)
+        for mutation in ['authority','receipt','identity']:
+            with self.subTest(mutation=mutation):
+                marker=copy.deepcopy(original)
+                if mutation=='authority':marker['authorization']['body']['newJournalId']='f'*32
+                if mutation=='receipt':marker['receipt']['body']['newJournalId']='f'*32
+                if mutation=='identity':n.atomic(str(self.state/'journal-identity.json'),{'journalId':'f'*32})
+                n.atomic(marker_path,marker)
+                with self.assertRaisesRegex(ValueError,'transition'):
+                    n.check_admission_epoch(str(self.state))
+                n.atomic(str(self.state/'journal-identity.json'),{'journalId':'e'*32})
+        n.atomic(marker_path,original);n.durable_admission_epoch(str(self.state))
+
+    def test_hardlinked_marker_refused_without_changing_evidence(self):
+        self.apply();marker=Path(str(self.state)+'.transition.json');raw=marker.read_bytes()
+        os.link(marker,self.root/'extra-marker-link')
+        with self.assertRaisesRegex(ValueError,'transition'):
+            n.check_admission_epoch(str(self.state))
+        self.assertEqual(marker.read_bytes(),raw)
+
+    def test_missing_completion_marker_is_not_a_fresh_journal(self):
+        self.apply()
+        Path(str(self.state)+'.transition.json').unlink()
+        with self.assertRaisesRegex(ValueError,'transition'):
+            n.check_admission_epoch(str(self.state))
+
+    def test_complete_marker_requires_matching_successor_owner(self):
+        self.apply()
+        n.atomic(str(self.state/'transition-owner.json'),{'transitionHash':'0'*64})
+        with self.assertRaisesRegex(ValueError,'transition'):
+            n.check_admission_epoch(str(self.state))
 
     def test_complete_and_duplicate_never_reset_successor(self):
         result=self.apply();self.assertTrue(result['committed']);self.assertEqual(n.read_json(str(self.state/'journal-identity.json')),{'journalId':'e'*32})

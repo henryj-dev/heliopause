@@ -270,6 +270,7 @@ def apply_agent(config_path,directory,archive_path,envelope,receipt,writer_lock,
             need(progress['authorization']==envelope and progress['receipt']==receipt,'different pending transition refused')
             if progress['phase']=='complete':
                 need(config['journalId']==t['newJournalId'] and n.read_json(str(directory/'journal-identity.json'))=={'journalId':t['newJournalId']},'completed transition drift')
+                n.durable_admission_epoch(str(directory))
                 return {'committed':True,'duplicate':True,'journalId':t['newJournalId']}
             absence(config,{**archive['agent'],'transactions':n.capacity_rows(archive['agent'],archive['identity'])})
         else:
