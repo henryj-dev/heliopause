@@ -173,3 +173,31 @@ before its lifetime budget is exhausted. Do not present this reservation as that
 Implementation validation and real VM capacity-pressure results must be reported
 separately. Synthetic padding and synthetic full-ledger fixtures do not establish the
 size of legitimate operational history or the completion of 1,024 real operations.
+
+
+## Completed epoch durability and recovery
+
+A visible `complete` marker is not proof that its rename reached durable storage if
+parent-directory fsync failed. Before admitting a new execution or a new preaccept
+cancellation identity, the Agent checks the protected completion marker, successor
+owner, identity, authority payload and receipt commitments, then fsyncs the same open
+files and directories through the marker parent. A repeated completed transition also
+performs this barrier without resetting any successor records. Confirmed boot activation
+uses the barrier; interrupted restore undo remains independent.
+
+Missing or inconsistent completion evidence refuses new admission and confirmed
+activation. For missing complete markers or inconsistent complete-marker ownership/payload binding,
+startup attempts existing owned unconfirmed undo and publishes terminal results before
+recording the completion-evidence error. The existing known pending/retired
+startup guard remains in place so startup cannot recreate an absent successor during an
+offline transition. Keep the original archive, receipt, marker, sidecars and partial paths;
+resume only the same approved transition. No timeout, pruning or local ownership rewrite
+repairs missing evidence.
+
+This local check binds previously verified protected payloads; it does not revalidate
+historical signatures or establish independent custody. It does not require reinstalling
+revoked keys. Same-length signature corruption cannot be detected by payload commitments
+alone; the full archive/signature verifier and offline transition retry remain separate.
+Boot restoration continues to verify its Manager/verifier authority against current trust.
+The fsync barrier reserves no physical storage. If it fails, existing owned undo, terminal
+export and identical-result retries remain available; new identities stay refused.

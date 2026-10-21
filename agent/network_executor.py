@@ -171,6 +171,85 @@ def assert_active_journal(directory):
     if journal_transition_pending(directory):raise ValueError('journal retired or offline transition pending')
 
 
+def epoch_payload(envelope):
+    # Protected evidence was verified by the offline transition. Do not require
+    # historical public keys again: revocation remains effective for boot authority.
+    exact(envelope,'version algorithm keyId payload signature')
+    if (envelope['version']!='heliopause-ed25519-v1' or envelope['algorithm']!='Ed25519'
+            or not isinstance(envelope['keyId'],str) or not re.fullmatch(r'sha256:[a-f0-9]{64}',envelope['keyId'])
+            or not isinstance(envelope['signature'],str) or not re.fullmatch(r'[A-Za-z0-9_-]{86}',envelope['signature'])
+            or len(base64.urlsafe_b64decode(envelope['signature']+'=='))!=64):
+        raise ValueError('invalid offline transition envelope')
+    encoded=envelope['payload']
+    if not isinstance(encoded,str) or len(encoded)>192*1024 or not re.fullmatch(r'[A-Za-z0-9_-]+',encoded):
+        raise ValueError('invalid offline transition payload')
+    raw=base64.urlsafe_b64decode(encoded+'='*((-len(encoded))%4))
+    value=decode_json(raw)
+    if len(raw)>128*1024 or raw!=canonical(value).encode() or base64.urlsafe_b64encode(raw).decode().rstrip('=')!=encoded:
+        raise ValueError('noncanonical offline transition payload')
+    return value
+
+
+def check_admission_epoch(directory, durable=False):
+    """Check completion before new identities or confirmed activation, under executor lock.
+
+    Owned undo and terminal reporting remain independent of this admission barrier.
+    No historical trust key is reinstalled or required.
+    """
+    directory=os.path.abspath(directory)
+    parent=os.open(os.path.dirname(directory),os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    opened=[]
+    try:
+        active=os.open(os.path.basename(directory),os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent)
+        opened.append(active)
+        def read_at(base,name,maximum=512*1024):
+            fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=base)
+            opened.append(fd);info=os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.geteuid() or info.st_mode&0o022 or info.st_nlink!=1:
+                raise ValueError('unsafe offline transition file')
+            raw=os.read(fd,maximum+1)
+            if len(raw)>maximum:raise ValueError('offline transition file exceeds limit')
+            return decode_json(raw)
+        try:read_at(active,'retired-journal.json')
+        except FileNotFoundError:pass
+        else:raise ValueError('offline transition journal retired')
+        try:marker=read_at(parent,os.path.basename(directory)+'.transition.json')
+        except FileNotFoundError:
+            try:read_at(active,'transition-owner.json')
+            except FileNotFoundError:return
+            raise ValueError('missing offline transition marker')
+        for fd in [parent,active]:
+            info=os.fstat(fd)
+            if info.st_uid!=os.geteuid() or info.st_mode&0o022:
+                raise ValueError('unsafe offline transition directory')
+        if not isinstance(marker,dict) or marker.get('phase')!='complete':
+            raise ValueError('offline transition incomplete')
+        owner=read_at(active,'transition-owner.json')
+        identity=read_at(active,'journal-identity.json')
+        authority=epoch_payload(marker.get('authorization'))
+        receipt=epoch_payload(marker.get('receipt'))
+        commitment=digest(authority)
+        if (not isinstance(authority,dict) or not isinstance(receipt,dict)
+                or marker['authorization']['keyId']!=marker['receipt']['keyId']
+                or marker.get('transitionHash')!=commitment
+                or owner!={'transitionHash':commitment}
+                or identity.get('journalId')!=authority.get('newJournalId')
+                or receipt.get('transitionHash')!=commitment
+                or any(receipt.get(key)!=authority.get(key) for key in ['oldJournalId','newJournalId','target','archiveHash','evidenceHash'])):
+            raise ValueError('offline transition identity or ownership mismatch')
+        if durable:
+            for fd in opened[1:]:os.fsync(fd)
+            os.fsync(active)
+            os.fsync(parent)
+    finally:
+        for fd in reversed(opened):os.close(fd)
+        os.close(parent)
+
+
+def durable_admission_epoch(directory):
+    check_admission_epoch(directory,durable=True)
+
+
 def crypto_helpers(directory):
     # Reuse the Agent's bounded trust loading and real OpenSSL Ed25519 verifier.
     spec = importlib.util.spec_from_file_location('network_signature_provider', os.path.join(os.path.dirname(__file__), 'heliopause-pull.py'))
@@ -755,6 +834,7 @@ class Executor:
                 try:
                     if time.monotonic() >= deadline:
                         raise ValueError('boot restoration budget exhausted')
+                    durable_admission_epoch(self.directory)
                     self.validate_restore_authority(row, data['journalId'])
                     self.select_driver(row['authorization']['operation'], row)
                     self.driver.deadline = None
@@ -859,6 +939,7 @@ class Executor:
             self.driver.deadline=None
             if len(canonical(data).encode())>6*1024*1024:
                 raise ValueError('transaction journal capacity reached')
+            durable_admission_epoch(self.directory)
             started_mono=time.monotonic()
             self.driver.command_deadline=started_mono+(a['expiresAt']-now)/1000
             try:
@@ -948,6 +1029,7 @@ class Executor:
             if reserved:
                 if reserved['authorizationHash']==digest(a) and digest(reserved['cancellation'])==digest(c):return reserved['state']
                 raise ValueError('capacity maintenance required; cancellation slot already reserved')
+            durable_admission_epoch(self.directory)
             row={'authorization':a,'cancellation':c,'state':'cancelled-before-accept','history':[]}
             # Include the complete terminal result and history in the admission measurement.
             result={'schemaVersion':2,'domain':CANCELLATION_RESULT_DOMAIN,'transactionId':a['transactionId'],'fenceId':a['transactionId'],'target':a['target'],'journalId':data['journalId'],'authorizationHash':digest(a),'artifactHash':a['artifactHash'],'registryRevision':a['registryRevision'],'state':row['state'],'sequence':data['terminalSequence']+1,'proof':{'cancellationHash':digest(c),'acceptancePrevented':True}}
