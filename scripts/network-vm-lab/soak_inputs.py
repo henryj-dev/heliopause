@@ -78,11 +78,12 @@ def frozen_inputs(role, config, etc=Path('/etc/heliopause'), base=Path('/var/lib
         key_paths = [Path(delivery['keyFile']), etc / 'pki/gateway.key']
         directories = {'manager': Path(config['managerKeys']), 'verifier': Path(config['verifierKeys']), 'breakGlass': etc / 'trust/break-glass'}
     elif role == 'peer':
-        certificates = {base / 'pki' / name for name in ('ca.pem', 'gateway.pem', 'manager.pem', 'relay.pem')}
+        # The actual relay fixture shares the Manager certificate/key.
+        certificates = {base / 'pki' / name for name in ('ca.pem', 'gateway.pem', 'manager.pem')}
         files = {base / 'config.json'} | certificates
         if config.get('lifecycleRevocations') is True:
             files.add(base / 'lifecycle-revocations.json')
-        key_paths = [base / 'manager.key', base / 'verifier.key'] + [base / 'pki' / name for name in ('ca.key','gateway.key','manager.key','relay.key')]
+        key_paths = [base / 'manager.key', base / 'verifier.key'] + [base / 'pki' / name for name in ('ca.key','gateway.key','manager.key')]
         directories = {name: base / name for name in ('manager', 'verifier')}
     else:
         raise ValueError('unknown disposable role')

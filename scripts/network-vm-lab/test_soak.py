@@ -178,6 +178,15 @@ class FrozenInputBoundaries(unittest.TestCase):
     def test_private_pem_never_produces_commitment(self):
         (self.root/'public.pem').write_text('-----BEGIN '+ 'PRIVATE KEY-----\ninvalid\n')
         with self.assertRaisesRegex(ValueError,'public PEM'):public_directory(self.root)
+    def test_peer_uses_real_shared_manager_relay_certificate_layout(self):
+        base=self.root/'peer';base.mkdir();(base/'pki').mkdir()
+        (base/'config.json').write_text('{}');(base/'lifecycle-revocations.json').write_text('{}')
+        for name in ['ca.pem','gateway.pem','manager.pem']:
+            (base/'pki'/name).write_text('-----BEGIN CERTIFICATE-----\npublic')
+        for role in ['manager','verifier']:
+            (base/role).mkdir();(base/role/'public.pem').write_text('-----BEGIN PUBLIC KEY-----\npublic')
+        result=frozen_inputs('peer',{'lifecycleRevocations':True},base=base)
+        self.assertEqual(set(result['files']),{str(base/'config.json'),str(base/'lifecycle-revocations.json')}|{str(base/'pki'/n)for n in ['ca.pem','gateway.pem','manager.pem']})
     def test_declared_private_inode_refused_before_open(self):
         path=self.root/'key';path.write_text('private');info=path.stat()
         with patch('soak_inputs.os.open',side_effect=AssertionError('private path opened')):
