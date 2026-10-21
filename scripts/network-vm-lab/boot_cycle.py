@@ -94,7 +94,10 @@ def main():
         code='import json,sys,hashlib;from pathlib import Path;v=json.load(sys.stdin);assert all(hashlib.sha256((Path(v["base"])/name).read_bytes()).hexdigest()==sha for name,sha in v["files"].items())'
         lab.ssh(role,'sudo','python3','-c',code,data=json.dumps({'base':base,'files':files}).encode())
 
-    report={'sourceCommit':commit,'imageSha256':lab.manifest['imageSha256'],'mode':args.mode,'passed':False,'before':lab.evidence(),'peerBootBefore':lab.boot('peer')}
+    report={'sourceCommit':commit,'imageSha256':lab.manifest['imageSha256'],'mode':args.mode,'transaction':args.transaction,'expected':args.expected,'passed':False,'before':lab.evidence(),'peerBootBefore':lab.boot('peer')}
+    target=report['before']['journal']['transactions'][args.transaction]
+    allowed={'confirmed'} if args.expected=='restored' else {'prepared','applying','awaiting-verification','awaiting-confirm','rolling-back','rollback-failed'}
+    if target['state'] not in allowed:raise ValueError('scenario pre-reboot transaction state mismatch')
     if args.output.exists():raise ValueError('existing evidence file refused')
     args.output.parent.mkdir(parents=True,exist_ok=True)
     started=time.monotonic();report['requestAt']=time.time()
@@ -119,6 +122,7 @@ def main():
         end=time.monotonic()+120
         while True:
             report['after']=lab.evidence()
+            if report['after']['bootId']!=boot:raise ValueError('unexpected additional gateway reboot')
             if recovery_complete(report['after']['journal'],args.transaction,boot,args.expected):break
             if time.monotonic()>=end:raise TimeoutError('Agent boot recovery not terminal')
             time.sleep(1)
@@ -127,7 +131,7 @@ def main():
         if args.require_confirmed_forwarding:
             lab.ssh('peer','sudo','/opt/node/bin/node','/source/scripts/network-vm-lab/verify.ts','observe',timeout=60)
             report['currentProbes']=json.loads(lab.ssh('peer','sudo','cat','/var/lib/heliopause-vm-lab/current-probes.json'))
-            if not fresh_packets(report['currentProbes'],boot,time.time()*1000):
+            if report['currentProbes'].get('transactionId')!=args.transaction or not fresh_packets(report['currentProbes'],boot,time.time()*1000):
                 raise ValueError('fresh independent connectivity failed')
         report['passed']=True
     except Exception as error:

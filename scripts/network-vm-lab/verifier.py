@@ -89,7 +89,7 @@ def main():
              'reverse':ping('p6-workload','198.51.100.6','198.51.100.2'),
              'management':ping(None,'192.0.2.1','192.0.2.2')}
     checks=evaluate(gateway,op,traffic)
-    result={'kind':'probe','observedAt':int(time.time()*1000),'checks':checks,'gateway':gateway,'traffic':traffic}
+    result={'kind':'probe','transactionId':a['transactionId'],'observedAt':int(time.time()*1000),'checks':checks,'gateway':gateway,'traffic':traffic}
     print(json.dumps(result),flush=True)
     if mode=='observe':return
     message=json.loads(sys.stdin.readline(180000))
