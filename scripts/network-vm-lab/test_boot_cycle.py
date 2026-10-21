@@ -1,7 +1,7 @@
 """Report acceptance must reject in-progress recovery and stale/empty packet evidence."""
 import copy
 import unittest
-from boot_cycle import recovery_complete, fresh_packets
+from boot_cycle import recovery_complete, fresh_packets, inactive_preserved
 
 class ReportAcceptance(unittest.TestCase):
     def test_restored_requires_terminal_matching_boot_without_other_debt(self):
@@ -19,6 +19,24 @@ class ReportAcceptance(unittest.TestCase):
         for state in ['confirmed','applying','rolling-back','rollback-failed']:
             self.assertFalse(recovery_complete({'transactions':{'tx':{'state':state}}},'tx','new','rolled-back'))
         self.assertTrue(recovery_complete({'transactions':{'tx':{'state':'rolled-back'}}},'tx','new','rolled-back'))
+    def test_negative_boot_requires_known_safe_degraded_or_preserved_inactive(self):
+        row={'state':'confirmed','bootRestore':{'bootId':'new','state':'degraded','recovery':'not-started'}}
+        journal={'transactions':{'tx':row}}
+        self.assertTrue(recovery_complete(journal,'tx','new','degraded-unchanged'))
+        row['bootRestore']['recovery']='rollback-failed'
+        self.assertFalse(recovery_complete(journal,'tx','new','degraded-unchanged'))
+        row['bootRestore']={'bootId':'old','state':'restored'}
+        self.assertTrue(recovery_complete(journal,'tx','new','inactive'))
+        self.assertFalse(recovery_complete(journal,'tx','new','unsupported'))
+    def test_negative_boot_preserves_exact_profile_and_no_kernel_objects(self):
+        before={'journal':{'transactions':{'tx':{'authorization':{'operation':{'profileUuid':'id','interfaceName':'hp-owned'}}}}},'profiles':[{'uuid':'id','sha256':'foreign'}]}
+        after={'profiles':copy.deepcopy(before['profiles']),'links':[],'routes':[]}
+        self.assertTrue(inactive_preserved(before,after,'tx'))
+        after['links']=[{'ifname':'hp-owned'}]
+        self.assertFalse(inactive_preserved(before,after,'tx'))
+        after['links']=[];after['profiles'][0]['sha256']='changed'
+        self.assertFalse(inactive_preserved(before,after,'tx'))
+
     def test_packets_require_exact_checks_current_boot_and_fresh_time(self):
         probe={'checks':{key:True for key in ['interface','address','route','fib','handshake','protected','management','forward','reverse']},'gateway':{'bootId':'new'},'observedAt':1000}
         self.assertTrue(fresh_packets(probe,'new',2000))

@@ -108,8 +108,22 @@ print(json.dumps({'at':time.time(),'bootId':pathlib.Path('/proc/sys/kernel/rando
 
 def recovery_complete(journal, transaction, boot, expected):
     target=journal['transactions'][transaction];restore=target.get('bootRestore',{})
-    complete=(target['state']=='confirmed' and restore.get('bootId')==boot and restore.get('state')=='restored') if expected=='restored' else target['state']=='rolled-back'
-    return complete and not any(row['state'] not in {'confirmed','rolled-back','cancelled-before-accept'} or row.get('bootRestore',{}).get('state')=='attempting' or row.get('bootRestore',{}).get('recovery')=='rollback-failed' for row in journal['transactions'].values())
+    if expected=='restored':
+        complete=target['state']=='confirmed' and restore.get('bootId')==boot and restore.get('state')=='restored'
+    elif expected=='rolled-back':complete=target['state']=='rolled-back'
+    elif expected=='degraded-unchanged':
+        complete=target['state']=='confirmed' and restore.get('bootId')==boot and restore.get('state')=='degraded' and restore.get('recovery') in {'not-started','rolled-back'}
+    elif expected=='rollback-failed':complete=target['state']=='rollback-failed'
+    elif expected=='inactive':complete=target['state']=='confirmed' and restore.get('bootId')!=boot
+    else:return False
+    return complete and not any((row['state'] not in {'confirmed','rolled-back','cancelled-before-accept'} or row.get('bootRestore',{}).get('state')=='attempting' or row.get('bootRestore',{}).get('recovery')=='rollback-failed') and not (identity==transaction and expected=='rollback-failed') for identity,row in journal['transactions'].items())
+
+
+def inactive_preserved(before, after, transaction):
+    op=before['journal']['transactions'][transaction]['authorization']['operation'];dev=op['interfaceName']
+    original=next(row for row in before['profiles'] if row['uuid']==op['profileUuid'])
+    current=next(row for row in after['profiles'] if row['uuid']==op['profileUuid'])
+    return original==current and not any(row['ifname']==dev for row in after['links']) and not any(row.get('dev')==dev for row in after['routes'])
 
 
 def fresh_packets(probe, boot, now):
@@ -118,7 +132,7 @@ def fresh_packets(probe, boot, now):
 
 
 def main():
-    parser=argparse.ArgumentParser();parser.add_argument('--root',type=Path,required=True);parser.add_argument('--mode',choices=['graceful','power-cut'],required=True);parser.add_argument('--output',type=Path,required=True);parser.add_argument('--require-confirmed-forwarding',action='store_true');parser.add_argument('--transaction',required=True);parser.add_argument('--expected',choices=['restored','rolled-back'],required=True);args=parser.parse_args()
+    parser=argparse.ArgumentParser();parser.add_argument('--root',type=Path,required=True);parser.add_argument('--mode',choices=['graceful','power-cut'],required=True);parser.add_argument('--output',type=Path,required=True);parser.add_argument('--require-confirmed-forwarding',action='store_true');parser.add_argument('--transaction',required=True);parser.add_argument('--expected',choices=['restored','rolled-back','degraded-unchanged','rollback-failed','inactive'],required=True);args=parser.parse_args()
     source=Path(__file__).resolve().parents[2]
     if run(['git','-C',str(source),'status','--porcelain']).strip():raise ValueError('clean committed source required for final boot evidence')
     commit=run(['git','-C',str(source),'rev-parse','HEAD']).decode().strip()
@@ -134,7 +148,7 @@ def main():
 
     report={'sourceCommit':commit,'imageSha256':lab.manifest['imageSha256'],'mode':args.mode,'transaction':args.transaction,'expected':args.expected,'passed':False,'before':lab.evidence(),'peerBootBefore':lab.boot('peer'),'managerBefore':lab.manager_evidence()}
     target=report['before']['journal']['transactions'][args.transaction]
-    allowed={'confirmed'} if args.expected=='restored' else {'prepared','applying','awaiting-verification','awaiting-confirm','rolling-back','rollback-failed'}
+    allowed={'confirmed'} if args.expected in {'restored','degraded-unchanged','inactive'} else {'prepared','applying','awaiting-verification','awaiting-confirm','rolling-back','rollback-failed'}
     if target['state'] not in allowed:raise ValueError('scenario pre-reboot transaction state mismatch')
     if args.output.exists():raise ValueError('existing evidence file refused')
     args.output.parent.mkdir(parents=True,exist_ok=True)
@@ -163,9 +177,14 @@ def main():
         while True:
             report['after']=lab.evidence()
             if report['after']['bootId']!=boot:raise ValueError('unexpected additional gateway reboot')
-            if recovery_complete(report['after']['journal'],args.transaction,boot,args.expected):break
+            complete=recovery_complete(report['after']['journal'],args.transaction,boot,args.expected)
+            if args.expected=='rollback-failed':
+                status=report['after'].get('lifecycle') or {}
+                complete=complete and status.get('agentPid') and 0<=report['after']['at']-status.get('reportedAt',0)<=10
+            if complete:break
             if time.monotonic()>=end:raise TimeoutError('Agent boot recovery not terminal')
             time.sleep(1)
+        if args.expected in {'degraded-unchanged','rollback-failed','inactive'} and not inactive_preserved(report['before'],report['after'],args.transaction):raise ValueError('negative-case profile/kernel preservation failed')
         report['peerBootAfter']=lab.boot('peer')
         if report['peerBootBefore']!=report['peerBootAfter']:raise ValueError('independent peer rebooted')
         if args.require_confirmed_forwarding:
@@ -193,6 +212,7 @@ def main():
             report['packetTimeline']=lab.monitor_stop(monitor_id,monitor_unit)
             report['managerAfter']=lab.manager_evidence()
             if not report['packetTimeline'] or any(row['peerBootId']!=report['peerBootBefore'] for row in report['packetTimeline']):raise ValueError('independent timeline unavailable')
+            if args.expected in {'degraded-unchanged','rollback-failed','inactive'} and not all(row['management'] is True and row['forward'] is False and row['reverse'] is False for row in report['packetTimeline'][-3:]):raise ValueError('negative-case independent packet result mismatch')
         except Exception:
             report['passed']=False;report['monitorError']='independent-monitor-unavailable'
         fd=os.open(args.output,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
