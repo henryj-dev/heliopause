@@ -1,3 +1,5 @@
+import { journalRows } from './network-journal-rows.ts';
+import { NETWORK_CANCEL_DOMAIN } from './network-execution-cancellation.ts';
 import { validateJournalEvidence, type JournalEvidenceManifest } from './network-journal-evidence.ts';
 /** Explicit scope A only: replace a quiescent single-target replay epoch after verified archival.
  * No confirmed ownership transfer, partial pruning, unlock, or implicit certificate rebinding.
@@ -22,7 +24,7 @@ export interface JournalArchive {
   rawFiles:Record<'manager'|'agent'|'identity'|'outbox'|'acknowledgments'|'trust'|'config'|'evidence',string>;
   manager:NetworkRegistryDocument;
   agent:{schemaVersion:2;journalId:string;acceptedSequence:number;terminalSequence:number;lastClock:number;transactions:Record<string,any>};
-  identity:{journalId:string};outbox:any[];acknowledgments:Record<string,true>;
+  identity:{journalId:string;capacityCancellation?:any};outbox:any[];acknowledgments:Record<string,true>;
   /** Audit-only public keys never installed into execution trust by a transition. */
   trust:{manager:Record<string,string>;verifier:Record<string,string>};
   evidence:JournalEvidenceManifest;
@@ -66,8 +68,9 @@ export function validateQuiescentArchive(archive:JournalArchive,target:NetworkTa
   }
   need(!auditKeys.manager.some(m=>auditKeys.verifier.some(v=>artifactSigningKeyId(m)===artifactSigningKeyId(v))),'audit trust classes must remain distinct');
   const a=archive.agent,m=archive.manager.execution;
-  validateJournalEvidence(archive.evidence,a.transactions);
-  need(exact(a,'schemaVersion journalId acceptedSequence terminalSequence lastClock transactions')&&a.schemaVersion===2&&id(a.journalId)&&equal(archive.identity,{journalId:a.journalId}),'invalid Agent archive identity');
+  const rows=journalRows(a,archive.identity),reserved=Object.hasOwn(archive.identity,'capacityCancellation')?1:0;
+  validateJournalEvidence(archive.evidence,rows);
+  need(exact(a,'schemaVersion journalId acceptedSequence terminalSequence lastClock transactions')&&a.schemaVersion===2&&id(a.journalId),'invalid Agent archive identity');
   need(archive.config.journalId===a.journalId&&equal(archive.config.identity,target),'archived configuration binding mismatch');
   const config=archive.config,fields='enabled identity journalId managerKeys verifierKeys secrets protectedAddresses'+('terminalDelivery' in config?' terminalDelivery':'');
   need(exact(config,fields)&&typeof config.enabled==='boolean','unsupported archived configuration');
@@ -80,15 +83,16 @@ export function validateQuiescentArchive(archive:JournalArchive,target:NetworkTa
   need(m&&archive.manager.schemaVersion===2,'Manager execution archive required');validateExecutionState(m);
   need(m.fence===null&&m.records.every(r=>r.state==='settled'&&r.journalId===a.journalId&&equal(r.target,target)),'single-target settled Manager required');
   need(a.transactions&&typeof a.transactions==='object'&&!Array.isArray(a.transactions)&&Object.keys(a.transactions).length<=1024&&a.acceptedSequence===Object.keys(a.transactions).length,'invalid Agent replay archive');
-  need(Array.isArray(archive.outbox)&&archive.outbox.length===m.records.length&&Object.keys(a.transactions).length===m.records.length,'archive record sets differ');
+  need(Array.isArray(archive.outbox)&&archive.outbox.length===m.records.length&&Object.keys(rows).length===m.records.length,'archive record sets differ');
   need(archive.acknowledgments&&typeof archive.acknowledgments==='object'&&!Array.isArray(archive.acknowledgments)&&Object.keys(archive.acknowledgments).length===archive.outbox.length&&Object.entries(archive.acknowledgments).every(([k,v])=>hash(k)&&v===true),'exact terminal acknowledgments required');
   const outbox=new Map(archive.outbox.map(r=>[r.transactionId,r]));need(outbox.size===archive.outbox.length,'duplicate outbox identity');
   const sequences=new Set<number>();
   for(const record of m.records) {
-    const row=a.transactions[record.transactionId],result=record.result;
+    const row=rows[record.transactionId],result=record.result;
     need(row&&['rolled-back','cancelled-before-accept'].includes(row.state)&&result&&result.state===row.state,'confirmed or nonterminal resources forbid scope A');
     need(!row.bootRestore&&!Object.hasOwn(row,'before')&&!Object.hasOwn(row,'paths'),'recovery/diagnostic debt requires reconciliation');
     const signed=verifyJournalMessage(record.authorization,NETWORK_EXECUTION_DOMAIN,auditKeys.manager);
+    if(record.cancellation){const cancelled=verifyJournalMessage(record.cancellation,NETWORK_CANCEL_DOMAIN,auditKeys.manager);need(equal(row.cancellation??null,cancelled)||!!row.cancellationResponse,'cancellation archive mismatch');}
     if(record.confirmation){const confirm=verifyJournalMessage(record.confirmation,NETWORK_CONFIRM_DOMAIN,auditKeys.manager);verifyJournalMessage(confirm.verification,NETWORK_VERIFY_DOMAIN,auditKeys.verifier);}
     need(equal(row.authorization,signed)&&record.authorizationHash===networkDigest(row.authorization),'authorization archive mismatch');
     need(equal(row.cancellationResponse??null,record.cancellationResponse??null),'accepted cancellation response archive mismatch');
@@ -98,9 +102,9 @@ export function validateQuiescentArchive(archive:JournalArchive,target:NetworkTa
     const {stateHash,...committed}=result;need(stateHash===networkDigest(committed),'terminal state commitment mismatch');
     need(Number.isSafeInteger(result.sequence)&&result.sequence>=1&&!sequences.has(result.sequence),'terminal sequence mismatch');sequences.add(result.sequence);
     if(result.state==='rolled-back')need(exact(result.proof,'removalVerified')&&'removalVerified' in result.proof&&result.proof.removalVerified===true,'removal proof required');
-    else need(exact(result.proof,'cancellationHash acceptancePrevented')&&'acceptancePrevented' in result.proof&&result.proof.acceptancePrevented===true,'never-accepted proof required');
+    else need(exact(result.proof,result.schemaVersion===3?'cancellationHash acceptancePrevented maintenanceRequired':'cancellationHash acceptancePrevented')&&'acceptancePrevented' in result.proof&&result.proof.acceptancePrevented===true,'never-accepted proof required');
   }
-  need(a.terminalSequence===m.records.length&&[...sequences].every(seq=>seq<=a.terminalSequence),'terminal ledger continuity required');
+  need(a.terminalSequence+reserved===m.records.length&&[...sequences].every(seq=>seq<=a.terminalSequence+reserved),'terminal ledger continuity required');
   need(!m.journalEpoch||(m.journalEpoch.journalId===a.journalId&&equal(m.journalEpoch.target,target)&&m.journalEpoch.transitions.length<JOURNAL_TRANSITION_LIMIT),'epoch transition capacity or identity refusal');
 }
 
@@ -153,13 +157,13 @@ export function commitManagerJournalTransition(store:NetworkRegistryStore,archiv
     validateQuiescentArchive({...archive,manager:doc},t.target);
     const receipt=signNetworkMessage(JOURNAL_TRANSITION_RECEIPT_DOMAIN,{schemaVersion:1,transitionHash:networkDigest(t),oldJournalId:t.oldJournalId,newJournalId:t.newJournalId,target:t.target,archiveHash:t.archiveHash,evidenceHash:t.evidenceHash,committedAt:now},key);
     state.journalEpoch={journalId:t.newJournalId,target:t.target,transitions:[...(state.journalEpoch?.transitions??[]),{oldJournalId:t.oldJournalId,newJournalId:t.newJournalId,transitionHash:networkDigest(t),archiveHash:t.archiveHash,evidenceHash:t.evidenceHash,authorization:envelope,receipt}]};
-    state.records=[];state.nextSequence=1;state.fence=null;
+    state.records=[];state.nextSequence=1;state.fence=null;state.schemaVersion=1;delete state.capacityHold;
     return receipt;
   });
 }
 
 /** A restart cannot silently keep authenticating the retired journal binding. */
 export function assertJournalEpochBinding(store:NetworkRegistryStore,targets:readonly (NetworkTarget&{journalId:string})[]):void {
-  const epoch=store.executionStatus().journalEpoch;if(!epoch)return;
+  const state=store.executionStatus(),epoch=state.journalEpoch??state.capacityHold;if(!epoch)return;
   need(targets.length===1&&targets[0]!.journalId===epoch.journalId&&equal({source:targets[0]!.source,host:targets[0]!.host,nodeId:targets[0]!.nodeId},epoch.target),'Manager configured journal binding is retired or ambiguous');
 }

@@ -36,6 +36,7 @@ def assess(sample, initial, expected_modules, expected_tx):
         raise ValueError('trust or semantic journal drift')
     for name in ['journal-identity.json','terminal-results.json','terminal-acks.json']:
         if gateway['files'][name].get('missing') or gateway['files'][name]!=initial['gateway']['files'][name]:raise ValueError('identity/outbox/ack drift')
+    if gateway.get('maintenanceRequired') or peer['ledger'].get('capacityHold'):raise ValueError('capacity maintenance excludes stability baseline')
     if peer['ledger']['fence'] is not None:raise ValueError('unsettled Manager fence')
     if gateway['bootId']!=initial['gateway']['bootId'] or peer['bootId']!=initial['peer']['bootId']:
         raise ValueError('unexpected reboot during baseline')

@@ -61,6 +61,10 @@ checks are separate from actual VM/storage-pressure qualification and independen
 Scope B (confirmed ownership/restoration carried across identity) remains unsupported. Never
 empty the journal because terminal delivery is done: confirmed ownership still depends on it.
 Manager256/Agent1024 and byte limits are finite; reserve workload budget before admission.
+Normal Agent admission stops at 1023 primary records; one bounded, resource-free
+never-accepted cancellation can use the last replay identity and persist a Manager
+issuance hold. See [the paired-rollout capacity-stop contract](network-journal-maintenance.md#capacity-stop-reservation-paired-rollout-required).
+Confirmed resources or recovery debt forbid that emergency reservation and scope-A retirement.
 No pruning, force-unlock or blind identity reuse is allowed.
 
 ## 24-hour baseline procedure

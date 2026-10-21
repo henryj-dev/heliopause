@@ -121,3 +121,37 @@ test('Manager restart preserves the exact full transition authority and receipt 
  assert.deepEqual(commitManagerJournalTransition(restarted,f.archive,saved.authorization,[f.keys.publicKey],f.keys.privateKey,f.archiveDirectory,f.now+3600001),receipt);
  }finally{f.cleanup();}
 });
+
+function capacityArchive() {
+  const f=fixture(),tx='b'.repeat(32),row=f.archive.agent.transactions[tx],a=row.authorization;
+  const cancellation={schemaVersion:1,transactionId:tx,fenceId:tx,target:a.target,journalId:a.journalId,authorizationHash:networkDigest(a),artifactHash:a.artifactHash,registryRevision:a.registryRevision,requestedAt:f.now,requestedBy:'alice',authorization:f.archive.manager.execution!.records[0]!.authorization};
+  const signedCancel=signNetworkMessage('heliopause-network-cancel-v1',cancellation,f.keys.privateKey);
+  const body={...row.terminalResult,schemaVersion:3,domain:'heliopause-network-capacity-stop-mtls-v1',state:'cancelled-before-accept',proof:{cancellationHash:networkDigest(cancellation),acceptancePrevented:true,maintenanceRequired:true}};delete body.stateHash;
+  const result={...body,stateHash:networkDigest(body)},resultHash=networkDigest(result);
+  f.store.executionTransaction(state=>{const record=state.records[0]!;record.cancellation=signedCancel;record.cancelStatus='settled';record.result=result;record.resultHash=resultHash;state.schemaVersion=2;state.capacityHold={target:f.target,journalId:f.journal,transactionId:tx,authorizationHash:networkDigest(a),resultHash};});
+  f.archive.manager=f.store.read();f.archive.agent.transactions={};f.archive.agent.acceptedSequence=f.archive.agent.terminalSequence=0;
+  f.archive.identity.capacityCancellation={authorization:a,cancellation,state:'cancelled-before-accept',history:[{state:'cancelled-before-accept',at:f.now}],authorizationHash:networkDigest(a),terminalResult:result};
+  f.archive.outbox=[result];f.archive.acknowledgments={[resultHash]:true};f.sync();
+  const attachments=Object.fromEntries(Object.keys(f.archive.evidence.files).map(name=>[name,readFileSync(join(f.archiveDirectory,'evidence',name))]));
+  rmSync(f.archiveDirectory,{recursive:true});createJournalArchive(f.archiveDirectory,Object.fromEntries(Object.entries(f.archive.rawFiles).map(([k,v])=>[k,Buffer.from(v,'base64url')])) as any,attachments);
+  return f;
+}
+test('verified full archive retires capacity reservation and hold together without pruning original identity',()=>{
+  const f=capacityArchive();try {
+    validateQuiescentArchive(f.archive,f.target);const oldIdentity=structuredClone(f.archive.identity),authority=f.issue();
+    commitManagerJournalTransition(f.store,f.archive,authority,[f.keys.publicKey],f.keys.privateKey,f.archiveDirectory,f.now);
+    const state=f.store.executionStatus();assert.equal(state.schemaVersion,1);assert.equal(state.capacityHold,undefined);assert.equal(state.records.length,0);
+    assert.deepEqual(f.archive.identity,oldIdentity);assert.equal(f.archive.agent.terminalSequence,0);assert.equal(f.archive.outbox.length,1);
+    assert.equal(state.journalEpoch!.transitions[0]!.oldJournalId,f.journal);
+  }finally{f.cleanup();}
+});
+for(const damage of ['missing-identity','bad-sequence','wrong-cancel','missing-ack','missing-evidence'] as const)test('capacity archive refuses '+damage,()=>{
+  const f=capacityArchive();try {
+    if(damage==='missing-identity')delete f.archive.identity.capacityCancellation;
+    else if(damage==='bad-sequence')f.archive.identity.capacityCancellation.terminalResult.sequence=1+f.archive.agent.terminalSequence+1;
+    else if(damage==='wrong-cancel')f.archive.identity.capacityCancellation.cancellation.authorizationHash='0'.repeat(64);
+    else if(damage==='missing-ack')f.archive.acknowledgments={};
+    else f.archive.evidence.runs=[];
+    f.sync();assert.throws(()=>validateQuiescentArchive(f.archive,f.target));
+  }finally{f.cleanup();}
+});
