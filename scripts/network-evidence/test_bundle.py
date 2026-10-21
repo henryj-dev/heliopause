@@ -27,7 +27,7 @@ def fixture():
         v = {'sourceCommit':SOURCE,'imageSha256':IMAGE,'mode':'graceful' if i<13 else 'power-cut',
              'transaction':tx,'expected':'restored','passed':True,'before':{'bootId':previous,'journal':copy.deepcopy(journal)},
              'after':{'bootId':boot,'journal':journal},'peerBootBefore':'peer','peerBootAfter':'peer',
-             'managerBefore':{'nextSequence':2,'records':[{}]},'managerAfter':{'nextSequence':2,'records':[{}]},
+             'managerBefore':{'nextSequence':2,'records':[{'transactionId':'a'*32,'authorizationHash':'c'*64}]},'managerAfter':{'nextSequence':2,'records':[{'transactionId':'a'*32,'authorizationHash':'c'*64}]},
              'requestAt':at,'requestPeerAt':at,'recoveredPeerAt':at+2,'packetTimeline':timeline,
              'monitorStopped':{'at':at+4,'bootId':'peer'},'currentProbes':{'transactionId':tx,'gateway':{'bootId':boot},
              'observedAt':(at+3)*1000,'checks':{k:True for k in ['interface','address','route','fib','handshake','protected','management','forward','reverse']}}}
@@ -36,10 +36,10 @@ def fixture():
                       'afterBootId':boot,'peerBootId':'peer','samples':5})
         previous=boot
     for i in range(10):
-        result={'state':'rolled-back'};stamp=b.sha(b.canonical(result))
+        auth={'target':{'source':'lab','host':'gw','nodeId':'node'},'artifactHash':'d'*64};authhash=b.sha(b.canonical(auth));result={'state':'rolled-back','target':auth['target'],'authorizationHash':authhash,'artifactHash':auth['artifactHash'],'transactionId':'tx'};stamp=b.sha(b.canonical(result))
         docs[f'/synthetic/{i}-settled.json']={'sourceCommit':SOURCE,'passed':True,'acknowledgedResultHash':stamp,
-            'evidence':{'journal':{'journalId':'b'*32,'transactions':{'tx':{'terminalResult':result}}},'acknowledgements':{stamp:True}},
-            'manager':{'fence':None,'records':[{'state':'settled','journalId':'b'*32,'transactionId':'tx','result':result,'resultHash':stamp}]}}
+            'evidence':{'journal':{'journalId':'b'*32,'transactions':{'tx':{'terminalResult':result,'authorization':auth}}},'acknowledgements':{stamp:True}},
+            'manager':{'fence':None,'records':[{'state':'settled','journalId':'b'*32,'transactionId':'tx','result':result,'resultHash':stamp,'target':auth['target'],'authorizationHash':authhash,'artifactHash':auth['artifactHash']}]}}
     groups=[{'id':name,'passed':True,'evidence':[]} for name in sorted(b.GROUPS)]
     for i,(p,v) in enumerate(docs.items()):groups[i%13]['evidence'].append({'path':p,'sha256':b.sha(b.canonical(v))})
     report={'kind':'rocky10-persistent-actual-vm-acceptance','sourceCommit':SOURCE,'imageSha256':IMAGE,
@@ -75,6 +75,13 @@ class EvidenceTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'hash mismatch'):b.check_bundle(dest,stamp,SOURCE,IMAGE,root)
             target.write_bytes(original);target.unlink()
             with self.assertRaises(FileNotFoundError):b.check_bundle(dest,stamp,SOURCE,IMAGE,root)
+    def test_archive_permissions_rechecked(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(b,'source_commitments',return_value={}):
+            root=Path(tmp);path,lab,dest,stamp=self.archive(root);b.preserve(path,lab,dest,stamp,SOURCE,IMAGE,root)
+            (dest/'report.json').chmod(0o644)
+            with self.assertRaisesRegex(ValueError,'0600'):b.check_bundle(dest,stamp,SOURCE,IMAGE,root)
+            (dest/'report.json').chmod(0o600);dest.chmod(0o755)
+            with self.assertRaisesRegex(ValueError,'0700'):b.check_bundle(dest,stamp,SOURCE,IMAGE,root)
     def test_archive_wrong_anchor_and_source(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(b,'source_commitments',return_value={}):
             root=Path(tmp);path,lab,dest,stamp=self.archive(root)
@@ -110,6 +117,15 @@ class EvidenceTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'duplicate'):b.check_bundle(dest,stamp,SOURCE,IMAGE,root)
 
     def test_synthetic_complete(self):self.assertEqual(len(self.check()),25)
+    def test_parent_traversal_reference_rejected(self):
+        self.report['groups'][0]['evidence'][0]['path']='/synthetic/../outside.json'
+        with self.assertRaisesRegex(ValueError,'parent traversal'):b.references(self.report)
+    def test_manager_record_substitution_rejected(self):
+        next(iter(self.docs.values()))['managerAfter']['records'][0]['transactionId']='other'
+        with self.assertRaisesRegex(ValueError,'issuance changed'):self.check()
+    def test_settlement_target_substitution_rejected(self):
+        self.docs['/synthetic/0-settled.json']['manager']['records'][0]['target']={'host':'other'}
+        with self.assertRaisesRegex(ValueError,'terminal result'):self.check()
     def test_missing_group(self):
         self.report['groups'].pop()
         with self.assertRaisesRegex(ValueError,'group'):self.check()

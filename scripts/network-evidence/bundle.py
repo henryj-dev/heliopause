@@ -61,7 +61,7 @@ def canonical(v):
     return json.dumps(v, sort_keys=True, separators=(',', ':'), ensure_ascii=False, allow_nan=False).encode()
 
 
-def safe_read(path, maximum=LIMIT):
+def safe_read(path, maximum=LIMIT, private=False):
     # Walk every ancestor with nofollow dirfds; do not resolve away a symlink.
     path = Path(os.path.abspath(path))
     fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
@@ -73,6 +73,8 @@ def safe_read(path, maximum=LIMIT):
         file = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
         try:
             info = os.fstat(file)
+            if private:
+                require(info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o600, 'private owned 0600 archive file required')
             require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_size <= maximum,
                     'bounded single-link regular evidence file required')
             with os.fdopen(os.dup(file), 'rb') as stream:
@@ -117,6 +119,7 @@ def references(report):
     result = {}
     for e in entries:
         require(set(e) == {'path','sha256'} and HEX.fullmatch(e['sha256']) and Path(e['path']).is_absolute(), 'invalid reference')
+        require('..' not in Path(e['path']).parts, 'parent traversal reference refused')
         require(Path(e['path']).suffix in {'.json','.py'}, 'unsupported evidence type')
         require(e['path'] not in result or result[e['path']] == e['sha256'], 'conflicting reference')
         result[e['path']] = e['sha256']
@@ -159,7 +162,8 @@ def validate(report, documents, source, image):
         require(old['journalId'] == new['journalId'] and old['acceptedSequence'] == new['acceptedSequence'], 'replay identity changed')
         require(old['transactions'][tx]['authorization']['operation']['driver'] == report['backend'], 'wrong operation driver')
         require(v['managerBefore']['nextSequence'] == v['managerAfter']['nextSequence'] and
-                len(v['managerBefore']['records']) == len(v['managerAfter']['records']), 'Manager issuance changed during boot')
+                [(r['transactionId'],r['authorizationHash']) for r in v['managerBefore']['records']] ==
+                [(r['transactionId'],r['authorizationHash']) for r in v['managerAfter']['records']], 'Manager issuance changed during boot')
         require(new['terminalSequence'] == old['terminalSequence'] + (1 if v['expected'] == 'rolled-back' else 0), 'terminal sequence mismatch')
         require(recovery_complete(new,tx,after['bootId'],v['expected']), 'recovery state mismatch')
         require(timeline_valid(v['packetTimeline'],v['peerBootBefore'],v['requestPeerAt'],v['recoveredPeerAt'],v['monitorStopped']), 'packet timeline incomplete')
@@ -186,7 +190,11 @@ def validate(report, documents, source, image):
         require(len(records) == 1 and records[0]['state'] == 'settled', 'exact Manager settlement missing')
         record = records[0];row = journal['transactions'][record['transactionId']]
         require(row['terminalResult'] == record['result'] and sha(canonical(record['result'])) == stamp and
-                record['journalId'] == journal['journalId'], 'terminal result/identity mismatch')
+                record['journalId'] == journal['journalId'] and
+                record['target'] == row['authorization']['target'] == record['result']['target'] and
+                record['authorizationHash'] == sha(canonical(row['authorization'])) == record['result']['authorizationHash'] and
+                record['artifactHash'] == row['authorization']['artifactHash'] == record['result']['artifactHash'] and
+                record['result']['transactionId'] == record['transactionId'], 'terminal result/identity mismatch')
     ordered = sorted(boots.values(),key=lambda v:v['requestAt'])
     for previous,current in zip(ordered,ordered[1:]):
         if previous['after']['journal']['journalId'] == current['before']['journal']['journalId']:
@@ -298,12 +306,14 @@ def preserve(report_path, root, output, expected_sha, source, image, repo):
 
 
 def check_bundle(directory, expected_sha, source, image, repo):
-    raw = safe_read(Path(directory)/'manifest.json')
+    info = Path(directory).lstat()
+    require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o700, 'private owned 0700 archive directory required')
+    raw = safe_read(Path(directory)/'manifest.json',private=True)
     manifest = parse(raw)
     require(manifest['schema'] == SCHEMA and manifest['runIdentity'] == expected_sha and
             manifest['reportSha256'] == expected_sha and manifest['sourceCommit'] == source and manifest['imageSha256'] == image, 'manifest anchor mismatch')
     require(manifest['sourceModules'] == source_commitments(repo,source), 'source module commitment mismatch')
-    report_raw = safe_read(Path(directory)/'report.json')
+    report_raw = safe_read(Path(directory)/'report.json',private=True)
     require(sha(report_raw) == expected_sha, 'report tampered')
     report = parse(report_raw);refs = references(report);documents = {};seen = set();total = len(report_raw)
     require(len(manifest['files']) == len(refs), 'missing/extra archived references')
@@ -312,7 +322,7 @@ def check_bundle(directory, expected_sha, source, image, repo):
         require(e['originalPath'] in refs and e['originalPath'] not in seen and
                 re.fullmatch(r'[0-9]{3}\.(json|py)',e['file']) and e['file'] not in names, 'duplicate/path-unsafe archive entry')
         seen.add(e['originalPath']);names.add(e['file'])
-        data = safe_read(Path(directory)/e['file']);total += len(data)
+        data = safe_read(Path(directory)/e['file'],private=True);total += len(data)
         require(total <= TOTAL and e['bytes'] == len(data) and e['transformation'] == 'none' and
                 sha(data) == e['archiveSha256'] == e['originalSha256'] == refs[e['originalPath']], 'archive file hash mismatch')
         secret_check(data,e['file'].endswith('.json'))
