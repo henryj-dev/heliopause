@@ -13,7 +13,8 @@ const manager=await startManager({hostname:'192.0.2.1',port:8443,relays:[],
   networkRegistryFile:join(dir,'registry.json'),networkObservationsDir:join(dir,'observations'),
   networkExecutionTargets:[{...cfg.identity,journalId:cfg.journalId,certificateSha256:createHash('sha256').update(new X509Certificate(readFileSync(join(pki,'gateway.pem'))).raw).digest('hex')}],
   artifactSigning:{privateKey:createPrivateKey(readFileSync(join(dir,'manager.key')))},
-  networkVerifierKeys:[createPublicKey(readFileSync(join(dir,'verifier/public.pem')))],log:()=>{}});
+  // Explicit finite-overlap exercise; fixed public paths, missing next key fails closed.
+  networkVerifierKeys:[createPublicKey(readFileSync(join(dir,'verifier/public.pem'))),...(cfg.lifecycleVerifierOverlap===true?[createPublicKey(readFileSync(join(dir,'verifier/next.pem')))]:[])],log:()=>{}});
 manager.server.prependListener('request',(req,res)=>{
   const marker=req.url==='/api/network/execution/cancel'?'drop-cancel-response':'drop-terminal-response';
   if(['/api/network/execution/terminal','/api/network/execution/cancel'].includes(req.url??'')&&existsSync(join(dir,marker))) {
