@@ -473,4 +473,23 @@ for index,entry in enumerate(CONTRACT['rawCommittedNumberCases']):
     setattr(Transition,'test_shared_committed_integer_token_'+str(index),raw_committed_contract_test(entry))
 
 
+class ArchiveUtf8Decoding(unittest.TestCase):
+    """Decoder-specific outcomes, not schema equivalence. No files/sockets/processes."""
+
+
+def utf8_archive_contract_test(entry):
+    def run(self):
+        raw=bytes.fromhex(entry['hex'])
+        if entry['agentDecoderAccepted']:
+            self.assertEqual(n.decode_json(raw),entry['expected'])
+        else:
+            with self.assertRaises(UnicodeDecodeError):
+                n.decode_json(raw)
+    return run
+
+
+for index,entry in enumerate(CONTRACT['rawUtf8ArchiveCases']):
+    setattr(ArchiveUtf8Decoding,'test_shared_utf8_archive_'+str(index),utf8_archive_contract_test(entry))
+
+
 if __name__=='__main__':unittest.main()

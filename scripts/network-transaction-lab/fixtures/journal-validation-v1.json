@@ -725,5 +725,76 @@
       "encoding": "exponent",
       "accepted": false
     }
+  ],
+  "rawUtf8ArchiveCases": [
+    {
+      "name": "real replacement character",
+      "hex": "7b22646961676e6f73746963223a22efbfbd227d",
+      "expected": {
+        "diagnostic": "\ufffd"
+      },
+      "managerArchiveParserAccepted": true,
+      "agentDecoderAccepted": true
+    },
+    {
+      "name": "multibyte Unicode",
+      "hex": "7b22646961676e6f73746963223a22ed959ceab88020f09f9a80227d",
+      "expected": {
+        "diagnostic": "\ud55c\uae00 \ud83d\ude80"
+      },
+      "managerArchiveParserAccepted": true,
+      "agentDecoderAccepted": true
+    },
+    {
+      "name": "stray byte",
+      "hex": "7b22646961676e6f73746963223a22ff227d",
+      "managerArchiveParserAccepted": false,
+      "agentDecoderAccepted": false
+    },
+    {
+      "name": "truncated sequence",
+      "hex": "7b22646961676e6f73746963223a22e282227d",
+      "managerArchiveParserAccepted": false,
+      "agentDecoderAccepted": false
+    },
+    {
+      "name": "overlong sequence",
+      "hex": "7b22646961676e6f73746963223a22c0af227d",
+      "managerArchiveParserAccepted": false,
+      "agentDecoderAccepted": false
+    },
+    {
+      "name": "encoded surrogate",
+      "hex": "7b22646961676e6f73746963223a22eda080227d",
+      "managerArchiveParserAccepted": false,
+      "agentDecoderAccepted": true,
+      "expected": {
+        "diagnostic": "\ud800"
+      }
+    },
+    {
+      "name": "above Unicode maximum",
+      "hex": "7b22646961676e6f73746963223a22f4908080227d",
+      "managerArchiveParserAccepted": false,
+      "agentDecoderAccepted": false
+    },
+    {
+      "name": "utf-16 with BOM",
+      "hex": "fffe7b00220064006900610067006e006f00730074006900630022003a00200022006c0065006700610063007900200065006e0063006f00640069006e0067002000660069007800740075007200650022007d00",
+      "managerArchiveParserAccepted": false,
+      "agentDecoderAccepted": true,
+      "expected": {
+        "diagnostic": "legacy encoding fixture"
+      }
+    },
+    {
+      "name": "utf-32 with BOM",
+      "hex": "fffe00007b00000022000000640000006900000061000000670000006e0000006f00000073000000740000006900000063000000220000003a00000020000000220000006c000000650000006700000061000000630000007900000020000000650000006e000000630000006f00000064000000690000006e000000670000002000000066000000690000007800000074000000750000007200000065000000220000007d000000",
+      "managerArchiveParserAccepted": false,
+      "agentDecoderAccepted": true,
+      "expected": {
+        "diagnostic": "legacy encoding fixture"
+      }
+    }
   ]
 }
