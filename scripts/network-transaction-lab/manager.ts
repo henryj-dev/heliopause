@@ -7,6 +7,7 @@ const dir=process.argv[2]!,cfg=JSON.parse(readFileSync(join(dir,'config.json'),'
 const pki=join(dir,'pki');
 const manager=await startManager({hostname:'192.0.2.1',port:8443,relays:[],
   tls:{certFile:join(pki,'manager.pem'),keyFile:join(pki,'manager.key'),caFile:join(pki,'ca.pem')},
+  revocationFile:cfg.lifecycleRevocations===true?join(dir,'lifecycle-revocations.json'):undefined,
   operatorCNs:['alice','bob'],writerCNs:['alice','bob'],
   networkRegistryFile:join(dir,'registry.json'),networkObservationsDir:join(dir,'observations'),
   networkExecutionTargets:[{...cfg.identity,journalId:cfg.journalId,certificateSha256:createHash('sha256').update(new X509Certificate(readFileSync(join(pki,'gateway.pem'))).raw).digest('hex')}],
