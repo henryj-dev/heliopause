@@ -125,6 +125,20 @@ def atomic(path, value):
             os.unlink(tmp)
 
 
+def journal_transition_pending(directory):
+    if os.path.lexists(os.path.join(directory,'retired-journal.json')):
+        return True
+    try:marker=read_json(directory+'.transition.json')
+    except FileNotFoundError:return False
+    if not isinstance(marker,dict) or marker.get('phase') not in {'prepared','old-retired','old-preserved','successor-prepared','successor-published','config-bound','complete'}:
+        raise ValueError('invalid offline journal transition marker')
+    return marker['phase']!='complete'
+
+
+def assert_active_journal(directory):
+    if journal_transition_pending(directory):raise ValueError('journal retired or offline transition pending')
+
+
 def crypto_helpers(directory):
     # Reuse the Agent's bounded trust loading and real OpenSSL Ed25519 verifier.
     spec = importlib.util.spec_from_file_location('network_signature_provider', os.path.join(os.path.dirname(__file__), 'heliopause-pull.py'))
@@ -760,6 +774,7 @@ class Executor:
 
     def accept(self,envelope):
         with self.locked():
+            assert_active_journal(self.directory)
             if self.config.get('enabled') is not True:
                 raise ValueError('new network execution disabled')
             independent_trust(self.config,self.provider)
@@ -872,6 +887,7 @@ class Executor:
         # Ledger-only: safe while firewall is busy or new network execution is disabled.
         # Accepted work is marked for the existing tick/ownership-checked undo, never relabelled.
         with self.locked():
+            assert_active_journal(self.directory)
             c=verify(envelope,CANCEL,self.config['managerKeys'],self.provider)
             exact(c,'schemaVersion transactionId fenceId target journalId authorizationHash artifactHash registryRevision requestedAt requestedBy authorization')
             a=verify(c['authorization'],EXECUTION,self.config['managerKeys'],self.provider)
@@ -903,6 +919,7 @@ class Executor:
 
     def confirm(self,envelope):
         with self.locked():
+            assert_active_journal(self.directory)
             data=self.load()
             independent_trust(self.config,self.provider)
             c=verify(envelope,CONFIRM,self.config['managerKeys'],self.provider)

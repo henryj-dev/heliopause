@@ -1,0 +1,124 @@
+# Quiescent network journal maintenance (scope A)
+
+This implementation supports only a single-target journal with **no confirmed resources**.
+It does not transfer ownership/restoration authority, delete confirmed resources, prune records,
+or unlock a fence. VM/capacity qualification is separate from the isolated tests below.
+
+## Admission and archive
+
+Stop the Agent and terminal courier through the independent console. Preserve their service
+state and verify every work item is terminal, every Manager record is settled, every exact
+terminal result is acknowledged, the fence is absent, and no rollback/restore debt remains.
+A read-only production inventory must find no old interface, host route, NM profile or keyfile.
+An unrelated object in one of those identities is a refusal, never an adoption/deletion.
+
+Stage exactly eight protected core files in a new owned0700 directory, with owned0600 single-link
+regular files and no symlink ancestors: `manager.json` (exact current Registry bytes),
+`transactions.json`, `journal-identity.json`, `terminal-results.json`, `terminal-acks.json`,
+`audit-public-keys.json`, `network-executor-config.json`, and `execution-evidence.json`, plus an owned0700 `evidence/` directory. The configuration contains only supported
+configuration/path references, never TLS/private-key bytes. Audit keys have distinct Manager/
+verifier public SPKI IDs; they verify old evidence and are never installed as execution trust.
+Preserve any existing sidecars in the old directory as well; the eight core files and explicitly indexed attachments are the signed
+archive contract, not a recursive export or an assertion that other files contain no secrets.
+
+`node bin/heliopause-network-journal-archive.ts --snapshot STAGED --output NEW_ARCHIVE`
+is read-only and reports an exact-byte commitment. Repeat with `--apply --expected-hash HASH`
+to create a new private fsynced archive. Existing destinations are refused. Duplicate JSON keys and explicit credential fields are refused; the scan is defense in depth,
+not permission to publish arbitrary lab data. Incomplete copies
+remain evidence and fail verification; they do not permit replacement. Store a verified copy
+under an independently chosen custody policy before operational maintenance. A copy on the
+same development disk is not independent backup, and this tool supplies no remote custody.
+
+The execution evidence index has `schemaVersion:1`, a `runs` array and a `files` map. Each exact
+transaction ID/authorization hash has a40hex source commit, image SHA256, module-manifest
+SHA256, and nonempty file lists for `report`, `inventory`, `packets`, `modules` and `history`.
+Explicit empty history is represented by an actual hashed history JSON; it is not omitted.
+An unused journal explicitly has empty runs/files and an empty evidence directory. Run IDs must
+exactly cover the archived Agent transactions. Module commitment binds the first modules file.
+The manifest SHA256 is included in approval, Manager receipt and permanent epoch tombstone.
+
+Attachments are flat, fixed relative lowercase JSON names, with exact kind/byte/SHA256 metadata:
+no recursion, absolute paths, traversal, duplicate runs/references, extra/missing files, symlink or
+hardlink adoption. Limits are4096files,4MiB each,128MiB total, and64files per role/run. Both the
+Manager and Agent independently re-open, hash, permission-check and fsync the indexed files.
+A mismatch refuses transition and preserves the old records. These are private evidence limits,
+not a claim that fitting within them makes an archive public-safe or operationally complete.
+
+Include original report/packet/inventory/module/failure/retry/interruption evidence, not a new
+success summary. A JSON wrapper for raw UTF8 diagnostics must distinguish original bytes/hash
+from wrapper bytes/hash and preserve the complete original text; redaction must retain separate
+original/derived commitments. Review source/deployed module commitments and independent
+packet provenance before approval. Integrity and required-role coverage do not authenticate an
+unsigned measurement, attest a loaded process, or prove that an author truthfully labeled a file.
+Historical public audit keys alone likewise do not establish an external origin of evidence.
+
+Configure the Manager's `networkJournalArchiveDirectory` explicitly. Each child archive name
+is exactly32lowercase hex characters. API callers cannot supply paths, shell, hooks or keys.
+The existing authenticated operator/writer/OTP/cross-site controls apply; this is not a separate
+certificate-only authentication system.
+
+Use `/api/network/journal-transition/propose` with `{archiveName}`, review the returned exact
+archive/target/old/new identity hashes through `review?hash=...`, have a different authenticated
+writer `approve` `{archiveName,hash}`, then `authorize` the same plan. Proposal maps are finite
+and volatile: a restart before authorization requires fresh review/approval. Commit the resulting
+envelope through `commit` `{archiveName,envelope}`. That operation reopens/verifies/fsyncs the
+archive and compares current Registry bytes under the existing Registry kernel-writer lock.
+It atomically replaces only that Manager store with a bounded retirement chain and fresh empty
+execution epoch. Registry resources and their generations are retained. An exact receipt retry
+returns its existing receipt; it cannot empty later successor records. The permanent tombstone
+also retains the exact signed authorization, allowing recovery after a lost response and Manager
+restart without reconstructing authority from local metadata. Current signer must match
+the approved signing identity. There is no local metadata promotion of old authority.
+
+Before Manager commit, transport the exact archive to protected Agent maintenance storage.
+`python3 agent/network_journal_transition.py --archive ARCHIVE` performs read-only inspection
+under existing host writer/executor locks: exact configuration and sidecars, quiescence, resource
+absence, and a replaceable journal directory. A journal that is itself a mount point or lies on a
+different filesystem from its parent is refused; storage migration is a separate operation.
+Inspection does not create missing lock files or write transition state.
+
+After Manager commit, transport the signed authorization and receipt to protected Agent storage.
+Use `--archive ARCHIVE --authorization ENVELOPE --manager-receipt RECEIPT --apply` only for
+the default integrated root-owned layout with Agent/courier stopped. Apply repeats the checks,
+requires exact approved configuration bytes (or the exact successor bytes during recovery), and
+executes the durable phases below. No network mutation is performed by this tool. A Manager
+receipt is mandatory; Agent cannot transition first. Signature verification uses temporary files
+in the existing protected Agent writer directory, never in the replaceable journal. A crash in
+verification must not recreate an unpublished successor or alter the immutable archive.
+
+After both commits, explicitly update the Manager target's journal binding, preserving the
+same target and exact authorized leaf pin. Restart Manager and Agent/courier; verify both ledgers,
+new journal, health and absence of a fence before allowing new work. The default network state parent `/var/lib/heliopause` must already
+be owned0700; maintenance refuses an unsafe parent and never silently chmods a shared directory. Manager restart with a
+retired/ambiguous configured binding fails. Old authorities/results cannot create a record in the
+new epoch. They do not justify replay reset, copying old records back, or certificate rebinding.
+
+## Crash boundaries
+
+| Durable boundary | State and next attempt |
+|---|---|
+| Before Manager commit | Old records remain; no Agent receipt exists. Revalidate/reapprove if expired. |
+| Manager committed, Agent untouched | New Manager epoch refuses old issuance; old Agent remains preserved. Stop admission and finish the exact approved transition. |
+| Agent intent saved | New network admission and courier writes refuse the pending transition; mandatory firewall/local recovery remains independent. |
+| Old retirement marker saved | Old journal cannot accept new work; exact original four replay/identity/outbox/ack files must match archive. |
+| Old directory renamed | Every original file remains at `.retired-OLD_JOURNAL`; it is rechecked on resume. |
+| Unique creating directory made, owner not yet saved | Preserve the unowned orphan; resume creates a distinct owned staging directory. It never fills/adopts the orphan. |
+| Owned stage published/partly written | Exact transition owner marker required; only expected empty successor bytes/prefixes can be completed, retaining partial hashes. Completion appends only the remaining approved bytes and fsyncs the file; it does not create an untracked replacement temporary file. Foreign stage is preserved/refused. |
+| Successor published, config still old | Pending marker prevents use; resume verifies pristine successor and rebinds only `journalId`. |
+| Config bound, completion not recorded | Exact old/new configuration permitted only for this receipt; finish same transition without resetting successor records. |
+| Complete | Exact retry is a no-op even after new work. A later approved transition preserves the prior completion marker inside its old directory. |
+
+These are separate stores and renames, not a single atomic distributed operation. Partial or
+foreign state requires stopping maintenance, preserving all files/hashes and inspecting through
+the console. Do not remove a lock, marker, retired directory, receipt or tombstone to force progress.
+The retirement chain itself is bounded256; exhaustion requires a separately designed policy.
+
+## Qualification limits
+
+Isolated tests exercise both real Node Ed25519/Registry transitions and Agent crash/file behavior
+with live network/subprocess/socket boundaries replaced. A regression retains the production
+signature helper's real directory/temp-file/fsync/cleanup behavior while replacing only its
+OpenSSL subprocess; replacing the entire helper would hide that filesystem boundary. A loopback mTLS test exercises actual
+operator authentication and two-person approval, receipt retry and retired-binding startup refusal.
+Those tests do not establish Rocky VM crash recovery, storage-pressure survival or remote custody.
+Confirmed-resource scope B remains unsupported and blocks a trial that requires that migration.

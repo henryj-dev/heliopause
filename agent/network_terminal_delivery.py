@@ -9,7 +9,7 @@ import time
 import urllib.parse
 import urllib.request
 import urllib.error
-from network_executor import atomic, canonical, read_file, read_json
+from network_executor import atomic, canonical, read_file, read_json, assert_active_journal
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -26,6 +26,7 @@ def validate_acks(ack):
 
 
 def deliver(config, directory):
+    assert_active_journal(directory)
     settings=config['terminalDelivery']
     if set(settings)!={'url','caFile','certFile','keyFile'}:
         raise ValueError('unsupported terminal delivery configuration')
@@ -74,6 +75,7 @@ def delivery_diagnostic(error):
 
 
 def record_delivery_status(directory, error=None):
+    assert_active_journal(directory)
     path=os.path.join(directory,'terminal-delivery-status.json')
     try:previous=read_json(path)
     except Exception:previous={}

@@ -5755,7 +5755,7 @@ def run_writer_mode():
     """One persistent process/host lock; network work is admitted beside the firewall loop."""
     import fcntl
     from network_lifecycle import Lifecycle
-    from network_executor import read_json, atomic
+    from network_executor import read_json, atomic, assert_active_journal
     global _lifecycle
     directory = os.path.dirname(STATE_FILE)
     os.makedirs(directory, mode=0o700, exist_ok=True)
@@ -5792,6 +5792,7 @@ def run_writer_mode():
                     raise ValueError("network path migration requires offline reconciliation")
                 config_path, network_dir = locator["config"], locator["stateDir"]
             if requested or os.path.exists(locator_path) or os.path.exists(os.path.join(network_dir, "transactions.json")):
+                assert_active_journal(network_dir)
                 cfg = read_json(config_path)
                 previous_errors = dict(_lifecycle.errors)
                 _lifecycle = Lifecycle(sys.modules.get(__name__) or __import__("types").SimpleNamespace(**globals()), cfg, network_dir, requested)

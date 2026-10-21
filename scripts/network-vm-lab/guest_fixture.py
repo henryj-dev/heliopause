@@ -63,6 +63,9 @@ def gateway_initialize():
     if not key.exists():
         if (STATE/'journal-identity.json').exists():raise ValueError('known gateway secret missing')
         protected(key, command('wg', 'genkey')+'\n')
+    STATE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    parent=STATE.parent.lstat()
+    if parent.st_uid!=0 or not stat.S_ISDIR(parent.st_mode) or stat.S_IMODE(parent.st_mode)!=0o700:raise ValueError('explicit owned0700 network state parent required')
     STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
     if not (STATE/'transactions.json').exists():
         if (STATE/'journal-identity.json').exists(): raise ValueError('known journal missing')
@@ -133,7 +136,9 @@ def gateway_install():
     for name in json.loads(Path('/source/package.json').read_text())['files']:
         if name.startswith('agent/') and name.endswith('.py'):
             shutil.copyfile('/source/'+name,target/Path(name).name);os.chmod(target/Path(name).name,0o600)
-    environment={'HELIOPAUSE_RELAY_URL':'https://192.0.2.1:8444','HELIOPAUSE_CA_FILE':str(ETC/'pki/ca.pem'),'HELIOPAUSE_CERT_FILE':str(ETC/'pki/gateway.pem'),'HELIOPAUSE_KEY_FILE':str(ETC/'pki/gateway.key'),'HELIOPAUSE_TARGET':'lab','HELIOPAUSE_HOST_ID':'gateway','HELIOPAUSE_MANAGER_SIGNING_KEYS_DIR':str(ETC/'trust/manager'),'HELIOPAUSE_BREAK_GLASS_KEYS_DIR':str(ETC/'trust/verifier'),'HELIOPAUSE_INTERVAL_SEC':'1','HELIOPAUSE_NETWORK_DISCOVERY':'1','HELIOPAUSE_NETWORK_DISCOVERY_BUDGET':'5'}
+    # Network verifier authority must not also authorize firewall break-glass changes.
+    (ETC/'trust/break-glass').mkdir(mode=0o700,exist_ok=True)
+    environment={'HELIOPAUSE_RELAY_URL':'https://192.0.2.1:8444','HELIOPAUSE_CA_FILE':str(ETC/'pki/ca.pem'),'HELIOPAUSE_CERT_FILE':str(ETC/'pki/gateway.pem'),'HELIOPAUSE_KEY_FILE':str(ETC/'pki/gateway.key'),'HELIOPAUSE_TARGET':'lab','HELIOPAUSE_HOST_ID':'gateway','HELIOPAUSE_MANAGER_SIGNING_KEYS_DIR':str(ETC/'trust/manager'),'HELIOPAUSE_BREAK_GLASS_KEYS_DIR':str(ETC/'trust/break-glass'),'HELIOPAUSE_INTERVAL_SEC':'1','HELIOPAUSE_NETWORK_DISCOVERY':'1','HELIOPAUSE_NETWORK_DISCOVERY_BUDGET':'5'}
     protected(ETC/'agent.env',''.join(key+'='+value+'\n' for key,value in environment.items()))
     units=Path('/etc/systemd/system')
     for name in ['heliopause-agent.service','heliopause-network-terminal.service']:

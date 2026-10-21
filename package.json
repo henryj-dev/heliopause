@@ -26,6 +26,7 @@
     "!src/test-util.ts",
     "agent/heliopause-pull.py",
     "agent/network_executor.py",
+    "agent/network_journal_transition.py",
     "agent/network_nm_profile.py",
     "agent/network_nm_wireguard.py",
     "agent/network_nm_settings.py",

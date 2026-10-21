@@ -1,3 +1,4 @@
+import type { JournalEpoch } from './network-journal-transition.ts';
 import { networkDigest } from './network-canonical.ts';
 import type { NetworkSignedEnvelope } from './network-execution.ts';
 export const NETWORK_EXECUTION_CAPACITY=256;
@@ -24,10 +25,25 @@ export interface NetworkExecutionState {
   schemaVersion:1;nextSequence:number;
   fence:null|{transactionId:string;fenceId:string;authorizationHash:string;registryRevision:number};
   records:NetworkExecutionRecord[];
+  /** Scope-A retirement tombstones, never pruned. After transition this Registry is single-target. */
+  journalEpoch?:JournalEpoch;
 }
 const hex=(v:unknown)=>typeof v==='string'&&/^[a-f0-9]{64}$/.test(v);
 export function validateExecutionState(state:NetworkExecutionState):void {
   if(!state||state.schemaVersion!==1||!Array.isArray(state.records)||state.records.length>NETWORK_EXECUTION_CAPACITY||state.nextSequence!==state.records.length+1) throw new Error('invalid execution ledger');
+  if(state.journalEpoch) {
+    const e=state.journalEpoch,retired=new Set<string>();let prior:string|undefined;
+    if(!/^[a-f0-9]{32}$/.test(e.journalId)||!e.target||Object.keys(e.target).sort().join(' ')!=='host nodeId source'||Object.values(e.target).some(v=>typeof v!=='string'||!/^[A-Za-z0-9_.-]{1,64}$/.test(v))||!Array.isArray(e.transitions)||!e.transitions.length||e.transitions.length>256) throw new Error('invalid journal epoch');
+    for(const t of e.transitions) {
+      if(!/^[a-f0-9]{32}$/.test(t.oldJournalId)||!/^[a-f0-9]{32}$/.test(t.newJournalId)||t.oldJournalId===t.newJournalId||retired.has(t.oldJournalId)||retired.has(t.newJournalId)||prior!==undefined&&t.oldJournalId!==prior||!hex(t.transitionHash)||!hex(t.archiveHash)||!hex(t.evidenceHash)||!t.authorization||!t.receipt) throw new Error('invalid journal retirement chain');
+      const authority=JSON.parse(Buffer.from(t.authorization.payload,'base64url').toString());
+      if(networkDigest(authority)!==t.transitionHash||authority.oldJournalId!==t.oldJournalId||authority.newJournalId!==t.newJournalId||authority.archiveHash!==t.archiveHash||authority.evidenceHash!==t.evidenceHash||networkDigest(authority.target)!==networkDigest(e.target)||t.authorization.keyId!==t.receipt.keyId)throw new Error('invalid durable transition authority');
+      const p=JSON.parse(Buffer.from(t.receipt.payload,'base64url').toString());
+      if(p.schemaVersion!==1||p.transitionHash!==t.transitionHash||p.archiveHash!==t.archiveHash||p.evidenceHash!==t.evidenceHash||p.oldJournalId!==t.oldJournalId||p.newJournalId!==t.newJournalId||networkDigest(p.target)!==networkDigest(e.target)||!Number.isSafeInteger(p.committedAt)) throw new Error('invalid journal retirement receipt');
+      retired.add(t.oldJournalId);prior=t.newJournalId;
+    }
+    if(prior!==e.journalId||retired.has(e.journalId)||state.records.some(r=>r.journalId!==e.journalId||networkDigest(r.target)!==networkDigest(e.target))) throw new Error('retired or foreign journal record');
+  }
   const ids=new Set<string>();
   for(const [index,r] of state.records.entries()) {
     const a=JSON.parse(Buffer.from(r.authorization.payload,'base64url').toString());

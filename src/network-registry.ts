@@ -183,6 +183,7 @@ export class NetworkRegistryStore {
       if(state.records.length>=NETWORK_EXECUTION_CAPACITY||state.records.some(r=>r.transactionId===transactionId)) throw fail('execution replay/capacity refusal',409);
       if(doc.revision!==revision) throw fail('registry revision conflict',409);
       const envelope=issue(doc),a=JSON.parse(Buffer.from(envelope.payload,'base64url').toString());
+      if(state.journalEpoch&&(a.journalId!==state.journalEpoch.journalId||digest(a.target)!==digest(state.journalEpoch.target))) throw fail('retired or foreign execution journal refused',409);
       // Reserve bounded room for cancellation (which embeds the original envelope), result and
       // audit updates. Existing legacy oversized records fail closed; nothing is pruned.
       if(Buffer.from(envelope.payload,'base64url').length>64*1024) throw fail('execution authority payload capacity exceeded',413);
