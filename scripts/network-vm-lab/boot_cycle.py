@@ -67,6 +67,10 @@ print(json.dumps({'at':time.time(),'bootId':pathlib.Path('/proc/sys/kernel/rando
 'routes':json.loads(r(['ip','-j','-4','route','show','table','all']).stdout)}))
 '''
         return json.loads(self.ssh('gateway','sudo','python3','-',data=code.encode(),timeout=40))
+    def manager_evidence(self):
+        code="import json;from pathlib import Path;p=Path('/var/lib/heliopause-vm-lab/registry.json');raw=p.read_bytes();assert len(raw)<=8*1024*1024;print(json.dumps(json.loads(raw)['execution']))"
+        return json.loads(self.ssh('peer','sudo','python3','-c',code))
+
     def monitor_start(self):
         identity=uuid.uuid4().hex
         unit='heliopause-vm-observer-'+identity
@@ -128,7 +132,7 @@ def main():
         code='import json,sys,hashlib;from pathlib import Path;v=json.load(sys.stdin);assert all(hashlib.sha256((Path(v["base"])/name).read_bytes()).hexdigest()==sha for name,sha in v["files"].items())'
         lab.ssh(role,'sudo','python3','-c',code,data=json.dumps({'base':base,'files':files}).encode())
 
-    report={'sourceCommit':commit,'imageSha256':lab.manifest['imageSha256'],'mode':args.mode,'transaction':args.transaction,'expected':args.expected,'passed':False,'before':lab.evidence(),'peerBootBefore':lab.boot('peer')}
+    report={'sourceCommit':commit,'imageSha256':lab.manifest['imageSha256'],'mode':args.mode,'transaction':args.transaction,'expected':args.expected,'passed':False,'before':lab.evidence(),'peerBootBefore':lab.boot('peer'),'managerBefore':lab.manager_evidence()}
     target=report['before']['journal']['transactions'][args.transaction]
     allowed={'confirmed'} if args.expected=='restored' else {'prepared','applying','awaiting-verification','awaiting-confirm','rolling-back','rollback-failed'}
     if target['state'] not in allowed:raise ValueError('scenario pre-reboot transaction state mismatch')
@@ -176,6 +180,7 @@ def main():
     finally:
         try:
             report['packetTimeline']=lab.monitor_stop(monitor_id,monitor_unit)
+            report['managerAfter']=lab.manager_evidence()
             if not report['packetTimeline'] or any(row['peerBootId']!=report['peerBootBefore'] for row in report['packetTimeline']):raise ValueError('independent timeline unavailable')
         except Exception:
             report['passed']=False;report['monitorError']='independent-monitor-unavailable'
