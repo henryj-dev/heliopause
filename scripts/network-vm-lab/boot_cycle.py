@@ -99,7 +99,12 @@ def main():
     args.output.parent.mkdir(parents=True,exist_ok=True)
     started=time.monotonic();report['requestAt']=time.time()
     try:
-        if args.mode=='graceful':lab.ssh('gateway','sudo','systemctl','reboot')
+        if args.mode=='graceful':
+            try:lab.ssh('gateway','sudo','systemctl','reboot')
+            except subprocess.CalledProcessError as error:
+                # sshd may exit before returning systemctl's successful response.
+                # Only an independently observed changed boot ID proves reboot below.
+                if error.returncode!=255:raise
         else:lab.power_cut()
         end=time.monotonic()+240
         while time.monotonic()<end:
