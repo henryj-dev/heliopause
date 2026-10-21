@@ -335,6 +335,26 @@ class Transition(unittest.TestCase):
         (self.archive/'transactions.json').write_bytes(b'{}')
         with self.assertRaisesRegex(ValueError,'hash mismatch'):self.apply()
         self.assertEqual(self.executor.load()['acceptedSequence'],1)
+    def test_exponent_counter_archive_apply_retries_preserve_all_original_stores(self):
+        import re
+        paths=[self.config]+[self.state/name for name in ['transactions.json','journal-identity.json','terminal-results.json','terminal-acks.json']]
+        before={p:p.read_bytes() for p in paths}
+        path=self.archive/'transactions.json'
+        raw=re.sub(rb'"lastClock":\d+',b'"lastClock":1e0',path.read_bytes());path.write_bytes(raw)
+        manifest=n.read_json(str(self.archive/'manifest.json'))
+        manifest['files'][path.name]={'sha256':hashlib.sha256(raw).hexdigest(),'bytes':len(raw)}
+        n.atomic(str(self.archive/'manifest.json'),manifest)
+        archive=t.read_archive(self.archive)
+        draft={k:v for k,v in self.payload.items() if k!='approval'}
+        draft.update(agentHash=hashlib.sha256(raw).hexdigest(),archiveHash=n.digest(archive['rawFiles']))
+        self.payload={**draft,'approval':{**self.payload['approval'],'planHash':'sha256:'+n.digest(draft)}}
+        self.envelope={'keyId':'test-manager','body':self.payload}
+        self.receipt={'keyId':'test-manager','body':{**self.receipt['body'],'transitionHash':n.digest(self.payload),'archiveHash':draft['archiveHash']}}
+        for _ in range(2):
+            with self.assertRaisesRegex(ValueError,'replay counters'):self.apply()
+            self.assertEqual({p:p.read_bytes() for p in paths},before)
+            self.assertEqual(path.read_bytes(),raw)
+            self.assertFalse(Path(str(self.state)+'.transition.json').exists())
     def test_configuration_drift(self):
         cfg=copy.deepcopy(self.cfg);cfg['enabled']=False;n.atomic(str(self.config),cfg)
         with self.assertRaisesRegex(ValueError,'configuration drift'):self.apply()
@@ -400,6 +420,57 @@ for index,entry in enumerate(CONTRACT['evidenceCases']):
     setattr(Transition,'test_shared_evidence_contract_'+str(index),evidence_contract_test(entry))
 for index,entry in enumerate(CONTRACT['emptyJournalCounterCases']):
     setattr(Transition,'test_shared_replay_counter_contract_'+str(index),counter_contract_test(entry))
+
+
+def raw_counter_contract_test(entry):
+    def test(self):
+        archive=t.read_archive(self.archive)
+        if entry['records']:
+            value=self.executor.load()
+        else:
+            value=t.empty_journal(self.cfg['journalId'])
+            archive.update(manager={'execution':{'fence':None,'records':[]}},identity={'journalId':self.cfg['journalId']},outbox=[],acknowledgments={})
+        import re
+        raw=re.sub('"'+entry['field']+'":-?[0-9]+','"'+entry['field']+'":'+entry['token'],n.canonical(value)).encode()
+        Path(self.executor.path).write_bytes(raw)
+        archive['agent']=n.decode_json(raw)
+        if entry['accepted']:
+            self.executor.load();t.validate_quiescent_core(archive,self.cfg['identity'],self.cfg['journalId'])
+        else:
+            with self.assertRaises(ValueError):self.executor.load()
+            with self.assertRaises(ValueError):t.validate_quiescent_core(archive,self.cfg['identity'],self.cfg['journalId'])
+        self.assertEqual(Path(self.executor.path).read_bytes(),raw)
+    return test
+
+for index,entry in enumerate(CONTRACT['rawCounterTokenCases']):
+    setattr(Transition,'test_shared_raw_counter_token_'+str(index),raw_counter_contract_test(entry))
+
+
+def raw_committed_contract_test(entry):
+    def test(self):
+        if entry['reserved']:self.reserve_capacity()
+        archive=t.read_archive(self.archive);value=copy.deepcopy(archive[entry['store']])
+        tx=next(iter(self.executor.load()['transactions']))
+        parts=[tx if part=='$tx' else next(iter(archive['evidence']['files'])) if part=='$firstFile' else int(part) if part.isdigit() else part for part in entry['path']]
+        parent=value
+        for part in parts[:-1]:parent=parent[part]
+        number=parent[parts[-1]];self.assertIs(type(number),int)
+        token=str(number)+('.0' if entry['encoding']=='decimal' else 'e0' if entry['encoding']=='exponent' else '')
+        parent[parts[-1]]='__raw_integer_contract_token__'
+        raw=n.canonical(value).replace('"__raw_integer_contract_token__"',token).encode()
+        archive[entry['store']]=n.decode_json(raw)
+        before={p:p.read_bytes() for p in [self.config]+list(self.state.glob('*.json'))}
+        def validate():
+            t.validate_quiescent_core(archive,self.cfg['identity'],self.cfg['journalId'])
+            t.validate_evidence(archive['evidence'],n.capacity_rows(archive['agent'],archive['identity']))
+        if entry['accepted']:validate()
+        else:
+            with self.assertRaises(ValueError):validate()
+        self.assertEqual({p:p.read_bytes() for p in before},before)
+    return test
+
+for index,entry in enumerate(CONTRACT['rawCommittedNumberCases']):
+    setattr(Transition,'test_shared_committed_integer_token_'+str(index),raw_committed_contract_test(entry))
 
 
 if __name__=='__main__':unittest.main()

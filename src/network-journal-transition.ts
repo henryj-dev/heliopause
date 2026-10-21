@@ -8,7 +8,7 @@ import { isIP } from 'node:net';
 import { isAbsolute, normalize } from 'node:path';
 import { createHash, createPublicKey, verify, type KeyObject } from 'node:crypto';
 import { artifactSigningKeyId } from './artifact-signature.ts';
-import { loadJournalArchive } from './network-journal-archive.ts';
+import { loadJournalArchive, parseJournalArchiveFile } from './network-journal-archive.ts';
 import { readBoundedStoreFile } from './json-store.ts';
 import { canonicalNetworkJson, networkDigest } from './network-canonical.ts';
 import { claimForPublish, settle, type ApprovalState } from './approval.ts';
@@ -57,7 +57,7 @@ export function validateQuiescentArchive(archive:JournalArchive,target:NetworkTa
   need(exact(archive.rawFiles,'manager agent identity outbox acknowledgments trust config evidence'),'exact raw archive files required');
   for(const name of ['manager','agent','identity','outbox','acknowledgments','trust','config','evidence'] as const) {
     const encoded=archive.rawFiles[name];need(typeof encoded==='string'&&encoded.length<=12*1024*1024,'raw archive file bound');
-    const raw=Buffer.from(encoded,'base64url');need(raw.toString('base64url')===encoded&&equal(JSON.parse(raw.toString()),archive[name]),'raw/parsed archive mismatch');
+    const raw=Buffer.from(encoded,'base64url');need(raw.toString('base64url')===encoded&&equal(parseJournalArchiveFile(name,raw),archive[name]),'raw/parsed archive mismatch');
   }
   need(exact(target,'source host nodeId')&&Object.values(target).every(principal),'exact target required');
   need(exact(archive.trust,'manager verifier'),'audit public trust required');

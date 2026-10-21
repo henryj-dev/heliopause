@@ -86,6 +86,37 @@ test('a previously signed malformed counter cannot clear the Manager before Agen
   assert.deepEqual(readFileSync(f.store.path),before);
  }finally{f.cleanup();}
 });
+for(const entry of validationContract.rawCounterTokenCases)test('shared raw counter encoding: '+entry.name,()=>{
+ const f=fixture(entry.records);try{
+  const raw=JSON.stringify(f.archive.agent).replace(new RegExp('"'+entry.field+'":-?[0-9]+'), '"'+entry.field+'":'+entry.token);
+  f.archive.rawFiles.agent=Buffer.from(raw).toString('base64url');f.archive.agent=JSON.parse(raw);
+  const before=readFileSync(f.store.path),input=Buffer.from(f.archive.rawFiles.agent,'base64url');
+  if(entry.accepted)validateQuiescentArchive(f.archive,f.target);
+  else assert.throws(()=>validateQuiescentArchive(f.archive,f.target));
+  assert.deepEqual(readFileSync(f.store.path),before);
+  assert.deepEqual(Buffer.from(f.archive.rawFiles.agent,'base64url'),input);
+  if(!entry.accepted&&/[.eE]/.test(entry.token)){
+   const destination=join(f.dir,'unsupported-number');
+   assert.throws(()=>createJournalArchive(destination,Object.fromEntries(Object.entries(f.archive.rawFiles).map(([name,encoded])=>[name,Buffer.from(encoded,'base64url')])) as any),/integer JSON token/);
+   assert.throws(()=>readFileSync(join(destination,'transactions.json')),/ENOENT/);
+  }
+ }finally{f.cleanup();}
+});
+test('signed exponent counter cannot commit a retained pre-upgrade archive or mutate Registry bytes',()=>{
+ const f=fixture(1);try{
+  const draft=f.draft(),before=readFileSync(f.store.path);
+  const raw=Buffer.from(f.archive.rawFiles.agent,'base64url').toString().replace(/"lastClock":\d+/,'"lastClock":1e0');
+  f.archive.rawFiles.agent=Buffer.from(raw).toString('base64url');f.archive.agent=JSON.parse(raw);
+  draft.archiveHash=networkDigest(f.archive.rawFiles);draft.agentHash=createHash('sha256').update(raw).digest('hex');
+  // Simulate an exact retained archive produced by the older validator, not a new archive.
+  const path=join(f.archiveDirectory,'transactions.json'),manifestPath=join(f.archiveDirectory,'manifest.json');
+  writeFileSync(path,raw);const manifest=JSON.parse(readFileSync(manifestPath,'utf8'));
+  manifest.files['transactions.json']={sha256:draft.agentHash,bytes:Buffer.byteLength(raw)};writeFileSync(manifestPath,JSON.stringify(manifest));
+  const authorization=signNetworkMessage(JOURNAL_TRANSITION_DOMAIN,{...draft,approval:{mode:'two-person',planHash:journalTransitionHash(draft),proposedBy:'alice',approvedBy:'bob',approvedAt:f.now}},f.keys.privateKey);
+  for(let i=0;i<2;i++)assert.throws(()=>commitManagerJournalTransition(f.store,f.archive,authorization,[f.keys.publicKey],f.keys.privateKey,f.archiveDirectory,f.now),/integer JSON token/);
+  assert.deepEqual(readFileSync(f.store.path),before);assert.equal(readFileSync(path,'utf8'),raw);
+ }finally{f.cleanup();}
+});
 for(const [name,change,pattern] of [
   ['confirmed resource',(f:any)=>{f.archive.agent.transactions['b'.repeat(32)].state='confirmed';},/confirmed/],
   ['rollback debt',(f:any)=>{f.archive.agent.transactions['b'.repeat(32)].state='rollback-failed';},/confirmed or nonterminal/],
@@ -166,6 +197,20 @@ function capacityArchive() {
   rmSync(f.archiveDirectory,{recursive:true});createJournalArchive(f.archiveDirectory,Object.fromEntries(Object.entries(f.archive.rawFiles).map(([k,v])=>[k,Buffer.from(v,'base64url')])) as any,attachments);
   return f;
 }
+for(const entry of validationContract.rawCommittedNumberCases)test('shared committed integer encoding: '+entry.name,()=>{
+ const f=entry.reserved?capacityArchive():fixture();try{
+  const value=structuredClone((f.archive as any)[entry.store]),path=entry.path.map((part:string)=>part==='$tx'?'b'.repeat(32):part==='$firstFile'?Object.keys(f.archive.evidence.files)[0]:part);
+  let parent=value;for(const part of path.slice(0,-1))parent=parent[part];
+  const field=path.at(-1),number=parent[field],token=String(number)+(entry.encoding==='decimal'?'.0':entry.encoding==='exponent'?'e0':'');
+  assert.equal(typeof number,'number');parent[field]='__raw_integer_contract_token__';
+  const raw=JSON.stringify(value).replace('"__raw_integer_contract_token__"',token),before=readFileSync(f.store.path);
+  (f.archive.rawFiles as any)[entry.store]=Buffer.from(raw).toString('base64url');(f.archive as any)[entry.store]=JSON.parse(raw);
+  if(entry.accepted)validateQuiescentArchive(f.archive,f.target);
+  else assert.throws(()=>validateQuiescentArchive(f.archive,f.target),/integer JSON token/);
+  assert.deepEqual(readFileSync(f.store.path),before);
+  assert.equal(Buffer.from((f.archive.rawFiles as any)[entry.store],'base64url').toString(),raw);
+ }finally{f.cleanup();}
+});
 test('verified full archive retires capacity reservation and hold together without pruning original identity',()=>{
   const f=capacityArchive();try {
     validateQuiescentArchive(f.archive,f.target);const oldIdentity=structuredClone(f.archive.identity),authority=f.issue();

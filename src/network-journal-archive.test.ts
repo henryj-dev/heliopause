@@ -3,7 +3,17 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createJournalArchive, parseArchiveJson } from './network-journal-archive.ts';
+import { createJournalArchive, parseArchiveJson, parseReplayJournalJson } from './network-journal-archive.ts';
+
+test('replay counter encoding preserves floating monotonic history and escaped keys',()=>{
+ const raw='{"acceptedSequence":1,"terminalSequence":1,"lastClock":9007199254740991,"transactions":{"x":{"mono":1.25,"diagnostic":"lastClock:1e0"}}}';
+ assert.deepEqual(parseReplayJournalJson(raw),JSON.parse(raw));
+ assert.throws(()=>parseReplayJournalJson('{"lastCl\\u006fck":1e0}'),/integer JSON token/);
+ assert.equal(parseArchiveJson('{"lastClock":1e0}').lastClock,1);
+ const tx='a'.repeat(32);
+ assert.throws(()=>parseReplayJournalJson(JSON.stringify({transactions:{[tx]:{authorization:{values:['integer-array-placeholder']}}}}).replace('"integer-array-placeholder"','1.0')),/integer JSON token/);
+ assert.doesNotThrow(()=>parseReplayJournalJson(JSON.stringify({transactions:{[tx]:{history:[{measurements:[1.25]}],mono:1.5}}})));
+});
 for(const raw of ['{"a":1,"a":2}','{"a":{"escaped":1,"escap\\u0065d":2}}','[{"a":1,"a":2}]'])test('archive refuses duplicate object keys: '+raw,()=>assert.throws(()=>parseArchiveJson(raw),/duplicate archive JSON/));
 test('archive parser accepts repeated keys in distinct objects and punctuation inside strings',()=>{
   const value={rows:[{key:'{},:"'},{key:'escaped\\"'}],nested:{value:0.00001},a:true};
