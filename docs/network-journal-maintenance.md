@@ -48,6 +48,24 @@ does not make an Agent-side refusal safe to bypass; resume only the same valid a
 after the exact refusal has been understood. Deploy compatible validators on both sides
 before journal maintenance.
 
+The stored top-level `acceptedSequence`, `terminalSequence` and `lastClock` use integer
+JSON tokens (optional minus sign, decimal digits only). Although `1.0` and `1e0` are valid
+JSON numbers with the same mathematical value, they are unsupported encodings for these
+three fields. The same integer-token rule applies inside the explicitly committed execution
+authorization, cancellation, terminal result and cancellation response objects, including
+their reserved-identity and Manager/outbox copies. Otherwise a decoded `registryRevision:1.0`
+or `sequence:1e0` can match JavaScript's digest but fail Python's. Manager record sequence
+tokens are checked too. Python rejects the floating-point parse result; Manager checks the
+original tokens before JavaScript loses that distinction. Escaped property names receive
+the same check. Execution-evidence schema version and attachment byte counters use the
+same integer-token rule. Other stored values, including monotonic floating-point history, retain
+their existing representation. This is not a whole-document canonicalization rule.
+Archive creation/loading and Manager plan/commit validation refuse unsupported counter
+encoding; Agent load and offline transition refuse it without rewriting the source.
+Preserve any pre-upgrade archive that uses it and the exact refusal. Do not normalize it
+to obtain a new authority or clear a partial transition. This narrow encoding contract
+does not prove equivalence of every TypeScript/Python schema or integer field.
+
 Attachments are flat, fixed relative lowercase JSON names, with exact kind/byte/SHA256 metadata:
 no recursion, absolute paths, traversal, duplicate runs/references, extra/missing files, symlink or
 hardlink adoption. Limits are4096files,4MiB each,128MiB total, and64files per role/run. Both the

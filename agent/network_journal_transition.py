@@ -139,10 +139,32 @@ def validate_authority(config,archive,envelope,receipt,provider):
     return t
 
 
+def integer_contract_encoding(value):
+    """Committed execution/cancellation/result objects define only integer numbers.
+
+    Decimal/exponent tokens parse as float even when mathematically integral. Do not
+    normalize them: that would change the original bytes and Python's committed digest.
+    History/monotonic measurements are deliberately outside these exact substructures.
+    """
+    need(type(value) is not float,'unsupported committed integer JSON token encoding')
+    if isinstance(value,dict):
+        for child in value.values():integer_contract_encoding(child)
+    elif isinstance(value,list):
+        for child in value:integer_contract_encoding(child)
+
+
 def validate_quiescent_core(archive,target,old_id):
     old=archive['agent'];manager=archive['manager']['execution']
     need(n.valid_replay_counters(old),'invalid Agent replay counters or clock')
     rows=n.capacity_rows(old,archive['identity'])
+    for row in rows.values():
+        for field in ['authorization','cancellation','terminalResult','cancellationResponse']:
+            if field in row:integer_contract_encoding(row[field])
+    for result in archive['outbox']:integer_contract_encoding(result)
+    for record in manager['records']:
+        if 'sequence' in record:integer_contract_encoding(record['sequence'])
+        for field in ['result','cancellationResponse']:
+            if field in record:integer_contract_encoding(record[field])
     need(old['schemaVersion']==2 and old['journalId']==old_id and manager['fence'] is None,'quiescent identities/fence required')
     need(len(old['transactions'])==old['acceptedSequence']==old['terminalSequence'] and len(rows)==len(manager['records'])==len(archive['outbox'])==len(archive['acknowledgments']),'complete terminal archive required')
     need(len({r['transactionId'] for r in manager['records']})==len(manager['records']) and {r['transactionId'] for r in manager['records']}==set(rows),'Manager/Agent record identities differ')
