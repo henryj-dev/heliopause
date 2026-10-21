@@ -80,6 +80,8 @@ run "@heliopause/agent" npm test -w @heliopause/agent --if-present
 run "VM read-only preflight" python3 scripts/network-vm-lab/test_preflight.py
 run "VM independent verifier" python3 scripts/network-vm-lab/test_verifier.py
 run "VM boot report acceptance" python3 scripts/network-vm-lab/test_boot_cycle.py
+run "VM 24-hour soak acceptance" python3 scripts/network-vm-lab/test_soak.py
+run "VM lifecycle PKI fixtures" python3 scripts/network-vm-lab/test_lifecycle_pki.py
 run "Private VM evidence archive" python3 scripts/network-evidence/test_bundle.py
 
 printf '\n'
