@@ -36,6 +36,14 @@ class Lab:
         code='''import json,hashlib,os,pathlib,subprocess,time
 r=lambda a:subprocess.run(a,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=5)
 p=pathlib.Path('/var/lib/heliopause/network-executor/transactions.json');d=json.loads(p.read_text())
+def optional(name):
+ p=pathlib.Path(name)
+ try:
+  raw=p.read_bytes()
+  if len(raw)>1024*1024:return {'error':'evidence-size-bound'}
+  return json.loads(raw)
+ except FileNotFoundError:return None
+ except (ValueError,OSError):return {'error':'evidence-unreadable'}
 profiles=[]
 for row in d['transactions'].values():
  u=row['authorization']['operation'].get('profileUuid')
@@ -46,6 +54,13 @@ for row in d['transactions'].values():
  except FileNotFoundError:profiles.append({'uuid':u,'missing':True})
 print(json.dumps({'at':time.time(),'bootId':pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
 'journal':d,'profiles':profiles,
+'lifecycle':optional('/var/lib/heliopause-agent/lifecycle-status.json'),
+'firewall':optional('/var/lib/heliopause-agent/state.json'),
+'acknowledgements':optional('/var/lib/heliopause/network-executor/terminal-acks.json'),
+'delivery':optional('/var/lib/heliopause/network-executor/terminal-delivery-status.json'),
+'kernel':r(['uname','-r']).stdout.decode().strip(),
+'packages':r(['rpm','-q','NetworkManager','NetworkManager-libnm','systemd','python3','iproute','wireguard-tools','nftables']).stdout.decode().splitlines(),
+'nmDevices':r(['nmcli','-t','-f','UUID,TYPE,DEVICE','connection','show','--active']).stdout.decode().splitlines(),
 'service':r(['systemctl','show','heliopause-agent.service','-p','MainPID','-p','ActiveState','-p','SubState','-p','After','-p','CapabilityBoundingSet','-p','ReadWritePaths']).stdout.decode(),
 'links':json.loads(r(['ip','-j','-d','link','show']).stdout),
 'addresses':json.loads(r(['ip','-j','address','show']).stdout),
