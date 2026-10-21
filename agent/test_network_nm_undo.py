@@ -27,6 +27,16 @@ class ActivationUndo(unittest.TestCase):
             self.commands.append(args)
             return next(active) if args[-1]=='--active' else ''
         self.driver.run=run
+    def test_foreign_fwmark_and_keepalive_block_owned_removal(self):
+        public=self.op['peers'][0]['publicKey']
+        for mark,keepalive in [('0x1',public+' 1'),('off',public+' 25'),('off','foreign 1')]:
+            self.driver.run=Mock(side_effect=[mark,keepalive] if mark=='off' else [mark])
+            with self.assertRaisesRegex(ValueError,'ownership conflict'):
+                self.driver.kernel_options_owned(self.op)
+        for keepalive in ['',public+' 1']:
+            self.driver.run=Mock(side_effect=['off',keepalive])
+            self.driver.kernel_options_owned(self.op)
+
     def test_activating_uuid_is_cancelled_even_without_kernel_link(self):
         self.responses(self.op['profileUuid']+':--','')
         self.driver.undo_restore(self.row)

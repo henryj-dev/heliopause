@@ -129,6 +129,20 @@ class NetworkManagerWireGuard(LinuxWireGuard):
         # Independent verification and local shape checks remain mandatory before confirm.
         pass
 
+    def kernel_options_owned(self, op):
+        if self.run(['wg','show',op['interfaceName'],'fwmark']) != 'off':
+            raise ValueError('persistent fwmark ownership conflict')
+        keepalive = dict(line.split() for line in self.run(['wg','show',op['interfaceName'],'persistent-keepalive']).splitlines())
+        expected = {peer['publicKey'] for peer in op['peers']}
+        if any(public not in expected or value != '1' for public,value in keepalive.items()):
+            raise ValueError('persistent keepalive ownership conflict')
+
+    def fingerprint(self, op):
+        value = super().fingerprint(op)
+        value['fwmark'] = self.run(['wg','show',op['interfaceName'],'fwmark'])
+        value['keepalive'] = self.run(['wg','show',op['interfaceName'],'persistent-keepalive'])
+        return value
+
     def ownership_marker(self, link, op, owner):
         self.check_file(op, owner)
         if not self.cached(op):
@@ -141,6 +155,7 @@ class NetworkManagerWireGuard(LinuxWireGuard):
             raise ValueError('persistent device ownership conflict')
         if link.get('linkinfo', {}).get('info_kind') != 'wireguard':
             raise ValueError('persistent device kind conflict')
+        self.kernel_options_owned(op)
         # Unlike the kernel driver, NM supplies the active UUID/device ownership marker.
         # Remaining kernel shape checks are shared with LinuxWireGuard.owned().
         return owner
