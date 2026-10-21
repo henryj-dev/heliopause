@@ -21,7 +21,7 @@ import network_executor as n
 DOMAIN='heliopause-network-quiescent-transition-v1'
 RECEIPT='heliopause-network-transition-manager-commit-v1'
 FILES={'manager':'manager.json','agent':'transactions.json','identity':'journal-identity.json',
-       'outbox':'terminal-results.json','acknowledgments':'terminal-acks.json','trust':'audit-public-keys.json','config':'network-executor-config.json'}
+       'outbox':'terminal-results.json','acknowledgments':'terminal-acks.json','trust':'audit-public-keys.json','config':'network-executor-config.json','evidence':'execution-evidence.json'}
 
 
 def need(condition,reason):
@@ -45,33 +45,86 @@ def read_at(fd,name,maximum):
     with os.fdopen(file,'rb') as stream:
         info=os.fstat(file)
         need(stat.S_ISREG(info.st_mode) and info.st_uid==os.geteuid() and stat.S_IMODE(info.st_mode)==0o600 and info.st_nlink==1 and info.st_size<=maximum,'bounded owned0600 file required')
-        raw=stream.read(maximum+1);need(len(raw)<=maximum,'archive file size limit');os.fsync(file);return raw
+        raw=stream.read(maximum+1);need(len(raw)<=maximum,'archive file size limit');after=os.fstat(file)
+        need((info.st_size,info.st_mtime_ns,info.st_ctime_ns,info.st_mode,info.st_uid,info.st_nlink)==(after.st_size,after.st_mtime_ns,after.st_ctime_ns,after.st_mode,after.st_uid,after.st_nlink) and len(raw)==after.st_size,'archive file changed during read')
+        os.fsync(file);return raw
 
 
 def read_archive(path):
     fd=secure_directory(path)
     try:
         manifest=n.decode_json(read_at(fd,'manifest.json',16384));n.exact(manifest,'schemaVersion files')
-        need(manifest['schemaVersion']==1 and set(manifest['files'])==set(FILES.values()) and set(os.listdir(fd))==set(FILES.values())|{'manifest.json'},'incomplete archive')
+        need(manifest['schemaVersion']==1 and set(manifest['files'])==set(FILES.values()) and set(os.listdir(fd))==set(FILES.values())|{'manifest.json','evidence'},'incomplete archive')
         parsed={};raw_files={}
         for name,file in FILES.items():
             raw=read_at(fd,file,(4 if name=='manager' else 8)*1024*1024)
             need(manifest['files'][file]=={'sha256':hashlib.sha256(raw).hexdigest(),'bytes':len(raw)},'archive file hash mismatch')
-            parsed[name]=n.decode_json(raw);raw_files[name]=base64.urlsafe_b64encode(raw).decode().rstrip('=')
+            parsed[name]=n.decode_json(raw);reject_credentials(parsed[name]);raw_files[name]=base64.urlsafe_b64encode(raw).decode().rstrip('=')
+        validate_evidence(parsed['evidence'],parsed['agent']['transactions'])
+        evidence_fd=secure_directory(Path(path)/'evidence')
+        try:
+            need(set(os.listdir(evidence_fd))==set(parsed['evidence']['files']),'missing/extra execution evidence files')
+            for name,entry in parsed['evidence']['files'].items():
+                raw=read_at(evidence_fd,name,4*1024*1024)
+                need(len(raw)==entry['bytes'] and hashlib.sha256(raw).hexdigest()==entry['sha256'],'execution evidence hash mismatch')
+                reject_credentials(n.decode_json(raw))
+            os.fsync(evidence_fd)
+        finally:os.close(evidence_fd)
         os.fsync(fd)
         return {'schemaVersion':1,'rawFiles':raw_files,**parsed}
     finally:os.close(fd)
 
 
+ROLES=['report','inventory','packets','modules','history']
+
+def reject_credentials(value,depth=0):
+    import re
+    need(depth<=128,'archive JSON depth bound')
+    if isinstance(value,str):need(not re.search(r'-----BEGIN (?:[A-Z ]*PRIVATE KEY|OPENSSH PRIVATE KEY)-----',value),'private key archive refused')
+    if isinstance(value,list):
+        for child in value:reject_credentials(child,depth+1)
+    if isinstance(value,dict):
+        for key,child in value.items():
+            need(re.sub('[_-]','',key.lower()) not in {'privatekey','password','token','clientsecret','presharedkey','cookie'},'credential field archive refused')
+            reject_credentials(child,depth+1)
+
+
+def validate_evidence(value,transactions):
+    import re
+    def hex_value(v,size):return isinstance(v,str) and re.fullmatch('[a-f0-9]{'+str(size)+'}',v)
+    n.exact(value,'schemaVersion runs files')
+    need(n.integer(value['schemaVersion'],1,1) and isinstance(value['runs'],list) and len(value['runs'])<=1024 and isinstance(value['files'],dict) and len(value['files'])<=4096,'invalid execution evidence manifest')
+    total=0
+    for name,entry in value['files'].items():
+        n.exact(entry,'kind sha256 bytes')
+        need(re.fullmatch(r'[a-z][a-z0-9-]{0,63}\.json',name) and entry['kind'] in ROLES and hex_value(entry['sha256'],64) and n.integer(entry['bytes'],1,4*1024*1024),'invalid execution evidence file')
+        total+=entry['bytes']
+    need(total<=128*1024*1024,'execution evidence total byte capacity')
+    ids=set();used=set()
+    for run in value['runs']:
+        n.exact(run,'transactionId authorizationHash sourceCommit imageSha256 moduleManifestSha256 files')
+        need(hex_value(run['transactionId'],32) and run['transactionId'] not in ids and hex_value(run['authorizationHash'],64) and hex_value(run['sourceCommit'],40) and hex_value(run['imageSha256'],64) and hex_value(run['moduleManifestSha256'],64),'duplicate/invalid execution evidence run')
+        ids.add(run['transactionId']);n.exact(run['files'],' '.join(ROLES))
+        for role in ROLES:
+            names=run['files'][role]
+            need(isinstance(names,list) and 1<=len(names)<=64 and all(isinstance(name,str) for name in names) and len(set(names))==len(names),'missing/duplicate execution evidence role')
+            for name in names:
+                need(name in value['files'] and value['files'][name]['kind']==role,'unbound execution evidence attachment');used.add(name)
+        need(value['files'][run['files']['modules'][0]]['sha256']==run['moduleManifestSha256'],'module evidence commitment mismatch')
+        row=transactions.get(run['transactionId'])
+        need(row and n.digest(row['authorization'])==run['authorizationHash'],'execution evidence authorization mismatch')
+    need(ids==set(transactions) and used==set(value['files']),'missing/unreferenced execution evidence')
+
+
 def validate_authority(config,archive,envelope,receipt,provider):
     t=n.verify(envelope,DOMAIN,config['managerKeys'],provider);r=n.verify(receipt,RECEIPT,config['managerKeys'],provider)
-    n.exact(t,'schemaVersion mode transitionId target oldJournalId newJournalId archiveHash managerHash agentHash configHash issuedAt expiresAt approval')
-    n.exact(r,'schemaVersion transitionHash oldJournalId newJournalId target archiveHash committedAt')
+    n.exact(t,'schemaVersion mode transitionId target oldJournalId newJournalId archiveHash managerHash agentHash configHash evidenceHash issuedAt expiresAt approval')
+    n.exact(r,'schemaVersion transitionHash oldJournalId newJournalId target archiveHash evidenceHash committedAt')
     for field in ['transitionId','oldJournalId','newJournalId']:
         need(isinstance(t[field],str) and __import__('re').fullmatch('[a-f0-9]{32}',t[field]),'invalid transition identity')
     need(t['schemaVersion']==r['schemaVersion']==1 and t['mode']=='quiescent-without-confirmed-v1' and t['oldJournalId']!=t['newJournalId'],'unsupported identity transition')
     need(t['target']==config['identity'] and t['archiveHash']==n.digest(archive['rawFiles']),'transition target/archive mismatch')
-    for field in ['oldJournalId','newJournalId','target','archiveHash']:need(r[field]==t[field],'Manager receipt binding mismatch')
+    for field in ['oldJournalId','newJournalId','target','archiveHash','evidenceHash']:need(r[field]==t[field],'Manager receipt binding mismatch')
     need(r['transitionHash']==n.digest(t) and receipt['keyId']==envelope['keyId'],'exact Manager commit receipt required')
     need(n.integer(t['issuedAt'],1,2**53-1) and n.integer(t['expiresAt'],t['issuedAt']+1,t['issuedAt']+3600000) and n.integer(r['committedAt'],t['issuedAt'],t['expiresAt']-1),'invalid Manager transition commit time')
     # Receipt proves the first commit was timely. Completing that same partial transition after
@@ -81,6 +134,7 @@ def validate_authority(config,archive,envelope,receipt,provider):
     need(t['agentHash']==hashlib.sha256(base64.urlsafe_b64decode(archive['rawFiles']['agent']+'==')).hexdigest() and t['managerHash']==hashlib.sha256(base64.urlsafe_b64decode(archive['rawFiles']['manager']+'==')).hexdigest(),'archive commitment mismatch')
     need(t['configHash']==hashlib.sha256(base64.urlsafe_b64decode(archive['rawFiles']['config']+'==')).hexdigest(),'configuration archive commitment mismatch')
     need(archive['config']['journalId']==t['oldJournalId'] and config in [archive['config'],{**archive['config'],'journalId':t['newJournalId']}],'configuration drift refused')
+    need(t['evidenceHash']==hashlib.sha256(base64.urlsafe_b64decode(archive['rawFiles']['evidence']+'==')).hexdigest(),'execution evidence manifest commitment mismatch')
     old=archive['agent'];manager=archive['manager']['execution']
     need(old['schemaVersion']==2 and old['journalId']==t['oldJournalId'] and archive['identity']=={'journalId':t['oldJournalId']} and manager['fence'] is None,'quiescent identities/fence required')
     need(len(old['transactions'])==old['acceptedSequence']==old['terminalSequence']==len(manager['records'])==len(archive['outbox'])==len(archive['acknowledgments']),'complete terminal archive required')

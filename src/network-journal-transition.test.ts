@@ -1,10 +1,10 @@
 import { settleNetworkExecution } from './network-execution-settlement.ts';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, rmSync, unlinkSync, symlinkSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { generateKeyPairSync } from 'node:crypto';
+import { generateKeyPairSync, createHash } from 'node:crypto';
 import { createJournalArchive } from './network-journal-archive.ts';
 import { NetworkRegistryStore } from './network-registry.ts';
 import { emptyApprovals, propose, approve } from './approval.ts';
@@ -27,9 +27,18 @@ function fixture(count=1) {
     state.records.push({sequence:1,transactionId:tx,fenceId:tx,planHash:a.approval.planHash,authorization:signNetworkMessage('heliopause-network-execution-v2',a,keys.privateKey),authorizationHash:networkDigest(a),target,journalId:journal,registryRevision:doc.revision,artifactHash:a.artifactHash,issuedAt:now,issuedBy:'alice',state:'settled',result,resultHash,settledAt:now,settledBy:'gateway',audit:[{action:'settled',actor:'gateway',at:now}]});
     state.nextSequence=2;
   });
-  const archive:JournalArchive={schemaVersion:1,rawFiles:{} as any,manager:store.read(),agent:{schemaVersion:2,journalId:journal,acceptedSequence:count,terminalSequence:count,lastClock:now,transactions:rows},identity:{journalId:journal},config:{enabled:true,journalId:journal,identity:target,managerKeys:'/etc/heliopause/trust/manager',verifierKeys:'/etc/heliopause/trust/verifier',secrets:'/etc/heliopause/secrets',protectedAddresses:['192.0.2.1']},outbox,acknowledgments:acks,trust:{manager:{[artifactSigningKeyId(keys.publicKey)]:keys.publicKey.export({type:'spki',format:'pem'}).toString()},verifier:{}}};
-  const sync=()=>{for(const name of ['manager','agent','identity','outbox','acknowledgments','trust','config'] as const)archive.rawFiles[name]=Buffer.from(JSON.stringify(archive[name])).toString('base64url');archive.rawFiles.manager=readFileSync(store.path).toString('base64url');};sync();
-  const archiveDirectory=join(dir,'archive');createJournalArchive(archiveDirectory,Object.fromEntries(Object.entries(archive.rawFiles).map(([name,encoded])=>[name,Buffer.from(encoded,'base64url')])) as any);
+  const attachments:Record<string,Buffer>={},evidence:any={schemaVersion:1,runs:[],files:{}};
+  for(const [transactionId,row] of Object.entries(rows)){
+    const files:Record<string,string[]>={};
+    for(const kind of ['report','inventory','packets','modules','history']){
+      const name=kind+'-'+transactionId+'.json',raw=Buffer.from(JSON.stringify({synthetic:true,kind,transactionId}));attachments[name]=raw;
+      evidence.files[name]={kind,bytes:raw.length,sha256:createHash('sha256').update(raw).digest('hex')};files[kind]=[name];
+    }
+    evidence.runs.push({transactionId,authorizationHash:networkDigest(row.authorization),sourceCommit:'1'.repeat(40),imageSha256:'2'.repeat(64),moduleManifestSha256:evidence.files[files.modules![0]!].sha256,files});
+  }
+  const archive:JournalArchive={schemaVersion:1,rawFiles:{} as any,evidence,manager:store.read(),agent:{schemaVersion:2,journalId:journal,acceptedSequence:count,terminalSequence:count,lastClock:now,transactions:rows},identity:{journalId:journal},config:{enabled:true,journalId:journal,identity:target,managerKeys:'/etc/heliopause/trust/manager',verifierKeys:'/etc/heliopause/trust/verifier',secrets:'/etc/heliopause/secrets',protectedAddresses:['192.0.2.1']},outbox,acknowledgments:acks,trust:{manager:{[artifactSigningKeyId(keys.publicKey)]:keys.publicKey.export({type:'spki',format:'pem'}).toString()},verifier:{}}};
+  const sync=()=>{for(const name of ['manager','agent','identity','outbox','acknowledgments','trust','config','evidence'] as const)archive.rawFiles[name]=Buffer.from(JSON.stringify(archive[name])).toString('base64url');archive.rawFiles.manager=readFileSync(store.path).toString('base64url');};sync();
+  const archiveDirectory=join(dir,'archive');createJournalArchive(archiveDirectory,Object.fromEntries(Object.entries(archive.rawFiles).map(([name,encoded])=>[name,Buffer.from(encoded,'base64url')])) as any,attachments);
   const approvals=emptyApprovals();
   const draft=()=>planJournalTransition(archive,target,'e'.repeat(32),'f'.repeat(32),now);
   const issue=()=>{const d=draft(),hash=journalTransitionHash(d);propose(approvals,{hash,generation:d.transitionId,summary:{hosts:[]},by:'alice',now:new Date(now)});approve(approvals,{hash,by:'bob',now:new Date(now)});return authorizeJournalTransition(archive,d,approvals,'alice',keys.privateKey,new Date(now));};
@@ -85,4 +94,20 @@ test('old authority and delayed old result cannot touch a successor fence',()=>{
 
 for(const length of [0,63,65])test('malformed transition signature length '+length+' cannot commit',()=>{
  const f=fixture();try{const envelope={...f.issue(),signature:Buffer.alloc(length).toString('base64url')},before=readFileSync(f.store.path);assert.throws(()=>commitManagerJournalTransition(f.store,f.archive,envelope,[f.keys.publicKey],f.keys.privateKey,f.archiveDirectory,f.now),/signature/);assert.deepEqual(readFileSync(f.store.path),before);}finally{f.cleanup();}
+});
+
+for(const [name,change,pattern] of [
+ ['missing run',(e:any)=>{e.runs=[];},/missing execution evidence run|unreferenced execution evidence files/],
+ ['duplicate run',(e:any)=>{e.runs.push(structuredClone(e.runs[0]));},/duplicate or invalid/],
+ ['wrong source',(e:any)=>{e.runs[0].sourceCommit='rolling-latest';},/duplicate or invalid/],
+ ['wrong authority',(e:any)=>{e.runs[0].authorizationHash='0'.repeat(64);},/authorization mismatch/],
+ ['wrong module commitment',(e:any)=>{e.runs[0].moduleManifestSha256='0'.repeat(64);},/module evidence commitment/],
+ ['missing packet role',(e:any)=>{e.runs[0].files.packets=[];},/missing or duplicate/],
+ ['path escape',(e:any)=>{e.files['../outside.json']={kind:'history',sha256:'0'.repeat(64),bytes:2};},/invalid execution evidence file/],
+] as const)test('archive evidence refuses '+name,()=>{const f=fixture();try{change(f.archive.evidence);f.sync();assert.throws(f.draft,pattern);}finally{f.cleanup();}});
+for(const fault of ['missing','tampered','symlink','permissions'] as const)test('Manager preserves old records when evidence attachment is '+fault,()=>{
+ const f=fixture();try{const envelope=f.issue(),name=f.archive.evidence.runs[0]!.files.report[0]!,path=join(f.archiveDirectory,'evidence',name),before=readFileSync(f.store.path);
+ if(fault==='missing')unlinkSync(path);if(fault==='tampered')writeFileSync(path,'{}');if(fault==='symlink'){unlinkSync(path);symlinkSync(f.store.path,path);}if(fault==='permissions')chmodSync(path,0o644);
+ assert.throws(()=>commitManagerJournalTransition(f.store,f.archive,envelope,[f.keys.publicKey],f.keys.privateKey,f.archiveDirectory,f.now));assert.deepEqual(readFileSync(f.store.path),before);
+ }finally{f.cleanup();}
 });

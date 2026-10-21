@@ -35,9 +35,9 @@ export function validateExecutionState(state:NetworkExecutionState):void {
     const e=state.journalEpoch,retired=new Set<string>();let prior:string|undefined;
     if(!/^[a-f0-9]{32}$/.test(e.journalId)||!e.target||Object.keys(e.target).sort().join(' ')!=='host nodeId source'||Object.values(e.target).some(v=>typeof v!=='string'||!/^[A-Za-z0-9_.-]{1,64}$/.test(v))||!Array.isArray(e.transitions)||!e.transitions.length||e.transitions.length>256) throw new Error('invalid journal epoch');
     for(const t of e.transitions) {
-      if(!/^[a-f0-9]{32}$/.test(t.oldJournalId)||!/^[a-f0-9]{32}$/.test(t.newJournalId)||t.oldJournalId===t.newJournalId||retired.has(t.oldJournalId)||retired.has(t.newJournalId)||prior!==undefined&&t.oldJournalId!==prior||!hex(t.transitionHash)||!hex(t.archiveHash)||!t.receipt) throw new Error('invalid journal retirement chain');
+      if(!/^[a-f0-9]{32}$/.test(t.oldJournalId)||!/^[a-f0-9]{32}$/.test(t.newJournalId)||t.oldJournalId===t.newJournalId||retired.has(t.oldJournalId)||retired.has(t.newJournalId)||prior!==undefined&&t.oldJournalId!==prior||!hex(t.transitionHash)||!hex(t.archiveHash)||!hex(t.evidenceHash)||!t.receipt) throw new Error('invalid journal retirement chain');
       const p=JSON.parse(Buffer.from(t.receipt.payload,'base64url').toString());
-      if(p.schemaVersion!==1||p.transitionHash!==t.transitionHash||p.archiveHash!==t.archiveHash||p.oldJournalId!==t.oldJournalId||p.newJournalId!==t.newJournalId||networkDigest(p.target)!==networkDigest(e.target)||!Number.isSafeInteger(p.committedAt)) throw new Error('invalid journal retirement receipt');
+      if(p.schemaVersion!==1||p.transitionHash!==t.transitionHash||p.archiveHash!==t.archiveHash||p.evidenceHash!==t.evidenceHash||p.oldJournalId!==t.oldJournalId||p.newJournalId!==t.newJournalId||networkDigest(p.target)!==networkDigest(e.target)||!Number.isSafeInteger(p.committedAt)) throw new Error('invalid journal retirement receipt');
       retired.add(t.oldJournalId);prior=t.newJournalId;
     }
     if(prior!==e.journalId||retired.has(e.journalId)||state.records.some(r=>r.journalId!==e.journalId||networkDigest(r.target)!==networkDigest(e.target))) throw new Error('retired or foreign journal record');

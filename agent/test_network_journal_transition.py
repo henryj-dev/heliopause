@@ -19,6 +19,17 @@ import network_journal_transition as t
 from test_network_executor import Fake,authorization
 
 
+def synthetic_evidence(rows):
+    evidence={'schemaVersion':1,'runs':[],'files':{}};attachments={}
+    for tx,row in rows.items():
+        files={}
+        for role in t.ROLES:
+            name=role+'-'+tx+'.json';raw=n.canonical({'synthetic':True,'kind':role,'transactionId':tx}).encode();attachments[name]=raw
+            evidence['files'][name]={'kind':role,'sha256':hashlib.sha256(raw).hexdigest(),'bytes':len(raw)};files[role]=[name]
+        evidence['runs'].append({'transactionId':tx,'authorizationHash':n.digest(row['authorization']),'sourceCommit':'1'*40,'imageSha256':'2'*64,'moduleManifestSha256':evidence['files'][files['modules'][0]]['sha256'],'files':files})
+    return evidence,attachments
+
+
 class Transition(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup);self.root=Path(self.temp.name)
@@ -33,15 +44,18 @@ class Transition(unittest.TestCase):
         agent=self.executor.load();result=agent['transactions'][a['transactionId']]['terminalResult'];stamp=n.digest(result)
         n.atomic(str(self.state/'terminal-acks.json'),{stamp:True})
         manager={'schemaVersion':2,'execution':{'fence':None,'records':[{'transactionId':a['transactionId'],'authorization':{'payload':base64.urlsafe_b64encode(n.canonical(a).encode()).decode().rstrip('=')},'authorizationHash':n.digest(a),'target':a['target'],'journalId':journal,'state':'settled','result':result,'resultHash':stamp}]}}
-        raw_files={'agent':(self.state/'transactions.json').read_bytes(),'manager':n.canonical(manager).encode(),'identity':(self.state/'journal-identity.json').read_bytes(),'outbox':(self.state/'terminal-results.json').read_bytes(),'acknowledgments':(self.state/'terminal-acks.json').read_bytes(),'trust':b'{"manager":{},"verifier":{}}','config':self.config.read_bytes()}
-        self.archive=self.root/'archive';self.archive.mkdir(mode=0o700);manifest={'schemaVersion':1,'files':{}}
+        evidence,attachments=synthetic_evidence(agent['transactions'])
+        raw_files={'evidence':n.canonical(evidence).encode(),'agent':(self.state/'transactions.json').read_bytes(),'manager':n.canonical(manager).encode(),'identity':(self.state/'journal-identity.json').read_bytes(),'outbox':(self.state/'terminal-results.json').read_bytes(),'acknowledgments':(self.state/'terminal-acks.json').read_bytes(),'trust':b'{"manager":{},"verifier":{}}','config':self.config.read_bytes()}
+        self.archive=self.root/'archive';self.archive.mkdir(mode=0o700);ed=self.archive/'evidence';ed.mkdir(mode=0o700)
+        for name,raw in attachments.items():p=ed/name;p.write_bytes(raw);p.chmod(0o600)
+        manifest={'schemaVersion':1,'files':{}}
         for name,raw in raw_files.items():
             file=t.FILES[name];p=self.archive/file;p.write_bytes(raw);p.chmod(0o600);manifest['files'][file]={'sha256':hashlib.sha256(raw).hexdigest(),'bytes':len(raw)}
         n.atomic(str(self.archive/'manifest.json'),manifest)
         archive=t.read_archive(self.archive);now=1000
-        draft={'schemaVersion':1,'mode':'quiescent-without-confirmed-v1','transitionId':'d'*32,'target':a['target'],'oldJournalId':journal,'newJournalId':'e'*32,'archiveHash':n.digest(archive['rawFiles']),'managerHash':hashlib.sha256(raw_files['manager']).hexdigest(),'agentHash':hashlib.sha256(raw_files['agent']).hexdigest(),'configHash':hashlib.sha256(raw_files['config']).hexdigest(),'issuedAt':now,'expiresAt':now+3600000}
+        draft={'schemaVersion':1,'mode':'quiescent-without-confirmed-v1','transitionId':'d'*32,'target':a['target'],'oldJournalId':journal,'newJournalId':'e'*32,'archiveHash':n.digest(archive['rawFiles']),'managerHash':hashlib.sha256(raw_files['manager']).hexdigest(),'agentHash':hashlib.sha256(raw_files['agent']).hexdigest(),'configHash':hashlib.sha256(raw_files['config']).hexdigest(),'evidenceHash':hashlib.sha256(raw_files['evidence']).hexdigest(),'issuedAt':now,'expiresAt':now+3600000}
         self.payload={**draft,'approval':{'mode':'two-person','planHash':'sha256:'+n.digest(draft),'proposedBy':'alice','approvedBy':'bob','approvedAt':now}}
-        self.envelope={'keyId':'test-manager','body':self.payload};self.receipt={'keyId':'test-manager','body':{'schemaVersion':1,'transitionHash':n.digest(self.payload),'oldJournalId':journal,'newJournalId':'e'*32,'target':a['target'],'archiveHash':draft['archiveHash'],'committedAt':now}}
+        self.envelope={'keyId':'test-manager','body':self.payload};self.receipt={'keyId':'test-manager','body':{'schemaVersion':1,'transitionHash':n.digest(self.payload),'oldJournalId':journal,'newJournalId':'e'*32,'target':a['target'],'archiveHash':draft['archiveHash'],'evidenceHash':draft['evidenceHash'],'committedAt':now}}
         self.writer=self.root/'writer.lock';self.writer.write_bytes(b'');self.writer.chmod(0o600)
         self.absence=patch.object(t,'resource_absence',side_effect=AssertionError('live kernel absence must be explicitly injected'));self.absence.start();self.addCleanup(self.absence.stop)
     def apply(self,event=None,absence=lambda *args:None):
@@ -53,9 +67,9 @@ class Transition(unittest.TestCase):
         self.assertTrue(self.apply()['duplicate']);self.assertEqual(n.read_json(str(self.state/'transactions.json'))['lastClock'],999)
     def test_two_successive_epochs_preserve_both_originals(self):
         first=self.apply();old=self.cfg['journalId'];self.cfg=n.read_json(str(self.config))
-        self.archive=self.root/'second-archive';self.archive.mkdir(mode=0o700)
+        self.archive=self.root/'second-archive';self.archive.mkdir(mode=0o700);(self.archive/'evidence').mkdir(mode=0o700)
         manager={'schemaVersion':2,'execution':{'fence':None,'records':[]}}
-        values={'manager':n.canonical(manager).encode(),'trust':b'{"manager":{},"verifier":{}}','config':self.config.read_bytes()}
+        values={'evidence':n.canonical({'schemaVersion':1,'runs':[],'files':{}}).encode(),'manager':n.canonical(manager).encode(),'trust':b'{"manager":{},"verifier":{}}','config':self.config.read_bytes()}
         for name in ['agent','identity','outbox','acknowledgments']:values[name]=(self.state/t.FILES[name]).read_bytes()
         manifest={'schemaVersion':1,'files':{}}
         for name,raw in values.items():
@@ -63,15 +77,28 @@ class Transition(unittest.TestCase):
             manifest['files'][path.name]={'sha256':hashlib.sha256(raw).hexdigest(),'bytes':len(raw)}
         n.atomic(str(self.archive/'manifest.json'),manifest);archive=t.read_archive(self.archive)
         draft={k:v for k,v in self.payload.items() if k!='approval'}
-        draft.update(transitionId='c'*32,oldJournalId='e'*32,newJournalId='f'*32,archiveHash=n.digest(archive['rawFiles']),managerHash=hashlib.sha256(values['manager']).hexdigest(),agentHash=hashlib.sha256(values['agent']).hexdigest(),configHash=hashlib.sha256(values['config']).hexdigest())
+        draft.update(transitionId='c'*32,oldJournalId='e'*32,newJournalId='f'*32,archiveHash=n.digest(archive['rawFiles']),managerHash=hashlib.sha256(values['manager']).hexdigest(),agentHash=hashlib.sha256(values['agent']).hexdigest(),configHash=hashlib.sha256(values['config']).hexdigest(),evidenceHash=hashlib.sha256(values['evidence']).hexdigest())
         self.payload={**draft,'approval':{**self.payload['approval'],'planHash':'sha256:'+n.digest(draft)}}
         self.envelope={'keyId':'test-manager','body':self.payload}
-        self.receipt={'keyId':'test-manager','body':{**self.receipt['body'],'transitionHash':n.digest(self.payload),'oldJournalId':'e'*32,'newJournalId':'f'*32,'archiveHash':draft['archiveHash']}}
+        self.receipt={'keyId':'test-manager','body':{**self.receipt['body'],'transitionHash':n.digest(self.payload),'oldJournalId':'e'*32,'newJournalId':'f'*32,'archiveHash':draft['archiveHash'],'evidenceHash':draft['evidenceHash']}}
         second=self.apply();self.assertTrue(second['committed'])
         self.assertEqual(n.read_json(str(self.state/'journal-identity.json')),{'journalId':'f'*32})
         self.assertEqual(n.read_json(str(Path(first['oldStatePreservedAt'])/'journal-identity.json')),{'journalId':old})
         prior=Path(second['oldStatePreservedAt']);self.assertTrue((prior/'previous-transition.json').exists())
         self.assertEqual(n.read_json(str(prior/'journal-identity.json')),{'journalId':'e'*32})
+    def test_missing_external_evidence_preserves_journal(self):
+        path=next((self.archive/'evidence').iterdir());path.unlink()
+        with self.assertRaisesRegex(ValueError,'missing/extra execution evidence'):self.apply()
+        self.assertEqual(self.executor.load()['acceptedSequence'],1)
+        self.assertFalse(Path(str(self.state)+'.transition.json').exists())
+    def test_tampered_external_evidence_preserves_journal(self):
+        next((self.archive/'evidence').iterdir()).write_bytes(b'{}')
+        with self.assertRaisesRegex(ValueError,'execution evidence hash mismatch'):self.apply()
+        self.assertEqual(self.executor.load()['acceptedSequence'],1)
+    def test_evidence_manifest_not_in_manager_receipt_refused(self):
+        self.receipt['body']['evidenceHash']='0'*64
+        with self.assertRaisesRegex(ValueError,'receipt binding mismatch'):self.apply()
+        self.assertFalse(Path(str(self.state)+'.transition.json').exists())
     def test_config_changed_while_waiting_for_lock(self):
         import fcntl
         original=fcntl.flock

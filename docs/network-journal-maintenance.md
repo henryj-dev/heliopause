@@ -12,13 +12,13 @@ terminal result is acknowledged, the fence is absent, and no rollback/restore de
 A read-only production inventory must find no old interface, host route, NM profile or keyfile.
 An unrelated object in one of those identities is a refusal, never an adoption/deletion.
 
-Stage exactly seven protected files in a new owned0700 directory, with owned0600 single-link
+Stage exactly eight protected core files in a new owned0700 directory, with owned0600 single-link
 regular files and no symlink ancestors: `manager.json` (exact current Registry bytes),
 `transactions.json`, `journal-identity.json`, `terminal-results.json`, `terminal-acks.json`,
-`audit-public-keys.json`, and `network-executor-config.json`. The last contains only supported
+`audit-public-keys.json`, `network-executor-config.json`, and `execution-evidence.json`, plus an owned0700 `evidence/` directory. The configuration contains only supported
 configuration/path references, never TLS/private-key bytes. Audit keys have distinct Manager/
 verifier public SPKI IDs; they verify old evidence and are never installed as execution trust.
-Preserve any existing sidecars in the old directory as well; the seven files are the signed
+Preserve any existing sidecars in the old directory as well; the eight core files and explicitly indexed attachments are the signed
 archive contract, not a recursive export or an assertion that other files contain no secrets.
 
 `node bin/heliopause-network-journal-archive.ts --snapshot STAGED --output NEW_ARCHIVE`
@@ -28,6 +28,29 @@ not permission to publish arbitrary lab data. Incomplete copies
 remain evidence and fail verification; they do not permit replacement. Store a verified copy
 under an independently chosen custody policy before operational maintenance. A copy on the
 same development disk is not independent backup, and this tool supplies no remote custody.
+
+The execution evidence index has `schemaVersion:1`, a `runs` array and a `files` map. Each exact
+transaction ID/authorization hash has a40hex source commit, image SHA256, module-manifest
+SHA256, and nonempty file lists for `report`, `inventory`, `packets`, `modules` and `history`.
+Explicit empty history is represented by an actual hashed history JSON; it is not omitted.
+An unused journal explicitly has empty runs/files and an empty evidence directory. Run IDs must
+exactly cover the archived Agent transactions. Module commitment binds the first modules file.
+The manifest SHA256 is included in approval, Manager receipt and permanent epoch tombstone.
+
+Attachments are flat, fixed relative lowercase JSON names, with exact kind/byte/SHA256 metadata:
+no recursion, absolute paths, traversal, duplicate runs/references, extra/missing files, symlink or
+hardlink adoption. Limits are4096files,4MiB each,128MiB total, and64files per role/run. Both the
+Manager and Agent independently re-open, hash, permission-check and fsync the indexed files.
+A mismatch refuses transition and preserves the old records. These are private evidence limits,
+not a claim that fitting within them makes an archive public-safe or operationally complete.
+
+Include original report/packet/inventory/module/failure/retry/interruption evidence, not a new
+success summary. A JSON wrapper for raw UTF8 diagnostics must distinguish original bytes/hash
+from wrapper bytes/hash and preserve the complete original text; redaction must retain separate
+original/derived commitments. Review source/deployed module commitments and independent
+packet provenance before approval. Integrity and required-role coverage do not authenticate an
+unsigned measurement, attest a loaded process, or prove that an author truthfully labeled a file.
+Historical public audit keys alone likewise do not establish an external origin of evidence.
 
 Configure the Manager's `networkJournalArchiveDirectory` explicitly. Each child archive name
 is exactly32lowercase hex characters. API callers cannot supply paths, shell, hooks or keys.
@@ -55,7 +78,8 @@ performed by this tool. A Manager receipt is mandatory; Agent cannot transition 
 
 After both commits, explicitly update the Manager target's journal binding, preserving the
 same target and exact authorized leaf pin. Restart Manager and Agent/courier; verify both ledgers,
-new journal, health and absence of a fence before allowing new work. Manager restart with a
+new journal, health and absence of a fence before allowing new work. The default network state parent `/var/lib/heliopause` must already
+be owned0700; maintenance refuses an unsafe parent and never silently chmods a shared directory. Manager restart with a
 retired/ambiguous configured binding fails. Old authorities/results cannot create a record in the
 new epoch. They do not justify replay reset, copying old records back, or certificate rebinding.
 

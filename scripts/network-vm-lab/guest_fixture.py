@@ -63,6 +63,9 @@ def gateway_initialize():
     if not key.exists():
         if (STATE/'journal-identity.json').exists():raise ValueError('known gateway secret missing')
         protected(key, command('wg', 'genkey')+'\n')
+    STATE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    parent=STATE.parent.lstat()
+    if parent.st_uid!=0 or not stat.S_ISDIR(parent.st_mode) or stat.S_IMODE(parent.st_mode)!=0o700:raise ValueError('explicit owned0700 network state parent required')
     STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
     if not (STATE/'transactions.json').exists():
         if (STATE/'journal-identity.json').exists(): raise ValueError('known journal missing')
