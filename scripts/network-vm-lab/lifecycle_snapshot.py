@@ -17,6 +17,7 @@ sys.path.insert(0,'/opt/heliopause/agent')
 sys.path.insert(0,'/source/agent')
 import network_executor as n
 from guest_fixture import guard
+from soak_inputs import source_modules, frozen_inputs
 
 
 def command(args):
@@ -54,8 +55,9 @@ def snapshot(role):
             'pageBytes':os.sysconf('SC_PAGE_SIZE')}
     base=Path('/var/lib/heliopause-vm-lab')
     if role=='peer':
-        registry=n.read_json(str(base/'registry.json'));state=registry['execution']
+        registry=n.read_json(str(base/'registry.json'));state=registry['execution'];cfg=n.read_json(str(base/'config.json'))
         result.update(manager=process('heliopause-vm-lab-manager.service'),relay=process('heliopause-vm-lab-relay.service'),
+                      deployedModules=source_modules('/source'),frozenInputs=frozen_inputs(role,cfg),targetBinding={'journalId':cfg['journalId'],'identity':cfg['identity']},
                       ledger={'commitment':commitment(base/'registry.json'),'nextSequence':state['nextSequence'],
                               'records':len(state['records']),'fence':state['fence'],'capacityHold':state.get('capacityHold'),'executionSchemaVersion':state['schemaVersion'],
                               'results':{r['transactionId']:r.get('resultHash') for r in state['records']}})
@@ -87,9 +89,9 @@ def snapshot(role):
         except FileNotFoundError:files[name]={'missing':True}
     status=n.read_json('/var/lib/heliopause-agent/lifecycle-status.json')
     result.update(agent=process('heliopause-agent.service'),courier=process('heliopause-network-terminal.service'),
-                  networkManager=process('NetworkManager.service'),journalId=journal['journalId'],
+                  networkManager=process('NetworkManager.service'),targetBinding={'journalId':cfg['journalId'],'identity':cfg['identity']},journalId=journal['journalId'],
                   acceptedSequence=journal['acceptedSequence'],terminalSequence=journal['terminalSequence'],effectiveAcceptedSequence=len(effective),effectiveTerminalSequence=journal['terminalSequence']+int('capacityCancellation' in identity),maintenanceRequired='capacityCancellation' in identity,transactions=rows,
-                  files=files,journalContentHash=n.digest({k:v for k,v in journal.items() if k!='lastClock'}),trust=trust,deployedModules=modules,lifecycle=status)
+                  files=files,frozenInputs=frozen_inputs(role,cfg),journalContentHash=n.digest({k:v for k,v in journal.items() if k!='lastClock'}),trust=trust,deployedModules=modules,lifecycle=status)
     result['at']=time.time()
     return result
 
