@@ -169,10 +169,21 @@ def main():
         report['peerBootAfter']=lab.boot('peer')
         if report['peerBootBefore']!=report['peerBootAfter']:raise ValueError('independent peer rebooted')
         if args.require_confirmed_forwarding:
-            lab.ssh('peer','sudo','/opt/node/bin/node','/source/scripts/network-vm-lab/verify.ts','observe',timeout=60)
-            report['currentProbes']=json.loads(lab.ssh('peer','sudo','cat','/var/lib/heliopause-vm-lab/current-probes.json'))
-            if report['currentProbes'].get('transactionId')!=args.transaction or not fresh_packets(report['currentProbes'],boot,time.time()*1000):
-                raise ValueError('fresh independent connectivity failed')
+            report['connectivityAttempts']=[]
+            for attempt in range(3):
+                try:
+                    lab.ssh('peer','sudo','/opt/node/bin/node','/source/scripts/network-vm-lab/verify.ts','observe',timeout=60)
+                    probe=json.loads(lab.ssh('peer','sudo','cat','/var/lib/heliopause-vm-lab/current-probes.json'))
+                    report['connectivityAttempts'].append(probe)
+                    if probe.get('transactionId')==args.transaction and fresh_packets(probe,boot,time.time()*1000):
+                        report['currentProbes']=probe
+                        break
+                except subprocess.CalledProcessError as error:
+                    # Preserve a fixed diagnostic code; never export arbitrary stderr/key material.
+                    text=(error.stderr or b'').decode(errors='replace')
+                    known=['stale collector result','collector span exceeds proof freshness','TimeoutError','probe command failed']
+                    report['connectivityAttempts'].append({'error':next((label for label in known if label in text),'independent-command-failed'),'stderrSha256':hashlib.sha256(error.stderr or b'').hexdigest()})
+            else:raise ValueError('fresh independent connectivity failed')
         report['passed']=True
     except Exception as error:
         report['error']=type(error).__name__+': '+str(error)[:400]
