@@ -71,6 +71,8 @@ export function validateQuiescentArchive(archive:JournalArchive,target:NetworkTa
   const rows=journalRows(a,archive.identity),reserved=Object.hasOwn(archive.identity,'capacityCancellation')?1:0;
   validateJournalEvidence(archive.evidence,rows);
   need(exact(a,'schemaVersion journalId acceptedSequence terminalSequence lastClock transactions')&&a.schemaVersion===2&&id(a.journalId),'invalid Agent archive identity');
+  // Check types before arithmetic: false/null must never become a terminal count of zero.
+  need([a.acceptedSequence,a.terminalSequence].every(v=>Number.isSafeInteger(v)&&v>=0&&v<=1024)&&Number.isSafeInteger(a.lastClock)&&a.lastClock>=0,'invalid Agent replay counters or clock');
   need(archive.config.journalId===a.journalId&&equal(archive.config.identity,target),'archived configuration binding mismatch');
   const config=archive.config,fields='enabled identity journalId managerKeys verifierKeys secrets protectedAddresses'+('terminalDelivery' in config?' terminalDelivery':'');
   need(exact(config,fields)&&typeof config.enabled==='boolean','unsupported archived configuration');

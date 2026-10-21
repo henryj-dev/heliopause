@@ -256,4 +256,34 @@ for boundary in ['intent-saved','old-retired','old-preserved','stage-created','s
     setattr(Transition,'test_resume_after_'+boundary.replace('-','_'),boundary_test(boundary))
 
 
+CONTRACT=json.loads((Path(__file__).resolve().parent.parent/'scripts/network-transaction-lab/fixtures/journal-validation-v1.json').read_text())
+
+def evidence_contract_test(entry):
+    def test(self):
+        rows=self.executor.load()['transactions'];value,_=synthetic_evidence(rows)
+        value['runs'][0][entry['field']]=entry['value']
+        if entry['accepted']:t.validate_evidence(value,rows)
+        else:
+            with self.assertRaises(ValueError):t.validate_evidence(value,rows)
+    return test
+
+def counter_contract_test(entry):
+    def test(self):
+        value=t.empty_journal(self.cfg['journalId']);value[entry['field']]=entry['value']
+        n.atomic(self.executor.path,value)
+        archive={'agent':value,'manager':{'execution':{'fence':None,'records':[]}},'identity':{'journalId':self.cfg['journalId']},'outbox':[],'acknowledgments':{}}
+        if entry['accepted']:
+            self.assertEqual(self.executor.load(),value)
+            t.validate_quiescent_core(archive,self.cfg['identity'],self.cfg['journalId'])
+        else:
+            with self.assertRaises(ValueError):self.executor.load()
+            with self.assertRaises(ValueError):t.validate_quiescent_core(archive,self.cfg['identity'],self.cfg['journalId'])
+    return test
+
+for index,entry in enumerate(CONTRACT['evidenceCases']):
+    setattr(Transition,'test_shared_evidence_contract_'+str(index),evidence_contract_test(entry))
+for index,entry in enumerate(CONTRACT['emptyJournalCounterCases']):
+    setattr(Transition,'test_shared_replay_counter_contract_'+str(index),counter_contract_test(entry))
+
+
 if __name__=='__main__':unittest.main()
