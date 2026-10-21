@@ -1,7 +1,7 @@
 """Report acceptance must reject in-progress recovery and stale/empty packet evidence."""
 import copy
 import unittest
-from boot_cycle import recovery_complete, fresh_packets, inactive_preserved, service_inactive
+from boot_cycle import recovery_complete, fresh_packets, inactive_preserved, service_inactive, removed_profile
 
 class ReportAcceptance(unittest.TestCase):
     def test_restored_requires_terminal_matching_boot_without_other_debt(self):
@@ -42,6 +42,14 @@ class ReportAcceptance(unittest.TestCase):
         self.assertFalse(inactive_preserved(before,after,'tx'))
         after['links']=[];after['profiles'][0]['sha256']='changed'
         self.assertFalse(inactive_preserved(before,after,'tx'))
+
+    def test_rollback_report_requires_file_cache_and_kernel_absence(self):
+        after={'journal':{'transactions':{'tx':{'authorization':{'operation':{'profileUuid':'id','interfaceName':'hp-owned'}}}}},'profiles':[{'uuid':'id','missing':True}],'links':[],'routes':[],'nmDevices':[]}
+        self.assertTrue(removed_profile(after,'tx'))
+        after['nmDevices']=['id:wireguard:hp-owned']
+        self.assertFalse(removed_profile(after,'tx'))
+        after['nmDevices']=[];after['profiles']=[{'uuid':'id','sha256':'leftover'}]
+        self.assertFalse(removed_profile(after,'tx'))
 
     def test_packets_require_exact_checks_current_boot_and_fresh_time(self):
         probe={'checks':{key:True for key in ['interface','address','route','fib','handshake','protected','management','forward','reverse']},'gateway':{'bootId':'new'},'observedAt':1000}

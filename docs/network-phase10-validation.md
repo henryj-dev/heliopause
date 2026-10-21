@@ -21,7 +21,8 @@ an assertion about a future trial target.
 Measured versions: kernel 6.12.0-211.16.1.el10_2.0.1.x86_64, NetworkManager/libnm
 1.56.0-1.el10, systemd 257-23.el10_2.1.rocky.0.1, Python 3.12.13, iproute2
 6.17.0-2.el10, wireguard-tools 1.0.20250521-2.el10, nftables 1.1.5-4.el10.
-Official NM 1.56 settings/keyfile documentation is the contract reference:
+This kernel labels WireGuard a technology preview; this lab does not establish vendor
+production support. Official NM 1.56 settings/keyfile documentation is the contract reference:
 https://networkmanager.dev/docs/api/1.56/settings-connection.html and
 https://networkmanager.dev/docs/api/1.56/nm-settings-keyfile.html.
 The installed version and individual active device UUIDs, rather than service presence alone,

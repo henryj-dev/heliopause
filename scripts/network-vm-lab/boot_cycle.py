@@ -119,6 +119,12 @@ def recovery_complete(journal, transaction, boot, expected):
     return complete and not any((row['state'] not in {'confirmed','rolled-back','cancelled-before-accept'} or row.get('bootRestore',{}).get('state')=='attempting' or row.get('bootRestore',{}).get('recovery')=='rollback-failed') and not (identity==transaction and expected=='rollback-failed') for identity,row in journal['transactions'].items())
 
 
+def removed_profile(after, transaction):
+    op=after['journal']['transactions'][transaction]['authorization']['operation'];dev=op['interfaceName']
+    current=next(row for row in after['profiles'] if row['uuid']==op['profileUuid'])
+    return current.get('missing') is True and not any(row['ifname']==dev for row in after['links']) and not any(row.get('dev')==dev for row in after['routes']) and not any(line.startswith(op['profileUuid']+':') for line in after.get('nmDevices',[]))
+
+
 def service_inactive(service):
     values=dict(line.split('=',1) for line in service.splitlines() if '=' in line)
     return values.get('MainPID')=='0' and values.get('ActiveState') in {'inactive','failed'} and values.get('SubState') in {'dead','failed'}
@@ -190,6 +196,7 @@ def main():
             if complete:break
             if time.monotonic()>=end:raise TimeoutError('Agent boot recovery not terminal')
             time.sleep(1)
+        if args.expected=='rolled-back' and not removed_profile(report['after'],args.transaction):raise ValueError('rolled-back objects remain')
         if args.expected in {'degraded-unchanged','rollback-failed','inactive'} and not inactive_preserved(report['before'],report['after'],args.transaction):raise ValueError('negative-case profile/kernel preservation failed')
         report['peerBootAfter']=lab.boot('peer')
         if report['peerBootBefore']!=report['peerBootAfter']:raise ValueError('independent peer rebooted')
