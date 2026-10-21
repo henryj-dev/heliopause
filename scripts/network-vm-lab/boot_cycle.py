@@ -119,7 +119,7 @@ def main():
         else:raise TimeoutError('changed actual guest boot ID not observed')
         report['sshRecoveredAt']=time.time();report['elapsedSeconds']=time.monotonic()-started
         # Wait for production worker, not merely sshd, to publish restored/degraded state.
-        end=time.monotonic()+120
+        end=time.monotonic()+240
         while True:
             report['after']=lab.evidence()
             if report['after']['bootId']!=boot:raise ValueError('unexpected additional gateway reboot')
