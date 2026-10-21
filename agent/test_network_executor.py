@@ -207,6 +207,25 @@ class Transactions(unittest.TestCase):
         self.trust.stop()
         with self.assertRaises(ValueError): n.independent_trust(self.cfg,Provider())
         self.trust.start()
+    def test_duplicate_network_key_identity_rejected_before_crypto(self):
+        class Provider:
+            def _load_artifact_key_dir(self,*args):return [('same','manager','first'),('same','manager','second')]
+            def _b64url(self,*args):raise AssertionError('duplicate ring reached signature parsing')
+        envelope={'version':'heliopause-ed25519-v1','algorithm':'Ed25519','keyId':'same','payload':'','signature':''}
+        with self.assertRaisesRegex(ValueError,'duplicate network'):n.network_trust_keys('unused',Provider())
+        self.decode.stop()
+        try:
+            with self.assertRaisesRegex(ValueError,'duplicate network'):n.verify(envelope,'test','unused',Provider())
+        finally:self.decode.start()
+    def test_duplicate_verifier_ring_rejected(self):
+        class Provider:
+            def _load_artifact_key_dir(provider,path,*args):
+                return [('manager','manager','first')] if path==self.cfg['managerKeys'] else [('verifier','manager','second')]*2
+        self.cfg['verifierKeys']='verifier-directory'
+        self.trust.stop()
+        try:
+            with self.assertRaisesRegex(ValueError,'duplicate network'):n.independent_trust(self.cfg,Provider())
+        finally:self.trust.start()
     def test_signature_rejection_has_no_driver_calls(self):
         with patch.object(n,'verify',side_effect=ValueError('bad signature')):
             with self.assertRaises(ValueError): self.e.accept(self.a)

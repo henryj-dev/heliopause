@@ -134,11 +134,19 @@ def crypto_helpers(directory):
     return provider
 
 
+def network_trust_keys(keydir, provider):
+    rows = provider._load_artifact_key_dir(keydir, 'manager')
+    keys = {row[0]: row[2] for row in rows}
+    if not keys or len(keys) != len(rows):
+        raise ValueError('empty or duplicate network signing key identity')
+    return keys
+
+
 def verify(envelope, domain, keydir, provider):
     exact(envelope, 'version algorithm keyId payload signature')
     if envelope['version'] != 'heliopause-ed25519-v1' or envelope['algorithm'] != 'Ed25519':
         raise ValueError('unsupported envelope')
-    keys = {row[0]: row[2] for row in provider._load_artifact_key_dir(keydir, 'manager')}
+    keys = network_trust_keys(keydir, provider)
     key = keys.get(envelope['keyId'])
     payload = provider._b64url(envelope['payload'], 'payload', 128*1024)
     signature = provider._b64url(envelope['signature'], 'signature', 64)
@@ -151,8 +159,8 @@ def verify(envelope, domain, keydir, provider):
 
 
 def independent_trust(config, provider):
-    manager={row[0] for row in provider._load_artifact_key_dir(config['managerKeys'],'manager')}
-    verifier={row[0] for row in provider._load_artifact_key_dir(config['verifierKeys'],'manager')}
+    manager=set(network_trust_keys(config['managerKeys'], provider))
+    verifier=set(network_trust_keys(config['verifierKeys'], provider))
     if not manager or not verifier or manager & verifier:
         raise ValueError('independent verifier trust must use distinct signing keys')
 
