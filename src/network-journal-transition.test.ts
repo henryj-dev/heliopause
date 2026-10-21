@@ -11,6 +11,7 @@ import { emptyApprovals, propose, approve } from './approval.ts';
 import { signNetworkMessage } from './network-execution.ts';
 import { artifactSigningKeyId } from './artifact-signature.ts';
 import { networkDigest } from './network-canonical.ts';
+import { validateJournalEvidence } from './network-journal-evidence.ts';
 import { networkLabInput } from '../examples/network-lab.ts';
 import { planJournalTransition, authorizeJournalTransition, validateQuiescentArchive, journalTransitionHash, commitManagerJournalTransition, verifyJournalMessage, JOURNAL_TRANSITION_DOMAIN, JOURNAL_TRANSITION_RECEIPT_DOMAIN, type JournalArchive } from './network-journal-transition.ts';
 
@@ -56,6 +57,35 @@ test('scope A commits a new epoch and retains retirement receipt; retry never pr
   }finally{f.cleanup();}
 });
 test('empty quiescent journal is explicitly supported',()=>{const f=fixture(0);try{validateQuiescentArchive(f.archive,f.target);}finally{f.cleanup();}});
+const validationContract=JSON.parse(readFileSync(new URL('../scripts/network-transaction-lab/fixtures/journal-validation-v1.json',import.meta.url),'utf8'));
+for(const entry of validationContract.evidenceCases)test('shared evidence contract: '+entry.name,()=>{
+ const f=fixture();try{
+  (f.archive.evidence.runs[0] as any)[entry.field]=entry.value;
+  // Validate without row lookup too: attachment loading uses this public boundary.
+  if(entry.accepted)validateJournalEvidence(f.archive.evidence);
+  else assert.throws(()=>validateJournalEvidence(f.archive.evidence));
+ }finally{f.cleanup();}
+});
+for(const entry of validationContract.emptyJournalCounterCases)test('shared replay counter contract: '+entry.name,()=>{
+ const f=fixture(0);try{
+  (f.archive.agent as any)[entry.field]=entry.value;f.sync();
+  if(entry.accepted)validateQuiescentArchive(f.archive,f.target);
+  else assert.throws(()=>validateQuiescentArchive(f.archive,f.target));
+ }finally{f.cleanup();}
+});
+test('a previously signed malformed counter cannot clear the Manager before Agent refusal',()=>{
+ const f=fixture(0);try{
+  const draft=f.draft(),before=readFileSync(f.store.path);
+  (f.archive.agent as any).terminalSequence=false;f.sync();
+  draft.archiveHash=networkDigest(f.archive.rawFiles);
+  draft.agentHash=createHash('sha256').update(Buffer.from(f.archive.rawFiles.agent,'base64url')).digest('hex');
+  const malformedDirectory=join(f.dir,'malformed-counter');
+  createJournalArchive(malformedDirectory,Object.fromEntries(Object.entries(f.archive.rawFiles).map(([name,encoded])=>[name,Buffer.from(encoded,'base64url')])) as any);
+  const authorization=signNetworkMessage(JOURNAL_TRANSITION_DOMAIN,{...draft,approval:{mode:'two-person',planHash:journalTransitionHash(draft),proposedBy:'alice',approvedBy:'bob',approvedAt:f.now}},f.keys.privateKey);
+  assert.throws(()=>commitManagerJournalTransition(f.store,f.archive,authorization,[f.keys.publicKey],f.keys.privateKey,malformedDirectory,f.now),/replay counters/);
+  assert.deepEqual(readFileSync(f.store.path),before);
+ }finally{f.cleanup();}
+});
 for(const [name,change,pattern] of [
   ['confirmed resource',(f:any)=>{f.archive.agent.transactions['b'.repeat(32)].state='confirmed';},/confirmed/],
   ['rollback debt',(f:any)=>{f.archive.agent.transactions['b'.repeat(32)].state='rollback-failed';},/confirmed or nonterminal/],

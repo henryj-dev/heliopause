@@ -141,6 +141,7 @@ def validate_authority(config,archive,envelope,receipt,provider):
 
 def validate_quiescent_core(archive,target,old_id):
     old=archive['agent'];manager=archive['manager']['execution']
+    need(n.valid_replay_counters(old),'invalid Agent replay counters or clock')
     rows=n.capacity_rows(old,archive['identity'])
     need(old['schemaVersion']==2 and old['journalId']==old_id and manager['fence'] is None,'quiescent identities/fence required')
     need(len(old['transactions'])==old['acceptedSequence']==old['terminalSequence'] and len(rows)==len(manager['records'])==len(archive['outbox'])==len(archive['acknowledgments']),'complete terminal archive required')

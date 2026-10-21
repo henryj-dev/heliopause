@@ -101,6 +101,12 @@ def integer(value, low, high):
     return type(value) is int and low <= value <= high
 
 
+def valid_replay_counters(data):
+    return (integer(data.get('acceptedSequence'),0,1024)
+            and integer(data.get('terminalSequence'),0,1024)
+            and integer(data.get('lastClock'),0,2**53-1))
+
+
 def name(value):
     return isinstance(value, str) and re.fullmatch(r'[a-zA-Z0-9_.-]{1,64}', value) is not None
 
@@ -591,7 +597,7 @@ class Executor:
             return data
         exact(data,'schemaVersion journalId terminalSequence acceptedSequence transactions lastClock')
         identity=read_json(os.path.join(self.directory,'journal-identity.json'))
-        if data['schemaVersion']!=2 or not re.fullmatch(r'[a-f0-9]{32}',str(data['journalId'])) or (self.config.get('journalId') is not None and data['journalId']!=self.config['journalId']) or not integer(data['terminalSequence'],0,1024) or not isinstance(data['transactions'],dict) or len(data['transactions'])>1024 or data['acceptedSequence']!=len(data['transactions']):
+        if data['schemaVersion']!=2 or not re.fullmatch(r'[a-f0-9]{32}',str(data['journalId'])) or (self.config.get('journalId') is not None and data['journalId']!=self.config['journalId']) or not valid_replay_counters(data) or not isinstance(data['transactions'],dict) or len(data['transactions'])>1024 or data['acceptedSequence']!=len(data['transactions']):
             raise ValueError('invalid transaction replay journal')
         capacity_rows(data,identity)
         if 'capacityCancellation' in identity:self.cancellation_binding(identity['capacityCancellation']['cancellation'],identity['capacityCancellation']['authorization'])

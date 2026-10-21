@@ -37,6 +37,17 @@ An unused journal explicitly has empty runs/files and an empty evidence director
 exactly cover the archived Agent transactions. Module commitment binds the first modules file.
 The manifest SHA256 is included in approval, Manager receipt and permanent epoch tombstone.
 
+Evidence identities and commitments must be JSON strings; a single-element array that
+looks like a hash is invalid. Replay counters must be integers from 0 through 1,024,
+and the saved clock must be a nonnegative safe integer. Both languages use the shared
+`scripts/network-transaction-lab/fixtures/journal-validation-v1.json` contract cases.
+A finite future clock watermark remains valid for clock-rollback detection. Malformed
+values are refused without rounding, clearing history or repairing an identity in place.
+Retain the original bytes and fence/transition evidence for inspection. A Manager commit
+does not make an Agent-side refusal safe to bypass; resume only the same valid authority
+after the exact refusal has been understood. Deploy compatible validators on both sides
+before journal maintenance.
+
 Attachments are flat, fixed relative lowercase JSON names, with exact kind/byte/SHA256 metadata:
 no recursion, absolute paths, traversal, duplicate runs/references, extra/missing files, symlink or
 hardlink adoption. Limits are4096files,4MiB each,128MiB total, and64files per role/run. Both the

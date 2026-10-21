@@ -1,0 +1,245 @@
+{
+  "schemaVersion": 1,
+  "evidenceCases": [
+    {
+      "name": "plain source commit",
+      "field": "sourceCommit",
+      "value": "cccccccccccccccccccccccccccccccccccccccc",
+      "accepted": true
+    },
+    {
+      "name": "array source commit",
+      "field": "sourceCommit",
+      "value": [
+        "cccccccccccccccccccccccccccccccccccccccc"
+      ],
+      "accepted": false
+    },
+    {
+      "name": "null source commit",
+      "field": "sourceCommit",
+      "value": null,
+      "accepted": false
+    },
+    {
+      "name": "array transaction identity",
+      "field": "transactionId",
+      "value": [
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      ],
+      "accepted": false
+    },
+    {
+      "name": "array image hash",
+      "field": "imageSha256",
+      "value": [
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      ],
+      "accepted": false
+    },
+    {
+      "name": "array authorization hash",
+      "field": "authorizationHash",
+      "value": [
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      ],
+      "accepted": false
+    },
+    {
+      "name": "array module hash",
+      "field": "moduleManifestSha256",
+      "value": [
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      ],
+      "accepted": false
+    }
+  ],
+  "emptyJournalCounterCases": [
+    {
+      "name": "acceptedSequence zero",
+      "field": "acceptedSequence",
+      "value": 0,
+      "accepted": true
+    },
+    {
+      "name": "acceptedSequence boolean false",
+      "field": "acceptedSequence",
+      "value": false,
+      "accepted": false
+    },
+    {
+      "name": "acceptedSequence boolean true",
+      "field": "acceptedSequence",
+      "value": true,
+      "accepted": false
+    },
+    {
+      "name": "acceptedSequence null",
+      "field": "acceptedSequence",
+      "value": null,
+      "accepted": false
+    },
+    {
+      "name": "acceptedSequence string zero",
+      "field": "acceptedSequence",
+      "value": "0",
+      "accepted": false
+    },
+    {
+      "name": "acceptedSequence array",
+      "field": "acceptedSequence",
+      "value": [],
+      "accepted": false
+    },
+    {
+      "name": "acceptedSequence object",
+      "field": "acceptedSequence",
+      "value": {},
+      "accepted": false
+    },
+    {
+      "name": "acceptedSequence negative",
+      "field": "acceptedSequence",
+      "value": -1,
+      "accepted": false
+    },
+    {
+      "name": "acceptedSequence fraction",
+      "field": "acceptedSequence",
+      "value": 0.5,
+      "accepted": false
+    },
+    {
+      "name": "acceptedSequence unsafe integer",
+      "field": "acceptedSequence",
+      "value": 9007199254740992,
+      "accepted": false
+    },
+    {
+      "name": "terminalSequence zero",
+      "field": "terminalSequence",
+      "value": 0,
+      "accepted": true
+    },
+    {
+      "name": "terminalSequence boolean false",
+      "field": "terminalSequence",
+      "value": false,
+      "accepted": false
+    },
+    {
+      "name": "terminalSequence boolean true",
+      "field": "terminalSequence",
+      "value": true,
+      "accepted": false
+    },
+    {
+      "name": "terminalSequence null",
+      "field": "terminalSequence",
+      "value": null,
+      "accepted": false
+    },
+    {
+      "name": "terminalSequence string zero",
+      "field": "terminalSequence",
+      "value": "0",
+      "accepted": false
+    },
+    {
+      "name": "terminalSequence array",
+      "field": "terminalSequence",
+      "value": [],
+      "accepted": false
+    },
+    {
+      "name": "terminalSequence object",
+      "field": "terminalSequence",
+      "value": {},
+      "accepted": false
+    },
+    {
+      "name": "terminalSequence negative",
+      "field": "terminalSequence",
+      "value": -1,
+      "accepted": false
+    },
+    {
+      "name": "terminalSequence fraction",
+      "field": "terminalSequence",
+      "value": 0.5,
+      "accepted": false
+    },
+    {
+      "name": "terminalSequence unsafe integer",
+      "field": "terminalSequence",
+      "value": 9007199254740992,
+      "accepted": false
+    },
+    {
+      "name": "lastClock zero",
+      "field": "lastClock",
+      "value": 0,
+      "accepted": true
+    },
+    {
+      "name": "lastClock boolean false",
+      "field": "lastClock",
+      "value": false,
+      "accepted": false
+    },
+    {
+      "name": "lastClock boolean true",
+      "field": "lastClock",
+      "value": true,
+      "accepted": false
+    },
+    {
+      "name": "lastClock null",
+      "field": "lastClock",
+      "value": null,
+      "accepted": false
+    },
+    {
+      "name": "lastClock string zero",
+      "field": "lastClock",
+      "value": "0",
+      "accepted": false
+    },
+    {
+      "name": "lastClock array",
+      "field": "lastClock",
+      "value": [],
+      "accepted": false
+    },
+    {
+      "name": "lastClock object",
+      "field": "lastClock",
+      "value": {},
+      "accepted": false
+    },
+    {
+      "name": "lastClock negative",
+      "field": "lastClock",
+      "value": -1,
+      "accepted": false
+    },
+    {
+      "name": "lastClock fraction",
+      "field": "lastClock",
+      "value": 0.5,
+      "accepted": false
+    },
+    {
+      "name": "lastClock unsafe integer",
+      "field": "lastClock",
+      "value": 9007199254740992,
+      "accepted": false
+    },
+    {
+      "name": "finite future watermark",
+      "field": "lastClock",
+      "value": 8000000000000000,
+      "accepted": true
+    }
+  ]
+}
