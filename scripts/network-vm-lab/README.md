@@ -27,9 +27,9 @@ outside the repository. Reports are created 0600 and preserve failure evidence. 
 keyfiles/profile exports into reports. Failed cases remain failures. Do not reset a used
 journal, remove confirmed objects or prune Manager fences to recycle a case.
 
-# Rocky Linux 10 VM preparation — blocked, not a boot test runner
+# Historical Phase 9 preparation record (superseded by Phase 10)
 
-The owner selected Rocky Linux10 on2026-10-20, could not confirm NetworkManager, and has no disposable VM available. Local `qemu-system-x86_64`, `limactl` and `virsh` are absent. This directory contains preparation inputs only. No VM was provisioned or rebooted, no persistent backend is implemented, and no boot report is claimed. Hosted container/kernel success is not Rocky/NetworkManager certification.
+The following section records the pre-Phase10 state, not current support. At that time, the owner selected Rocky Linux10 on2026-10-20, could not confirm NetworkManager, and has no disposable VM available. Local `qemu-system-x86_64`, `limactl` and `virsh` are absent. This directory contains preparation inputs only. No VM was provisioned or rebooted, no persistent backend is implemented, and no boot report is claimed. Hosted container/kernel success is not Rocky/NetworkManager certification.
 
 ## Reproducible preparation checklist
 
@@ -72,7 +72,7 @@ Only the production Agent performs subsequent restore/undo and authenticated set
 
 Run each of the13 handoff VM cases: confirmed restore+independent management/bidirectional workload, kill/reboot prepared/applying, awaiting-confirm reboot, rollback reboot, rollback-failed reboot, delayed/failed Agent startup, NM restart, profile corruption/missing/foreign change, missing/unsafe secret, firewall boot restore coexistence, execution disabled recovery, and delayed terminal settlement retry. Treat confirmed restore and current connectivity as separate results: old verifier proof is never fresh forwarding evidence.
 
-For every case record exact sourceCommit/image hash/version, before/after guest boot ID, Agent PID, persistent profile UUID/ownership, journal/fence state, timestamped management loss/recovery, link/address/routes, heartbeat/discovery/watchdog, independently observed forward/reverse packets and preserved failure diagnostics. A new process PID without changed `/proc/sys/kernel/random/boot_id` is not a host reboot. Do not turn unavailable virtualization into a skipped successful report. Current result remains `hostRebootVerified:false`.
+For every case record exact sourceCommit/image hash/version, before/after guest boot ID, Agent PID, persistent profile UUID/ownership, journal/fence state, timestamped management loss/recovery, link/address/routes, heartbeat/discovery/watchdog, independently observed forward/reverse packets and preserved failure diagnostics. A new process PID without changed `/proc/sys/kernel/random/boot_id` is not a host reboot. Do not turn unavailable virtualization into a skipped successful report. The historical Phase9/container result remains `hostRebootVerified:false`; Phase10 actual VM evidence is a separate result.
 
 Do not enable a persistence backend on a trial/operational host until these cases pass with its actual OS and network manager. This preparation changes no host or network.
 
@@ -88,6 +88,6 @@ It prints JSON to stdout and exits **2** while prerequisites remain blocked. Thi
 
 The collector reads only bounded `/etc/os-release` ID/version and the local boot ID, kernel/architecture, four fixed tool-version commands and three fixed service `is-active` queries. Each command has a three-second timeout and a 4KiB stdout cap; stderr and inherited environment settings are discarded. Only recognized version/state fields are included, never whole command output. No interface addresses, route contents, NM connection names/UUIDs, profile settings, environment dumps, private keys or secret paths are collected. Do not upload the report without inspecting it: boot ID and kernel/OS versions remain machine metadata.
 
-Device/route ownership, service ordering/security properties and the independent management/underlay/workload paths remain the manual checklist above; an active NM service does not establish ownership of a particular interface. NM failure stays unknown. No backend is selected from service presence. This command does not establish VM isolation, x86-64-v3 availability, image authenticity, clock safety, current packet delivery or a host reboot. The missing disposable Rocky10 VM still blocks Phase C.
+Device/route ownership, service ordering/security properties and the independent management/underlay/workload paths remain the manual checklist above; an active NM service does not establish ownership of a particular interface. NM failure stays unknown. No backend is selected from service presence. This command does not establish VM isolation, x86-64-v3 availability, image authenticity, clock safety, current packet delivery or a host reboot. That historical missing-VM blocker was resolved for the measured Phase10 development lab. The collector itself still proves no boot result.
 
 Run the isolated fixture suite with `python3 scripts/network-vm-lab/test_preflight.py`; `npm test` also invokes it. Inventory tests replace OS/file/probe boundaries and fail on escaped Popen/socket/file access. Probe-boundary tests launch only the local Python interpreter for timeout, output cap, invalid UTF-8 and environment/stderr handling; file tests use a private temporary directory. They do not run host ip/wg/systemctl or exercise a VM backend.
