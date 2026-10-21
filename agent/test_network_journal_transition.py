@@ -16,6 +16,7 @@ import unittest
 from unittest.mock import patch
 import network_executor as n
 import network_journal_transition as t
+REAL_CRYPTO_HELPERS=n.crypto_helpers
 from test_network_executor import Fake,authorization
 
 
@@ -61,6 +62,25 @@ class Transition(unittest.TestCase):
         self.absence=patch.object(t,'resource_absence',side_effect=AssertionError('live kernel absence must be explicitly injected'));self.absence.start();self.addCleanup(self.absence.stop)
     def apply(self,event=None,absence=lambda *args:None):
         return t.apply_agent(str(self.config),str(self.state),str(self.archive),self.envelope,self.receipt,str(self.writer),event=event,absence=absence)
+    def test_real_signature_workspace_does_not_recreate_unpublished_successor(self):
+        # Retain the production helper's mkdir/temp-file/fsync/cleanup behavior while
+        # isolating its only subprocess (OpenSSL); no host network command can escape.
+        def openssl_only(argv,*args,**kwargs):
+            self.assertEqual(argv[1:3],['pkeyutl','-verify'])
+            return subprocess.CompletedProcess(argv,0,b'Verified',b'')
+        def verify(value,domain,keys,provider):
+            self.assertTrue(provider._verify_ed25519('public-test',b'message',b'signature'))
+            return value.get('body',value)
+        with patch.object(n,'crypto_helpers',side_effect=REAL_CRYPTO_HELPERS),patch.object(n,'verify',side_effect=verify),patch.object(subprocess,'run',side_effect=openssl_only):
+            def crash(point):
+                if point=='old-preserved':raise RuntimeError('crash')
+            with self.assertRaisesRegex(RuntimeError,'crash'):self.apply(event=crash)
+            self.assertFalse(self.state.exists())
+            result=self.apply()
+            self.assertTrue(result['committed'])
+            self.assertEqual(n.read_json(str(self.state/'journal-identity.json')),{'journalId':'e'*32})
+        self.assertFalse(list(self.root.glob('.artifact-signature.*')))
+
     def test_complete_and_duplicate_never_reset_successor(self):
         result=self.apply();self.assertTrue(result['committed']);self.assertEqual(n.read_json(str(self.state/'journal-identity.json')),{'journalId':'e'*32})
         previous=Path(result['oldStatePreservedAt']);self.assertTrue((previous/'transactions.json').exists());self.assertTrue(n.journal_transition_pending(str(previous)))

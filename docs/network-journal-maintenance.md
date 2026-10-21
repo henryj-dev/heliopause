@@ -82,7 +82,9 @@ Use `--archive ARCHIVE --authorization ENVELOPE --manager-receipt RECEIPT --appl
 the default integrated root-owned layout with Agent/courier stopped. Apply repeats the checks,
 requires exact approved configuration bytes (or the exact successor bytes during recovery), and
 executes the durable phases below. No network mutation is performed by this tool. A Manager
-receipt is mandatory; Agent cannot transition first.
+receipt is mandatory; Agent cannot transition first. Signature verification uses temporary files
+in the existing protected Agent writer directory, never in the replaceable journal. A crash in
+verification must not recreate an unpublished successor or alter the immutable archive.
 
 After both commits, explicitly update the Manager target's journal binding, preserving the
 same target and exact authorized leaf pin. Restart Manager and Agent/courier; verify both ledgers,
@@ -114,7 +116,9 @@ The retirement chain itself is bounded256; exhaustion requires a separately desi
 ## Qualification limits
 
 Isolated tests exercise both real Node Ed25519/Registry transitions and Agent crash/file behavior
-with live network/subprocess/socket boundaries replaced. A loopback mTLS test exercises actual
+with live network/subprocess/socket boundaries replaced. A regression retains the production
+signature helper's real directory/temp-file/fsync/cleanup behavior while replacing only its
+OpenSSL subprocess; replacing the entire helper would hide that filesystem boundary. A loopback mTLS test exercises actual
 operator authentication and two-person approval, receipt retry and retired-binding startup refusal.
 Those tests do not establish Rocky VM crash recovery, storage-pressure survival or remote custody.
 Confirmed-resource scope B remains unsupported and blocks a trial that requires that migration.

@@ -228,7 +228,11 @@ def inspect_agent(config_path,directory,archive_path,writer_lock,absence=resourc
 def apply_agent(config_path,directory,archive_path,envelope,receipt,writer_lock,event=None,absence=resource_absence):
     event=event or (lambda _:None)
     config_raw=n.read_file(config_path);config=n.decode_json(config_raw);n.validate_execution_config(config)
-    archive=read_archive(archive_path);provider=n.crypto_helpers(directory)
+    archive=read_archive(archive_path)
+    # The shared verifier creates temporary signature/message files. Never point it at the
+    # replaceable journal: verification on resume would recreate an unpublished successor.
+    workspace=Path(writer_lock).parent;workspace_fd=secure_directory(workspace);os.close(workspace_fd)
+    provider=n.crypto_helpers(str(workspace))
     t=validate_authority(config,archive,envelope,receipt,provider)
     need(config_raw in [base64.urlsafe_b64decode(archive['rawFiles']['config']+'=='),n.canonical({**archive['config'],'journalId':t['newJournalId']}).encode()],'configuration bytes differ from approved transition')
     directory=Path(os.path.abspath(directory));parent=secure_directory(directory.parent)
