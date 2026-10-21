@@ -1,11 +1,11 @@
 import { settleNetworkExecution } from './network-execution-settlement.ts';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, writeFileSync, rmSync, unlinkSync, symlinkSync, chmodSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, rmSync, unlinkSync, symlinkSync, chmodSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { generateKeyPairSync, createHash } from 'node:crypto';
-import { createJournalArchive } from './network-journal-archive.ts';
+import { createJournalArchive, loadJournalArchive } from './network-journal-archive.ts';
 import { NetworkRegistryStore } from './network-registry.ts';
 import { emptyApprovals, propose, approve } from './approval.ts';
 import { signNetworkMessage } from './network-execution.ts';
@@ -229,4 +229,42 @@ for(const damage of ['missing-identity','bad-sequence','wrong-cancel','missing-a
     else f.archive.evidence.runs=[];
     f.sync();assert.throws(()=>validateQuiescentArchive(f.archive,f.target));
   }finally{f.cleanup();}
+});
+
+test('malformed UTF-8 archive cannot clear Manager state even with a signed transition',()=>{
+ const f=fixture();try{
+  const draft=f.draft(),before=readFileSync(f.store.path),row=Object.values(f.archive.agent.transactions)[0] as any;
+  row.diagnostic='utf8-marker';f.sync();
+  const original=Buffer.from(f.archive.rawFiles.agent,'base64url'),index=original.indexOf(Buffer.from('utf8-marker'));assert.ok(index>=0);
+  const raw=Buffer.concat([original.subarray(0,index),Buffer.from([0xff]),original.subarray(index+'utf8-marker'.length)]);
+  f.archive.rawFiles.agent=raw.toString('base64url');row.diagnostic='\ufffd';
+  const path=join(f.archiveDirectory,'transactions.json'),manifestPath=join(f.archiveDirectory,'manifest.json'),manifest=JSON.parse(readFileSync(manifestPath,'utf8'));
+  writeFileSync(path,raw);manifest.files['transactions.json']={sha256:createHash('sha256').update(raw).digest('hex'),bytes:raw.length};writeFileSync(manifestPath,JSON.stringify(manifest));
+  draft.archiveHash=networkDigest(f.archive.rawFiles);draft.agentHash=manifest.files['transactions.json'].sha256;
+  const envelope=signNetworkMessage(JOURNAL_TRANSITION_DOMAIN,{...draft,approval:{mode:'two-person',planHash:journalTransitionHash(draft),proposedBy:'alice',approvedBy:'bob',approvedAt:f.now}},f.keys.privateKey);
+  for(let i=0;i<2;i++){
+   assert.throws(()=>commitManagerJournalTransition(f.store,f.archive,envelope,[f.keys.publicKey],f.keys.privateKey,f.archiveDirectory,f.now),/UTF-8/);
+   assert.deepEqual(readFileSync(f.store.path),before);assert.deepEqual(readFileSync(path),raw);
+  }
+ }finally{f.cleanup();}
+});
+
+for(const stage of ['create','load'] as const)test('archive '+stage+' refuses malformed UTF-8 evidence despite matching commitments',()=>{
+ const f=fixture();try{
+  const name=Object.keys(f.archive.evidence.files).find(name=>name.startsWith('history-'))!,raw=Buffer.concat([Buffer.from('{"diagnostic":"'),Buffer.from([0xff]),Buffer.from('"}')]);
+  const entry=f.archive.evidence.files[name]!;entry.sha256=createHash('sha256').update(raw).digest('hex');entry.bytes=raw.length;f.sync();
+  const before=readFileSync(f.store.path);
+  if(stage==='create'){
+   const attachments=Object.fromEntries(Object.keys(f.archive.evidence.files).map(file=>[file,file===name?raw:readFileSync(join(f.archiveDirectory,'evidence',file))]));
+   const destination=join(f.dir,'malformed-evidence');
+   assert.throws(()=>createJournalArchive(destination,Object.fromEntries(Object.entries(f.archive.rawFiles).map(([key,value])=>[key,Buffer.from(value,'base64url')])) as any,attachments),/UTF-8/);
+   assert.equal(existsSync(destination),false);
+  }else{
+   writeFileSync(join(f.archiveDirectory,'evidence',name),raw);
+   const evidence=Buffer.from(f.archive.rawFiles.evidence,'base64url'),manifestPath=join(f.archiveDirectory,'manifest.json'),manifest=JSON.parse(readFileSync(manifestPath,'utf8'));
+   writeFileSync(join(f.archiveDirectory,'execution-evidence.json'),evidence);manifest.files['execution-evidence.json']={sha256:createHash('sha256').update(evidence).digest('hex'),bytes:evidence.length};writeFileSync(manifestPath,JSON.stringify(manifest));
+   assert.throws(()=>loadJournalArchive(f.archiveDirectory),/UTF-8/);assert.deepEqual(readFileSync(join(f.archiveDirectory,'evidence',name)),raw);
+  }
+  assert.deepEqual(readFileSync(f.store.path),before);
+ }finally{f.cleanup();}
 });

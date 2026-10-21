@@ -219,3 +219,12 @@ alone; the full archive/signature verifier and offline transition retry remain s
 Boot restoration continues to verify its Manager/verifier authority against current trust.
 The fsync barrier reserves no physical storage. If it fails, existing owned undo, terminal
 export and identical-result retries remain available; new identities stay refused.
+
+
+### Archive byte encoding
+
+Manager archive creation, loading, evidence attachment validation and signed transition validation reject malformed UTF-8 before JSON decoding. Invalid bytes are not replaced with Unicode replacement characters or rewritten. Valid UTF-8, including an actual U+FFFD character, remains accepted where its field permits it. The existing Manager refusal of a UTF-8 BOM is retained; this does not add other JSON encodings or establish whole-schema equivalence with the Agent.
+
+If encoding validation fails, preserve the original archive and reconcile its provenance. Do not repair the bytes in place, approve a normalized copy as the original, or clear the old journal. A paired compatible rollout and the existing full-archive/two-person transition checks remain required.
+
+The shared byte fixtures record decoder-specific outcomes. Python's existing byte JSON decoder also accepts UTF-16/32 with a BOM and UTF-8 encoded surrogate bytes; Manager archive parsing refuses them. This stricter Manager behavior prevents approval of bytes the Agent would later reject without changing the Agent's common config/mailbox/journal decoder. It does not claim that every byte representation accepted by either decoder is a supported archive. Any Agent-wide encoding restriction requires separate compatibility qualification.

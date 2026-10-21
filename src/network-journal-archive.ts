@@ -2,6 +2,7 @@ import { journalRows } from './network-journal-rows.ts';
 import { validateJournalEvidence, type JournalEvidenceManifest } from './network-journal-evidence.ts';
 /** Restricted exact-byte snapshot archive; no secrets/recursive lab copy or ledger mutation. */
 import { createHash } from 'node:crypto';
+import { isUtf8 } from 'node:buffer';
 import { constants, openSync, closeSync, fstatSync, lstatSync, fsyncSync, readSync, writeFileSync, mkdirSync, readdirSync } from 'node:fs';
 import { dirname, resolve, join } from 'node:path';
 import { networkDigest } from './network-canonical.ts';
@@ -10,6 +11,11 @@ const files={manager:'manager.json',agent:'transactions.json',identity:'journal-
 type Name=keyof typeof files;
 export type JournalArchiveBytes=Record<Name,Buffer>;
 const digest=(bytes:Buffer)=>createHash('sha256').update(bytes).digest('hex');
+/** Reject malformed bytes before toString can replace them. Preserve the existing BOM refusal. */
+function archiveText(raw:Buffer):string {
+  if(!isUtf8(raw))throw new Error('invalid archive UTF-8');
+  return raw.toString('utf8');
+}
 /** JSON.parse alone silently accepts duplicate keys, unlike the production Agent decoder. */
 export function parseArchiveJson(raw:string,integerToken:(path:readonly string[])=>boolean=()=>false):any {
   const parsed=JSON.parse(raw),stack:Array<{object:boolean;key:boolean;field?:string;path:string[];seen:Set<string>}>=[];
@@ -39,8 +45,8 @@ export function parseReplayJournalJson(raw:string):any {
 // Their decoded copies must retain that encoding too: 1.0 changes Python's digest.
 const committedRowFields=['authorization','cancellation','terminalResult','cancellationResponse'];
 export function parseJournalArchiveFile(name:Name,raw:Buffer):any {
-  if(name==='agent')return parseReplayJournalJson(raw.toString());
-  return parseArchiveJson(raw.toString(),path=>{
+  if(name==='agent')return parseReplayJournalJson(archiveText(raw));
+  return parseArchiveJson(archiveText(raw),path=>{
     if(name==='identity')return path.length>=3&&path[0]==='capacityCancellation'&&committedRowFields.includes(path[1]!);
     if(name==='outbox')return path.length>=2&&path[0]==='[]';
     if(name==='evidence')return path.join('/')==='schemaVersion'||(path.length===3&&path[0]==='files'&&path[2]==='bytes');
@@ -71,14 +77,14 @@ function refuseCredentials(value:unknown):void {
 }
 export function createJournalArchive(directory:string,bytes:JournalArchiveBytes,attachments:Record<string,Buffer>={}):JournalArchive {
   for(const [name] of Object.entries(files) as [Name,string][]){const raw=bytes[name];if(!Buffer.isBuffer(raw)||raw.length>(name==='manager'?4:8)*1024*1024)throw new Error('snapshot archive size bound');refuseCredentials(parseJournalArchiveFile(name,raw));}
-  const evidence=parseJournalArchiveFile('evidence',bytes.evidence) as JournalEvidenceManifest;validateJournalEvidence(evidence,journalRows(parseReplayJournalJson(bytes.agent.toString()),parseArchiveJson(bytes.identity.toString())));
+  const evidence=parseJournalArchiveFile('evidence',bytes.evidence) as JournalEvidenceManifest;validateJournalEvidence(evidence,journalRows(parseReplayJournalJson(archiveText(bytes.agent)),parseArchiveJson(archiveText(bytes.identity))));
   if(Object.keys(attachments).sort().join(' ')!==Object.keys(evidence.files).sort().join(' '))throw new Error('missing/extra execution evidence attachments');
-  for(const [name,entry] of Object.entries(evidence.files)){const raw=attachments[name]!;if(!Buffer.isBuffer(raw)||raw.length!==entry.bytes||digest(raw)!==entry.sha256)throw new Error('execution evidence attachment mismatch');refuseCredentials(parseArchiveJson(raw.toString()));}
+  for(const [name,entry] of Object.entries(evidence.files)){const raw=attachments[name]!;if(!Buffer.isBuffer(raw)||raw.length!==entry.bytes||digest(raw)!==entry.sha256)throw new Error('execution evidence attachment mismatch');refuseCredentials(parseArchiveJson(archiveText(raw)));}
   privateDirectory(dirname(resolve(directory)));mkdirSync(directory,{mode:0o700});
   const manifest:{schemaVersion:1;files:Record<string,{sha256:string;bytes:number}>}={schemaVersion:1,files:{}};
   for(const [name,file] of Object.entries(files) as [Name,string][]) {
     const raw=bytes[name];if(!Buffer.isBuffer(raw)||raw.length>(name==='manager'?4:8)*1024*1024)throw new Error('snapshot archive size bound');
-    if(/-----BEGIN (?:[A-Z ]*PRIVATE KEY|OPENSSH PRIVATE KEY)-----/.test(raw.toString()))throw new Error('private key archive refused');
+    if(/-----BEGIN (?:[A-Z ]*PRIVATE KEY|OPENSSH PRIVATE KEY)-----/.test(archiveText(raw)))throw new Error('private key archive refused');
     writeFileSync(join(directory,file),raw,{flag:'wx',mode:0o600});read(join(directory,file),8*1024*1024);manifest.files[file]={sha256:digest(raw),bytes:raw.length};
   }
   const evidenceDirectory=join(directory,'evidence');mkdirSync(evidenceDirectory,{mode:0o700});
@@ -87,7 +93,7 @@ export function createJournalArchive(directory:string,bytes:JournalArchiveBytes,
   writeFileSync(join(directory,'manifest.json'),JSON.stringify(manifest)+'\n',{flag:'wx',mode:0o600});read(join(directory,'manifest.json'),16384);seal(directory);seal(dirname(directory));return loadJournalArchive(directory);
 }
 export function loadJournalArchive(directory:string):JournalArchive {
-  privateDirectory(directory);const manifest=parseArchiveJson(read(join(directory,'manifest.json'),16384).toString());
+  privateDirectory(directory);const manifest=parseArchiveJson(archiveText(read(join(directory,'manifest.json'),16384)));
   if(manifest.schemaVersion!==1||Object.keys(manifest).sort().join(' ')!=='files schemaVersion'||Object.keys(manifest.files).sort().join(' ')!==Object.values(files).sort().join(' ')||readdirSync(directory).sort().join(' ')!==[...Object.values(files),'manifest.json','evidence'].sort().join(' '))throw new Error('invalid/incomplete snapshot archive manifest');
   const rawFiles={} as JournalArchive['rawFiles'],parsed={} as Record<Name,any>;
   for(const [name,file] of Object.entries(files) as [Name,string][]) {
@@ -112,6 +118,6 @@ export function readJournalEvidenceAttachments(directory:string,manifest:Journal
   validateJournalEvidence(manifest);const path=join(directory,'evidence');privateDirectory(path);
   if(readdirSync(path).sort().join(' ')!==Object.keys(manifest.files).sort().join(' '))throw new Error('missing/extra execution evidence files');
   const result:Record<string,Buffer>={};
-  for(const [name,entry] of Object.entries(manifest.files)){if(!/^[a-z][a-z0-9-]{0,63}\.json$/.test(name))throw new Error('unsafe execution evidence filename');const raw=read(join(path,name),4*1024*1024);if(raw.length!==entry.bytes||digest(raw)!==entry.sha256)throw new Error('execution evidence hash mismatch');refuseCredentials(parseArchiveJson(raw.toString()));result[name]=raw;}
+  for(const [name,entry] of Object.entries(manifest.files)){if(!/^[a-z][a-z0-9-]{0,63}\.json$/.test(name))throw new Error('unsafe execution evidence filename');const raw=read(join(path,name),4*1024*1024);if(raw.length!==entry.bytes||digest(raw)!==entry.sha256)throw new Error('execution evidence hash mismatch');refuseCredentials(parseArchiveJson(archiveText(raw)));result[name]=raw;}
   seal(path);return result;
 }
