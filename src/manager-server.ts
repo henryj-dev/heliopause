@@ -1,3 +1,6 @@
+import { existsSync } from 'node:fs';
+import { loadJournalArchive } from './network-journal-archive.ts';
+import { planJournalTransition, journalTransitionHash, authorizeJournalTransition, commitManagerJournalTransition, assertJournalEpochBinding, type JournalTransitionDraft } from './network-journal-transition.ts';
 import { NETWORK_EXECUTION_CAPACITY } from './network-execution-state.ts';
 import { issueDurableNetworkCancellation } from './network-execution-cancellation.ts';
 import { issueDurableNetworkConfirm, settleNetworkExecution } from './network-execution-settlement.ts';
@@ -57,7 +60,7 @@ import { createSecureContext, type SecureContext, type TLSSocket } from "node:tl
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { readFile, readdir, realpath } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { createHash, createPublicKey, type KeyObject } from "node:crypto";
+import { createHash, createPublicKey, randomBytes, type KeyObject } from "node:crypto";
 import { peerCN, type FleetView } from "./relay.ts";
 import { BodyTooLargeError, readBoundedNodeBody, readBoundedText } from "./bounded-body.ts";
 import { NetworkObservationStore, observationFreshness, NETWORK_COLLECTOR_NAMES } from "./network-observation.ts";
@@ -325,6 +328,7 @@ export const API_ROUTES: ReadonlySet<string> = new Set([
  * fleet agent fetches its own certificate from there, through a name in stardust's SNI allowlist.
  */
 export const API_ROUTE_PATTERNS: readonly RegExp[] = [
+  /^\/network\/journal-transition\/(?:propose|review|approve|authorize|commit)$/,
   /^\/network\/execution\/(?:propose|approve|authorize|confirm|cancel|review|status)$/,
   /^\/network\/inventory\/[^/]+$/,
   /^\/network\/observations\/[^/]+\/[^/]+$/,
@@ -432,6 +436,8 @@ export interface ManagerOptions {
   networkRegistryFile?: string;
   /** Separate opt-in writer issuance; identities are deployment trust, never request claims. */
   networkVerifierKeys?: readonly KeyObject[];
+  /** Pre-staged private archives only; clients cannot submit filesystem paths. */
+  networkJournalArchiveDirectory?: string;
   networkExecutionTargets?: readonly { source: string; host: string; nodeId: string; journalId: string; certificateSha256: string }[];
   /** Per-relay cached observations, separate from desired state. */
   networkObservationsDir?: string;
@@ -1405,6 +1411,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
   }
   if (opts.artifactSigning) artifactSigningKeyId(createPublicKey(opts.artifactSigning.privateKey));
   const terminalPins=opts.networkExecutionTargets??[];
+  if(opts.networkRegistryFile&&existsSync(opts.networkRegistryFile)&&new NetworkRegistryStore(opts.networkRegistryFile).read().execution?.journalEpoch) assertJournalEpochBinding(new NetworkRegistryStore(opts.networkRegistryFile),terminalPins);
   if(opts.networkExecutionTargets?.some(t=>!/^[a-f0-9]{32}$/.test(t.journalId))||terminalPins.some(t=>!/^[a-f0-9]{64}$/.test(t.certificateSha256!))||new Set(terminalPins.map(t=>t.certificateSha256)).size!==terminalPins.length) throw new Error("invalid or ambiguous network Agent identity pins");
   if (opts.artifactSigning && opts.networkExecutionTargets?.length) validateNetworkVerifierKeys(opts.networkVerifierKeys ?? [], opts.artifactSigning.privateKey);
   if (opts.tls.public && opts.tls.public.serverNames.length === 0) {
@@ -1588,6 +1595,8 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
   const approvals = emptyApprovals();
   const networkApprovals = emptyApprovals();
   const networkDrafts = new Map<string, NetworkExecutionDraft>();
+  const journalApprovals=emptyApprovals();
+  const journalDrafts=new Map<string,{draft:JournalTransitionDraft;archiveName:string}>();
 
   function networkEvidence(draft: NetworkExecutionDraft) {
     if (!opts.networkRegistryFile || !opts.networkObservationsDir || !opts.relays.some(r => r.name === draft.target.source)) throw new Error("execution evidence unavailable");
@@ -2370,6 +2379,46 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     // One boolean, one place. Certificates read the live allowlist; sessions carry the decision
     // taken at login — see `Principal.canWrite` for why that is stated rather than hidden.
     const mayWrite = principal.canWrite;
+    const journalMatch=/^\/network\/journal-transition\/(propose|review|approve|authorize|commit)$/.exec(url.pathname);
+    if(journalMatch){
+      if(!opts.networkJournalArchiveDirectory||!opts.networkRegistryFile||!opts.artifactSigning||!opts.networkExecutionTargets?.length)return send(res,503,{error:'journal transition disabled'});
+      const action=journalMatch[1];
+      if(action==='review'&&req.method==='GET'){
+        const entry=journalDrafts.get(url.searchParams.get('hash')??'');
+        return entry?send(res,200,{draft:entry.draft,archiveName:entry.archiveName}):send(res,404,{error:'transition proposal unavailable'});
+      }
+      if(req.method!=='POST')return send(res,405,{error:'method not allowed'});
+      if(!mayWrite)return refuseWrite(res,who,url.pathname,principal.via);
+      if(crossSiteRequest(req))return send(res,403,{error:'cross-site transition refused'});
+      try{
+        const body=JSON.parse((await readNetworkRegistryBody(req)).toString('utf8'));
+        if(action!=='propose'&&(await requireOtp(principal,body,res,url.pathname))==='answered')return;
+        const archiveName=String(body.archiveName??'');
+        if(!/^[a-f0-9]{32}$/.test(archiveName))throw new Error('fixed archive identity required');
+        const archivePath=join(opts.networkJournalArchiveDirectory,archiveName),archive=loadJournalArchive(archivePath);
+        const pin=opts.networkExecutionTargets.find(t=>t.journalId===archive.agent.journalId&&networkDigest({source:t.source,host:t.host,nodeId:t.nodeId})===networkDigest(archive.config.identity));
+        if(!pin)throw new Error('archive target binding refused');
+        const target={source:pin.source,host:pin.host,nodeId:pin.nodeId},at=now();
+        if(action==='commit'){
+          const receipt=commitManagerJournalTransition(new NetworkRegistryStore(opts.networkRegistryFile),archive,body.envelope,[createPublicKey(opts.artifactSigning.privateKey)],opts.artifactSigning.privateKey,archivePath,+at);
+          return send(res,200,{receipt,agentCommitRequired:true,managerBindingRestartRequired:true});
+        }
+        if(action==='propose'){
+          if(journalDrafts.size>=32)throw new Error('transition proposal capacity reached');
+          const draft=planJournalTransition(archive,target,randomBytes(16).toString('hex'),randomBytes(16).toString('hex'),+at),hash=journalTransitionHash(draft);
+          const plan=propose(journalApprovals,{hash,generation:draft.transitionId,summary:{hosts:[{host:target.host,stage:'journal-maintenance',ruleCount:0,rulesetHash:draft.archiveHash}]},by:who,byOtp:otpIdentityOf(principal),now:at});
+          journalDrafts.set(hash,{draft,archiveName});return send(res,201,{hash,plan,draft});
+        }
+        const hash=String(body.hash??''),entry=journalDrafts.get(hash);
+        if(!entry||entry.archiveName!==archiveName)throw new Error('re-propose exact transition archive');
+        if(action==='approve'){
+          const aka=alsoKnownAsFor(principal);if(!aka)return send(res,503,{error:'identity store unavailable'});
+          return send(res,200,{hash,plan:approve(journalApprovals,{hash,by:who,alsoKnownAs:aka,byOtp:otpIdentityOf(principal),now:at})});
+        }
+        const envelope=authorizeJournalTransition(archive,entry.draft,journalApprovals,who,opts.artifactSigning.privateKey,at);
+        journalDrafts.delete(hash);return send(res,200,{envelope});
+      }catch{return send(res,409,{error:'exact quiescent journal transition refused'});}
+    }
     const networkExecutionMatch = /^\/network\/execution\/(propose|approve|authorize|confirm|cancel|review|status)$/.exec(url.pathname);
     if (networkExecutionMatch) {
       if(req.method==="GET"&&networkExecutionMatch[1]==="status") {

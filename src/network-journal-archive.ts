@@ -1,13 +1,28 @@
 /** Restricted exact-byte snapshot archive; no secrets/recursive lab copy or ledger mutation. */
 import { createHash } from 'node:crypto';
-import { constants, openSync, closeSync, fstatSync, lstatSync, fsyncSync, readFileSync, writeFileSync, mkdirSync, readdirSync } from 'node:fs';
-import { dirname, resolve, parse, join } from 'node:path';
+import { constants, openSync, closeSync, fstatSync, lstatSync, fsyncSync, readSync, writeFileSync, mkdirSync, readdirSync } from 'node:fs';
+import { dirname, resolve, join } from 'node:path';
 import { networkDigest } from './network-canonical.ts';
 import type { JournalArchive } from './network-journal-transition.ts';
-const files={manager:'manager.json',agent:'transactions.json',identity:'journal-identity.json',outbox:'terminal-results.json',acknowledgments:'terminal-acks.json'} as const;
+const files={manager:'manager.json',agent:'transactions.json',identity:'journal-identity.json',outbox:'terminal-results.json',acknowledgments:'terminal-acks.json',trust:'audit-public-keys.json',config:'network-executor-config.json'} as const;
 type Name=keyof typeof files;
 export type JournalArchiveBytes=Record<Name,Buffer>;
 const digest=(bytes:Buffer)=>createHash('sha256').update(bytes).digest('hex');
+/** JSON.parse alone silently accepts duplicate keys, unlike the production Agent decoder. */
+export function parseArchiveJson(raw:string):any {
+  const parsed=JSON.parse(raw),stack:Array<{object:boolean;key:boolean;seen:Set<string>}>=[];
+  const tokens=/"(?:[^"\\]|\\[\s\S])*"|[{}\[\]:,]|[^\s{}\[\]:,"]+/g;
+  let token:RegExpExecArray|null;
+  while((token=tokens.exec(raw))){
+    const value=token[0],frame=stack.at(-1);
+    if(value==='{'||value==='['){if(stack.length>=128)throw new Error('archive JSON depth bound');stack.push({object:value==='{',key:true,seen:new Set()});}
+    else if(value==='}'||value===']')stack.pop();
+    else if(value===','&&frame?.object)frame.key=true;
+    else if(value===':'&&frame?.object)frame.key=false;
+    else if(value.startsWith('"')&&frame?.object&&frame.key){const key=JSON.parse(value);if(frame.seen.has(key))throw new Error('duplicate archive JSON key');frame.seen.add(key);}
+  }
+  return parsed;
+}
 function ancestry(path:string):void {
   let current=resolve(path);
   while(true){const s=lstatSync(current);if(s.isSymbolicLink()||!s.isDirectory())throw new Error('archive path symlink/non-directory refused');const parent=dirname(current);if(current===parent)break;current=parent;}
@@ -17,7 +32,7 @@ function privateDirectory(path:string):void {
 }
 function read(path:string,maximum:number):Buffer {
   const fd=openSync(path,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
-  try{const s=fstatSync(fd);if(!s.isFile()||s.uid!==process.geteuid?.()||(s.mode&0o777)!==0o600||s.nlink!==1||s.size>maximum)throw new Error('bounded owned0600 archive file required');const raw=readFileSync(fd);if(raw.length>maximum)throw new Error('archive file growth bound');fsyncSync(fd);return raw;}finally{closeSync(fd);}
+  try{const s=fstatSync(fd);if(!s.isFile()||s.uid!==process.geteuid?.()||(s.mode&0o777)!==0o600||s.nlink!==1||s.size>maximum)throw new Error('bounded owned0600 archive file required');const buffer=Buffer.alloc(maximum+1);let length=0;while(length<buffer.length){const count=readSync(fd,buffer,length,buffer.length-length,null);if(!count)break;length+=count;}const after=fstatSync(fd);if(length>maximum||after.size!==length||s.size!==after.size||s.mtimeMs!==after.mtimeMs||s.ctimeMs!==after.ctimeMs)throw new Error('archive file growth/change bound');fsyncSync(fd);return buffer.subarray(0,length);}finally{closeSync(fd);}
 }
 function seal(path:string):void {const fd=openSync(path,constants.O_RDONLY|constants.O_DIRECTORY|constants.O_NOFOLLOW);try{fsyncSync(fd);}finally{closeSync(fd);}}
 export function createJournalArchive(directory:string,bytes:JournalArchiveBytes):JournalArchive {
@@ -31,14 +46,21 @@ export function createJournalArchive(directory:string,bytes:JournalArchiveBytes)
   writeFileSync(join(directory,'manifest.json'),JSON.stringify(manifest)+'\n',{flag:'wx',mode:0o600});read(join(directory,'manifest.json'),16384);seal(directory);seal(dirname(directory));return loadJournalArchive(directory);
 }
 export function loadJournalArchive(directory:string):JournalArchive {
-  privateDirectory(directory);const manifest=JSON.parse(read(join(directory,'manifest.json'),16384).toString());
+  privateDirectory(directory);const manifest=parseArchiveJson(read(join(directory,'manifest.json'),16384).toString());
   if(manifest.schemaVersion!==1||Object.keys(manifest).sort().join(' ')!=='files schemaVersion'||Object.keys(manifest.files).sort().join(' ')!==Object.values(files).sort().join(' ')||readdirSync(directory).sort().join(' ')!==[...Object.values(files),'manifest.json'].sort().join(' '))throw new Error('invalid/incomplete snapshot archive manifest');
   const rawFiles={} as JournalArchive['rawFiles'],parsed={} as Record<Name,any>;
   for(const [name,file] of Object.entries(files) as [Name,string][]) {
     const raw=read(join(directory,file),(name==='manager'?4:8)*1024*1024),entry=manifest.files[file];
     if(entry.sha256!==digest(raw)||entry.bytes!==raw.length)throw new Error('snapshot archive hash mismatch');
-    rawFiles[name]=raw.toString('base64url');parsed[name]=JSON.parse(raw.toString());
+    rawFiles[name]=raw.toString('base64url');parsed[name]=parseArchiveJson(raw.toString());
   }
   seal(directory);return {schemaVersion:1,rawFiles,...parsed};
 }
 export const journalArchiveCommitment=(archive:JournalArchive)=>networkDigest(archive.rawFiles);
+
+/** Exact fixed-name inputs, staged while writers are stopped. Live hashes are rechecked at commit. */
+export function readJournalSnapshot(directory:string):JournalArchiveBytes {
+  privateDirectory(directory);
+  if(readdirSync(directory).sort().join(' ')!==Object.values(files).sort().join(' '))throw new Error('exact seven staged snapshot files required');
+  return Object.fromEntries((Object.entries(files) as [Name,string][]).map(([name,file])=>[name,read(join(directory,file),(name==='manager'?4:8)*1024*1024)])) as JournalArchiveBytes;
+}

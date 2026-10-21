@@ -1,13 +1,15 @@
 /** Explicit scope A only: replace a quiescent single-target replay epoch after verified archival.
  * No confirmed ownership transfer, partial pruning, unlock, or implicit certificate rebinding.
  */
+import { isIP } from 'node:net';
+import { isAbsolute, normalize } from 'node:path';
 import { createHash, createPublicKey, verify, type KeyObject } from 'node:crypto';
 import { artifactSigningKeyId } from './artifact-signature.ts';
 import { loadJournalArchive } from './network-journal-archive.ts';
 import { readBoundedStoreFile } from './json-store.ts';
 import { canonicalNetworkJson, networkDigest } from './network-canonical.ts';
 import { claimForPublish, settle, type ApprovalState } from './approval.ts';
-import { signNetworkMessage, type NetworkSignedEnvelope } from './network-execution.ts';
+import { signNetworkMessage, NETWORK_EXECUTION_DOMAIN, NETWORK_CONFIRM_DOMAIN, NETWORK_VERIFY_DOMAIN, type NetworkSignedEnvelope } from './network-execution.ts';
 import { NetworkRegistryStore, type NetworkRegistryDocument } from './network-registry.ts';
 import { validateExecutionState, type NetworkTarget } from './network-execution-state.ts';
 
@@ -16,14 +18,17 @@ export const JOURNAL_TRANSITION_RECEIPT_DOMAIN='heliopause-network-transition-ma
 export const JOURNAL_TRANSITION_LIMIT=256;
 export interface JournalArchive {
   schemaVersion:1;
-  rawFiles:Record<'manager'|'agent'|'identity'|'outbox'|'acknowledgments',string>;
+  rawFiles:Record<'manager'|'agent'|'identity'|'outbox'|'acknowledgments'|'trust'|'config',string>;
   manager:NetworkRegistryDocument;
   agent:{schemaVersion:2;journalId:string;acceptedSequence:number;terminalSequence:number;lastClock:number;transactions:Record<string,any>};
   identity:{journalId:string};outbox:any[];acknowledgments:Record<string,true>;
+  /** Audit-only public keys never installed into execution trust by a transition. */
+  trust:{manager:Record<string,string>;verifier:Record<string,string>};
+  config:{journalId:string;identity:NetworkTarget;[key:string]:unknown};
 }
 export interface JournalTransitionDraft {
   schemaVersion:1;mode:'quiescent-without-confirmed-v1';transitionId:string;target:NetworkTarget;
-  oldJournalId:string;newJournalId:string;archiveHash:string;managerHash:string;agentHash:string;
+  oldJournalId:string;newJournalId:string;archiveHash:string;managerHash:string;agentHash:string;configHash:string;
   issuedAt:number;expiresAt:number;
 }
 export interface JournalTransition extends JournalTransitionDraft {
@@ -44,15 +49,31 @@ function need(condition:unknown,reason:string):asserts condition {if(!condition)
  * independent Agent maintenance checks are mandatory before its own commit.
  */
 export function validateQuiescentArchive(archive:JournalArchive,target:NetworkTarget):void {
-  need(exact(archive,'schemaVersion rawFiles manager agent identity outbox acknowledgments')&&archive.schemaVersion===1,'unsupported archive');
-  need(exact(archive.rawFiles,'manager agent identity outbox acknowledgments'),'exact raw archive files required');
-  for(const name of ['manager','agent','identity','outbox','acknowledgments'] as const) {
+  need(exact(archive,'schemaVersion rawFiles manager agent identity outbox acknowledgments trust config')&&archive.schemaVersion===1,'unsupported archive');
+  need(exact(archive.rawFiles,'manager agent identity outbox acknowledgments trust config'),'exact raw archive files required');
+  for(const name of ['manager','agent','identity','outbox','acknowledgments','trust','config'] as const) {
     const encoded=archive.rawFiles[name];need(typeof encoded==='string'&&encoded.length<=12*1024*1024,'raw archive file bound');
     const raw=Buffer.from(encoded,'base64url');need(raw.toString('base64url')===encoded&&equal(JSON.parse(raw.toString()),archive[name]),'raw/parsed archive mismatch');
   }
   need(exact(target,'source host nodeId')&&Object.values(target).every(principal),'exact target required');
+  need(exact(archive.trust,'manager verifier'),'audit public trust required');
+  const auditKeys={} as Record<'manager'|'verifier',KeyObject[]>;
+  for(const role of ['manager','verifier'] as const) {
+    const entries=Object.entries(archive.trust[role]);need(entries.length<=256,'audit key capacity exceeded');
+    auditKeys[role]=entries.map(([id,pem])=>{need(typeof pem==='string'&&pem.length<=16384&&pem.trim().startsWith('-----BEGIN PUBLIC KEY-----'),'audit public key required');const key=createPublicKey(pem);need(artifactSigningKeyId(key)===id,'audit public key identity mismatch');return key;});
+  }
+  need(!auditKeys.manager.some(m=>auditKeys.verifier.some(v=>artifactSigningKeyId(m)===artifactSigningKeyId(v))),'audit trust classes must remain distinct');
   const a=archive.agent,m=archive.manager.execution;
   need(exact(a,'schemaVersion journalId acceptedSequence terminalSequence lastClock transactions')&&a.schemaVersion===2&&id(a.journalId)&&equal(archive.identity,{journalId:a.journalId}),'invalid Agent archive identity');
+  need(archive.config.journalId===a.journalId&&equal(archive.config.identity,target),'archived configuration binding mismatch');
+  const config=archive.config,fields='enabled identity journalId managerKeys verifierKeys secrets protectedAddresses'+('terminalDelivery' in config?' terminalDelivery':'');
+  need(exact(config,fields)&&typeof config.enabled==='boolean','unsupported archived configuration');
+  const path=(v:unknown)=>typeof v==='string'&&v.length<=4096&&isAbsolute(v)&&normalize(v)===v&&!v.includes('\0');
+  need(['managerKeys','verifierKeys','secrets'].every(k=>path(config[k])),'protected configuration path references required');
+  const protectedAddresses=config.protectedAddresses;
+  need(Array.isArray(protectedAddresses)&&protectedAddresses.length>=1&&protectedAddresses.length<=16&&new Set(protectedAddresses).size===protectedAddresses.length&&protectedAddresses.every(v=>typeof v==='string'&&isIP(v)===4),'protected IPv4 management addresses required');
+  if('terminalDelivery' in config){const delivery=config.terminalDelivery as any;need(exact(delivery,'url caFile certFile keyFile')&&['caFile','certFile','keyFile'].every(k=>path(delivery[k])),'only terminal TLS path references may be archived');const url=new URL(delivery.url);need(url.protocol==='https:'&&!url.username&&!url.password&&!url.search&&!url.hash&&url.pathname==='/api/network/execution/terminal','direct terminal endpoint required');}
+
   need(m&&archive.manager.schemaVersion===2,'Manager execution archive required');validateExecutionState(m);
   need(m.fence===null&&m.records.every(r=>r.state==='settled'&&r.journalId===a.journalId&&equal(r.target,target)),'single-target settled Manager required');
   need(a.transactions&&typeof a.transactions==='object'&&!Array.isArray(a.transactions)&&Object.keys(a.transactions).length<=1024&&a.acceptedSequence===Object.keys(a.transactions).length,'invalid Agent replay archive');
@@ -64,7 +85,9 @@ export function validateQuiescentArchive(archive:JournalArchive,target:NetworkTa
     const row=a.transactions[record.transactionId],result=record.result;
     need(row&&['rolled-back','cancelled-before-accept'].includes(row.state)&&result&&result.state===row.state,'confirmed or nonterminal resources forbid scope A');
     need(!row.bootRestore&&!row.before&&!row.paths,'recovery/diagnostic debt requires reconciliation');
-    need(equal(row.authorization,JSON.parse(Buffer.from(record.authorization.payload,'base64url').toString()))&&record.authorizationHash===networkDigest(row.authorization),'authorization archive mismatch');
+    const signed=verifyJournalMessage(record.authorization,NETWORK_EXECUTION_DOMAIN,auditKeys.manager);
+    if(record.confirmation){const confirm=verifyJournalMessage(record.confirmation,NETWORK_CONFIRM_DOMAIN,auditKeys.manager);verifyJournalMessage(confirm.verification,NETWORK_VERIFY_DOMAIN,auditKeys.verifier);}
+    need(equal(row.authorization,signed)&&record.authorizationHash===networkDigest(row.authorization),'authorization archive mismatch');
     need(equal(row.cancellationResponse??null,record.cancellationResponse??null),'accepted cancellation response archive mismatch');
     need(row.authorization.journalId===a.journalId&&equal(row.authorization.target,target),'Agent target archive mismatch');
     need(equal(row.terminalResult,result)&&equal(outbox.get(record.transactionId),result)&&record.resultHash===networkDigest(result)&&archive.acknowledgments[record.resultHash!]===true,'exact archived settlement/ack required');
@@ -84,7 +107,7 @@ export function planJournalTransition(archive:JournalArchive,target:NetworkTarge
   need(!archive.manager.execution!.journalEpoch?.transitions.some(t=>t.oldJournalId===newJournalId||t.newJournalId===newJournalId),'journal identity reuse refused');
   need(Number.isSafeInteger(now)&&now>0,'valid transition clock required');
   return {schemaVersion:1,mode:'quiescent-without-confirmed-v1',transitionId,target,oldJournalId:archive.agent.journalId,newJournalId,
-    archiveHash:networkDigest(archive.rawFiles),managerHash:createHash('sha256').update(Buffer.from(archive.rawFiles.manager,'base64url')).digest('hex'),agentHash:createHash('sha256').update(Buffer.from(archive.rawFiles.agent,'base64url')).digest('hex'),issuedAt:now,expiresAt:now+3600000};
+    archiveHash:networkDigest(archive.rawFiles),managerHash:createHash('sha256').update(Buffer.from(archive.rawFiles.manager,'base64url')).digest('hex'),agentHash:createHash('sha256').update(Buffer.from(archive.rawFiles.agent,'base64url')).digest('hex'),configHash:createHash('sha256').update(Buffer.from(archive.rawFiles.config,'base64url')).digest('hex'),issuedAt:now,expiresAt:now+3600000};
 }
 export const journalTransitionHash=(draft:JournalTransitionDraft)=>'sha256:'+networkDigest(draft);
 export function authorizeJournalTransition(archive:JournalArchive,draft:JournalTransitionDraft,approvals:ApprovalState,by:string,key:KeyObject,now=new Date()):NetworkSignedEnvelope {
@@ -113,7 +136,7 @@ export function commitManagerJournalTransition(store:NetworkRegistryStore,archiv
   need(equal(durableArchive,archive),'durable archive differs from approved input');
   need(artifactSigningKeyId(createPublicKey(key))===envelope.keyId,'transition receipt must use approved Manager signing key');
   const t=verifyJournalMessage(envelope,JOURNAL_TRANSITION_DOMAIN,trustedKeys) as JournalTransition;
-  need(exact(t,'schemaVersion mode transitionId target oldJournalId newJournalId archiveHash managerHash agentHash issuedAt expiresAt approval'),'invalid transition contract');
+  need(exact(t,'schemaVersion mode transitionId target oldJournalId newJournalId archiveHash managerHash agentHash configHash issuedAt expiresAt approval'),'invalid transition contract');
   const {approval,...draft}=t;
   const expected=planJournalTransition(archive,t.target,t.newJournalId,t.transitionId,t.issuedAt);
   need(equal(draft,expected)&&exact(approval,'mode planHash proposedBy approvedBy approvedAt')&&approval.mode==='two-person'&&approval.planHash===journalTransitionHash(draft)&&principal(approval.proposedBy)&&principal(approval.approvedBy)&&approval.proposedBy!==approval.approvedBy&&Number.isSafeInteger(approval.approvedAt)&&approval.approvedAt>=t.issuedAt&&approval.approvedAt<t.expiresAt,'transition approval mismatch');
@@ -128,4 +151,10 @@ export function commitManagerJournalTransition(store:NetworkRegistryStore,archiv
     state.records=[];state.nextSequence=1;state.fence=null;
     return receipt;
   });
+}
+
+/** A restart cannot silently keep authenticating the retired journal binding. */
+export function assertJournalEpochBinding(store:NetworkRegistryStore,targets:readonly (NetworkTarget&{journalId:string})[]):void {
+  const epoch=store.executionStatus().journalEpoch;if(!epoch)return;
+  need(targets.length===1&&targets[0]!.journalId===epoch.journalId&&equal({source:targets[0]!.source,host:targets[0]!.host,nodeId:targets[0]!.nodeId},epoch.target),'Manager configured journal binding is retired or ambiguous');
 }

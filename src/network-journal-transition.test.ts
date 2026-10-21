@@ -1,3 +1,4 @@
+import { settleNetworkExecution } from './network-execution-settlement.ts';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
@@ -8,6 +9,7 @@ import { createJournalArchive } from './network-journal-archive.ts';
 import { NetworkRegistryStore } from './network-registry.ts';
 import { emptyApprovals, propose, approve } from './approval.ts';
 import { signNetworkMessage } from './network-execution.ts';
+import { artifactSigningKeyId } from './artifact-signature.ts';
 import { networkDigest } from './network-canonical.ts';
 import { networkLabInput } from '../examples/network-lab.ts';
 import { planJournalTransition, authorizeJournalTransition, validateQuiescentArchive, journalTransitionHash, commitManagerJournalTransition, verifyJournalMessage, JOURNAL_TRANSITION_DOMAIN, JOURNAL_TRANSITION_RECEIPT_DOMAIN, type JournalArchive } from './network-journal-transition.ts';
@@ -25,8 +27,8 @@ function fixture(count=1) {
     state.records.push({sequence:1,transactionId:tx,fenceId:tx,planHash:a.approval.planHash,authorization:signNetworkMessage('heliopause-network-execution-v2',a,keys.privateKey),authorizationHash:networkDigest(a),target,journalId:journal,registryRevision:doc.revision,artifactHash:a.artifactHash,issuedAt:now,issuedBy:'alice',state:'settled',result,resultHash,settledAt:now,settledBy:'gateway',audit:[{action:'settled',actor:'gateway',at:now}]});
     state.nextSequence=2;
   });
-  const archive:JournalArchive={schemaVersion:1,rawFiles:{} as any,manager:store.read(),agent:{schemaVersion:2,journalId:journal,acceptedSequence:count,terminalSequence:count,lastClock:now,transactions:rows},identity:{journalId:journal},outbox,acknowledgments:acks};
-  const sync=()=>{for(const name of ['manager','agent','identity','outbox','acknowledgments'] as const)archive.rawFiles[name]=Buffer.from(JSON.stringify(archive[name])).toString('base64url');archive.rawFiles.manager=readFileSync(store.path).toString('base64url');};sync();
+  const archive:JournalArchive={schemaVersion:1,rawFiles:{} as any,manager:store.read(),agent:{schemaVersion:2,journalId:journal,acceptedSequence:count,terminalSequence:count,lastClock:now,transactions:rows},identity:{journalId:journal},config:{enabled:true,journalId:journal,identity:target,managerKeys:'/etc/heliopause/trust/manager',verifierKeys:'/etc/heliopause/trust/verifier',secrets:'/etc/heliopause/secrets',protectedAddresses:['192.0.2.1']},outbox,acknowledgments:acks,trust:{manager:{[artifactSigningKeyId(keys.publicKey)]:keys.publicKey.export({type:'spki',format:'pem'}).toString()},verifier:{}}};
+  const sync=()=>{for(const name of ['manager','agent','identity','outbox','acknowledgments','trust','config'] as const)archive.rawFiles[name]=Buffer.from(JSON.stringify(archive[name])).toString('base64url');archive.rawFiles.manager=readFileSync(store.path).toString('base64url');};sync();
   const archiveDirectory=join(dir,'archive');createJournalArchive(archiveDirectory,Object.fromEntries(Object.entries(archive.rawFiles).map(([name,encoded])=>[name,Buffer.from(encoded,'base64url')])) as any);
   const approvals=emptyApprovals();
   const draft=()=>planJournalTransition(archive,target,'e'.repeat(32),'f'.repeat(32),now);
@@ -62,4 +64,21 @@ test('no two-person approval means no transition authority',()=>{const f=fixture
 test('wrong key and wrong domain cannot commit',()=>{const f=fixture();try{const envelope=f.issue(),wrong=generateKeyPairSync('ed25519');assert.throws(()=>commitManagerJournalTransition(f.store,f.archive,envelope,[wrong.publicKey],f.keys.privateKey,f.archiveDirectory,f.now),/signature/);assert.throws(()=>verifyJournalMessage(envelope,JOURNAL_TRANSITION_RECEIPT_DOMAIN,[f.keys.publicKey]),/signature/);assert.equal(f.store.executionStatus().records.length,1);}finally{f.cleanup();}});
 test('expired Manager first commit does not reclaim records',()=>{const f=fixture();try{const envelope=f.issue();assert.throws(()=>commitManagerJournalTransition(f.store,f.archive,envelope,[f.keys.publicKey],f.keys.privateKey,f.archiveDirectory,f.now+3600000),/expired/);assert.equal(f.store.executionStatus().records.length,1);}finally{f.cleanup();}});
 test('changed Manager rejects stale approved archive',()=>{const f=fixture();try{const envelope=f.issue();f.store.executionTransaction(state=>{state.records[0]!.audit.push({action:'observed',actor:'operator',at:f.now});});assert.throws(()=>commitManagerJournalTransition(f.store,f.archive,envelope,[f.keys.publicKey],f.keys.privateKey,f.archiveDirectory,f.now),/changed/);assert.equal(f.store.executionStatus().records.length,1);}finally{f.cleanup();}});
-test('same record count with foreign journal cannot be archived',()=>{const f=fixture();try{f.archive.agent.journalId='0'.repeat(32);f.archive.identity.journalId=f.archive.agent.journalId;f.sync();assert.throws(f.draft,/single-target/);}finally{f.cleanup();}});
+test('same record count with foreign journal cannot be archived',()=>{const f=fixture();try{f.archive.agent.journalId='0'.repeat(32);f.archive.identity.journalId=f.archive.agent.journalId;f.archive.config.journalId=f.archive.agent.journalId;f.sync();assert.throws(f.draft,/single-target/);}finally{f.cleanup();}});
+
+test('old authority and delayed old result cannot touch a successor fence',()=>{
+ const f=fixture();try{
+  const envelope=f.issue();commitManagerJournalTransition(f.store,f.archive,envelope,[f.keys.publicKey],f.keys.privateKey,f.archiveDirectory,f.now);
+  const old=f.archive.manager.execution!.records[0]!,oldEnvelope=old.authorization;
+  assert.throws(()=>f.store.fenceExecution(f.store.read().revision,old.transactionId,()=>oldEnvelope,'alice'),/retired or foreign/);
+  assert.equal(f.store.executionStatus().fence,null);
+  const payload=JSON.parse(Buffer.from(oldEnvelope.payload,'base64url').toString());payload.journalId='e'.repeat(32);payload.transactionId='1'.repeat(32);
+  const fresh=signNetworkMessage('heliopause-network-execution-v2',payload,f.keys.privateKey);
+  f.store.fenceExecution(f.store.read().revision,payload.transactionId,()=>fresh,'alice');
+  const before=readFileSync(f.store.path);
+  assert.throws(()=>settleNetworkExecution(f.store,old.result!,{...f.target,journalId:f.journal},'gateway'));
+  assert.deepEqual(readFileSync(f.store.path),before);
+  commitManagerJournalTransition(f.store,f.archive,envelope,[f.keys.publicKey],f.keys.privateKey,f.archiveDirectory,f.now);
+  assert.equal(f.store.executionStatus().records.length,1);assert.equal(f.store.executionStatus().fence!.transactionId,payload.transactionId);
+ }finally{f.cleanup();}
+});

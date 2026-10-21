@@ -1,0 +1,143 @@
+"""Offline transition crash-window tests. Only tempfiles; all host processes/sockets fatal.
+
+Cryptographic checks are independently exercised by Node/production signing tests and VM
+round trips; these tests replace signature decoding and live kernel absence explicitly.
+"""
+import base64
+import copy
+import hashlib
+import json
+import os
+from pathlib import Path
+import socket
+import subprocess
+import tempfile
+import unittest
+from unittest.mock import patch
+import network_executor as n
+import network_journal_transition as t
+from test_network_executor import Fake,authorization
+
+
+class Transition(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup);self.root=Path(self.temp.name)
+        for module,name in [(subprocess,'Popen'),(socket,'socket')]:
+            guard=patch.object(module,name,side_effect=AssertionError('escaped transition unit boundary'));guard.start();self.addCleanup(guard.stop)
+        for target,options in [('crypto_helpers',{'return_value':object()}),('verify',{'side_effect':lambda value,*args:value.get('body',value)}),('independent_trust',{'return_value':None})]:
+            guard=patch.object(n,target,**options);guard.start();self.addCleanup(guard.stop)
+        self.state=self.root/'state';self.state.mkdir(mode=0o700);journal=n.initialize_journal(str(self.state));a=authorization();a['journalId']=journal;a['approval']['planHash']='sha256:'+n.digest({k:v for k,v in a.items() if k!='approval'})
+        self.cfg={'enabled':True,'journalId':journal,'identity':a['target'],'managerKeys':'unused','verifierKeys':'unused','secrets':'unused','protectedAddresses':['192.0.2.1']}
+        self.config=self.root/'config.json';n.atomic(str(self.config),self.cfg)
+        self.executor=n.Executor(self.cfg,str(self.state),Fake());self.executor.accept(a);self.executor.recover();self.executor.publish_results()
+        agent=self.executor.load();result=agent['transactions'][a['transactionId']]['terminalResult'];stamp=n.digest(result)
+        n.atomic(str(self.state/'terminal-acks.json'),{stamp:True})
+        manager={'schemaVersion':2,'execution':{'fence':None,'records':[{'transactionId':a['transactionId'],'authorization':{'payload':base64.urlsafe_b64encode(n.canonical(a).encode()).decode().rstrip('=')},'authorizationHash':n.digest(a),'target':a['target'],'journalId':journal,'state':'settled','result':result,'resultHash':stamp}]}}
+        raw_files={'agent':(self.state/'transactions.json').read_bytes(),'manager':n.canonical(manager).encode(),'identity':(self.state/'journal-identity.json').read_bytes(),'outbox':(self.state/'terminal-results.json').read_bytes(),'acknowledgments':(self.state/'terminal-acks.json').read_bytes(),'trust':b'{"manager":{},"verifier":{}}','config':self.config.read_bytes()}
+        self.archive=self.root/'archive';self.archive.mkdir(mode=0o700);manifest={'schemaVersion':1,'files':{}}
+        for name,raw in raw_files.items():
+            file=t.FILES[name];p=self.archive/file;p.write_bytes(raw);p.chmod(0o600);manifest['files'][file]={'sha256':hashlib.sha256(raw).hexdigest(),'bytes':len(raw)}
+        n.atomic(str(self.archive/'manifest.json'),manifest)
+        archive=t.read_archive(self.archive);now=1000
+        draft={'schemaVersion':1,'mode':'quiescent-without-confirmed-v1','transitionId':'d'*32,'target':a['target'],'oldJournalId':journal,'newJournalId':'e'*32,'archiveHash':n.digest(archive['rawFiles']),'managerHash':hashlib.sha256(raw_files['manager']).hexdigest(),'agentHash':hashlib.sha256(raw_files['agent']).hexdigest(),'configHash':hashlib.sha256(raw_files['config']).hexdigest(),'issuedAt':now,'expiresAt':now+3600000}
+        self.payload={**draft,'approval':{'mode':'two-person','planHash':'sha256:'+n.digest(draft),'proposedBy':'alice','approvedBy':'bob','approvedAt':now}}
+        self.envelope={'keyId':'test-manager','body':self.payload};self.receipt={'keyId':'test-manager','body':{'schemaVersion':1,'transitionHash':n.digest(self.payload),'oldJournalId':journal,'newJournalId':'e'*32,'target':a['target'],'archiveHash':draft['archiveHash'],'committedAt':now}}
+        self.writer=self.root/'writer.lock';self.writer.write_bytes(b'');self.writer.chmod(0o600)
+        self.absence=patch.object(t,'resource_absence',side_effect=AssertionError('live kernel absence must be explicitly injected'));self.absence.start();self.addCleanup(self.absence.stop)
+    def apply(self,event=None,absence=lambda *args:None):
+        return t.apply_agent(str(self.config),str(self.state),str(self.archive),self.envelope,self.receipt,str(self.writer),event=event,absence=absence)
+    def test_complete_and_duplicate_never_reset_successor(self):
+        result=self.apply();self.assertTrue(result['committed']);self.assertEqual(n.read_json(str(self.state/'journal-identity.json')),{'journalId':'e'*32})
+        previous=Path(result['oldStatePreservedAt']);self.assertTrue((previous/'transactions.json').exists());self.assertTrue(n.journal_transition_pending(str(previous)))
+        data=n.read_json(str(self.state/'transactions.json'));data['lastClock']=999;n.atomic(str(self.state/'transactions.json'),data)
+        self.assertTrue(self.apply()['duplicate']);self.assertEqual(n.read_json(str(self.state/'transactions.json'))['lastClock'],999)
+    def test_two_successive_epochs_preserve_both_originals(self):
+        first=self.apply();old=self.cfg['journalId'];self.cfg=n.read_json(str(self.config))
+        self.archive=self.root/'second-archive';self.archive.mkdir(mode=0o700)
+        manager={'schemaVersion':2,'execution':{'fence':None,'records':[]}}
+        values={'manager':n.canonical(manager).encode(),'trust':b'{"manager":{},"verifier":{}}','config':self.config.read_bytes()}
+        for name in ['agent','identity','outbox','acknowledgments']:values[name]=(self.state/t.FILES[name]).read_bytes()
+        manifest={'schemaVersion':1,'files':{}}
+        for name,raw in values.items():
+            path=self.archive/t.FILES[name];path.write_bytes(raw);path.chmod(0o600)
+            manifest['files'][path.name]={'sha256':hashlib.sha256(raw).hexdigest(),'bytes':len(raw)}
+        n.atomic(str(self.archive/'manifest.json'),manifest);archive=t.read_archive(self.archive)
+        draft={k:v for k,v in self.payload.items() if k!='approval'}
+        draft.update(transitionId='c'*32,oldJournalId='e'*32,newJournalId='f'*32,archiveHash=n.digest(archive['rawFiles']),managerHash=hashlib.sha256(values['manager']).hexdigest(),agentHash=hashlib.sha256(values['agent']).hexdigest(),configHash=hashlib.sha256(values['config']).hexdigest())
+        self.payload={**draft,'approval':{**self.payload['approval'],'planHash':'sha256:'+n.digest(draft)}}
+        self.envelope={'keyId':'test-manager','body':self.payload}
+        self.receipt={'keyId':'test-manager','body':{**self.receipt['body'],'transitionHash':n.digest(self.payload),'oldJournalId':'e'*32,'newJournalId':'f'*32,'archiveHash':draft['archiveHash']}}
+        second=self.apply();self.assertTrue(second['committed'])
+        self.assertEqual(n.read_json(str(self.state/'journal-identity.json')),{'journalId':'f'*32})
+        self.assertEqual(n.read_json(str(Path(first['oldStatePreservedAt'])/'journal-identity.json')),{'journalId':old})
+        prior=Path(second['oldStatePreservedAt']);self.assertTrue((prior/'previous-transition.json').exists())
+        self.assertEqual(n.read_json(str(prior/'journal-identity.json')),{'journalId':'e'*32})
+    def test_config_changed_while_waiting_for_lock(self):
+        import fcntl
+        original=fcntl.flock
+        def change(fd,operation):
+            result=original(fd,operation)
+            cfg=copy.deepcopy(self.cfg);cfg['enabled']=False;n.atomic(str(self.config),cfg)
+            return result
+        with patch.object(fcntl,'flock',side_effect=change):
+            with self.assertRaisesRegex(ValueError,'configuration changed'):self.apply()
+        self.assertFalse(Path(str(self.state)+'.transition.json').exists())
+    def test_retired_sidecar_drift_on_resume(self):
+        def crash(point):
+            if point=='old-preserved':raise RuntimeError('crash')
+        with self.assertRaises(RuntimeError):self.apply(event=crash)
+        previous=self.state.with_name(self.state.name+'.retired-'+self.cfg['journalId'])
+        n.atomic(str(previous/'terminal-acks.json'),{})
+        with self.assertRaisesRegex(ValueError,'sidecar drift'):self.apply()
+        self.assertFalse(self.state.exists())
+    def test_foreign_stage_without_owner_preserved(self):
+        stage=self.state.with_name(self.state.name+'.prepared-'+self.payload['transitionId'])
+        stage.mkdir(mode=0o700);foreign=stage/'transactions.json';foreign.write_bytes(b'{');foreign.chmod(0o600)
+        with self.assertRaises(FileNotFoundError):self.apply()
+        self.assertEqual(foreign.read_bytes(),b'{')
+    def test_missing_receipt_no_intent(self):
+        self.receipt['body']['transitionHash']='f'*64
+        with self.assertRaisesRegex(ValueError,'exact Manager'):self.apply()
+        self.assertFalse(Path(str(self.state)+'.transition.json').exists())
+    def test_archive_tamper_no_mutation(self):
+        (self.archive/'transactions.json').write_bytes(b'{}')
+        with self.assertRaisesRegex(ValueError,'hash mismatch'):self.apply()
+        self.assertEqual(self.executor.load()['acceptedSequence'],1)
+    def test_configuration_drift(self):
+        cfg=copy.deepcopy(self.cfg);cfg['enabled']=False;n.atomic(str(self.config),cfg)
+        with self.assertRaisesRegex(ValueError,'configuration drift'):self.apply()
+    def test_missing_ack_no_mutation(self):
+        n.atomic(str(self.state/'terminal-acks.json'),{})
+        with self.assertRaisesRegex(ValueError,'sidecar drift'):self.apply()
+    def test_foreign_resource_refused(self):
+        with self.assertRaisesRegex(ValueError,'foreign interface'):self.apply(absence=lambda *args:(_ for _ in ()).throw(ValueError('old/foreign interface remains')))
+        self.assertFalse(Path(str(self.state)+'.transition.json').exists())
+    def test_preexisting_destination_never_overwritten(self):
+        previous=self.state.with_name(self.state.name+'.retired-'+self.cfg['journalId']);previous.mkdir(mode=0o700)
+        with self.assertRaises(FileNotFoundError):self.apply()
+        self.assertEqual(self.executor.load()['acceptedSequence'],1)
+    def test_unsafe_archive_symlink(self):
+        path=self.archive/'terminal-acks.json';data=path.read_bytes();path.unlink();target=self.root/'outside';target.write_bytes(data);target.chmod(0o600);path.symlink_to(target)
+        with self.assertRaises(OSError):self.apply()
+    def test_pending_blocks_admission_but_preserves_terminal_recovery(self):
+        def crash(point):
+            if point=='intent-saved':raise RuntimeError('crash')
+        with self.assertRaisesRegex(RuntimeError,'crash'):self.apply(event=crash)
+        with self.assertRaisesRegex(ValueError,'offline transition'):self.executor.accept(authorization())
+        self.executor.recover();self.assertEqual(self.executor.load()['acceptedSequence'],1)
+        self.assertTrue(self.apply()['committed'])
+
+
+def boundary_test(point):
+    def test(self):
+        def crash(value):
+            if value==point:raise RuntimeError('simulated crash '+point)
+        with self.assertRaisesRegex(RuntimeError,'simulated crash'):self.apply(event=crash)
+        self.assertTrue(self.apply()['committed'])
+        self.assertEqual(n.read_json(str(self.state/'transactions.json'))['acceptedSequence'],0)
+    return test
+for boundary in ['intent-saved','old-retired','old-preserved','stage-created','stage-owned','successor-prepared','successor-published','config-bound','complete']:
+    setattr(Transition,'test_resume_after_'+boundary.replace('-','_'),boundary_test(boundary))
+
+
+if __name__=='__main__':unittest.main()

@@ -54,9 +54,10 @@ Restoring an urgently revoked key to make a reboot pass is not an approved recov
 
 ## Record replacement scope
 
-Only scope A (no confirmed resources, all work terminal, exact Manager settlement/outbox ack,
-no recovery debt/fence, complete verified archive, single writer) is a candidate for implementation.
-Neither the evidence archive nor the observation tools currently perform an identity transition.
+Scope A (no confirmed resources, all work terminal, exact Manager settlement/outbox ack,
+no recovery debt/fence, complete verified archive, single writer) has an explicit
+[maintenance contract](network-journal-maintenance.md). Its implementation and isolated
+checks are separate from actual VM/storage-pressure qualification and independent archive custody.
 Scope B (confirmed ownership/restoration carried across identity) remains unsupported. Never
 empty the journal because terminal delivery is done: confirmed ownership still depends on it.
 Manager256/Agent1024 and byte limits are finite; reserve workload budget before admission.
