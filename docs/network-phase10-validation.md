@@ -96,7 +96,9 @@ The existing mailbox worker and common writer gate execute restore; no independe
 writer bypasses heartbeat/watchdog/discovery arbitration. Synchronous startup recovery never
 iterates confirmed undo debts. Worker restore has shared 120-second activation/180-second total
 recovery budgets and a ten-second NM child-command cap; tick retries one confirmed undo debt with twenty seconds, never reactivating
-in the same boot. Admission is blocked while recovery is unresolved. Capacity is checked
+in the same boot. Read-only preparation may retry a transient child timeout at most three
+times within that same shared budget; foreign/unsupported material fails immediately and
+activation is never retried. Admission is blocked while recovery is unresolved. Capacity is checked
 before saving restore undo and before mutation; successful plans compact to a hash.
 
 Confirmed terminal history/settlement/replay identity is preserved across boot. Restoration

@@ -88,7 +88,7 @@ python3 agent/test_network_nm_undo.py 2>&1 | tee "$log"
 check_suite "test_network_nm_undo.py" 9 || rc=1
 
 python3 agent/test_network_nm_executor.py 2>&1 | tee "$log"
-check_suite "test_network_nm_executor.py" 14 || rc=1
+check_suite "test_network_nm_executor.py" 16 || rc=1
 
 python3 agent/test_network_nm_profile.py 2>&1 | tee "$log"
 check_suite "test_network_nm_profile.py" 14 || rc=1

@@ -703,7 +703,18 @@ class Executor:
                     self.select_driver(row['authorization']['operation'], row)
                     self.driver.deadline = None
                     self.driver.command_deadline = deadline
-                    row['bootRestore']['plan'] = self.driver.prepare_restore(row, self.config['protectedAddresses'])
+                    # Preparation only reads ownership, secret and fresh boot state. A cold
+                    # NM/libnm timeout may be retried, but never a mutation/activation.
+                    for attempt in range(1,4):
+                        row['bootRestore']['preparationAttempts'] = attempt
+                        try:
+                            row['bootRestore']['plan'] = self.driver.prepare_restore(row, self.config['protectedAddresses'])
+                            break
+                        except RuntimeError as error:
+                            if not str(error).startswith('network command unavailable or timed out:') or attempt==3 or time.monotonic()>=deadline:
+                                raise
+                            row['bootRestore']['preparationDiagnostic'] = safe_diagnostic(error)
+                            self.save(data)
                     if len(canonical(row['bootRestore']['plan']).encode()) > 1024*1024 or len(canonical(data).encode()) > 7*1024*1024:
                         raise ValueError('boot undo capacity unavailable')
                     self.save(data)

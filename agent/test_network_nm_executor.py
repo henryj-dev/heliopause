@@ -82,6 +82,19 @@ class Persistence(unittest.TestCase):
         self.e.accept(self.a)
         with patch.object(n,'current_boot_id',return_value=BOOT_B):self.e.recover();self.e.restore_confirmed_boot()
         self.assertEqual(self.row()['state'],'rolled-back');self.assertEqual(self.driver.restores,0)
+    def test_only_readonly_preparation_timeout_retries_before_one_activation(self):
+        self.confirm();plan=self.driver.prepare_restore(self.row(),[])
+        with patch.object(self.driver,'prepare_restore',side_effect=[RuntimeError('network command unavailable or timed out: python3 helper'),plan]) as prepare:
+            with patch.object(n,'current_boot_id',return_value=BOOT_B):self.e.restore_confirmed_boot()
+        self.assertEqual(prepare.call_count,2);self.assertEqual(self.driver.restores,1)
+        self.assertEqual(self.row()['bootRestore']['preparationAttempts'],2)
+    def test_foreign_preparation_failure_never_retries_or_activates(self):
+        self.confirm()
+        with patch.object(self.driver,'prepare_restore',side_effect=ValueError('foreign profile')) as prepare:
+            with patch.object(n,'current_boot_id',return_value=BOOT_B):
+                with self.assertRaises(ValueError):self.e.restore_confirmed_boot()
+        self.assertEqual(prepare.call_count,1);self.assertEqual(self.driver.restores,0)
+
     def test_failed_restore_undoes_activation_and_preserves_confirmation(self):
         self.confirm();self.driver.restore_failure=True
         with patch.object(n,'current_boot_id',return_value=BOOT_B):
