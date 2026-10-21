@@ -13,6 +13,7 @@ import shlex
 import signal
 import subprocess
 import time
+import uuid
 
 
 def run(argv, data=None, timeout=30):
@@ -51,6 +52,24 @@ print(json.dumps({'at':time.time(),'bootId':pathlib.Path('/proc/sys/kernel/rando
 'routes':json.loads(r(['ip','-j','-4','route','show','table','all']).stdout)}))
 '''
         return json.loads(self.ssh('gateway','sudo','python3','-',data=code.encode(),timeout=40))
+    def monitor_start(self):
+        identity=uuid.uuid4().hex
+        unit='heliopause-vm-observer-'+identity
+        self.ssh('peer','sudo','systemd-run','--unit='+unit,'--collect','/usr/bin/python3','/source/scripts/network-vm-lab/monitor.py','--nonce',self.nonce,'--id',identity)
+        end=time.monotonic()+30
+        while time.monotonic()<end:
+            try:
+                ready=json.loads(self.ssh('peer','sudo','cat','/var/lib/heliopause-vm-lab/observations/'+identity+'.ready'))
+                return identity,unit,ready
+            except subprocess.CalledProcessError:time.sleep(.5)
+        self.ssh('peer','sudo','systemctl','stop',unit)
+        raise TimeoutError('independent monitor did not become ready')
+    def monitor_stop(self, identity, unit):
+        self.ssh('peer','sudo','systemctl','stop',unit)
+        raw=self.ssh('peer','sudo','head','-c','524288','/var/lib/heliopause-vm-lab/observations/'+identity+'.jsonl')
+        if len(raw)>=524288:raise ValueError('packet timeline exceeds evidence bound')
+        return [json.loads(line) for line in raw.splitlines()]
+
     def power_cut(self):
         pid=int((self.root/'gateway-qemu.pid').read_text())
         actual=Path('/proc')/str(pid)/'cmdline'
@@ -100,6 +119,8 @@ def main():
     if target['state'] not in allowed:raise ValueError('scenario pre-reboot transaction state mismatch')
     if args.output.exists():raise ValueError('existing evidence file refused')
     args.output.parent.mkdir(parents=True,exist_ok=True)
+    monitor_id,monitor_unit,ready=lab.monitor_start()
+    if ready['peerBootId']!=report['peerBootBefore']:raise ValueError('peer monitor boot mismatch')
     started=time.monotonic();report['requestAt']=time.time()
     try:
         if args.mode=='graceful':
@@ -138,8 +159,14 @@ def main():
         report['error']=type(error).__name__+': '+str(error)[:400]
         raise
     finally:
+        try:
+            report['packetTimeline']=lab.monitor_stop(monitor_id,monitor_unit)
+            if not report['packetTimeline'] or any(row['peerBootId']!=report['peerBootBefore'] for row in report['packetTimeline']):raise ValueError('independent timeline unavailable')
+        except Exception:
+            report['passed']=False;report['monitorError']='independent-monitor-unavailable'
         fd=os.open(args.output,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
         with os.fdopen(fd,'w') as stream:json.dump(report,stream,indent=2);stream.write('\n')
+    if not report['passed']:raise RuntimeError('boot evidence did not satisfy all requirements')
 
 
 if __name__=='__main__':main()

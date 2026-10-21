@@ -121,7 +121,7 @@ def collect():
     # isolated hypervisor and actual reboot still require separate evidence.
     report["blockers"].extend(["device-and-route-ownership-review-required",
                                "isolated-vm-and-console-evidence-required",
-                               "persistent-backend-not-implemented",
+                               "persistent-backend-validation-required",
                                "actual-vm-reboot-not-verified"])
     return report
 
