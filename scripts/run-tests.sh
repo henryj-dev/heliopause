@@ -80,6 +80,7 @@ run "@heliopause/agent" npm test -w @heliopause/agent --if-present
 run "VM read-only preflight" python3 scripts/network-vm-lab/test_preflight.py
 run "VM independent verifier" python3 scripts/network-vm-lab/test_verifier.py
 run "VM boot report acceptance" python3 scripts/network-vm-lab/test_boot_cycle.py
+run "Private VM evidence archive" python3 scripts/network-evidence/test_bundle.py
 
 printf '\n'
 if [ ${#failed[@]} -eq 0 ]; then
