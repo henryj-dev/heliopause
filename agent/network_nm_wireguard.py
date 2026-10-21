@@ -3,6 +3,7 @@ import hashlib
 import os
 import re
 import sys
+import time
 from network_executor import LinuxWireGuard
 from network_nm_profile import DRIVER, ProfileStore, render
 
@@ -14,6 +15,14 @@ class NetworkManagerWireGuard(LinuxWireGuard):
         super().__init__(secrets)
         self.store = ProfileStore()
         self.row = None
+
+    def command_timeout(self):
+        # Cold libnm/GI startup on the measured TCG guest exceeds the kernel driver's
+        # five-second command cap. Every child still shares the operation's absolute budget.
+        limits=[value-time.monotonic() for value in [self.deadline,self.command_deadline] if value is not None]
+        remaining=min([10]+limits)
+        if remaining<=0:raise RuntimeError('network operation budget elapsed')
+        return remaining
 
     def bind(self, row):
         self.row = row

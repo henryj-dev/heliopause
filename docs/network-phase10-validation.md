@@ -95,7 +95,7 @@ attempt. Unit configuration is not itself proof of measured boot ordering.
 The existing mailbox worker and common writer gate execute restore; no independent network
 writer bypasses heartbeat/watchdog/discovery arbitration. Synchronous startup recovery never
 iterates confirmed undo debts. Worker restore has shared 120-second activation/180-second total
-recovery budgets; tick retries one confirmed undo debt with twenty seconds, never reactivating
+recovery budgets and a ten-second NM child-command cap; tick retries one confirmed undo debt with twenty seconds, never reactivating
 in the same boot. Admission is blocked while recovery is unresolved. Capacity is checked
 before saving restore undo and before mutation; successful plans compact to a hash.
 
