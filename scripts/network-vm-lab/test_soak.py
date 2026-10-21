@@ -12,20 +12,40 @@ import os
 import json
 from soak_inputs import source_modules, public_directory, file_commitment, frozen_inputs
 from boot_cycle import Lab
+from soak_settlement import agent_view, manager_view, require_settled
+sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'agent'))
+import network_executor as n
+import lifecycle_snapshot
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).parent))
 import soak
 
 
+TX='c'*32
+TARGET={'source':'lab','host':'gateway','nodeId':'gateway'}
+
+def terminal_fixture(tx=TX, sequence=1, state='confirmed'):
+    authorization={'transactionId':tx,'target':dict(TARGET),'journalId':'a'*32,'artifactHash':'d'*64,'registryRevision':1}
+    result={'schemaVersion':2 if state=='cancelled-before-accept'else 1,'domain':n.CANCELLATION_RESULT_DOMAIN if state=='cancelled-before-accept'else n.TERMINAL_DOMAIN,'transactionId':tx,'fenceId':tx,'target':dict(TARGET),'journalId':'a'*32,'authorizationHash':n.digest(authorization),'artifactHash':'d'*64,'registryRevision':1,'state':state,'sequence':sequence,'proof':{'fixture':True}}
+    result['stateHash']=n.digest(result)
+    row={'authorization':authorization,'state':state,'terminalResult':result}
+    manager={'sequence':sequence,'transactionId':tx,'target':dict(TARGET),'journalId':'a'*32,'authorizationHash':n.digest(authorization),'artifactHash':'d'*64,'registryRevision':1,'state':'settled','result':result,'resultHash':n.digest(result)}
+    return row,manager
+
 def sample():
     process={'pid':1,'active':'active','startTicks':1,'cpuTicks':0,'rssPages':10,'fdCount':5,'children':0}
     gateway={'journalId':'a'*32,'acceptedSequence':1,'terminalSequence':1,'bootId':'gateway-boot','deployedModules':{'agent.py':'b'*64},
              'at':100,'pageBytes':4096,'clockTicksPerSecond':100,'lifecycle':{'reportedAt':100,'agentPid':1,'heartbeat':{'lastSuccess':99},'discovery':{'enabled':True,'lastSuccess':99},'errors':{},'recoveryDebt':{'network':False,'firewall':False,'workload':False}},
-             'frozenInputs':{'config':{'sha256':'config'}},'trust':{'manager':['key-a'],'verifier':['key-b']},'journalContentHash':'same','files':{name:{'bytes':1000,'sha256':'same'} for name in ['transactions.json','journal-identity.json','terminal-results.json','terminal-acks.json']},'transactions':{'tx':{'state':'confirmed','configurationMatches':True,'historicalAuthorityValid':True}}}
+             'frozenInputs':{'config':{'sha256':'config'}},'trust':{'manager':['key-a'],'verifier':['key-b']},'journalContentHash':'same','files':{name:{'bytes':1000,'sha256':'same'} for name in ['transactions.json','journal-identity.json','terminal-results.json','terminal-acks.json']},'transactions':{TX:{'state':'confirmed','configurationMatches':True,'historicalAuthorityValid':True}}}
     peer={'bootId':'peer-boot','at':100,'pageBytes':4096,'clockTicksPerSecond':100,'ledger':{'fence':None},'deployedModules':{'src/manager-server.ts':'a'*64},'frozenInputs':{'config':{'sha256':'config'}}}
     for role in [gateway,peer]:role['targetBinding']={'journalId':'a'*32,'identity':{'source':'lab','host':'gateway','nodeId':'gateway'}}
     for key in ['agent','courier','networkManager']:gateway[key]=copy.deepcopy(process)
     for key in ['manager','relay']:peer[key]=copy.deepcopy(process)
+    row,record=terminal_fixture()
+    gateway['transactions'][TX]['authorizationHash']=record['authorizationHash']
+    gateway['settlement']=agent_view({TX:row},[record['result']],{record['resultHash']:True},n.digest)
+    peer['settlement']=manager_view([record],n.digest)
+    peer['ledger'].update(records=1,nextSequence=2,results={TX:record['resultHash']})
     return {'gateway':gateway,'peer':peer,'observedAt':100,'packets':[{'at':99,'peerBootId':'peer-boot','management':True,'forward':True,'reverse':True}]}
 
 
@@ -34,7 +54,7 @@ class SoakAcceptance(unittest.TestCase):
         self.initial=sample();self.current=copy.deepcopy(self.initial)
         for module,name in [(subprocess,'Popen'),(socket,'socket')]:
             guard=patch.object(module,name,side_effect=AssertionError('escaped host boundary'));guard.start();self.addCleanup(guard.stop)
-    def check(self):return soak.assess(self.current,self.initial,{'gateway':{'agent.py':'b'*64},'peer':{'src/manager-server.ts':'a'*64}},'tx')
+    def check(self):return soak.assess(self.current,self.initial,{'gateway':{'agent.py':'b'*64},'peer':{'src/manager-server.ts':'a'*64}},TX)
     def test_peer_module_drift_is_rejected(self):
         self.initial['peer']['deployedModules']={'src/manager-server.ts':'a'*64}
         self.current=copy.deepcopy(self.initial)
@@ -93,7 +113,7 @@ class SoakAcceptance(unittest.TestCase):
         self.current['gateway']['trust']={}
         with self.assertRaisesRegex(ValueError,'trust'):self.check()
     def test_degraded_refused(self):
-        self.current['gateway']['transactions']['tx']['bootRestore']={'state':'attempting'};self.initial=copy.deepcopy(self.current)
+        self.current['gateway']['transactions'][TX]['bootRestore']={'state':'attempting'};self.initial=copy.deepcopy(self.current)
         with self.assertRaisesRegex(ValueError,'configuration mismatch'):self.check()
     def test_discovery_recovered_failure_refused(self):
         self.current['gateway']['lifecycle']['discovery']['lastFailure']=100
@@ -142,14 +162,111 @@ class SoakAcceptance(unittest.TestCase):
         self.current['gateway']['lifecycle']['discovery']['lastSuccess']=-300
         with self.assertRaisesRegex(ValueError,'discovery'):self.check()
     def test_recovery_debt(self):
-        self.current['gateway']['transactions']['tx']['bootRestore']={'recovery':'rollback-failed'};self.initial=copy.deepcopy(self.current)
+        self.current['gateway']['transactions'][TX]['bootRestore']={'recovery':'rollback-failed'};self.initial=copy.deepcopy(self.current)
         with self.assertRaisesRegex(ValueError,'recovery debt'):self.check()
     def test_profile_drift(self):
-        self.current['gateway']['transactions']['tx']['configurationMatches']=False;self.initial=copy.deepcopy(self.current)
+        self.current['gateway']['transactions'][TX]['configurationMatches']=False;self.initial=copy.deepcopy(self.current)
         with self.assertRaisesRegex(ValueError,'configuration mismatch'):self.check()
     def test_journal_capacity(self):
         self.current['gateway']['files']['transactions.json']['bytes']=7*1024*1024
         with self.assertRaisesRegex(ValueError,'reserve exhausted'):self.check()
+
+
+class SettlementAcceptance(unittest.TestCase):
+    setUp=SoakAcceptance.setUp
+    check=SoakAcceptance.check
+    def initial_failure(self,change,reason):
+        change(self.current)
+        self.initial=copy.deepcopy(self.current)
+        before=n.digest(self.current)
+        with self.assertRaisesRegex(ValueError,reason):self.check()
+        self.assertEqual(n.digest(self.current),before)
+    def test_missing_initial_Manager_transaction_cannot_be_frozen(self):
+        self.initial_failure(lambda s:s['peer'].update(settlement=[]),'transaction set')
+    def test_initial_undelivered_result(self):
+        self.initial_failure(lambda s:s['gateway']['settlement'].update(outbox=[]),'outbox coverage')
+    def test_initial_unacknowledged_result(self):
+        self.initial_failure(lambda s:s['gateway']['settlement'].update(acknowledgments={}),'not acknowledged')
+    def test_boolean_and_numeric_ack_values_refused(self):
+        for value in [False,1,None,'true']:
+            self.current=sample()
+            self.initial_failure(lambda s:s['gateway']['settlement']['acknowledgments'].update({s['peer']['settlement'][0]['resultHash']:value}),'ack values')
+    def test_initial_unsettled_Manager_record(self):
+        self.initial_failure(lambda s:s['peer']['settlement'][0].update(state='issued'),'not settled')
+    def test_wrong_Manager_result_hash(self):
+        self.initial_failure(lambda s:s['peer']['settlement'][0].update(resultHash='0'*64),'exact Manager')
+    def test_wrong_Manager_result_body(self):
+        self.initial_failure(lambda s:s['peer']['settlement'][0]['result'].update(state='rolled-back'),'exact Manager')
+    def test_same_numeric_value_different_Manager_encoding_refused(self):
+        self.initial_failure(lambda s:s['peer']['settlement'][0]['result'].update(sequence=1.0),'exact Manager')
+    def test_same_numeric_value_different_outbox_encoding_refused(self):
+        self.initial_failure(lambda s:s['gateway']['settlement']['outbox'][0].update(registryRevision=1.0),'exact Manager')
+    def test_bool_Manager_revision_not_an_integer_commitment(self):
+        self.initial_failure(lambda s:s['peer']['settlement'][0].update(registryRevision=True),'authorization binding')
+    def test_result_sequence_types_refused(self):
+        for value in [True,1.0,None,'1',0,1025]:
+            self.current=sample()
+            self.initial_failure(lambda s:s['gateway']['settlement']['records'][0]['result'].update(sequence=value),'result sequence')
+    def test_result_schema_boolean_refused(self):
+        self.initial_failure(lambda s:s['gateway']['settlement']['records'][0]['result'].update(schemaVersion=True),'result domain')
+    def test_initial_duplicate_Agent_transaction(self):
+        self.initial_failure(lambda s:s['gateway']['settlement']['records'].append(copy.deepcopy(s['gateway']['settlement']['records'][0])),'duplicate transaction')
+    def test_initial_duplicate_Manager_transaction(self):
+        self.initial_failure(lambda s:s['peer']['settlement'].append(copy.deepcopy(s['peer']['settlement'][0])),'duplicate transaction')
+    def test_initial_duplicate_outbox_result(self):
+        self.initial_failure(lambda s:s['gateway']['settlement']['outbox'].append(copy.deepcopy(s['gateway']['settlement']['outbox'][0])),'outbox coverage')
+    def test_unknown_old_ack_not_adopted(self):
+        self.initial_failure(lambda s:s['gateway']['settlement']['acknowledgments'].update({'e'*64:True}),'foreign acknowledgment')
+    def test_initial_result_identity_mismatch(self):
+        self.initial_failure(lambda s:s['gateway']['settlement']['records'][0]['result'].update(journalId='b'*32),'result identity')
+    def test_initial_projection_state_mismatch(self):
+        self.initial_failure(lambda s:s['gateway']['settlement']['records'][0].update(state='rolled-back'),'projection mismatch')
+    def test_initial_bool_counter_refused(self):
+        self.initial_failure(lambda s:s['gateway'].update(acceptedSequence=True),'terminal counters')
+    def test_initial_Manager_sequence_boolean_refused(self):
+        self.initial_failure(lambda s:s['peer']['settlement'][0].update(sequence=True),'Manager sequence')
+    def with_accepted_cancel_response(self,recorded=True,acked=True):
+        s=sample();tx='d'*32;row,record=terminal_fixture(tx,2,'rolled-back')
+        response={**record['result'],'schemaVersion':2,'domain':n.CANCELLATION_RESULT_DOMAIN,'state':'cancellation-rejected','proof':{'acceptedState':'applying','cancellationHash':'f'*64}}
+        response.pop('stateHash');response['stateHash']=n.digest(response);row['cancellationResponse']=response
+        if recorded:record.update(cancellationResponse=response,cancellationResponseHash=n.digest(response))
+        original_row,original_record=terminal_fixture();rows={TX:original_row,tx:row};records=[original_record,record]
+        acknowledgments={n.digest(r['result']):True for r in records}
+        if acked:acknowledgments[n.digest(response)]=True
+        s['gateway']['transactions'][tx]={'state':'rolled-back','authorizationHash':record['authorizationHash']}
+        s['gateway']['acceptedSequence']=s['gateway']['terminalSequence']=2
+        s['gateway']['settlement']=agent_view(rows,[r['result'] for r in records],acknowledgments,n.digest)
+        s['peer']['settlement']=manager_view(records,n.digest);s['peer']['ledger'].update(records=2,nextSequence=3,results={r['transactionId']:n.digest(r['result']) for r in records})
+        self.current=s;self.initial=copy.deepcopy(s)
+    def test_old_acked_response_and_final_result_both_retained(self):
+        self.with_accepted_cancel_response();self.check()
+    def test_unpublished_intermediate_response_not_new_delivery_debt(self):
+        self.with_accepted_cancel_response(recorded=False,acked=False);self.check()
+    def test_old_response_ack_without_Manager_commit_refused(self):
+        self.with_accepted_cancel_response(recorded=False,acked=True)
+        with self.assertRaisesRegex(ValueError,'no Manager record'):self.check()
+    def test_response_in_wrong_journal_refused(self):
+        self.with_accepted_cancel_response();self.current['gateway']['settlement']['records'][1]['cancellationResponse']['journalId']='f'*32
+        with self.assertRaisesRegex(ValueError,'response identity'):self.check()
+
+
+class ReadOnlyReplayLoad(unittest.TestCase):
+    def setUp(self):
+        import test_network_executor as fixtures
+        fixtures.Transactions.setUp(self)
+        for module,name in [(subprocess,'Popen'),(socket,'socket')]:
+            guard=patch.object(module,name,side_effect=AssertionError('escaped host boundary'));guard.start();self.addCleanup(guard.stop)
+    def observe(self):
+        with patch.object(n.Executor,'__init__',side_effect=AssertionError('collector constructed writer')),patch.object(n,'atomic',side_effect=AssertionError('collector wrote journal')),patch.object(n.os,'fsync',side_effect=AssertionError('collector invoked durable writer barrier')):
+            return lifecycle_snapshot.load_journal(self.cfg,Path(self.e.directory))
+    def test_production_replay_load_without_constructor_or_writes(self):
+        before={p.name:p.read_bytes() for p in Path(self.e.directory).iterdir()if p.is_file()}
+        self.assertEqual(self.observe()['transactions'],{})
+        self.assertEqual({p.name:p.read_bytes() for p in Path(self.e.directory).iterdir()if p.is_file()},before)
+    def test_malformed_counter_refusal_preserves_original_bytes(self):
+        data=self.e.load();data['acceptedSequence']=False;n.atomic(self.e.path,data);before=Path(self.e.path).read_bytes()
+        with self.assertRaisesRegex(ValueError,'invalid transaction replay journal'):self.observe()
+        self.assertEqual(Path(self.e.path).read_bytes(),before)
 
 
 class FrozenInputBoundaries(unittest.TestCase):

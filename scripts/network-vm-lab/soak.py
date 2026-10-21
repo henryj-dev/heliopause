@@ -13,9 +13,13 @@ from pathlib import Path
 import subprocess
 import time
 import uuid
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from boot_cycle import Lab, run
 from soak_inputs import source_modules
+from soak_settlement import require_settled
+sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'agent'))
+from network_executor import digest
 
 HOURS = 24
 INTERVAL = 60
@@ -47,6 +51,7 @@ def assess(sample, initial, expected_modules, expected_tx):
             raise ValueError(role+' configuration or public trust drift')
     if gateway['targetBinding']!=peer['targetBinding'] or gateway['targetBinding']['journalId']!=gateway['journalId']:
         raise ValueError('Manager/Agent target or journal binding mismatch')
+    require_settled(gateway,peer,expected_tx,digest)
     if peer['ledger']!=initial['peer']['ledger']:raise ValueError('Manager ledger drift or new fence')
     for role,key,rss_limit in [('gateway','agent',512),('gateway','courier',256),('gateway','networkManager',512),('peer','manager',768),('peer','relay',256)]:
         process=sample[role][key]
@@ -108,7 +113,7 @@ def main():
     lab=Lab(a.root,ssh_ports={'gateway':a.gateway_ssh_port,'peer':a.peer_ssh_port})
     for role in ['gateway','peer']:lab.guard(role)
     for role in ['gateway','peer']:
-        for name in ['lifecycle_snapshot.py','soak_inputs.py','soak_peer.py','monitor.py','guest_fixture.py']:
+        for name in ['lifecycle_snapshot.py','soak_inputs.py','soak_settlement.py','soak_peer.py','monitor.py','guest_fixture.py']:
             expected_sha=hashlib.sha256((source/'scripts/network-vm-lab'/name).read_bytes()).hexdigest()
             observed=lab.ssh(role,'sudo','sha256sum','/source/scripts/network-vm-lab/'+name).decode().split()[0]
             if observed!=expected_sha:raise ValueError('deployed observation tool mismatch')

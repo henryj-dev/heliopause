@@ -96,6 +96,18 @@ Manager and Agent target/journal bindings must agree, and lifecycle status must 
 current Agent PID. These disk measurements do not attest the running process memory or
 untracked dependency bytes. Repeated sampling cannot disprove changes between samples.
 
+Initial settlement is checked before the baseline is accepted, then again on every sample.
+A read-only production `Executor.load()` validates the Agent replay state without constructing
+an executor, taking a writer lock, saving, repairing or running recovery. Legacy recovery-only
+journals remain recoverable by the Agent, but cannot enter this baseline. The observer requires
+identical transaction sets, target/journal/authority/artifact/revision bindings, closed Agent states,
+settled Manager records, contiguous sequences, exact terminal result and outbox hashes, and
+literal-true acknowledgments. An unchanged initial file hash alone does not establish settlement.
+A retained acknowledgment for an intermediate cancellation response is permitted only when the
+Manager retains that exact cached response. An intermediate response replaced by the final outbox
+result need not have been delivered; it cannot carry an unexplained acknowledgment. These checks
+establish cross-store agreement, not external PKI provenance or whole-schema equivalence.
+
 The default console SSH ports remain22220/22221. For an explicitly identified pair on other
 ports, pass `--gateway-ssh-port PORT --peer-ssh-port PORT` to the production runner; the two
 ports must be distinct valid integers. Guest nonce checks still apply. Do not monkeypatch the
