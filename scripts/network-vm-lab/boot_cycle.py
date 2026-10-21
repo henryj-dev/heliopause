@@ -61,7 +61,7 @@ print(json.dumps({'at':time.time(),'bootId':pathlib.Path('/proc/sys/kernel/rando
 'kernel':r(['uname','-r']).stdout.decode().strip(),
 'packages':r(['rpm','-q','NetworkManager','NetworkManager-libnm','systemd','python3','iproute','wireguard-tools','nftables']).stdout.decode().splitlines(),
 'nmDevices':r(['nmcli','-t','-f','UUID,TYPE,DEVICE','connection','show','--active']).stdout.decode().splitlines(),
-'service':r(['systemctl','show','heliopause-agent.service','-p','MainPID','-p','ActiveState','-p','SubState','-p','After','-p','CapabilityBoundingSet','-p','ReadWritePaths']).stdout.decode(),
+'service':r(['systemctl','show','heliopause-agent.service','-p','MainPID','-p','ActiveState','-p','SubState','-p','ExecStart','-p','UnitFileState','-p','After','-p','CapabilityBoundingSet','-p','ReadWritePaths']).stdout.decode(),
 'links':json.loads(r(['ip','-j','-d','link','show']).stdout),
 'addresses':json.loads(r(['ip','-j','address','show']).stdout),
 'routes':json.loads(r(['ip','-j','-4','route','show','table','all']).stdout)}))
@@ -117,6 +117,11 @@ def recovery_complete(journal, transaction, boot, expected):
     elif expected=='inactive':complete=target['state']=='confirmed' and restore.get('bootId')!=boot
     else:return False
     return complete and not any((row['state'] not in {'confirmed','rolled-back','cancelled-before-accept'} or row.get('bootRestore',{}).get('state')=='attempting' or row.get('bootRestore',{}).get('recovery')=='rollback-failed') and not (identity==transaction and expected=='rollback-failed') for identity,row in journal['transactions'].items())
+
+
+def service_inactive(service):
+    values=dict(line.split('=',1) for line in service.splitlines() if '=' in line)
+    return values.get('MainPID')=='0' and values.get('ActiveState') in {'inactive','failed'} and values.get('SubState') in {'dead','failed'}
 
 
 def inactive_preserved(before, after, transaction):
@@ -178,6 +183,7 @@ def main():
             report['after']=lab.evidence()
             if report['after']['bootId']!=boot:raise ValueError('unexpected additional gateway reboot')
             complete=recovery_complete(report['after']['journal'],args.transaction,boot,args.expected)
+            if args.expected=='inactive':complete=complete and service_inactive(report['after']['service'])
             if args.expected=='rollback-failed':
                 status=report['after'].get('lifecycle') or {}
                 complete=complete and status.get('agentPid') and 0<=report['after']['at']-status.get('reportedAt',0)<=10

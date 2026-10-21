@@ -1,7 +1,7 @@
 """Report acceptance must reject in-progress recovery and stale/empty packet evidence."""
 import copy
 import unittest
-from boot_cycle import recovery_complete, fresh_packets, inactive_preserved
+from boot_cycle import recovery_complete, fresh_packets, inactive_preserved, service_inactive
 
 class ReportAcceptance(unittest.TestCase):
     def test_restored_requires_terminal_matching_boot_without_other_debt(self):
@@ -28,6 +28,12 @@ class ReportAcceptance(unittest.TestCase):
         row['bootRestore']={'bootId':'old','state':'restored'}
         self.assertTrue(recovery_complete(journal,'tx','new','inactive'))
         self.assertFalse(recovery_complete(journal,'tx','new','unsupported'))
+    def test_inactive_agent_requires_no_process_and_no_activation_in_progress(self):
+        self.assertTrue(service_inactive('MainPID=0\nActiveState=failed\nSubState=failed'))
+        self.assertTrue(service_inactive('MainPID=0\nActiveState=inactive\nSubState=dead'))
+        for service in ['MainPID=12\nActiveState=active\nSubState=running','MainPID=0\nActiveState=activating\nSubState=auto-restart','MainPID=0']:
+            self.assertFalse(service_inactive(service))
+
     def test_negative_boot_preserves_exact_profile_and_no_kernel_objects(self):
         before={'journal':{'transactions':{'tx':{'authorization':{'operation':{'profileUuid':'id','interfaceName':'hp-owned'}}}}},'profiles':[{'uuid':'id','sha256':'foreign'}]}
         after={'profiles':copy.deepcopy(before['profiles']),'links':[],'routes':[]}
