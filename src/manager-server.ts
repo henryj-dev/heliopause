@@ -1411,7 +1411,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
   }
   if (opts.artifactSigning) artifactSigningKeyId(createPublicKey(opts.artifactSigning.privateKey));
   const terminalPins=opts.networkExecutionTargets??[];
-  if(opts.networkRegistryFile&&existsSync(opts.networkRegistryFile)&&new NetworkRegistryStore(opts.networkRegistryFile).read().execution?.journalEpoch) assertJournalEpochBinding(new NetworkRegistryStore(opts.networkRegistryFile),terminalPins);
+  if(opts.networkRegistryFile&&existsSync(opts.networkRegistryFile)){const store=new NetworkRegistryStore(opts.networkRegistryFile),execution=store.read().execution;if(execution?.journalEpoch||execution?.capacityHold)assertJournalEpochBinding(store,terminalPins);}
   if(opts.networkExecutionTargets?.some(t=>!/^[a-f0-9]{32}$/.test(t.journalId))||terminalPins.some(t=>!/^[a-f0-9]{64}$/.test(t.certificateSha256!))||new Set(terminalPins.map(t=>t.certificateSha256)).size!==terminalPins.length) throw new Error("invalid or ambiguous network Agent identity pins");
   if (opts.artifactSigning && opts.networkExecutionTargets?.length) validateNetworkVerifierKeys(opts.networkVerifierKeys ?? [], opts.artifactSigning.privateKey);
   if (opts.tls.public && opts.tls.public.serverNames.length === 0) {
@@ -2425,7 +2425,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         if(!opts.networkRegistryFile) return send(res,503,{error:"execution ledger unavailable"});
         try {const snapshot=new NetworkRegistryStore(opts.networkRegistryFile).executionSnapshot(),status=snapshot.execution;
           const current=status.records.find(r=>r.transactionId===status.fence?.transactionId);
-          const fenceReason=!status.fence?null:current?.cancelStatus==='accepted-recovery-required'?'accepted execution requires verified rollback':current?.cancelStatus==='requested'?'Agent cancellation acknowledgment required':'authenticated terminal settlement required';
+          const fenceReason=status.capacityHold?'verified archive and journal transition required':!status.fence?null:current?.cancelStatus==='accepted-recovery-required'?'accepted execution requires verified rollback':current?.cancelStatus==='requested'?'Agent cancellation acknowledgment required':'authenticated terminal settlement required';
           return send(res,200,{...status,capacity:{used:status.records.length,limit:NETWORK_EXECUTION_CAPACITY,remaining:NETWORK_EXECUTION_CAPACITY-status.records.length,...snapshot.storage},fenceReason});}
         catch {return send(res,409,{error:"execution ledger unavailable or legacy reconciliation required"});}
       }

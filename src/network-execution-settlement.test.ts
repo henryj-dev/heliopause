@@ -289,3 +289,67 @@ test('new issuance reserves recovery bytes and rejects an oversized authority wi
     assert.equal(readFileSync(f.store.path,'utf8'),before);assert.equal(f.store.executionStatus().fence,null);
   }finally{f.cleanup();}
 });
+
+function capacityResult(f:ReturnType<typeof issued>):NetworkTerminalResult {
+  const ordinary=cancelled(f),{stateHash,...body}=ordinary;
+  const result={...body,schemaVersion:3 as const,domain:'heliopause-network-capacity-stop-mtls-v1' as const,proof:{...body.proof,maintenanceRequired:true as const}};
+  return {...result,stateHash:networkDigest(result)};
+}
+test('capacity cancellation atomically settles and persists a downgrade-resistant issuance hold',()=>{
+  const f=issued();try {
+    const result=capacityResult(f);settleNetworkExecution(f.store,result,f.agent,'gateway');
+    const state=new NetworkRegistryStore(f.store.path).executionStatus();
+    assert.equal(state.schemaVersion,2);assert.equal(state.fence,null);assert.equal(state.capacityHold!.resultHash,networkDigest(result));
+    assert.throws(()=>f.store.fenceExecution(1,'b'.repeat(32),()=>{throw new Error('issuance escaped hold');},'alice'),/capacity maintenance/);
+    assert.deepEqual(settleNetworkExecution(f.store,result,f.agent,'gateway'),{settled:true,duplicate:true});
+    assert.deepEqual(f.store.executionStatus().capacityHold,state.capacityHold);
+  }finally{f.cleanup();}
+});
+for(const field of ['maintenanceRequired','cancellationHash','schemaVersion','domain'] as const)test('capacity result refuses altered '+field+' without releasing fence',()=>{
+  const f=issued();try {
+    const r:any=capacityResult(f);
+    if(field==='maintenanceRequired')r.proof.maintenanceRequired=false;
+    else if(field==='cancellationHash')r.proof.cancellationHash='0'.repeat(64);
+    else if(field==='schemaVersion')r.schemaVersion=2;
+    else r.domain='heliopause-network-cancellation-mtls-v1';
+    const {stateHash,...body}=r;r.stateHash=networkDigest(body);
+    assert.throws(()=>settleNetworkExecution(f.store,r,f.agent,'gateway'));
+    assert.ok(f.store.executionStatus().fence);assert.equal(f.store.executionStatus().capacityHold,undefined);
+  }finally{f.cleanup();}
+});
+for(const damage of ['remove-hold','downgrade','wrong-result','wrong-journal'] as const)test('capacity ledger refuses damaged '+damage,()=>{
+  const f=issued();try {
+    settleNetworkExecution(f.store,capacityResult(f),f.agent,'gateway');
+    const doc=JSON.parse(readFileSync(f.store.path,'utf8'));
+    if(damage==='remove-hold')delete doc.execution.capacityHold;
+    else if(damage==='downgrade'){doc.execution.schemaVersion=1;delete doc.execution.capacityHold;}
+    else if(damage==='wrong-result')doc.execution.capacityHold.resultHash='0'.repeat(64);
+    else doc.execution.capacityHold.journalId='0'.repeat(32);
+    writeFileSync(f.store.path,JSON.stringify(doc));assert.throws(()=>new NetworkRegistryStore(f.store.path).executionStatus());
+  }finally{f.cleanup();}
+});
+for(const point of ['before-commit','after-commit'] as const)test('capacity settlement crash '+point+' preserves fence or exact hold',()=>{
+  const f=issued();try {
+    const r=capacityResult(f);
+    const p=child(`import fs from 'node:fs';import {syncBuiltinESMExports} from 'node:module';import {NetworkRegistryStore} from ${JSON.stringify(registryUrl)};import {settleNetworkExecution} from ${JSON.stringify(settlementUrl)};
+      const path=${JSON.stringify(f.store.path)},rename=fs.renameSync;
+      fs.renameSync=(from,to)=>{if(String(to)===path){if(${JSON.stringify(point)}==='before-commit')process.kill(process.pid,'SIGKILL');rename(from,to);process.kill(process.pid,'SIGKILL');}else rename(from,to)};
+      syncBuiltinESMExports();settleNetworkExecution(new NetworkRegistryStore(path),${JSON.stringify(r)},${JSON.stringify(f.agent)},'gateway');`);
+    assert.equal(p.signal,'SIGKILL',p.stderr);const state=f.store.executionStatus();
+    assert.equal(Boolean(state.fence),point==='before-commit');assert.equal(Boolean(state.capacityHold),point==='after-commit');
+    settleNetworkExecution(f.store,r,f.agent,'gateway');assert.ok(f.store.executionStatus().capacityHold);
+  }finally{f.cleanup();}
+});
+
+test('capacity stop cannot retire an epoch containing a confirmed resource',()=>{
+ const f=issued();try {
+  f.confirm();settleNetworkExecution(f.store,f.result('confirmed'),f.agent,'gateway');
+  const a={...f.a,transactionId:'b'.repeat(32)},authorization=signNetworkMessage(NETWORK_EXECUTION_DOMAIN,a,f.key.privateKey);
+  f.store.fenceExecution(1,a.transactionId,()=>authorization,'alice');
+  const c=issueDurableNetworkCancellation(f.store,a.transactionId,networkDigest(a),f.key.privateKey,'alice');
+  const body={...f.result(),transactionId:a.transactionId,fenceId:a.transactionId,authorizationHash:networkDigest(a),schemaVersion:3 as const,domain:'heliopause-network-capacity-stop-mtls-v1' as const,state:'cancelled-before-accept' as const,sequence:2,proof:{cancellationHash:cancellationHash(c),acceptancePrevented:true as const,maintenanceRequired:true as const}};
+  const {stateHash,...committed}=body,result={...committed,stateHash:networkDigest(committed)};
+  assert.throws(()=>settleNetworkExecution(f.store,result,f.agent,'gateway'),/resource-free/);
+  assert.equal(f.store.executionStatus().fence!.transactionId,a.transactionId);assert.equal(f.store.executionStatus().capacityHold,undefined);
+ }finally{f.cleanup();}
+});

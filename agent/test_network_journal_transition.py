@@ -62,6 +62,41 @@ class Transition(unittest.TestCase):
         self.absence=patch.object(t,'resource_absence',side_effect=AssertionError('live kernel absence must be explicitly injected'));self.absence.start();self.addCleanup(self.absence.stop)
     def apply(self,event=None,absence=lambda *args:None):
         return t.apply_agent(str(self.config),str(self.state),str(self.archive),self.envelope,self.receipt,str(self.writer),event=event,absence=absence)
+    def reserve_capacity(self):
+        from test_network_cancellation import cancellation
+        data=self.executor.load();data['transactions'][next(iter(data['transactions']))]['diagnostic']='x'*(6*1024*1024);n.atomic(self.executor.path,data)
+        a=copy.deepcopy(next(iter(data['transactions'].values()))['authorization']);a['transactionId']='f'*32
+        self.executor.cancel(cancellation(a));self.executor.publish_results()
+        rows=n.capacity_rows(self.executor.load(),n.read_json(str(self.state/'journal-identity.json')))
+        results=self.executor.terminal_results();acks={n.digest(r):True for r in results};n.atomic(str(self.state/'terminal-acks.json'),acks)
+        manager=n.read_json(str(self.archive/'manager.json'));record=copy.deepcopy(manager['execution']['records'][0]);result=results[-1]
+        record.update(transactionId=a['transactionId'],authorization={'payload':base64.urlsafe_b64encode(n.canonical(a).encode()).decode().rstrip('=')},authorizationHash=n.digest(a),result=result,resultHash=n.digest(result));manager['execution']['records'].append(record)
+        evidence,attachments=synthetic_evidence(rows)
+        for name,raw in attachments.items():path=self.archive/'evidence'/name;path.write_bytes(raw);path.chmod(0o600)
+        values={'manager':n.canonical(manager).encode(),'evidence':n.canonical(evidence).encode()}
+        for name in ['agent','identity','outbox','acknowledgments']:values[name]=(self.state/t.FILES[name]).read_bytes()
+        manifest=n.read_json(str(self.archive/'manifest.json'))
+        for name,raw in values.items():
+            path=self.archive/t.FILES[name];path.write_bytes(raw);path.chmod(0o600);manifest['files'][path.name]={'sha256':hashlib.sha256(raw).hexdigest(),'bytes':len(raw)}
+        n.atomic(str(self.archive/'manifest.json'),manifest);archive=t.read_archive(self.archive)
+        draft={k:v for k,v in self.payload.items() if k!='approval'};draft.update(archiveHash=n.digest(archive['rawFiles']),managerHash=hashlib.sha256(values['manager']).hexdigest(),agentHash=hashlib.sha256(values['agent']).hexdigest(),evidenceHash=hashlib.sha256(values['evidence']).hexdigest())
+        self.payload={**draft,'approval':{**self.payload['approval'],'planHash':'sha256:'+n.digest(draft)}};self.envelope={'keyId':'test-manager','body':self.payload}
+        self.receipt={'keyId':'test-manager','body':{**self.receipt['body'],'transitionHash':n.digest(self.payload),'archiveHash':draft['archiveHash'],'evidenceHash':draft['evidenceHash']}}
+        return values
+    def test_capacity_archive_preserves_both_raw_replay_stores_and_checks_absence_for_reservation(self):
+        values=self.reserve_capacity();seen=[]
+        result=self.apply(absence=lambda cfg,old:seen.extend(old['transactions']))
+        previous=Path(result['oldStatePreservedAt'])
+        for name in ['agent','identity','outbox','acknowledgments']:self.assertEqual((previous/t.FILES[name]).read_bytes(),values[name])
+        self.assertEqual(len(seen),2);self.assertEqual(n.read_json(str(self.state/'journal-identity.json')),{'journalId':'e'*32})
+    def test_capacity_archive_resumes_after_primary_preserved_without_losing_reservation(self):
+        values=self.reserve_capacity()
+        def crash(point):
+            if point=='old-preserved':raise RuntimeError('power cut')
+        with self.assertRaises(RuntimeError):self.apply(event=crash)
+        result=self.apply();previous=Path(result['oldStatePreservedAt'])
+        self.assertEqual((previous/'journal-identity.json').read_bytes(),values['identity'])
+
     def test_real_signature_workspace_does_not_recreate_unpublished_successor(self):
         # Retain the production helper's mkdir/temp-file/fsync/cleanup behavior while
         # isolating its only subprocess (OpenSSL); no host network command can escape.

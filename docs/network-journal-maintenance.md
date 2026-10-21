@@ -122,3 +122,43 @@ OpenSSL subprocess; replacing the entire helper would hide that filesystem bound
 operator authentication and two-person approval, receipt retry and retired-binding startup refusal.
 Those tests do not establish Rocky VM crash recovery, storage-pressure survival or remote custody.
 Confirmed-resource scope B remains unsupported and blocks a trial that requires that migration.
+
+## Capacity-stop reservation (paired rollout required)
+
+Normal Agent admission stops at 1,023 primary records and the existing 6 MiB admission
+budget. The 1,024th replay identity is reserved for one Manager-signed cancellation of
+an authority that was never accepted. If its complete terminal record would exceed
+the admission budget, the Agent atomically preserves that record in
+`journal-identity.json` (`capacityCancellation`, whole identity at most 512 KiB).
+The primary journal bytes and counters remain unchanged. The effective record set and
+terminal sequence include the reservation. All primary operations must already be
+rolled back or cancelled before acceptance, with no confirmed resource or recovery debt; existing undo, reporting and acknowledgments continue. This is bounded
+logical capacity protection, not a guarantee against physical storage failure.
+
+The reservation produces terminal schema 3, domain
+`heliopause-network-capacity-stop-mtls-v1`, with the original cancellation hash and
+`acceptancePrevented=true, maintenanceRequired=true`. Direct pinned Agent mTLS still
+authenticates delivery. The Manager atomically settles the exact fence and persists
+an issuance hold. Execution-ledger schema 2 makes older Managers refuse this state;
+older Agents refuse the extended identity. Deploy both versions before enabling new
+work. A mixed-version rejection retains debt and requires the compatible binaries;
+never downgrade the terminal result or remove the hold/identity field by hand.
+
+Retries export the identical result/hash/sequence, including a restart between identity
+persistence and outbox publication. A duplicate result cannot release the hold. New
+Agent acceptance and Manager issuance remain stopped until the normal two-person,
+full-archive scope-A transition retires the complete primary-plus-reserved history.
+Its archive commits the raw identity and primary journal separately and preserves both
+original files. No partial pruning or timeout clears this condition.
+
+A pre-existing legacy primary ledger with 1,024 rows has no free emergency slot and
+fails closed; existing accepted undo/report/settlement remain available. A confirmed
+resource, including one in an otherwise terminal ledger, forbids the emergency reservation
+and scope A. Capacity refusal then retains the Manager fence; existing recovery and
+settlement remain available. The capacity stop does not transfer its ownership or restore authority. Such
+a target needs a separately specified scope-B transition or an approved exit procedure
+before its lifetime budget is exhausted. Do not present this reservation as that feature.
+
+Implementation validation and real VM capacity-pressure results must be reported
+separately. Synthetic padding and synthetic full-ledger fixtures do not establish the
+size of legitimate operational history or the completion of 1,024 real operations.

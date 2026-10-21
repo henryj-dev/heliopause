@@ -106,6 +106,101 @@ class Cancellation(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'capacity'):self.e.cancel(cancellation(a))
         self.assertEqual(len(self.e.terminal_results()),1024)
 
+    def fill_bytes(self):
+        self.e.cancel(cancellation(self.a))
+        data=self.e.load();data['transactions'][self.a['transactionId']]['diagnostic']='x'*(6*1024*1024)
+        n.atomic(self.e.path,data)
+        b=copy.deepcopy(self.a);b['transactionId']='f'*32
+        return b
+    def test_capacity_reservation_preserves_primary_and_exports_explicit_stop(self):
+        b=self.fill_bytes();before=n.read_file(self.e.path)
+        self.e.cancel(cancellation(b))
+        self.assertEqual(before,n.read_file(self.e.path));self.assertFalse(self.driver.calls)
+        results=self.e.terminal_results();self.assertEqual(len(results),2)
+        self.assertEqual(results[-1]['schemaVersion'],3);self.assertEqual(results[-1]['domain'],n.CAPACITY_RESULT_DOMAIN)
+        self.assertEqual(results[-1]['sequence'],2);self.assertTrue(results[-1]['proof']['maintenanceRequired'])
+    def test_reserved_identity_restart_and_duplicate_keep_exact_result(self):
+        b=self.fill_bytes();c=cancellation(b);self.e.cancel(c);before=self.e.terminal_results()
+        e=n.Executor(self.cfg,self.temp.name,self.driver);e.recover();e.cancel(c)
+        self.assertEqual(before,e.terminal_results());self.assertEqual(e.load()['acceptedSequence'],1)
+    def test_capacity_save_then_crash_regenerates_same_outbox(self):
+        b=self.fill_bytes();event=self.e.event
+        def crash(state):
+            if state=='capacity-reserved':raise RuntimeError('injected after identity fsync')
+            event(state)
+        with patch.object(self.e,'event',side_effect=crash),self.assertRaises(RuntimeError):self.e.cancel(cancellation(b))
+        result=self.e.terminal_results();self.e.publish_results()
+        self.assertEqual(result,n.read_json(os.path.join(self.temp.name,'terminal-results.json')))
+    def test_failed_capacity_save_keeps_no_false_result(self):
+        b=self.fill_bytes();before=n.read_file(self.e.path)
+        with patch.object(n,'atomic',side_effect=OSError('bounded volume full')),self.assertRaises(OSError):self.e.cancel(cancellation(b))
+        self.assertEqual(before,n.read_file(self.e.path));self.assertEqual(len(self.e.terminal_results()),1)
+    def test_reserved_slot_rejects_another_cancel_and_new_acceptance(self):
+        b=self.fill_bytes();self.e.cancel(cancellation(b))
+        other=copy.deepcopy(b);other['transactionId']='e'*32
+        with self.assertRaisesRegex(ValueError,'maintenance'):self.e.cancel(cancellation(other))
+        other['operation']['interfaceName']='hp'+other['transactionId'][:12];other['artifactHash']=n.digest(other['operation'])
+        other['approval']['planHash']='sha256:'+n.digest({k:v for k,v in other.items() if k!='approval'})
+        with self.assertRaisesRegex(ValueError,'maintenance'):self.e.accept(other)
+        self.assertEqual(len(self.e.terminal_results()),2)
+    def test_reserved_identity_tamper_is_never_delivered(self):
+        b=self.fill_bytes();self.e.cancel(cancellation(b));path=os.path.join(self.temp.name,'journal-identity.json');original=n.read_json(path)
+        for field,value in [('sequence',1),('domain',n.CANCELLATION_RESULT_DOMAIN),('schemaVersion',2)]:
+            changed=copy.deepcopy(original);changed['capacityCancellation']['terminalResult'][field]=value;n.atomic(path,changed)
+            with self.subTest(field=field),self.assertRaises(ValueError):self.e.terminal_results()
+        n.atomic(path,original)
+    def test_capacity_reservation_refuses_existing_recovery_debt(self):
+        self.e.accept(self.a);data=self.e.load();data['transactions'][self.a['transactionId']]['diagnostic']='x'*(6*1024*1024);n.atomic(self.e.path,data)
+        b=copy.deepcopy(self.a);b['transactionId']='f'*32
+        with self.assertRaisesRegex(ValueError,'recovery debt'):self.e.cancel(cancellation(b))
+        self.assertTrue(self.driver.exists);self.e.cancel(cancellation(self.a));self.e.tick()
+        self.assertEqual(self.row()['state'],'rolled-back')
+    def test_capacity_identity_is_bounded_independently_of_primary(self):
+        b=self.fill_bytes();b['approval']['oversize']='x'*(512*1024)
+        with self.assertRaisesRegex(ValueError,'identity too large'):self.e.cancel(cancellation(b))
+        self.assertEqual(len(self.e.terminal_results()),1)
+
+    def test_capacity_lifecycle_reports_effective_records_and_maintenance(self):
+        from network_lifecycle import Lifecycle
+        b=self.fill_bytes();self.e.cancel(cancellation(b))
+        life=Lifecycle(None,directory=self.temp.name,executor=self.e);life.refresh();status=life.snapshot['network']
+        self.assertEqual(status['state'],'capacity-maintenance');self.assertTrue(status['maintenanceRequired'])
+        self.assertEqual(status['ledger']['used'],2);self.assertEqual(status['ledger']['primaryUsed'],1)
+        self.assertEqual(status['ledger']['admissionRemaining'],0);self.assertEqual(status['ledger']['effectiveTerminalSequence'],2)
+    def test_1023_closed_primary_records_leave_one_bounded_cancellation_identity(self):
+        data=self.e.load()
+        # Synthetic shaped history: this does not claim 1,023 actual kernel operations.
+        for i in range(1023):
+            a=copy.deepcopy(self.a);a['transactionId']=format(i+1,'032x');c=cancellation(a)
+            result={'schemaVersion':2,'domain':n.CANCELLATION_RESULT_DOMAIN,'transactionId':a['transactionId'],'fenceId':a['transactionId'],'target':a['target'],'journalId':a['journalId'],'authorizationHash':n.digest(a),'artifactHash':a['artifactHash'],'registryRevision':a['registryRevision'],'state':'cancelled-before-accept','sequence':i+1,'proof':{'cancellationHash':n.digest(c),'acceptancePrevented':True}}
+            data['transactions'][a['transactionId']]={'authorization':a,'cancellation':c,'state':'cancelled-before-accept','history':[],'terminalResult':{**result,'stateHash':n.digest(result)}}
+        data['acceptedSequence']=data['terminalSequence']=1023;n.atomic(self.e.path,data)
+        self.e.cancel(cancellation(self.a));results=self.e.terminal_results()
+        self.assertEqual(len(results),1024);self.assertEqual(results[-1]['schemaVersion'],3);self.assertEqual(results[-1]['sequence'],1024)
+        self.assertEqual(len(self.e.load()['transactions']),1023);self.assertFalse(self.driver.calls)
+
+    def test_capacity_does_not_reserve_over_confirmed_resource_or_retained_debt(self):
+        self.e.accept(self.a);self.e.confirm(self.confirmation());data=self.e.load();row=data['transactions'][self.a['transactionId']];row['diagnostic']='x'*(6*1024*1024);n.atomic(self.e.path,data)
+        b=copy.deepcopy(self.a);b['transactionId']='f'*32
+        with self.assertRaisesRegex(ValueError,'confirmed resources'):self.e.cancel(cancellation(b))
+        self.assertTrue(self.driver.exists);self.assertNotIn('capacityCancellation',n.read_json(os.path.join(self.temp.name,'journal-identity.json')))
+    def test_capacity_rejects_null_undo_and_restore_markers(self):
+        b=self.fill_bytes();original=self.e.load()
+        for field in ['before','paths','bootRestore']:
+            data=copy.deepcopy(original);data['transactions'][self.a['transactionId']][field]=None;n.atomic(self.e.path,data)
+            with self.subTest(field=field),self.assertRaises(ValueError):self.e.cancel(cancellation(b))
+            self.assertNotIn('capacityCancellation',n.read_json(os.path.join(self.temp.name,'journal-identity.json')))
+        n.atomic(self.e.path,original)
+
+    def test_identity_rename_then_fsync_error_still_exports_the_exact_reserved_result(self):
+        b=self.fill_bytes();original=n.atomic;identity=os.path.join(self.temp.name,'journal-identity.json')
+        def uncertain(path,value):
+            original(path,value)
+            if path==identity:raise OSError('injected after rename')
+        with patch.object(n,'atomic',side_effect=uncertain),self.assertRaises(OSError):self.e.cancel(cancellation(b))
+        results=self.e.terminal_results();self.assertEqual(results[-1]['schemaVersion'],3)
+        self.e.publish_results();self.assertEqual(n.read_json(os.path.join(self.temp.name,'terminal-results.json')),results)
+
 
 CHILD=r'''
 import sys,os,time,json,socket,subprocess

@@ -57,7 +57,7 @@ def snapshot(role):
         registry=n.read_json(str(base/'registry.json'));state=registry['execution']
         result.update(manager=process('heliopause-vm-lab-manager.service'),relay=process('heliopause-vm-lab-relay.service'),
                       ledger={'commitment':commitment(base/'registry.json'),'nextSequence':state['nextSequence'],
-                              'records':len(state['records']),'fence':state['fence'],
+                              'records':len(state['records']),'fence':state['fence'],'capacityHold':state.get('capacityHold'),'executionSchemaVersion':state['schemaVersion'],
                               'results':{r['transactionId']:r.get('resultHash') for r in state['records']}})
         result['at']=time.time()
         return result
@@ -69,7 +69,8 @@ def snapshot(role):
     modules={Path(name).name:commitment(modulebase/Path(name).name)['sha256'] for name in package['files'] if name.startswith('agent/') and name.endswith('.py')}
     status=n.read_json('/var/lib/heliopause-agent/lifecycle-status.json')
     rows={}
-    for tx,row in journal['transactions'].items():
+    identity=n.read_json(str(directory/'journal-identity.json'));effective=n.capacity_rows(journal,identity)
+    for tx,row in effective.items():
         rows[tx]={'state':row['state'],'bootRestore':{k:v for k,v in row.get('bootRestore',{}).items() if k in {'bootId','state','reason','recovery','currentConnectivity','diagnostic'}},
                   'diagnostic':row.get('diagnostic'),'authorizationHash':row.get('authorizationHash')}
         if row['state']=='confirmed' and row['authorization']['operation']['driver']==n.PERSISTENT_DRIVER:
@@ -87,7 +88,7 @@ def snapshot(role):
     status=n.read_json('/var/lib/heliopause-agent/lifecycle-status.json')
     result.update(agent=process('heliopause-agent.service'),courier=process('heliopause-network-terminal.service'),
                   networkManager=process('NetworkManager.service'),journalId=journal['journalId'],
-                  acceptedSequence=journal['acceptedSequence'],terminalSequence=journal['terminalSequence'],transactions=rows,
+                  acceptedSequence=journal['acceptedSequence'],terminalSequence=journal['terminalSequence'],effectiveAcceptedSequence=len(effective),effectiveTerminalSequence=journal['terminalSequence']+int('capacityCancellation' in identity),maintenanceRequired='capacityCancellation' in identity,transactions=rows,
                   files=files,journalContentHash=n.digest({k:v for k,v in journal.items() if k!='lastClock'}),trust=trust,deployedModules=modules,lifecycle=status)
     result['at']=time.time()
     return result

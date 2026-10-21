@@ -1,3 +1,4 @@
+import { journalRows } from './network-journal-rows.ts';
 import { validateJournalEvidence, type JournalEvidenceManifest } from './network-journal-evidence.ts';
 /** Restricted exact-byte snapshot archive; no secrets/recursive lab copy or ledger mutation. */
 import { createHash } from 'node:crypto';
@@ -46,7 +47,7 @@ function refuseCredentials(value:unknown):void {
 }
 export function createJournalArchive(directory:string,bytes:JournalArchiveBytes,attachments:Record<string,Buffer>={}):JournalArchive {
   for(const [name] of Object.entries(files) as [Name,string][]){const raw=bytes[name];if(!Buffer.isBuffer(raw)||raw.length>(name==='manager'?4:8)*1024*1024)throw new Error('snapshot archive size bound');refuseCredentials(parseArchiveJson(raw.toString()));}
-  const evidence=parseArchiveJson(bytes.evidence.toString()) as JournalEvidenceManifest;validateJournalEvidence(evidence,parseArchiveJson(bytes.agent.toString()).transactions);
+  const evidence=parseArchiveJson(bytes.evidence.toString()) as JournalEvidenceManifest;validateJournalEvidence(evidence,journalRows(parseArchiveJson(bytes.agent.toString()),parseArchiveJson(bytes.identity.toString())));
   if(Object.keys(attachments).sort().join(' ')!==Object.keys(evidence.files).sort().join(' '))throw new Error('missing/extra execution evidence attachments');
   for(const [name,entry] of Object.entries(evidence.files)){const raw=attachments[name]!;if(!Buffer.isBuffer(raw)||raw.length!==entry.bytes||digest(raw)!==entry.sha256)throw new Error('execution evidence attachment mismatch');refuseCredentials(parseArchiveJson(raw.toString()));}
   privateDirectory(dirname(resolve(directory)));mkdirSync(directory,{mode:0o700});
@@ -70,7 +71,7 @@ export function loadJournalArchive(directory:string):JournalArchive {
     if(!entry||Object.keys(entry).sort().join(' ')!=='bytes sha256'||entry.sha256!==digest(raw)||entry.bytes!==raw.length)throw new Error('snapshot archive hash mismatch');
     rawFiles[name]=raw.toString('base64url');parsed[name]=parseArchiveJson(raw.toString());refuseCredentials(parsed[name]);
   }
-  validateJournalEvidence(parsed.evidence,parsed.agent.transactions);readJournalEvidenceAttachments(directory,parsed.evidence);
+  validateJournalEvidence(parsed.evidence,journalRows(parsed.agent,parsed.identity));readJournalEvidenceAttachments(directory,parsed.evidence);
   seal(directory);return {schemaVersion:1,rawFiles,...parsed};
 }
 export const journalArchiveCommitment=(archive:JournalArchive)=>networkDigest(archive.rawFiles);

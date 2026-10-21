@@ -179,6 +179,7 @@ export class NetworkRegistryStore {
     return withNetworkRegistryLock(this.path,fail,()=>{
       const doc=this.read();this.requireExecution(doc);
       const state=doc.execution!;
+      if(state.capacityHold) throw fail('network journal capacity maintenance required',409);
       if(state.fence) throw fail('network execution fence requires settlement',409);
       if(state.records.length>=NETWORK_EXECUTION_CAPACITY||state.records.some(r=>r.transactionId===transactionId)) throw fail('execution replay/capacity refusal',409);
       if(doc.revision!==revision) throw fail('registry revision conflict',409);
