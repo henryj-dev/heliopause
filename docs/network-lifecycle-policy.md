@@ -86,6 +86,23 @@ A crash/incomplete archive cannot produce a successful final result. Resource bu
 created plan; peak process bounds and average CPU checks are limited by the collection interval.
 Transient peaks between samples are not disproved.
 
+Both roles' installed runtime source commitments are compared with the clean source checkout,
+including the Manager/relay source and observation tools, package metadata and i18n dependencies.
+Configuration/public certificate and public trust commitments must remain equal to the initial
+sample. The collector refuses declared private-key inode aliases before opening a public input;
+it does not export private key material or establish that arbitrary source/config bytes are safe
+for publication. Reads require stable file identity/size/metadata before and after collection.
+Manager and Agent target/journal bindings must agree, and lifecycle status must belong to the
+current Agent PID. These disk measurements do not attest the running process memory or
+untracked dependency bytes. Repeated sampling cannot disprove changes between samples.
+
+The default console SSH ports remain22220/22221. For an explicitly identified pair on other
+ports, pass `--gateway-ssh-port PORT --peer-ssh-port PORT` to the production runner; the two
+ports must be distinct valid integers. Guest nonce checks still apply. Do not monkeypatch the
+transport or accidentally observe a different retained lab. These checks are prerequisites for a
+new final-source baseline; synthetic tests do not qualify a real24-hour run.
+
+
 This is a **zero-issuance baseline**, consuming0new ledger slots. Certificate rotation/fault injection
 must run separately, before/after this baseline, and retain their own identities and failure history.
 Do not perform them concurrently and then label a reset/restarted baseline continuous. A shorter
