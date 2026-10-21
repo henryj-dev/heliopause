@@ -11,17 +11,19 @@ import { authorizeNetworkExecution, confirmNetworkExecution, networkExecutionHas
 import { networkDigest } from './network-canonical.ts';
 import { networkLabInput } from '../examples/network-lab.ts';
 
-function fixture() {
+function fixture(persistent=false) {
   const dir=mkdtempSync(join(tmpdir(),'hp-execution-')),store=new NetworkRegistryStore(join(dir,'registry.json'));
   const input=networkLabInput();
-  for (const r of input.registry.resources) if (r.management.mode==='managed') { r.management.driver='wg-quick'; if(r.kind==='interface'&&r.id==='wg0')r.name='hpaaaaaaaaaaaa'; if(r.kind==='route'&&r.interfaceId==='wg0'){r.protocol='static';r.metric=42760;} }
+  for (const r of input.registry.resources) if (r.management.mode==='managed') { r.management.driver=persistent?'networkmanager-wireguard-1.56-v1':'wg-quick'; if(r.kind==='interface'&&r.id==='wg0')r.name='hpaaaaaaaaaaaa'; if(r.kind==='route'&&r.interfaceId==='wg0'){r.protocol='static';r.metric=42760;} }
   const registry=store.mutate(0,'alice',{action:'replace',resources:input.registry.resources});
   store.initializeExecutions();
   const now=Date.now();
   const observation=structuredClone(input.observations[0]!);observation.receivedAt=new Date(now).toISOString();observation.report.completedAt=observation.receivedAt;
   const review=buildNetworkChangeSet({...input,wireguard:undefined,frr:undefined,registry,now});
   const operation={driver:'linux-wireguard-v1' as const,interfaceId:'wg0',interfaceName:'hpaaaaaaaaaaaa',address:'198.51.100.1/32',mtu:1420,listenPort:51820,secretRef:'local',publicKey:Buffer.alloc(32,1).toString('base64'),peers:[{publicKey:Buffer.alloc(32,2).toString('base64'),endpoint:'203.0.113.2:51820',allowedIps:['198.51.100.2/32']}],routes:['198.51.100.2/32']};
-  const draft:NetworkExecutionDraft={schemaVersion:2,journalId:'e'.repeat(32),transactionId:'a'.repeat(32),target:{source:'lab-relay',host:'lab-host-0',nodeId:'n0'},registryRevision:1,resources:registry.resources.map(r=>({id:r.id,generation:r.generation})),desiredDigest:review.desiredDigest,reviewHash:review.contentHash,artifactHash:networkDigest(operation),observation:{digest:networkDigest(observation),collectedAt:now,maxAgeMs:10000},localPrecondition:'b'.repeat(64),operation,issuedAt:now,expiresAt:now+10000,rollbackAt:now+20000};
+  const persistentOperation={...operation,driver:'networkmanager-wireguard-1.56-v1' as const,profileUuid:'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',bootPolicy:'agent-confirmed-only' as const};
+  const selected=persistent?persistentOperation:operation;
+  const draft:NetworkExecutionDraft={schemaVersion:2,journalId:'e'.repeat(32),transactionId:'a'.repeat(32),target:{source:'lab-relay',host:'lab-host-0',nodeId:'n0'},registryRevision:1,resources:registry.resources.map(r=>({id:r.id,generation:r.generation})),desiredDigest:review.desiredDigest,reviewHash:review.contentHash,artifactHash:networkDigest(selected),observation:{digest:networkDigest(observation),collectedAt:now,maxAgeMs:10000},localPrecondition:'b'.repeat(64),operation:selected,issuedAt:now,expiresAt:now+10000,rollbackAt:now+20000};
   const approvals=emptyApprovals(),key=generateKeyPairSync('ed25519');
   const proposeDraft=()=>propose(approvals,{hash:networkExecutionHash(draft),generation:draft.transactionId,summary:{hosts:[]},by:'alice',now:new Date(now)});
   const approveDraft=()=>approve(approvals,{hash:networkExecutionHash(draft),by:'bob',now:new Date(now)});
@@ -76,4 +78,29 @@ test('manager signing key cannot impersonate an independent verifier',()=>{
     f.proposeDraft();f.approveDraft();const envelope=f.issue();
     assert.throws(()=>confirmNetworkExecution(envelope,envelope,[f.key.publicKey],f.key.privateKey),/separate signing keys/);
   } finally {rmSync(f.dir,{recursive:true,force:true});}
+});
+
+
+test('NM persistence identity and boot policy are bound to the approved artifact',()=>{
+  const f=fixture(true);try {
+    f.proposeDraft();f.approveDraft();const envelope=f.issue();
+    const signed=JSON.parse(Buffer.from(envelope.payload,'base64url').toString());
+    assert.equal(signed.operation.driver,'networkmanager-wireguard-1.56-v1');
+    assert.equal(signed.operation.bootPolicy,'agent-confirmed-only');
+    assert.equal(signed.operation.profileUuid,'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa');
+    assert.equal(signed.artifactHash,networkDigest(signed.operation));
+  }finally{rmSync(f.dir,{recursive:true,force:true});}
+});
+test('NM authority refuses profile/policy/path substitution and kernel ownership fallback',()=>{
+  for(const mutation of ['uuid','policy','path','ownership']){
+    const f=fixture(true);try {
+      const op=f.draft.operation as any;
+      if(mutation==='uuid')op.profileUuid='bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
+      if(mutation==='policy')op.bootPolicy='autoconnect';
+      if(mutation==='path')op.profilePath='/tmp/profile';
+      if(mutation==='ownership')op.driver='linux-wireguard-v1';
+      f.draft.artifactHash=networkDigest(op);f.proposeDraft();f.approveDraft();assert.throws(f.issue);
+      assert.equal(existsSync(f.store.path+'.execution-fence'),false);
+    }finally{rmSync(f.dir,{recursive:true,force:true});}
+  }
 });

@@ -11,12 +11,17 @@ import { prefixContains } from './network-prefix-policy.ts';
 export const NETWORK_EXECUTION_DOMAIN = 'heliopause-network-execution-v2';
 export const NETWORK_CONFIRM_DOMAIN = 'heliopause-network-confirm-v1';
 export const NETWORK_VERIFY_DOMAIN = 'heliopause-network-verification-v1';
-export interface NetworkWireGuardOperation {
+export interface NetworkKernelWireGuardOperation {
   driver: 'linux-wireguard-v1'; interfaceId: string; interfaceName: string;
   address: string; mtu: number; listenPort: number; secretRef: string; publicKey: string;
   peers: Array<{ publicKey: string; endpoint: string; allowedIps: string[] }>;
   routes: string[];
 }
+export interface NetworkManagerWireGuardOperation extends Omit<NetworkKernelWireGuardOperation, 'driver'> {
+  driver: 'networkmanager-wireguard-1.56-v1';
+  profileUuid: string; bootPolicy: 'agent-confirmed-only';
+}
+export type NetworkWireGuardOperation = NetworkKernelWireGuardOperation | NetworkManagerWireGuardOperation;
 export interface NetworkExecutionDraft {
   schemaVersion: 2; transactionId: string; journalId: string;
   target: { source: string; host: string; nodeId: string };
@@ -39,7 +44,9 @@ export function validateNetworkExecutionDraft(draft:NetworkExecutionDraft):void 
   const exact=(value:any,fields:string)=>value&&typeof value==='object'&&!Array.isArray(value)&&Object.keys(value).sort().join(' ')===fields.split(' ').sort().join(' ');
   if(!exact(draft,'schemaVersion journalId transactionId target registryRevision resources desiredDigest reviewHash artifactHash observation localPrecondition operation issuedAt expiresAt rollbackAt')||!exact(draft.target,'source host nodeId')||!exact(draft.observation,'digest collectedAt maxAgeMs')) throw new Error('unsupported execution fields');
   const op=draft.operation;
-  if(!exact(op,'driver interfaceId interfaceName address mtu listenPort secretRef publicKey peers routes')||op.driver!=='linux-wireguard-v1'||!Array.isArray(op.peers)||op.peers.length<1||op.peers.length>16||op.peers.some(p=>!exact(p,'publicKey endpoint allowedIps'))||!Array.isArray(op.routes)||op.routes.length>64) throw new Error('unsupported structured driver operation');
+  const persistent=op?.driver==='networkmanager-wireguard-1.56-v1';
+  if(persistent && (op.bootPolicy!=='agent-confirmed-only'||op.profileUuid!==draft.transactionId.replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/, '$1-$2-$3-$4-$5'))) throw new Error('persistent profile identity/policy mismatch');
+  if(!exact(op,'driver interfaceId interfaceName address mtu listenPort secretRef publicKey peers routes'+(persistent?' profileUuid bootPolicy':''))||!['linux-wireguard-v1','networkmanager-wireguard-1.56-v1'].includes(op.driver)||!Array.isArray(op.peers)||op.peers.length<1||op.peers.length>16||op.peers.some(p=>!exact(p,'publicKey endpoint allowedIps'))||!Array.isArray(op.routes)||op.routes.length>64) throw new Error('unsupported structured driver operation');
 }
 /** Caller supplies authenticated principals to the existing propose/approve APIs first. */
 export function authorizeNetworkExecution(store: NetworkRegistryStore, approvals: ApprovalState, draft: NetworkExecutionDraft, by: string, key: KeyObject, evidence: { observation: NetworkObservationRecord; review: NetworkChangeSet }, now=new Date()): NetworkSignedEnvelope {
@@ -58,11 +65,12 @@ export function authorizeNetworkExecution(store: NetworkRegistryStore, approvals
     if(networkDigest([...registry.resources].sort((a,b)=>a.id<b.id?-1:a.id>b.id?1:0).map(r=>({resourceId:r.id,generation:r.generation,digest:networkDigest(r)})))!==draft.desiredDigest) throw new Error('desired digest mismatch');
     if(!draft.resources.length || new Set(draft.resources.map(r=>r.id)).size!==draft.resources.length || draft.resources.some(expected=>registry.resources.find(r=>r.id===expected.id)?.generation!==expected.generation)) throw new Error('resource generation mismatch');
     const op=draft.operation, iface=registry.resources.find(r=>r.id===op.interfaceId);
+    const ownershipDriver=op.driver==='linux-wireguard-v1'?'wg-quick':'networkmanager-wireguard-1.56-v1';
     const node=registry.resources.find(r=>r.id===draft.target.nodeId);
-    if(node?.kind!=='node'||iface?.kind!=='interface'||iface.nodeId!==node.id||iface.name!==op.interfaceName||iface.mtu!==op.mtu||iface.management.mode!=='managed'||iface.management.provider!=='wireguard'||iface.management.driver!=='wg-quick'||!draft.resources.some(r=>r.id===iface.id)) throw new Error('interface ownership mismatch');
+    if(node?.kind!=='node'||iface?.kind!=='interface'||iface.nodeId!==node.id||iface.name!==op.interfaceName||iface.mtu!==op.mtu||iface.management.mode!=='managed'||iface.management.provider!=='wireguard'||iface.management.driver!==ownershipDriver||!draft.resources.some(r=>r.id===iface.id)) throw new Error('interface ownership mismatch');
     const net=registry.resources.find(r=>r.id===iface.networkId);
     if(net?.kind!=='network'||net.purpose!=='backbone'||!registry.resources.some(r=>r.kind==='subnet'&&r.networkId===net.id&&prefixContains(r.cidr,op.address))) throw new Error('address outside backbone');
-    for(const dst of op.routes) if(!registry.resources.some(r=>r.kind==='route'&&r.interfaceId===iface.id&&r.destination===dst&&r.table===254&&r.management.mode==='managed'&&r.management.provider==='wireguard'&&r.management.driver==='wg-quick'&&r.nextHop===null&&r.protocol==='static'&&r.metric===42760&&r.preferredSource===undefined&&(r.routeType===undefined||r.routeType==='unicast')&&draft.resources.some(e=>e.id===r.id))) throw new Error('host route ownership mismatch');
+    for(const dst of op.routes) if(!registry.resources.some(r=>r.kind==='route'&&r.interfaceId===iface.id&&r.destination===dst&&r.table===254&&r.management.mode==='managed'&&r.management.provider==='wireguard'&&r.management.driver===ownershipDriver&&r.nextHop===null&&r.protocol==='static'&&r.metric===42760&&r.preferredSource===undefined&&(r.routeType===undefined||r.routeType==='unicast')&&draft.resources.some(e=>e.id===r.id))) throw new Error('host route ownership mismatch');
     const envelope=signNetworkMessage(NETWORK_EXECUTION_DOMAIN,{...draft,approval:{mode:'two-person',planHash:hash,proposedBy:plan.proposedBy,approvedBy:plan.approval!.by,approvedAt:Date.parse(plan.approval!.at)}},key);
     settle(approvals,hash);
     return envelope;

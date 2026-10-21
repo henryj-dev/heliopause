@@ -1,3 +1,32 @@
+## Persistent backend development (Phase 10)
+
+The Phase 9 read-only collector below remains inventory only. The new implementation and
+measured Rocky 10.2/NM 1.56.0 development environment are described in
+[the Phase 10 record](../../docs/network-phase10-validation.md). Its required boot matrix
+and final source-bound report are separate completion gates; this README does not grant
+readiness from service presence or a prototype reboot.
+
+New tools act only on explicitly marked disposable guests. VM creation remains an
+explicit lab preparation step; preserve the verified image manifest, exact QEMU argv,
+private disk ownership and serial-console evidence in the dedicated lab root:
+
+- `guest_fixture.py` provisions lab credentials, production Agent/service installation and
+  fixed peer/workload namespaces. It never applies or restores a gateway transaction profile.
+- `verify.ts confirm|observe` runs on the independent peer. Confirm signs fresh bounded
+  collector evidence, uses the production Manager mTLS API and delivers its signed envelope
+  to the production Agent mailbox. Observe produces a separately signed current boot
+  observation and never reuses old verifier proof.
+- `boot_cycle.py --root LAB --mode graceful|power-cut --output NEW_REPORT --transaction TX --expected restored|rolled-back` is a boot primitive,
+  not the thirteen-case suite. It refuses dirty source, mismatched deployed module hashes,
+  unmarked guests or a foreign QEMU process. `--require-confirmed-forwarding` requires fresh
+  external packet probes after the changed guest boot ID. Virtual SIGKILL power loss differs
+  from host power failure; disk/controller/host power durability is not inferred.
+
+Lab roots contain private test credentials and persistent guest disks; keep them private and
+outside the repository. Reports are created 0600 and preserve failure evidence. Do not copy
+keyfiles/profile exports into reports. Failed cases remain failures. Do not reset a used
+journal, remove confirmed objects or prune Manager fences to recycle a case.
+
 # Rocky Linux 10 VM preparation — blocked, not a boot test runner
 
 The owner selected Rocky Linux10 on2026-10-20, could not confirm NetworkManager, and has no disposable VM available. Local `qemu-system-x86_64`, `limactl` and `virsh` are absent. This directory contains preparation inputs only. No VM was provisioned or rebooted, no persistent backend is implemented, and no boot report is claimed. Hosted container/kernel success is not Rocky/NetworkManager certification.

@@ -29,7 +29,7 @@ if(action==='keys') {
 } else if(action==='issue'||action==='next') {
   const second=action==='next';
   const facts=read(second?'facts-next.json':'facts.json'),now=Date.now(),at=new Date(now).toISOString(),transactionId=randomBytes(16).toString('hex'),device='hp'+transactionId.slice(0,12);
-  const management={mode:'managed',provider:'wireguard',driver:'wg-quick'};
+  const management={mode:'managed',provider:'wireguard',driver:facts.persistentDriver===true?'networkmanager-wireguard-1.56-v1':'wg-quick'};
   const base={owner:'lab',generation:1,management};
   const store=new NetworkRegistryStore(join(dir,'registry.json'));
   const fresh=[{...base,id:'site',kind:'site'},{...base,id:'gateway',kind:'node',siteId:'site'}, {...base,id:'domain',kind:'routing-domain',name:'global',isolation:'global'},
@@ -38,15 +38,17 @@ if(action==='keys') {
     {...base,id:'wg-new',kind:'interface',nodeId:'gateway',networkId:'backbone',name:device,mtu:1400},
     ...['192.0.2.130/32','198.51.100.6/32'].map((destination,i)=>({...base,id:'route'+i,kind:'route',interfaceId:'wg-new',routingDomainId:'domain',destination,table:254,nextHop:null,protocol:'static',metric:42760}))];
   const current=store.read();
-  const resources=second?[...current.resources,
+  const desiredResources=second?[...current.resources,
     {...base,id:'subnet-next',kind:'subnet',networkId:'backbone',cidr:'192.0.2.144/28'},
     {...base,id:'wg-next',kind:'interface',nodeId:'gateway',networkId:'backbone',name:device,mtu:1400},
     ...['192.0.2.146/32','198.51.100.14/32'].map((destination,i)=>({...base,id:'route-next'+i,kind:'route',interfaceId:'wg-next',routingDomainId:'domain',destination,table:254,nextHop:null,protocol:'static',metric:42760}))]:fresh;
+  const resources=desiredResources.map(resource=>{const existing=current.resources.find(row=>row.id===resource.id);return existing?{...resource,generation:existing.generation}:resource;});
   const registry=store.mutate(current.revision,'lab-authority',{action:'replace',resources});
   store.initializeExecutions();
   const observation={source:'lab',host:'gateway',receivedAt:at,report:{schemaVersion:1 as const,collectionId:'00000000-0000-4000-8000-000000000006',startedAt:at,completedAt:at,observations:{links:{status:'success' as const,startedAt:at,completedAt:at,data:facts.snapshot.links.map((l:any)=>({ifname:l.name,ifindex:l.index,mtu:l.mtu}))},addresses:{status:'success' as const,startedAt:at,completedAt:at,data:[]},routes4:{status:'success' as const,startedAt:at,completedAt:at,data:facts.snapshot.routes}},capabilities:{links:{available:true,status:'success' as const},addresses:{available:true,status:'success' as const},routes4:{available:true,status:'success' as const}}}};
   const review=buildNetworkChangeSet({id:'execution-review',registry,expectedRegistryRevision:registry.revision,now,observations:[observation],bindings:[{source:'lab',host:'gateway',nodeId:'gateway',siteId:'site'}]});
-  const operation={driver:'linux-wireguard-v1' as const,interfaceId:'wg-new',interfaceName:device,address:'192.0.2.129/32',mtu:1400,listenPort:51820,secretRef:'gateway',publicKey:facts.publicKey,peers:[{publicKey:facts.peerPublicKey,endpoint:'203.0.113.2:51820',allowedIps:['192.0.2.130/32','198.51.100.6/32']}],routes:['192.0.2.130/32','198.51.100.6/32']};
+  let operation:NetworkExecutionDraft['operation']={driver:'linux-wireguard-v1' as const,interfaceId:'wg-new',interfaceName:device,address:'192.0.2.129/32',mtu:1400,listenPort:51820,secretRef:'gateway',publicKey:facts.publicKey,peers:[{publicKey:facts.peerPublicKey,endpoint:'203.0.113.2:51820',allowedIps:['192.0.2.130/32','198.51.100.6/32']}],routes:['192.0.2.130/32','198.51.100.6/32']};
+  if(facts.persistentDriver===true) operation={...operation,driver:'networkmanager-wireguard-1.56-v1',profileUuid:transactionId.replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/, '$1-$2-$3-$4-$5'),bootPolicy:'agent-confirmed-only'};
   if(second) Object.assign(operation,{interfaceId:'wg-next',address:'192.0.2.145/32',listenPort:51821,secretRef:'gateway2',peers:[{publicKey:facts.peerPublicKey,endpoint:'203.0.113.2:51821',allowedIps:['192.0.2.146/32','198.51.100.14/32']}],routes:['192.0.2.146/32','198.51.100.14/32']});
   const draft:NetworkExecutionDraft={schemaVersion:2,journalId:facts.journalId,transactionId,target:{source:'lab',host:'gateway',nodeId:'gateway'},registryRevision:registry.revision,resources:registry.resources.map(r=>({id:r.id,generation:r.generation})),desiredDigest:review.desiredDigest,reviewHash:review.contentHash,artifactHash:networkDigest(operation),observation:{digest:networkDigest(observation),collectedAt:now,maxAgeMs:30000},localPrecondition:networkDigest(facts.snapshot),operation,issuedAt:now,expiresAt:now+(facts.validityMs??5000),rollbackAt:now+(facts.timeoutMs??12000)};
   const approvals=emptyApprovals(),hash=networkExecutionHash(draft);

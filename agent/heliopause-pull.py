@@ -5665,7 +5665,12 @@ def main():
     # only on `confirmed`), and before the monitor
     # starts, so the restore is not observed as a change this agent did not make. Writes no state.
     if backfill_allowed:
-        _boot_restore()
+        try:
+            _boot_restore()
+        except Exception:
+            if _lifecycle is None:
+                raise
+            _lifecycle.error('firewall-boot-restore', 'confirmed-firewall-restoration-unresolved')
     if _lifecycle is not None:
         _lifecycle.start()
 

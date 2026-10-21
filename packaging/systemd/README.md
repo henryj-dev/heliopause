@@ -117,7 +117,7 @@ node bin/heliopause-pki.ts renew  ./pki    # 같은 CA로 재발급 (앵커 불�
 
 ```bash
 install -d -m 755 /opt/heliopause/agent
-install -m 644 agent/heliopause-pull.py agent/network_discovery.py agent/network_discovery_worker.py agent/network_discovery_lifecycle.py agent/network_executor.py agent/network_lifecycle.py agent/network_terminal_delivery.py /opt/heliopause/agent/
+install -m 644 agent/heliopause-pull.py agent/network_discovery.py agent/network_discovery_worker.py agent/network_discovery_lifecycle.py agent/network_executor.py agent/network_nm_profile.py agent/network_nm_wireguard.py agent/network_nm_settings.py agent/network_lifecycle.py agent/network_terminal_delivery.py /opt/heliopause/agent/
 install -d -m 700 /etc/heliopause/pki
 install -m 640 packaging/systemd/agent.env.example /etc/heliopause/agent.env   # 편집할 것
 install -m 644 packaging/systemd/heliopause-agent.service /etc/systemd/system/

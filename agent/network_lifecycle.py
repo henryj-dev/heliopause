@@ -117,6 +117,17 @@ class Lifecycle:
                 self.error('network-recovery', 'network-journal-or-recovery-unresolved')
             self.publish()
 
+    def restore_confirmed_boot(self):
+        if self.executor is None:
+            return
+        try:
+            if self.worker_fd is None:
+                raise ValueError('network worker lock unavailable')
+            self.executor.restore_confirmed_boot()
+        except Exception:
+            self.error('network-boot-restore', 'confirmed-restoration-unresolved')
+        self.publish()
+
     def blocked(self):
         with self.status_lock:
             return bool(self.errors)
@@ -157,7 +168,7 @@ class Lifecycle:
     def refresh(self):
         data = self.executor.load()
         rows = data['transactions']
-        pending = [(tx, row) for tx, row in rows.items() if row['state'] not in TERMINAL]
+        pending = [(tx, row) for tx, row in rows.items() if row['state'] not in TERMINAL or row.get('bootRestore', {}).get('recovery') == 'rollback-failed' or row.get('bootRestore', {}).get('state') == 'attempting']
         with self.gate:
             if pending:
                 tx, _ = pending[0]
@@ -172,16 +183,24 @@ class Lifecycle:
             self.last_observation = time.monotonic()
             if row['state'] == 'confirmed':
                 try:
-                    self.executor.driver.command_deadline = time.monotonic()+2
+                    self.executor.select_driver(row['authorization']['operation'], row)
+                    budget = 5 if row['authorization']['operation'].get('driver') == 'networkmanager-wireguard-1.56-v1' else 2
+                    self.executor.driver.command_deadline = time.monotonic()+budget
                     present = self.executor.driver.owned(row['authorization']['operation'], row['owner'])
+                    if present and row['authorization']['operation'].get('driver') == 'networkmanager-wireguard-1.56-v1':
+                        self.executor.driver.configuration_matches(row['authorization']['operation'], row['owner'])
                     observed[tx] = {'state': 'matching' if present else 'absent-or-drifted', 'at': time.time()}
+                except ValueError:
+                    observed[tx] = {'state': 'absent-or-drifted', 'at': time.time()}
                 except Exception:
                     observed[tx] = {'state': 'unknown', 'at': time.time()}
                 finally:
                     self.executor.driver.command_deadline = None
         with self.status_lock:
             self.snapshot['network'] = {'state': 'recovery-debt' if pending else 'idle',
-                'transactions': [{'transactionId': tx, 'state': row['state']} for tx, row in rows.items()],
+                'transactions': [{'transactionId': tx, 'state': row['state'],
+                                  **({'bootRestore': {key:value for key,value in row['bootRestore'].items() if key in {'bootId','state','currentConnectivity','reason','recovery'}}} if 'bootRestore' in row else {})}
+                                 for tx, row in rows.items()],
                 'ledger': {'used': len(rows), 'limit': 1024, 'remaining': 1024-len(rows),
                            'bytes':len(__import__('network_executor').canonical(data).encode()),'admissionByteLimit':6*1024*1024,'byteLimit':8*1024*1024},
                 'confirmedKernel': copy.deepcopy(observed), 'observedAt': time.time()}
@@ -264,7 +283,15 @@ class Lifecycle:
         self.status_thread.start()
         if not self.executor or self.worker_fd is None:
             return
+        with self.gate:
+            if self.active is None:
+                self.active = {'kind':'network', 'transactionId':None, 'phase':'boot-restore'}
         def loop():
+            self.restore_confirmed_boot()
+            try:
+                self.refresh()
+            except Exception:
+                self.error('network-recovery', 'network-journal-or-recovery-unresolved')
             while not self.agent._stop.is_set():
                 try:
                     self.step()
