@@ -87,7 +87,7 @@ export function validateQuiescentArchive(archive:JournalArchive,target:NetworkTa
   for(const record of m.records) {
     const row=a.transactions[record.transactionId],result=record.result;
     need(row&&['rolled-back','cancelled-before-accept'].includes(row.state)&&result&&result.state===row.state,'confirmed or nonterminal resources forbid scope A');
-    need(!row.bootRestore&&!row.before&&!row.paths,'recovery/diagnostic debt requires reconciliation');
+    need(!row.bootRestore&&!Object.hasOwn(row,'before')&&!Object.hasOwn(row,'paths'),'recovery/diagnostic debt requires reconciliation');
     const signed=verifyJournalMessage(record.authorization,NETWORK_EXECUTION_DOMAIN,auditKeys.manager);
     if(record.confirmation){const confirm=verifyJournalMessage(record.confirmation,NETWORK_CONFIRM_DOMAIN,auditKeys.manager);verifyJournalMessage(confirm.verification,NETWORK_VERIFY_DOMAIN,auditKeys.verifier);}
     need(equal(row.authorization,signed)&&record.authorizationHash===networkDigest(row.authorization),'authorization archive mismatch');

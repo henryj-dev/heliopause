@@ -59,6 +59,8 @@ test('empty quiescent journal is explicitly supported',()=>{const f=fixture(0);t
 for(const [name,change,pattern] of [
   ['confirmed resource',(f:any)=>{f.archive.agent.transactions['b'.repeat(32)].state='confirmed';},/confirmed/],
   ['rollback debt',(f:any)=>{f.archive.agent.transactions['b'.repeat(32)].state='rollback-failed';},/confirmed or nonterminal/],
+  ['null undo marker',(f:any)=>{f.archive.agent.transactions['b'.repeat(32)].before=null;},/debt/],
+  ['null path marker',(f:any)=>{f.archive.agent.transactions['b'.repeat(32)].paths=null;},/debt/],
   ['missing acknowledgment',(f:any)=>{f.archive.acknowledgments={};},/acknowledgments/],
   ['missing outbox',(f:any)=>{f.archive.outbox=[];},/record sets/],
   ['journal reuse',(f:any)=>{},/fresh transition/],
