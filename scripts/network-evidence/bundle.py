@@ -207,7 +207,7 @@ def verify_signatures(documents, manager_key, manager_id, verifier_key, verifier
     # Reuse production Ed25519 domains, framing, key ID computation and canonical checks.
     import tempfile
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'agent'))
-    from network_executor import crypto_helpers, verify, EXECUTION, CONFIRM, VERIFY
+    from network_executor import crypto_helpers, verify, Executor, EXECUTION, CONFIRM, VERIFY
     require(manager_id != verifier_id, 'Manager/verifier trust must be distinct')
     verified = set()
     with tempfile.TemporaryDirectory() as temp:
@@ -241,6 +241,10 @@ def verify_signatures(documents, manager_key, manager_id, verifier_key, verifier
                             c['transactionId'] == tx and proof['transactionId'] == tx and
                             c['authorizationHash'] == sha(canonical(a)) == proof['authorizationHash'] and
                             c['artifactHash'] == a['artifactHash'] == proof['artifactHash'], 'signed authority binding mismatch')
+                    checker = object.__new__(Executor)
+                    checker.config = {'managerKeys':str(Path(temp)/'manager'),'verifierKeys':str(Path(temp)/'verifier'),'identity':a['target']}
+                    checker.provider = provider
+                    checker.validate_restore_authority(row,v[field]['journal']['journalId'])
                     verified.add(stamp)
     require(verified and len(authorities) == 10, 'missing signed restoration or transaction evidence')
     return {'restoration':len(verified),'transactions':len(authorities)}

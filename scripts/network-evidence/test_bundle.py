@@ -204,4 +204,46 @@ class EvidenceTests(unittest.TestCase):
             finally:os.close(fd)
 
 
+class CryptoBoundaryTests(unittest.TestCase):
+    def setUp(self):
+        import subprocess,shutil
+        self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup);self.root=Path(self.temp.name)
+        binary=shutil.which('openssl');self.assertIsNotNone(binary)
+        original=subprocess.run
+        def guarded(argv,*args,**kwargs):
+            if argv[0] not in {'openssl',binary}:raise AssertionError('escaped crypto subprocess')
+            kwargs['timeout']=min(kwargs.get('timeout',5),5)
+            return original(argv,*args,**kwargs)
+        self.run=patch('subprocess.run',side_effect=guarded);self.run.start();self.addCleanup(self.run.stop)
+        self.socket=patch('socket.socket',side_effect=AssertionError('escaped crypto socket'));self.socket.start();self.addCleanup(self.socket.stop)
+        self.keys={}
+        for role in ['manager','verifier','wrong']:
+            private=self.root/(role+'.key');public=self.root/(role+'.pem')
+            guarded(['openssl','genpkey','-algorithm','ED25519','-out',str(private)],check=True,capture_output=True)
+            guarded(['openssl','pkey','-in',str(private),'-pubout','-out',str(public)],check=True,capture_output=True)
+            der=guarded(['openssl','pkey','-pubin','-in',str(public),'-outform','DER'],check=True,capture_output=True).stdout
+            self.keys[role]=(public,'sha256:'+b.sha(der))
+    def verify(self,docs=None):return b.verify_signatures(docs or {},*self.keys['manager'],*self.keys['verifier'])
+    def test_wrong_public_pin(self):
+        path,pin=self.keys['manager'];self.keys['manager']=(path,self.keys['wrong'][1])
+        with self.assertRaisesRegex(ValueError,'pin mismatch'):self.verify()
+    def test_trust_separation(self):
+        self.keys['verifier']=self.keys['manager']
+        with self.assertRaisesRegex(ValueError,'distinct'):self.verify()
+    def test_missing_public_key(self):
+        self.keys['manager'][0].unlink()
+        with self.assertRaises(FileNotFoundError):self.verify()
+    def test_corrupt_public_key(self):
+        self.keys['manager'][0].write_bytes(b'corrupt')
+        with self.assertRaisesRegex(ValueError,'public key required'):self.verify()
+    def test_bad_signature_refused(self):
+        import base64
+        a={'operation':{},'artifactHash':b.sha(b'{}'),'transactionId':'a'*32}
+        envelope={'version':'heliopause-ed25519-v1','algorithm':'Ed25519','keyId':self.keys['manager'][1],
+                  'payload':base64.urlsafe_b64encode(b.canonical(a)).decode().rstrip('='),'signature':'A'*86}
+        with self.assertRaisesRegex(ValueError,'invalid signature'):self.verify({'synthetic':{'authorization':envelope,'decoded':a}})
+    def test_no_historical_authority_refused(self):
+        with self.assertRaisesRegex(ValueError,'missing signed'):self.verify()
+
+
 if __name__=='__main__':unittest.main()
