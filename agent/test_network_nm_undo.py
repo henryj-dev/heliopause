@@ -27,6 +27,14 @@ class ActivationUndo(unittest.TestCase):
             self.commands.append(args)
             return next(active) if args[-1]=='--active' else ''
         self.driver.run=run
+    def test_cold_nm_command_cap_never_exceeds_shared_deadline(self):
+        with patch('network_nm_wireguard.time.monotonic',return_value=100):
+            self.assertEqual(self.driver.command_timeout(),10)
+            self.driver.deadline=108;self.driver.command_deadline=103
+            self.assertEqual(self.driver.command_timeout(),3)
+            self.driver.command_deadline=99
+            with self.assertRaisesRegex(RuntimeError,'budget elapsed'):self.driver.command_timeout()
+
     def test_foreign_fwmark_and_keepalive_block_owned_removal(self):
         public=self.op['peers'][0]['publicKey']
         for mark,keepalive in [('0x1',public+' 1'),('off',public+' 25'),('off','foreign 1')]:
