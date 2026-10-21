@@ -65,16 +65,24 @@ envelope through `commit` `{archiveName,envelope}`. That operation reopens/verif
 archive and compares current Registry bytes under the existing Registry kernel-writer lock.
 It atomically replaces only that Manager store with a bounded retirement chain and fresh empty
 execution epoch. Registry resources and their generations are retained. An exact receipt retry
-returns its existing receipt; it cannot empty later successor records. Current signer must match
+returns its existing receipt; it cannot empty later successor records. The permanent tombstone
+also retains the exact signed authorization, allowing recovery after a lost response and Manager
+restart without reconstructing authority from local metadata. Current signer must match
 the approved signing identity. There is no local metadata promotion of old authority.
 
-Transport the exact archive, signed authorization and Manager commit receipt to protected
-Agent maintenance storage. `python3 agent/network_journal_transition.py --archive ARCHIVE
---authorization ENVELOPE --manager-receipt RECEIPT` checks authority without applying. Add
-`--apply` only for the default integrated root-owned layout with Agent/courier stopped. It holds
-the existing host writer and executor locks, rechecks configuration/archive/current sidecars and
-production resource absence, then executes the durable phases below. No network mutation is
-performed by this tool. A Manager receipt is mandatory; Agent cannot transition first.
+Before Manager commit, transport the exact archive to protected Agent maintenance storage.
+`python3 agent/network_journal_transition.py --archive ARCHIVE` performs read-only inspection
+under existing host writer/executor locks: exact configuration and sidecars, quiescence, resource
+absence, and a replaceable journal directory. A journal that is itself a mount point or lies on a
+different filesystem from its parent is refused; storage migration is a separate operation.
+Inspection does not create missing lock files or write transition state.
+
+After Manager commit, transport the signed authorization and receipt to protected Agent storage.
+Use `--archive ARCHIVE --authorization ENVELOPE --manager-receipt RECEIPT --apply` only for
+the default integrated root-owned layout with Agent/courier stopped. Apply repeats the checks,
+requires exact approved configuration bytes (or the exact successor bytes during recovery), and
+executes the durable phases below. No network mutation is performed by this tool. A Manager
+receipt is mandatory; Agent cannot transition first.
 
 After both commits, explicitly update the Manager target's journal binding, preserving the
 same target and exact authorized leaf pin. Restart Manager and Agent/courier; verify both ledgers,
@@ -93,7 +101,7 @@ new epoch. They do not justify replay reset, copying old records back, or certif
 | Old retirement marker saved | Old journal cannot accept new work; exact original four replay/identity/outbox/ack files must match archive. |
 | Old directory renamed | Every original file remains at `.retired-OLD_JOURNAL`; it is rechecked on resume. |
 | Unique creating directory made, owner not yet saved | Preserve the unowned orphan; resume creates a distinct owned staging directory. It never fills/adopts the orphan. |
-| Owned stage published/partly written | Exact transition owner marker required; only expected empty successor bytes/prefixes can be completed, retaining partial hashes. Foreign stage is preserved/refused. |
+| Owned stage published/partly written | Exact transition owner marker required; only expected empty successor bytes/prefixes can be completed, retaining partial hashes. Completion appends only the remaining approved bytes and fsyncs the file; it does not create an untracked replacement temporary file. Foreign stage is preserved/refused. |
 | Successor published, config still old | Pending marker prevents use; resume verifies pristine successor and rebinds only `journalId`. |
 | Config bound, completion not recorded | Exact old/new configuration permitted only for this receipt; finish same transition without resetting successor records. |
 | Complete | Exact retry is a no-op even after new work. A later approved transition preserves the prior completion marker inside its old directory. |

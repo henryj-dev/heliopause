@@ -135,17 +135,22 @@ def validate_authority(config,archive,envelope,receipt,provider):
     need(t['configHash']==hashlib.sha256(base64.urlsafe_b64decode(archive['rawFiles']['config']+'==')).hexdigest(),'configuration archive commitment mismatch')
     need(archive['config']['journalId']==t['oldJournalId'] and config in [archive['config'],{**archive['config'],'journalId':t['newJournalId']}],'configuration drift refused')
     need(t['evidenceHash']==hashlib.sha256(base64.urlsafe_b64decode(archive['rawFiles']['evidence']+'==')).hexdigest(),'execution evidence manifest commitment mismatch')
+    validate_quiescent_core(archive,t['target'],t['oldJournalId'])
+    return t
+
+
+def validate_quiescent_core(archive,target,old_id):
     old=archive['agent'];manager=archive['manager']['execution']
-    need(old['schemaVersion']==2 and old['journalId']==t['oldJournalId'] and archive['identity']=={'journalId':t['oldJournalId']} and manager['fence'] is None,'quiescent identities/fence required')
+    need(old['schemaVersion']==2 and old['journalId']==old_id and archive['identity']=={'journalId':old_id} and manager['fence'] is None,'quiescent identities/fence required')
     need(len(old['transactions'])==old['acceptedSequence']==old['terminalSequence']==len(manager['records'])==len(archive['outbox'])==len(archive['acknowledgments']),'complete terminal archive required')
+    need(len({r['transactionId'] for r in manager['records']})==len(manager['records']) and {r['transactionId'] for r in manager['records']}==set(old['transactions']),'Manager/Agent record identities differ')
     outbox={row['transactionId']:row for row in archive['outbox']};need(len(outbox)==len(archive['outbox']),'duplicate outbox identity')
     for record in manager['records']:
         row=old['transactions'][record['transactionId']];result=record['result']
         need(row['state'] in {'rolled-back','cancelled-before-accept'} and record['state']=='settled' and row.get('bootRestore') is None and 'before' not in row and 'paths' not in row,'confirmed resources or recovery debt forbid scope A')
-        need(record['journalId']==old['journalId'] and record['target']==t['target'] and row['authorization']['target']==t['target'] and row['authorization']['journalId']==old['journalId'],'archive target mismatch')
+        need(record['journalId']==old['journalId'] and record['target']==target and row['authorization']['target']==target and row['authorization']['journalId']==old['journalId'],'archive target mismatch')
         need(row['authorization']==n.decode_json(base64.urlsafe_b64decode(record['authorization']['payload']+'==')) and n.digest(row['authorization'])==record['authorizationHash'],'archive authorization mismatch')
         need(row['terminalResult']==outbox[record['transactionId']]==result and record['resultHash']==n.digest(result) and archive['acknowledgments'].get(record['resultHash']) is True,'exact settlement/outbox/ack required')
-    return t
 
 
 def resource_absence(config,old):
@@ -179,11 +184,53 @@ def empty_journal(identity):
     return {'schemaVersion':2,'journalId':identity,'terminalSequence':0,'acceptedSequence':0,'transactions':{},'lastClock':0}
 
 
+def mount_info():
+    with open('/proc/self/mountinfo',encoding='utf-8') as stream:
+        raw=stream.read(1024*1024+1)
+    need(len(raw)<=1024*1024,'mount inventory bound')
+    return [line.split()[4].replace('\\040',' ').replace('\\011','\t').replace('\\012','\n').replace('\\134','\\') for line in raw.splitlines()]
+
+
+def inspect_layout(directory,parent):
+    info=directory.lstat()
+    need(stat.S_ISDIR(info.st_mode) and info.st_uid==os.geteuid() and stat.S_IMODE(info.st_mode)==0o700,'owned0700 journal required')
+    need(info.st_dev==os.fstat(parent).st_dev and str(directory) not in mount_info(),'mounted journal directory cannot be replaced; explicit storage migration required')
+
+
+def inspect_agent(config_path,directory,archive_path,writer_lock,absence=resource_absence):
+    config=n.read_json(config_path);n.validate_execution_config(config);archive=read_archive(archive_path)
+    need(n.read_file(config_path)==base64.urlsafe_b64decode(archive['rawFiles']['config']+'=='),'configuration drift refused')
+    validate_quiescent_core(archive,config['identity'],config['journalId'])
+    directory=Path(os.path.abspath(directory));parent=secure_directory(directory.parent);host=None;executor=None
+    try:
+        host=os.open(writer_lock,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+        info=os.fstat(host);need(stat.S_ISREG(info.st_mode) and info.st_uid==os.geteuid() and stat.S_IMODE(info.st_mode)==0o600,'owned host writer lock required')
+        fcntl.flock(host,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        executor=os.open(directory/'executor.lock',os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+        info=os.fstat(executor);need(stat.S_ISREG(info.st_mode) and info.st_uid==os.geteuid() and stat.S_IMODE(info.st_mode)==0o600,'owned executor lock required')
+        fcntl.flock(executor,fcntl.LOCK_EX|fcntl.LOCK_NB);inspect_layout(directory,parent);n.assert_active_journal(str(directory))
+        config_raw=n.read_file(config_path)
+        need(config_raw==base64.urlsafe_b64decode(archive['rawFiles']['config']+'=='),'configuration changed during inspection')
+        config=n.decode_json(config_raw);n.validate_execution_config(config)
+        need(read_archive(archive_path)['rawFiles']==archive['rawFiles'],'archive changed during inspection')
+        for name in ['agent','identity','outbox','acknowledgments']:
+            need(n.read_file(str(directory/FILES[name]))==base64.urlsafe_b64decode(archive['rawFiles'][name]+'=='),'Agent changed since archive')
+        need(n.Executor(config,str(directory)).load()==archive['agent'],'Agent/archive mismatch')
+        for row in archive['agent']['transactions'].values():need(row['state'] in {'rolled-back','cancelled-before-accept'} and row.get('bootRestore') is None and 'before' not in row and 'paths' not in row,'confirmed resources or recovery debt forbid scope A')
+        absence(config,archive['agent'])
+        return {'readOnly':True,'oldJournalId':config['journalId'],'archiveHash':n.digest(archive['rawFiles']),'evidenceHash':hashlib.sha256(base64.urlsafe_b64decode(archive['rawFiles']['evidence']+'==')).hexdigest(),'readyForManagerReview':True}
+    finally:
+        if executor is not None:os.close(executor)
+        if host is not None:os.close(host)
+        os.close(parent)
+
+
 def apply_agent(config_path,directory,archive_path,envelope,receipt,writer_lock,event=None,absence=resource_absence):
     event=event or (lambda _:None)
     config_raw=n.read_file(config_path);config=n.decode_json(config_raw);n.validate_execution_config(config)
     archive=read_archive(archive_path);provider=n.crypto_helpers(directory)
     t=validate_authority(config,archive,envelope,receipt,provider)
+    need(config_raw in [base64.urlsafe_b64decode(archive['rawFiles']['config']+'=='),n.canonical({**archive['config'],'journalId':t['newJournalId']}).encode()],'configuration bytes differ from approved transition')
     directory=Path(os.path.abspath(directory));parent=secure_directory(directory.parent)
     host=os.open(writer_lock,os.O_RDWR|os.O_NOFOLLOW|os.O_NONBLOCK)
     executor_fd=None
@@ -204,7 +251,7 @@ def apply_agent(config_path,directory,archive_path,envelope,receipt,writer_lock,
             for name in ['agent','identity','outbox','acknowledgments']:
                 need(n.read_file(str(location/FILES[name]))==base64.urlsafe_b64decode(archive['rawFiles'][name]+'=='),'preserved original sidecar drift')
         if previous.exists():check_original(previous)
-        else:check_original(directory)
+        else:inspect_layout(directory,parent);check_original(directory)
         progress=n.read_json(str(marker)) if marker.exists() else None
         if progress and progress['transitionHash']!=n.digest(t):
             need(progress['phase']=='complete','different pending transition refused')
@@ -255,8 +302,14 @@ def apply_agent(config_path,directory,archive_path,envelope,receipt,writer_lock,
                         partial=read_at(stagefd,name,8*1024*1024)
                         if partial==raw:continue
                         need(raw.startswith(partial),'foreign/nonempty successor staging refused')
-                        progress.setdefault('partialStages',{})[name]=hashlib.sha256(partial).hexdigest();n.atomic(str(marker),progress)
-                        n.atomic(str(path),value) # Only complete an owned, empty successor prefix.
+                        history=progress.setdefault('partialStages',{}).setdefault(name,[]);stamp=hashlib.sha256(partial).hexdigest()
+                        if not history or history[-1]!=stamp:
+                            need(len(history)<256,'partial stage diagnostic capacity');history.append(stamp);n.atomic(str(marker),progress)
+                        fd=os.open(name,os.O_RDWR|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=stagefd)
+                        with os.fdopen(fd,'r+b') as stream:
+                            info=os.fstat(stream.fileno())
+                            need(stat.S_ISREG(info.st_mode) and info.st_uid==os.geteuid() and stat.S_IMODE(info.st_mode)==0o600 and info.st_nlink==1 and stream.read(len(raw)+1)==partial,'partial stage changed')
+                            stream.write(raw[len(partial):]);stream.flush();os.fsync(stream.fileno())
                     else:
                         fd=os.open(name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=stagefd)
                         with os.fdopen(fd,'wb') as stream:stream.write(raw);stream.flush();os.fsync(stream.fileno())
@@ -281,13 +334,15 @@ def apply_agent(config_path,directory,archive_path,envelope,receipt,writer_lock,
 
 
 def main():
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--archive',required=True);p.add_argument('--authorization',required=True);p.add_argument('--manager-receipt',required=True);p.add_argument('--apply',action='store_true');a=p.parse_args()
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--archive',required=True);p.add_argument('--authorization');p.add_argument('--manager-receipt');p.add_argument('--apply',action='store_true');a=p.parse_args()
     config_path='/etc/heliopause/network-executor.json';directory='/var/lib/heliopause/network-executor';writer='/var/lib/heliopause-agent/writer.lock'
-    cfg=n.read_json(config_path);archive=read_archive(a.archive);envelope=n.read_json(a.authorization);receipt=n.read_json(a.manager_receipt)
-    t=validate_authority(cfg,archive,envelope,receipt,n.crypto_helpers(directory))
-    if not a.apply:print(n.canonical({'readOnly':True,'transitionId':t['transitionId'],'oldJournalId':t['oldJournalId'],'newJournalId':t['newJournalId'],'scope':'no confirmed resources; offline apply required'}));return
-    need(os.geteuid()==0,'root offline maintenance required')
     need(n.read_json('/var/lib/heliopause-agent/network-writer-locator.json')=={'config':config_path,'stateDir':directory},'default integrated writer layout required')
+    if not a.apply:
+        need(not a.authorization and not a.manager_receipt,'authorization and receipt are apply-only; inspect archive before Manager commit')
+        print(n.canonical(inspect_agent(config_path,directory,a.archive,writer)));return
+    need(a.authorization and a.manager_receipt,'signed authorization and Manager commit receipt required for apply')
+    envelope=n.read_json(a.authorization);receipt=n.read_json(a.manager_receipt)
+    need(os.geteuid()==0,'root offline maintenance required')
     for unit in ['heliopause-agent.service','heliopause-network-terminal.service']:
         result=subprocess.run(['systemctl','show',unit,'-p','MainPID','--value'],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=5,check=True)
         need(result.stdout.strip()==b'0','stop Agent and courier before maintenance')

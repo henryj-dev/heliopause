@@ -38,7 +38,7 @@ export interface JournalTransition extends JournalTransitionDraft {
 }
 export interface JournalEpoch {
   journalId:string;target:NetworkTarget;
-  transitions:Array<{oldJournalId:string;newJournalId:string;transitionHash:string;archiveHash:string;evidenceHash:string;receipt:NetworkSignedEnvelope}>;
+  transitions:Array<{oldJournalId:string;newJournalId:string;transitionHash:string;archiveHash:string;evidenceHash:string;authorization:NetworkSignedEnvelope;receipt:NetworkSignedEnvelope}>;
 }
 const exact=(v:any,fields:string)=>v&&typeof v==='object'&&!Array.isArray(v)&&Object.keys(v).sort().join(' ')===fields.split(' ').sort().join(' ');
 const id=(v:unknown):v is string=>typeof v==='string'&&/^[a-f0-9]{32}$/.test(v);
@@ -152,7 +152,7 @@ export function commitManagerJournalTransition(store:NetworkRegistryStore,archiv
     need(createHash('sha256').update(readBoundedStoreFile(store.path,4*1024*1024)).digest('hex')===t.managerHash,'Manager changed since archived plan');
     validateQuiescentArchive({...archive,manager:doc},t.target);
     const receipt=signNetworkMessage(JOURNAL_TRANSITION_RECEIPT_DOMAIN,{schemaVersion:1,transitionHash:networkDigest(t),oldJournalId:t.oldJournalId,newJournalId:t.newJournalId,target:t.target,archiveHash:t.archiveHash,evidenceHash:t.evidenceHash,committedAt:now},key);
-    state.journalEpoch={journalId:t.newJournalId,target:t.target,transitions:[...(state.journalEpoch?.transitions??[]),{oldJournalId:t.oldJournalId,newJournalId:t.newJournalId,transitionHash:networkDigest(t),archiveHash:t.archiveHash,evidenceHash:t.evidenceHash,receipt}]};
+    state.journalEpoch={journalId:t.newJournalId,target:t.target,transitions:[...(state.journalEpoch?.transitions??[]),{oldJournalId:t.oldJournalId,newJournalId:t.newJournalId,transitionHash:networkDigest(t),archiveHash:t.archiveHash,evidenceHash:t.evidenceHash,authorization:envelope,receipt}]};
     state.records=[];state.nextSequence=1;state.fence=null;
     return receipt;
   });

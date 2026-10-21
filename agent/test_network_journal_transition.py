@@ -57,6 +57,7 @@ class Transition(unittest.TestCase):
         self.payload={**draft,'approval':{'mode':'two-person','planHash':'sha256:'+n.digest(draft),'proposedBy':'alice','approvedBy':'bob','approvedAt':now}}
         self.envelope={'keyId':'test-manager','body':self.payload};self.receipt={'keyId':'test-manager','body':{'schemaVersion':1,'transitionHash':n.digest(self.payload),'oldJournalId':journal,'newJournalId':'e'*32,'target':a['target'],'archiveHash':draft['archiveHash'],'evidenceHash':draft['evidenceHash'],'committedAt':now}}
         self.writer=self.root/'writer.lock';self.writer.write_bytes(b'');self.writer.chmod(0o600)
+        mount_guard=patch.object(t,'mount_info',return_value=[]);mount_guard.start();self.addCleanup(mount_guard.stop)
         self.absence=patch.object(t,'resource_absence',side_effect=AssertionError('live kernel absence must be explicitly injected'));self.absence.start();self.addCleanup(self.absence.stop)
     def apply(self,event=None,absence=lambda *args:None):
         return t.apply_agent(str(self.config),str(self.state),str(self.archive),self.envelope,self.receipt,str(self.writer),event=event,absence=absence)
@@ -86,6 +87,39 @@ class Transition(unittest.TestCase):
         self.assertEqual(n.read_json(str(Path(first['oldStatePreservedAt'])/'journal-identity.json')),{'journalId':old})
         prior=Path(second['oldStatePreservedAt']);self.assertTrue((prior/'previous-transition.json').exists())
         self.assertEqual(n.read_json(str(prior/'journal-identity.json')),{'journalId':'e'*32})
+    def test_config_boolean_alias_not_accepted_as_same_bytes(self):
+        cfg=copy.deepcopy(self.cfg);cfg['enabled']=1;n.atomic(str(self.config),cfg)
+        with self.assertRaisesRegex(ValueError,'configuration bytes differ'):self.apply()
+        self.assertFalse(Path(str(self.state)+'.transition.json').exists())
+    def test_read_only_inspection_refuses_manager_fence(self):
+        path=self.archive/'manager.json';manager=n.read_json(str(path));manager['execution']['fence']={'transactionId':'f'*32};n.atomic(str(path),manager)
+        manifest=n.read_json(str(self.archive/'manifest.json'));raw=path.read_bytes();manifest['files'][path.name]={'sha256':hashlib.sha256(raw).hexdigest(),'bytes':len(raw)};n.atomic(str(self.archive/'manifest.json'),manifest)
+        with self.assertRaisesRegex(ValueError,'quiescent identities/fence'):t.inspect_agent(str(self.config),str(self.state),str(self.archive),str(self.writer),absence=lambda *args:None)
+        self.assertFalse(Path(str(self.state)+'.transition.json').exists())
+    def test_read_only_inspection_before_manager_commit_does_not_change_files(self):
+        before={str(p.relative_to(self.root)):p.read_bytes() for p in self.root.rglob('*') if p.is_file()}
+        result=t.inspect_agent(str(self.config),str(self.state),str(self.archive),str(self.writer),absence=lambda *args:None)
+        self.assertTrue(result['readOnly']);self.assertTrue(result['readyForManagerReview'])
+        self.assertEqual(before,{str(p.relative_to(self.root)):p.read_bytes() for p in self.root.rglob('*') if p.is_file()})
+    def test_mounted_state_refused_before_intent(self):
+        with patch.object(t,'mount_info',return_value=[str(self.state)]):
+            with self.assertRaisesRegex(ValueError,'mounted journal directory'):self.apply()
+        self.assertFalse(Path(str(self.state)+'.transition.json').exists())
+    def test_owned_partial_stage_completed_without_tempfile_overwrite(self):
+        def crash(point):
+            if point=='stage-owned':raise RuntimeError('crash')
+        with self.assertRaises(RuntimeError):self.apply(event=crash)
+        stage=self.state.with_name(self.state.name+'.prepared-'+self.payload['transitionId'])
+        raw=n.canonical(t.empty_journal(self.payload['newJournalId'])).encode();partial=raw[:17]
+        file=stage/'transactions.json';file.write_bytes(partial);file.chmod(0o600)
+        original=n.atomic
+        def no_stage_atomic(path,value):
+            if str(path).startswith(str(stage)+os.sep):raise AssertionError('partial staging must use append without orphan tempfiles')
+            return original(path,value)
+        with patch.object(n,'atomic',side_effect=no_stage_atomic):self.assertTrue(self.apply()['committed'])
+        progress=n.read_json(str(self.state)+'.transition.json')
+        self.assertEqual(progress['partialStages']['transactions.json'],[hashlib.sha256(partial).hexdigest()])
+        self.assertEqual((self.state/'transactions.json').read_bytes(),raw)
     def test_missing_external_evidence_preserves_journal(self):
         path=next((self.archive/'evidence').iterdir());path.unlink()
         with self.assertRaisesRegex(ValueError,'missing/extra execution evidence'):self.apply()

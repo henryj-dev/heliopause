@@ -113,3 +113,11 @@ for(const fault of ['missing','tampered','symlink','permissions'] as const)test(
  assert.throws(()=>commitManagerJournalTransition(f.store,f.archive,envelope,[f.keys.publicKey],f.keys.privateKey,f.archiveDirectory,f.now));assert.deepEqual(readFileSync(f.store.path),before);
  }finally{f.cleanup();}
 });
+
+test('Manager restart preserves the exact full transition authority and receipt after a lost response',()=>{
+ const f=fixture();try{const envelope=f.issue(),receipt=commitManagerJournalTransition(f.store,f.archive,envelope,[f.keys.publicKey],f.keys.privateKey,f.archiveDirectory,f.now);
+ const restarted=new NetworkRegistryStore(f.store.path),saved=restarted.executionStatus().journalEpoch!.transitions[0]!;
+ assert.deepEqual(saved.authorization,envelope);assert.deepEqual(saved.receipt,receipt);
+ assert.deepEqual(commitManagerJournalTransition(restarted,f.archive,saved.authorization,[f.keys.publicKey],f.keys.privateKey,f.archiveDirectory,f.now+3600001),receipt);
+ }finally{f.cleanup();}
+});
