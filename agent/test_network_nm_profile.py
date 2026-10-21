@@ -81,10 +81,21 @@ class Profiles(unittest.TestCase):
         with self.assertRaises(OSError): self.store.remove(self.identity, '0'*64)
         self.assertTrue(os.path.islink(self.path()))
 
+    def reported_mode(self, path, mode):
+        # Inject unsafe metadata at fstat; never loosen permissions even on fake secrets.
+        original=os.fstat;identity=os.stat(path)
+        def observe(fd):
+            info=original(fd)
+            if (info.st_dev,info.st_ino)==(identity.st_dev,identity.st_ino):
+                values=list(info);values[0]=(info.st_mode & ~0o777)|mode
+                return os.stat_result(values)
+            return info
+        return patch('network_nm_profile.os.fstat',side_effect=observe)
+
     def test_group_readable_secret_is_rejected(self):
         self.store.create(self.identity, self.content, OWNER)
-        os.chmod(self.path(), 0o640)
-        with self.assertRaises(ValueError): self.store.read(self.identity)
+        with self.reported_mode(self.path(),0o640):
+            with self.assertRaises(ValueError): self.store.read(self.identity)
 
     def test_symlink_directory_is_rejected(self):
         alias = self.temp.name+'-alias'; os.symlink(self.temp.name, alias)
@@ -92,8 +103,8 @@ class Profiles(unittest.TestCase):
         with self.assertRaises(OSError): ProfileStore(alias).read(self.identity)
 
     def test_writable_directory_is_rejected(self):
-        os.chmod(self.temp.name, 0o770)
-        with self.assertRaises(ValueError): self.store.create(self.identity, self.content, OWNER)
+        with self.reported_mode(self.temp.name,0o770):
+            with self.assertRaises(ValueError): self.store.create(self.identity, self.content, OWNER)
 
     def test_unsafe_signed_fields_are_rejected(self):
         for field, value in [('bootPolicy', 'autoconnect'), ('profileUuid', '../foreign'), ('interfaceName', 'external'), ('secretRef', 'x\nPostUp=sh')]:

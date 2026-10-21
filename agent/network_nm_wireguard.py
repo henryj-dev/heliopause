@@ -119,8 +119,8 @@ class NetworkManagerWireGuard(LinuxWireGuard):
         path = os.path.join(self.store.directory, self.store.basename(op['profileUuid']))
         if not self.cached(op):
             self.run(['nmcli', '--wait', '10', 'connection', 'load', path])
-        if not self.cached(op):
-            raise ValueError('persistent profile load unverified')
+            if not self.cached(op):
+                raise ValueError('persistent profile load unverified')
         self.run(['nmcli', '--wait', '10', 'connection', 'up', 'uuid', op['profileUuid']])
         self.check_file(op, self.row['owner'])
 

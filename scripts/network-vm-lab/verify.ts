@@ -1,13 +1,16 @@
 /** Warm production signer around the independent peer collector; Agent never sees verifier keys. */
 import { spawn } from 'node:child_process';
-import { readFileSync, writeFileSync, lstatSync } from 'node:fs';
+import { readFileSync, writeFileSync, openSync, fstatSync, closeSync, constants } from 'node:fs';
 import { createPrivateKey, randomBytes } from 'node:crypto';
 import { signNetworkMessage, NETWORK_VERIFY_DOMAIN } from '../../src/network-execution.ts';
 import { networkDigest } from '../../src/network-canonical.ts';
 const base='/var/lib/heliopause-vm-lab',mode=process.argv[2];
 if(!['confirm','observe'].includes(mode??'')||process.getuid?.()!==0)throw new Error('marked peer verifier required');
-const marker=lstatSync('/etc/heliopause-disposable-lab');
-if(!marker.isFile()||marker.uid!==0||(marker.mode&0o777)!==0o600||JSON.parse(readFileSync('/etc/heliopause-disposable-lab','utf8')).role!=='peer')throw new Error('unsafe lab marker');
+const markerFd=openSync('/etc/heliopause-disposable-lab',constants.O_RDONLY|constants.O_NOFOLLOW);
+try {
+  const marker=fstatSync(markerFd);
+  if(!marker.isFile()||marker.uid!==0||(marker.mode&0o777)!==0o600||JSON.parse(readFileSync(markerFd,'utf8')).role!=='peer')throw new Error('unsafe lab marker');
+} finally { closeSync(markerFd); }
 const authorization=JSON.parse(readFileSync(base+'/authorization.json','utf8'));
 const a=JSON.parse(Buffer.from(authorization.payload,'base64url').toString());
 const verifier=createPrivateKey(readFileSync(base+'/verifier.key'));

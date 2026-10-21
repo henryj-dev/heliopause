@@ -229,7 +229,7 @@ class LinuxWireGuard:
         try:
             p = subprocess.run(args, input=data, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=self.command_timeout(), check=False, pass_fds=pass_fds)
         except (OSError, subprocess.TimeoutExpired):
-            raise RuntimeError('network command unavailable or timed out') from None
+            raise RuntimeError('network command unavailable or timed out: '+os.path.basename(args[0])+' '+os.path.basename(args[1])) from None
         if p.returncode:
             # Never include input, stdout, stderr, secret paths or full argv in error records.
             raise RuntimeError('network command failed: '+args[0]+' '+args[1])
@@ -664,8 +664,8 @@ class Executor:
             if not candidates:
                 return
             boot = current_boot_id()
-            deadline = time.monotonic()+60
-            recovery_deadline = deadline+30
+            deadline = time.monotonic()+120
+            recovery_deadline = deadline+60
             failed = False
             for row in candidates:
                 if row.get('bootIdAtConfirm') == boot:
@@ -946,7 +946,7 @@ class Executor:
                 row = debts[cursor]
                 self.select_driver(row['authorization']['operation'], row)
                 try:
-                    self.driver.command_deadline = time.monotonic()+5
+                    self.driver.command_deadline = time.monotonic()+20
                     self.driver.undo_restore(row)
                     row['bootRestore']['recovery'] = 'rolled-back'
                 except Exception:
