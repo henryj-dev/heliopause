@@ -34,12 +34,18 @@ original authority requirements. Cached confirms/cancellations retain original k
 of any required historical Manager/verifier key **denies boot restoration** in current code.
 Do not silently keep a retired key forever or relabel old authority as signed by a new key.
 
+The selected lifecycle policy prioritizes revocation: restoration refusal and stopping the trial
+are permitted when a required historical key is removed. This is not permission to erase
+evidence or to bypass revocation for availability.
+
 Emergency removal uses that same fail-closed verification: no new activation under a removed
 key. Preserve the exact profile, original authority, journal, fence/outbox and degraded diagnostic.
 An already active kernel configuration is not automatically deleted by removing a trust file;
 there is no general reconciliation or confirmed-resource deletion. Use the independent console,
 stop new work, and assess isolation/recovery explicitly. Availability is not permission to ignore
-revocation. Missing/corrupt/duplicate-ID trust must fail closed.
+revocation. Missing/corrupt/duplicate-ID trust must fail closed. Agent network verification refuses repeated
+SPKI IDs within either ring as well as overlap across rings. Manager startup and confirm issuance
+refuse duplicate verifier IDs; copying one public key to another filename is not key overlap.
 
 **Unsupported:** a new-key restoration reauthorization contract for an existing confirmed resource.
 If key retirement must preserve that resource's next-boot availability, this is a trial blocker until

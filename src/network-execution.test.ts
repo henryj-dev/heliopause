@@ -3,11 +3,11 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { generateKeyPairSync, verify } from 'node:crypto';
+import { generateKeyPairSync, createPublicKey, verify } from 'node:crypto';
 import { NetworkRegistryStore } from './network-registry.ts';
 import { buildNetworkChangeSet } from './network-change-set.ts';
 import { emptyApprovals, propose, approve } from './approval.ts';
-import { authorizeNetworkExecution, confirmNetworkExecution, networkExecutionHash, NETWORK_EXECUTION_DOMAIN, type NetworkExecutionDraft } from './network-execution.ts';
+import { authorizeNetworkExecution, validateNetworkVerifierKeys, confirmNetworkExecution, networkExecutionHash, NETWORK_EXECUTION_DOMAIN, type NetworkExecutionDraft } from './network-execution.ts';
 import { networkDigest } from './network-canonical.ts';
 import { networkLabInput } from '../examples/network-lab.ts';
 
@@ -103,4 +103,14 @@ test('NM authority refuses profile/policy/path substitution and kernel ownership
       assert.equal(existsSync(f.store.path+'.execution-fence'),false);
     }finally{rmSync(f.dir,{recursive:true,force:true});}
   }
+});
+
+
+test('network verifier ring rejects duplicate SPKI identities before confirmation parsing',()=>{
+  const manager=generateKeyPairSync('ed25519'),verifier=generateKeyPairSync('ed25519');
+  const duplicate=createPublicKey(verifier.publicKey.export({format:'pem',type:'spki'}));
+  assert.throws(()=>validateNetworkVerifierKeys([verifier.publicKey,duplicate],manager.privateKey),/duplicate network verifier/);
+  assert.throws(()=>confirmNetworkExecution({payload:'e30'} as any,{} as any,[verifier.publicKey,duplicate],manager.privateKey),/duplicate network verifier/);
+  assert.doesNotThrow(()=>validateNetworkVerifierKeys([verifier.publicKey],manager.privateKey));
+  assert.throws(()=>validateNetworkVerifierKeys([manager.publicKey],manager.privateKey),/independent verifier/);
 });

@@ -77,10 +77,17 @@ export function authorizeNetworkExecution(store: NetworkRegistryStore, approvals
   },by);
 }
 
+/** Reject ambiguous ring configuration before issuance; roles must remain independent. */
+export function validateNetworkVerifierKeys(verifierKeys: readonly KeyObject[], managerKey: KeyObject): void {
+  const identities=verifierKeys.map(k=>artifactSigningKeyId(k));
+  if(new Set(identities).size!==identities.length) throw new Error('duplicate network verifier signing key identity');
+  if(identities.includes(artifactSigningKeyId(createPublicKey(managerKey)))) throw new Error('independent verifier must use separate signing keys');
+}
+
 /** Explicit confirm issuance after the original approval was consumed, using an independent ring. */
 export function confirmNetworkExecution(authorization: NetworkSignedEnvelope, receipt: NetworkSignedEnvelope, verifierKeys: readonly KeyObject[], managerKey: KeyObject, now=Date.now()): NetworkSignedEnvelope {
   const a=JSON.parse(Buffer.from(authorization.payload,'base64url').toString());
-  if(verifierKeys.some(k=>artifactSigningKeyId(k)===artifactSigningKeyId(createPublicKey(managerKey)))) throw new Error('independent verifier must use separate signing keys');
+  validateNetworkVerifierKeys(verifierKeys,managerKey);
   if(receipt.version!=='heliopause-ed25519-v1'||receipt.algorithm!=='Ed25519'||receipt.payload.length>180000||receipt.signature.length!==86) throw new Error('invalid verifier envelope');
   const publicKey=verifierKeys.find(k=>artifactSigningKeyId(k)===receipt.keyId);
   const bytes=Buffer.from(receipt.payload,'base64url');

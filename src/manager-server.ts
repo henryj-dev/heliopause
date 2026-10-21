@@ -2,7 +2,7 @@ import { NETWORK_EXECUTION_CAPACITY } from './network-execution-state.ts';
 import { issueDurableNetworkCancellation } from './network-execution-cancellation.ts';
 import { issueDurableNetworkConfirm, settleNetworkExecution } from './network-execution-settlement.ts';
 import { buildNetworkChangeSet } from './network-change-set.ts';
-import { authorizeNetworkExecution, validateNetworkExecutionDraft, networkExecutionHash, type NetworkSignedEnvelope, type NetworkExecutionDraft } from './network-execution.ts';
+import { authorizeNetworkExecution, validateNetworkVerifierKeys, validateNetworkExecutionDraft, networkExecutionHash, type NetworkSignedEnvelope, type NetworkExecutionDraft } from './network-execution.ts';
 import { networkDigest } from './network-canonical.ts';
 // The manager's HTTP surface (H26): reads the whole site, and is the ordinary way a generation gets
 // published.
@@ -1406,7 +1406,7 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
   if (opts.artifactSigning) artifactSigningKeyId(createPublicKey(opts.artifactSigning.privateKey));
   const terminalPins=opts.networkExecutionTargets??[];
   if(opts.networkExecutionTargets?.some(t=>!/^[a-f0-9]{32}$/.test(t.journalId))||terminalPins.some(t=>!/^[a-f0-9]{64}$/.test(t.certificateSha256!))||new Set(terminalPins.map(t=>t.certificateSha256)).size!==terminalPins.length) throw new Error("invalid or ambiguous network Agent identity pins");
-  if (opts.artifactSigning && opts.networkExecutionTargets?.length && opts.networkVerifierKeys?.some(k => artifactSigningKeyId(k) === artifactSigningKeyId(createPublicKey(opts.artifactSigning!.privateKey)))) throw new Error("network verifier signing keys must be independent");
+  if (opts.artifactSigning && opts.networkExecutionTargets?.length) validateNetworkVerifierKeys(opts.networkVerifierKeys ?? [], opts.artifactSigning.privateKey);
   if (opts.tls.public && opts.tls.public.serverNames.length === 0) {
     throw new Error("public serverNames must contain at least one exact DNS name");
   }
