@@ -16,7 +16,7 @@ private disk ownership and serial-console evidence in the dedicated lab root:
   collector evidence, uses the production Manager mTLS API and delivers its signed envelope
   to the production Agent mailbox. Observe produces a separately signed current boot
   observation and never reuses old verifier proof.
-- `boot_cycle.py --root LAB --mode graceful|power-cut --output NEW_REPORT --transaction TX --expected restored|rolled-back` is a boot primitive,
+- `boot_cycle.py --root LAB --mode graceful|power-cut --output NEW_REPORT --transaction TX --expected restored|rolled-back|degraded-unchanged|rollback-failed|inactive` is a boot primitive,
   not the thirteen-case suite. It refuses dirty source, mismatched deployed module hashes,
   unmarked guests or a foreign QEMU process. `--require-confirmed-forwarding` requires fresh
   external packet probes after the changed guest boot ID. Virtual SIGKILL power loss differs
@@ -60,6 +60,13 @@ These are a read-only checklist, not a collector that was run on a trial host. D
 
 6. Once actual NM ownership/version is known, choose exactly one persistence backend. The current `linux-wireguard-v1` stays kernel-only. A future NM capability requires a distinct approved artifact/driver identity, unique owned profile UUID, autoconnect policy, secret reference and protected files; it must refuse foreign profiles and unavailable backend rather than falling back. The official [keyfile reference](https://networkmanager.pages.freedesktop.org/NetworkManager/NetworkManager/nm-settings-keyfile.html) and [settings reference](https://networkmanager.pages.freedesktop.org/NetworkManager/NetworkManager/nm-settings-nmcli.html) are design sources, not measurements of the missing VM's version.
 7. Before any backend writes, implement and review this boot invariant: unconfirmed profiles cannot auto-activate before Agent recovery. A durable per-profile undo/snapshot precedes persistence; confirmed activation permission is promoted only after explicit confirm. Recovery must still run when new execution is disabled. Order network recovery and existing firewall boot restore without stopping heartbeat/watchdogs; keep an independent console/verifier. The exact unit ordering and NM API must be proven on the selected installed version. No such unit/backend is installed by this PR.
+
+The peer `monitor.py` records management/forward/reverse packets throughout a boot. A report
+requires fresh post-recovery samples, bounded gaps, matching final peer boot identity and a
+non-expired monitor. `fault_entry.py` freezes only at production durable event boundaries.
+`faults.py` injects fixed reversible prerequisite faults under a unique fault ID in a marked
+guest; it preserves root-only originals/hashes and never activates or undoes a transaction.
+Only the production Agent performs subsequent restore/undo and authenticated settlement.
 
 ## Required boot evidence before Phase C completion
 

@@ -1,8 +1,9 @@
 # Rocky 10 persistent backend — development record
 
-Status: implementation candidate; actual boot matrix, final regressions, final source-bound report,
-review and merge are required before completion. No trial/production deployment is authorized.
-Phase 8/9 kernel-only results remain separate and do not prove persistent boot recovery.
+This record defines the implemented contract and measured development platform. Acceptance
+status and exact-source runner evidence belong to [PR #206](https://github.com/henryj-dev/heliopause/pull/206).
+No trial/production deployment is authorized. Phase 8/9 kernel-only results remain separate
+and do not prove persistent boot recovery.
 
 ## Measured disposable environment
 
@@ -113,14 +114,22 @@ ledger reset, automatic reacceptance or general confirmed-profile deletion is pr
 
 ## Validation and remaining gates
 
-Prototype runs use dirty development source and are excluded from final source-bound counts.
-Real Agent signed apply reached awaiting-verification; independent forward/reverse/management
-packets were observed. A delayed confirm expired and the Agent rolled back and settled through
-real mTLS. This is useful failure evidence, not a successful confirmed-boot test.
+Only clean, committed source with matching deployed module hashes may produce acceptance
+reports. Each actual boot report records changed gateway boot IDs, an unchanged independent
+peer boot ID, profile/cache/kernel state, Agent service and lifecycle state, journal/fence/acks,
+versions, bounded continuous packet samples and new independently signed connectivity
+observations. A transient failed observation remains visible even when a subsequent fresh
+observation succeeds. Exploratory failures are preserved separately and excluded from final
+acceptance counts. Neither a changed Agent PID nor hosted-container results substitute for
+a changed guest boot ID.
 
-Required final report must distinguish implementation, measured VM results, hosted-container
-regressions and documentation. The thirteen actual boot scenarios, certificate rotation and
-revocation exercises, bounded evidence archive/ledger replacement, prolonged stability,
-independent final review and green main merge remain completion/trial gates. No long-term
-readiness is claimed without safe archive/replacement tooling. Never prune replay ledgers or
-remove an existing confirmed object to make another test fit.
+Acceptance requires all thirteen handoff boot scenario groups, independent review and final
+head regression checks. Evidence and counts must bind to the final PR head; publishing this
+contract or provisioning the VM does not establish acceptance. Virtual QEMU process power
+loss does not establish host/controller power-loss durability or a general recovery-time SLA.
+
+Certificate rotation/revocation exercises, safe bounded evidence archival and ledger replacement,
+and prolonged stability remain separate trial gates. No long-term readiness is claimed without
+safe archive/replacement tooling. Never prune replay ledgers or remove an existing confirmed
+object to recycle a case. The trial target, change scope, console, stop/undo criteria, maximum
+unconfirmed time, recovery owner and evidence retention require a separate trial decision.
