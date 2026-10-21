@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 /** Read-only exact-byte archive plan unless --apply and the expected commitment are supplied. */
+import { installCliLanguage } from '../src/operator-i18n.ts';
 import { parseArgs } from 'node:util';
 import { resolve } from 'node:path';
 import { readJournalSnapshot, createJournalArchive } from '../src/network-journal-archive.ts';
 import { networkDigest } from '../src/network-canonical.ts';
+installCliLanguage();
 const {values}=parseArgs({options:{snapshot:{type:'string'},output:{type:'string'},'expected-hash':{type:'string'},apply:{type:'boolean',default:false}}});
 if(!values.snapshot||!values.output)throw new Error('--snapshot and --output required');
 if(resolve(values.snapshot)===resolve(values.output))throw new Error('new distinct archive destination required');
