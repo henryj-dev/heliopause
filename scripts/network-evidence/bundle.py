@@ -210,6 +210,7 @@ def verify_signatures(documents, manager_key, manager_id, verifier_key, verifier
     from network_executor import crypto_helpers, verify, Executor, EXECUTION, CONFIRM, VERIFY
     require(manager_id != verifier_id, 'Manager/verifier trust must be distinct')
     verified = set()
+    confirmed = set()
     with tempfile.TemporaryDirectory() as temp:
         provider = crypto_helpers(temp)
         for role,path,key_id in [('manager',manager_key,manager_id),('verifier',verifier_key,verifier_id)]:
@@ -241,13 +242,17 @@ def verify_signatures(documents, manager_key, manager_id, verifier_key, verifier
                             c['transactionId'] == tx and proof['transactionId'] == tx and
                             c['authorizationHash'] == sha(canonical(a)) == proof['authorizationHash'] and
                             c['artifactHash'] == a['artifactHash'] == proof['artifactHash'], 'signed authority binding mismatch')
+                    if row['state'] != 'confirmed':
+                        verified.add(stamp)
+                        continue
                     checker = object.__new__(Executor)
                     checker.config = {'managerKeys':str(Path(temp)/'manager'),'verifierKeys':str(Path(temp)/'verifier'),'identity':a['target']}
                     checker.provider = provider
                     checker.validate_restore_authority(row,v[field]['journal']['journalId'])
                     verified.add(stamp)
-    require(verified and len(authorities) == 10, 'missing signed restoration or transaction evidence')
-    return {'restoration':len(verified),'transactions':len(authorities)}
+                    confirmed.add(tx)
+    require(confirmed and len(authorities) == 10, 'missing signed restoration or transaction evidence')
+    return {'confirmedRestoration':len(confirmed),'signedConfirmationPairs':len(verified),'transactions':len(authorities)}
 
 
 def write_file(fd, name, raw):

@@ -30,7 +30,7 @@ and verify the archive; the path in this document is not evidence of future acce
 ## Provenance and retained measurement limits
 
 The retained lab's public Manager/verifier keys verify ten execution authorizations and two
-historical confirmed restoration authorities using production framing/domains and canonical
+signed confirmation pairs (one confirmed restoration authority and one retained rolled-back attempt) using production framing/domains and canonical
 payload checks. Public leaf CA signature, CN gateway, clientAuth and endpoint fingerprints were
 also rechecked independently during the audit. These keys are internally consistent with the
 retained provisioning artifacts. They are not authenticated by a separate external operator PKI.
