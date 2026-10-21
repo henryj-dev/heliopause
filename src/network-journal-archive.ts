@@ -35,7 +35,16 @@ function read(path:string,maximum:number):Buffer {
   try{const s=fstatSync(fd);if(!s.isFile()||s.uid!==process.geteuid?.()||(s.mode&0o777)!==0o600||s.nlink!==1||s.size>maximum)throw new Error('bounded owned0600 archive file required');const buffer=Buffer.alloc(maximum+1);let length=0;while(length<buffer.length){const count=readSync(fd,buffer,length,buffer.length-length,null);if(!count)break;length+=count;}const after=fstatSync(fd);if(length>maximum||after.size!==length||s.size!==after.size||s.mtimeMs!==after.mtimeMs||s.ctimeMs!==after.ctimeMs)throw new Error('archive file growth/change bound');fsyncSync(fd);return buffer.subarray(0,length);}finally{closeSync(fd);}
 }
 function seal(path:string):void {const fd=openSync(path,constants.O_RDONLY|constants.O_DIRECTORY|constants.O_NOFOLLOW);try{fsyncSync(fd);}finally{closeSync(fd);}}
+function refuseCredentials(value:unknown):void {
+  if(typeof value==='string'&&/-----BEGIN (?:[A-Z ]*PRIVATE KEY|OPENSSH PRIVATE KEY)-----/.test(value))throw new Error('private key archive refused');
+  if(Array.isArray(value)){value.forEach(refuseCredentials);return;}
+  if(value&&typeof value==='object')for(const [key,child] of Object.entries(value)){
+    if(['privatekey','password','token','clientsecret','presharedkey','cookie'].includes(key.toLowerCase().replace(/[_-]/g,'')))throw new Error('credential field archive refused');
+    refuseCredentials(child);
+  }
+}
 export function createJournalArchive(directory:string,bytes:JournalArchiveBytes):JournalArchive {
+  for(const [name] of Object.entries(files) as [Name,string][]){const raw=bytes[name];if(!Buffer.isBuffer(raw)||raw.length>(name==='manager'?4:8)*1024*1024)throw new Error('snapshot archive size bound');refuseCredentials(parseArchiveJson(raw.toString()));}
   privateDirectory(dirname(resolve(directory)));mkdirSync(directory,{mode:0o700});
   const manifest:{schemaVersion:1;files:Record<string,{sha256:string;bytes:number}>}={schemaVersion:1,files:{}};
   for(const [name,file] of Object.entries(files) as [Name,string][]) {
@@ -52,7 +61,7 @@ export function loadJournalArchive(directory:string):JournalArchive {
   for(const [name,file] of Object.entries(files) as [Name,string][]) {
     const raw=read(join(directory,file),(name==='manager'?4:8)*1024*1024),entry=manifest.files[file];
     if(entry.sha256!==digest(raw)||entry.bytes!==raw.length)throw new Error('snapshot archive hash mismatch');
-    rawFiles[name]=raw.toString('base64url');parsed[name]=parseArchiveJson(raw.toString());
+    rawFiles[name]=raw.toString('base64url');parsed[name]=parseArchiveJson(raw.toString());refuseCredentials(parsed[name]);
   }
   seal(directory);return {schemaVersion:1,rawFiles,...parsed};
 }

@@ -23,7 +23,8 @@ archive contract, not a recursive export or an assertion that other files contai
 
 `node bin/heliopause-network-journal-archive.ts --snapshot STAGED --output NEW_ARCHIVE`
 is read-only and reports an exact-byte commitment. Repeat with `--apply --expected-hash HASH`
-to create a new private fsynced archive. Existing destinations are refused. Incomplete copies
+to create a new private fsynced archive. Existing destinations are refused. Duplicate JSON keys and explicit credential fields are refused; the scan is defense in depth,
+not permission to publish arbitrary lab data. Incomplete copies
 remain evidence and fail verification; they do not permit replacement. Store a verified copy
 under an independently chosen custody policy before operational maintenance. A copy on the
 same development disk is not independent backup, and this tool supplies no remote custody.
