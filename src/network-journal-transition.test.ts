@@ -82,3 +82,7 @@ test('old authority and delayed old result cannot touch a successor fence',()=>{
   assert.equal(f.store.executionStatus().records.length,1);assert.equal(f.store.executionStatus().fence!.transactionId,payload.transactionId);
  }finally{f.cleanup();}
 });
+
+for(const length of [0,63,65])test('malformed transition signature length '+length+' cannot commit',()=>{
+ const f=fixture();try{const envelope={...f.issue(),signature:Buffer.alloc(length).toString('base64url')},before=readFileSync(f.store.path);assert.throws(()=>commitManagerJournalTransition(f.store,f.archive,envelope,[f.keys.publicKey],f.keys.privateKey,f.archiveDirectory,f.now),/signature/);assert.deepEqual(readFileSync(f.store.path),before);}finally{f.cleanup();}
+});

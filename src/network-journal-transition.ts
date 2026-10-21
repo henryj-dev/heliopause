@@ -123,7 +123,9 @@ export function verifyJournalMessage(envelope:NetworkSignedEnvelope,domain:strin
   const material=new Map(keys.map(key=>[artifactSigningKeyId(key),key]));need(material.size===keys.length,'duplicate transition trust key');
   const key=material.get(envelope.keyId),payload=Buffer.from(envelope.payload,'base64url'),signature=Buffer.from(envelope.signature,'base64url');
   const frame=(data:Buffer)=>{const size=Buffer.alloc(4);size.writeUInt32BE(data.length);return Buffer.concat([size,data]);};
-  need(key&&signature.length===64&&verify(null,Buffer.concat([frame(Buffer.from(domain)),frame(Buffer.from(envelope.keyId)),frame(payload)]),key,signature),'untrusted transition signature');
+  if(!key||signature.length!==64)throw new Error('untrusted transition signature');
+  const signatureValid=verify(null,Buffer.concat([frame(Buffer.from(domain)),frame(Buffer.from(envelope.keyId)),frame(payload)]),key,signature);
+  if(!signatureValid)throw new Error('untrusted transition signature');
   const parsed=JSON.parse(payload.toString());need(canonicalNetworkJson(parsed)===payload.toString(),'noncanonical transition message');return parsed;
 }
 
