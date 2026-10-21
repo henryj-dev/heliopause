@@ -713,7 +713,8 @@ class Executor:
                     if plan is not None:
                         row['bootRestore']['undoHash'] = digest(plan)
                     row['bootRestore']['state'] = 'restored'
-                except Exception:
+                except Exception as error:
+                    row['bootRestore']['diagnostic'] = safe_diagnostic(error)
                     row['bootRestore']['state'] = 'degraded'
                     row['bootRestore']['reason'] = 'restoration-unresolved'
                     if not plan_persisted:
