@@ -1,7 +1,8 @@
 // The prober, and the one mapping that would turn an unmeasured family green.
-import { describe, it } from "node:test";
+import { describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
-import { createServer } from "node:net";
+import net, { createServer, Socket } from "node:net";
+import { syncBuiltinESMExports } from "node:module";
 import { outcomeForError, probeAll, probeOne } from "./coverage-probe.ts";
 import { coverageRows, coverageSummary, type CoverageCheck, type Family } from "./coverage.ts";
 
@@ -41,14 +42,24 @@ describe("probeOne", () => {
   // The mapping the whole file exists for. A machine with no route to a family answers instantly,
   // and calling that a timeout would credit a firewall that never saw the packet.
   it("reports a local-stack error as error, never as timeout", async () => {
-    // 240.0.0.0/4 is reserved and unroutable, so the local stack refuses to send.
-    const r = await probeOne("240.0.0.1", 22, "v4", { ...opts, timeoutMs: 1200 });
-    assert.notEqual(r.outcome, "refused");
-    if (r.outcome === "error") {
-      assert.match(r.detail ?? "", /nothing was measured|E[A-Z]+/);
-    } else {
-      // Some stacks do let this out and it simply never answers. That is a real timeout.
-      assert.equal(r.outcome, "timeout");
+    // Reserved addresses can still get a RST from a host or intermediary. Force the
+    // socket error instead of depending on this runner's routing and egress policy.
+    const socket = new Socket();
+    const connect = mock.method(net, "connect", () => {
+      queueMicrotask(() => socket.emit("error", Object.assign(new Error("no route"), { code: "ENETUNREACH" })));
+      return socket;
+    });
+    syncBuiltinESMExports();
+    try {
+      const r = await probeOne("192.0.2.1", 22, "v4", opts);
+      assert.equal(connect.mock.callCount(), 1);
+      assert.equal(r.outcome, "error");
+      assert.match(r.detail ?? "", /ENETUNREACH.*nothing was measured/);
+      assert.equal(socket.destroyed, true);
+    } finally {
+      connect.mock.restore();
+      syncBuiltinESMExports();
+      socket.destroy();
     }
   });
 });
