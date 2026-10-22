@@ -795,6 +795,101 @@
       "expected": {
         "diagnostic": "legacy encoding fixture"
       }
+    },
+    {
+      "name": "escaped lone high surrogate value",
+      "hex": "7b22646961676e6f73746963223a225c7564383030227d",
+      "managerArchiveParserAccepted": false,
+      "agentDecoderAccepted": true,
+      "expected": {
+        "diagnostic": "\ud800"
+      },
+      "managerError": "unpaired archive Unicode surrogate"
+    },
+    {
+      "name": "escaped lone low surrogate value",
+      "hex": "7b22646961676e6f73746963223a225c7564666666227d",
+      "managerArchiveParserAccepted": false,
+      "agentDecoderAccepted": true,
+      "expected": {
+        "diagnostic": "\udfff"
+      },
+      "managerError": "unpaired archive Unicode surrogate"
+    },
+    {
+      "name": "escaped lone surrogate key",
+      "hex": "7b225c7564383030223a2276616c7565227d",
+      "managerArchiveParserAccepted": false,
+      "agentDecoderAccepted": true,
+      "expected": {
+        "\ud800": "value"
+      },
+      "managerError": "unpaired archive Unicode surrogate"
+    },
+    {
+      "name": "escaped lone surrogate in array",
+      "hex": "7b22686973746f7279223a5b225c7564383030225d7d",
+      "managerArchiveParserAccepted": false,
+      "agentDecoderAccepted": true,
+      "expected": {
+        "history": [
+          "\ud800"
+        ]
+      },
+      "managerError": "unpaired archive Unicode surrogate"
+    },
+    {
+      "name": "escaped valid pair",
+      "hex": "7b22646961676e6f73746963223a225c75643833645c7564653830227d",
+      "managerArchiveParserAccepted": true,
+      "agentDecoderAccepted": true,
+      "expected": {
+        "diagnostic": "\ud83d\ude80"
+      }
+    },
+    {
+      "name": "escaped valid pair key",
+      "hex": "7b225c75643833645c7564653830223a2276616c7565227d",
+      "managerArchiveParserAccepted": true,
+      "agentDecoderAccepted": true,
+      "expected": {
+        "\ud83d\ude80": "value"
+      }
+    },
+    {
+      "name": "literal backslash surrogate spelling",
+      "hex": "7b22646961676e6f73746963223a225c5c7564383030227d",
+      "managerArchiveParserAccepted": true,
+      "agentDecoderAccepted": true,
+      "expected": {
+        "diagnostic": "\\ud800"
+      }
+    },
+    {
+      "name": "escaped alias duplicate key",
+      "hex": "7b22646961676e6f73746963223a312c225c75303036346961676e6f73746963223a327d",
+      "managerArchiveParserAccepted": false,
+      "agentDecoderAccepted": false,
+      "managerError": "duplicate archive JSON key",
+      "agentError": "duplicate key"
+    },
+    {
+      "name": "duplicate plain key",
+      "hex": "7b22646961676e6f73746963223a312c22646961676e6f73746963223a327d",
+      "managerArchiveParserAccepted": false,
+      "agentDecoderAccepted": false,
+      "managerError": "duplicate archive JSON key",
+      "agentError": "duplicate key"
+    },
+    {
+      "name": "utf8 BOM",
+      "hex": "efbbbf7b22646961676e6f73746963223a226c656761637920424f4d227d",
+      "managerArchiveParserAccepted": false,
+      "agentDecoderAccepted": true,
+      "expected": {
+        "diagnostic": "legacy BOM"
+      },
+      "managerError": "Unexpected token"
     }
   ]
 }

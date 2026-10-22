@@ -23,6 +23,9 @@ export function parseArchiveJson(raw:string,integerToken:(path:readonly string[]
   let token:RegExpExecArray|null;
   while((token=tokens.exec(raw))){
     const value=token[0],frame=stack.at(-1);
+    // Python's canonical UTF-8 encoding cannot represent an unpaired surrogate.
+    // Check decoded keys and values; the Unicode regexp treats a valid pair as one scalar.
+    if(value.startsWith('"')&&/[\uD800-\uDFFF]/u.test(JSON.parse(value)))throw new Error('unpaired archive Unicode surrogate');
     if(value==='{'||value==='['){if(stack.length>=128)throw new Error('archive JSON depth bound');const path=frame?[...frame.path,frame.object?frame.field!:'[]']:[];stack.push({object:value==='{',key:true,path,seen:new Set()});}
     else if(value==='}'||value===']')stack.pop();
     else if(value===','&&frame?.object)frame.key=true;
@@ -47,7 +50,7 @@ const committedRowFields=['authorization','cancellation','terminalResult','cance
 export function parseJournalArchiveFile(name:Name,raw:Buffer):any {
   if(name==='agent')return parseReplayJournalJson(archiveText(raw));
   return parseArchiveJson(archiveText(raw),path=>{
-    if(name==='identity')return path.length>=3&&path[0]==='capacityCancellation'&&committedRowFields.includes(path[1]!);
+    if(name==='identity')return path.length>=3&&path[0]==='capacityCancellation'&&committedRowFields.includes(path[1]!)||path.join('/')==='capacityCancellation/history/[]/at';
     if(name==='outbox')return path.length>=2&&path[0]==='[]';
     if(name==='evidence')return path.join('/')==='schemaVersion'||(path.length===3&&path[0]==='files'&&path[2]==='bytes');
     if(name==='manager')return path.join('/')==='execution/records/[]/sequence'||

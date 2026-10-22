@@ -66,6 +66,25 @@ Preserve any pre-upgrade archive that uses it and the exact refusal. Do not norm
 to obtain a new authority or clear a partial transition. This narrow encoding contract
 does not prove equivalence of every TypeScript/Python schema or integer field.
 
+Manager archive parsing also refuses unpaired Unicode surrogates in decoded keys and values,
+including ASCII JSON escapes such as `\ud800`. Valid surrogate pairs, Unicode scalars and
+U+FFFD remain supported. This prevents later Python UTF-8 serialization failures; it does not
+normalize or replace historical bytes. The shared exact-byte fixtures state separate Manager
+archive-parser and Agent decoder outcomes: Python's wider BOM/UTF-16/UTF-32 and surrogate
+acceptance remains unchanged for existing recovery. Base64-encoded signed payload decoders
+are a separate boundary; these tests do not establish whole-schema/decoder equivalence.
+
+An emergency `capacityCancellation` archive must contain the history actually produced by the
+Agent: one object with exactly `state:"cancelled-before-accept"` and a nonnegative safe integer
+`at`, stored as an integer JSON token. Decimal/exponent tokens, extra entries or fields are
+refused by the Manager even if unsigned history otherwise matches the terminal result. This
+prevents Python/JavaScript canonical byte-length differences at the 512 KiB sidecar limit.
+Primary transaction history and monotonic measurements retain their floating-point support.
+The Agent's existing journal/recovery decoder is unchanged. Preserve unsupported old archives
+and refusal evidence; do not rewrite history, reset a journal or bypass approval to transition.
+The fix requires current Manager archive validation before new approvals/commits; deploying it
+does not qualify a guest, establish evidence custody or repair an already partial transition.
+
 Attachments are flat, fixed relative lowercase JSON names, with exact kind/byte/SHA256 metadata:
 no recursion, absolute paths, traversal, duplicate runs/references, extra/missing files, symlink or
 hardlink adoption. Limits are4096files,4MiB each,128MiB total, and64files per role/run. Both the

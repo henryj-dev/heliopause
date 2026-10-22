@@ -33,8 +33,8 @@ for(const field of ['privateKey','private_key','password','token','presharedKey'
 });
 
 const utf8Contract=JSON.parse(readFileSync(new URL('../scripts/network-transaction-lab/fixtures/journal-validation-v1.json',import.meta.url),'utf8')).rawUtf8ArchiveCases;
-for(const name of ['manager','agent','identity','outbox','acknowledgments','trust','config','evidence'] as const)test('archive refuses malformed UTF-8 before parsing '+name,()=>{
- for(const entry of utf8Contract){const raw=Buffer.from(entry.hex,'hex');if(entry.managerArchiveParserAccepted)assert.deepEqual(parseJournalArchiveFile(name,raw),entry.expected);else assert.throws(()=>parseJournalArchiveFile(name,raw),/UTF-8/);}
+for(const name of ['manager','agent','identity','outbox','acknowledgments','trust','config','evidence'] as const)test('shared exact-byte archive parser contract for '+name,()=>{
+ for(const entry of utf8Contract){const raw=Buffer.from(entry.hex,'hex');if(entry.managerArchiveParserAccepted)assert.deepEqual(parseJournalArchiveFile(name,raw),entry.expected);else assert.throws(()=>parseJournalArchiveFile(name,raw),new RegExp(entry.managerError??'UTF-8'));}
 });
 test('archive preserves valid Unicode including a real replacement character and retains BOM refusal',()=>{
  const value={diagnostic:'replacement \ufffd, 한글, \u{1f680}'};
