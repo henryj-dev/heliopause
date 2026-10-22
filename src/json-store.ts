@@ -8,10 +8,35 @@
  */
 import { randomBytes } from "node:crypto";
 import {
-  chmodSync, closeSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync,
+  constants, chmodSync, closeSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, resolve } from "node:path";
+
+/** Read one regular file through the descriptor that was checked, with a hard byte ceiling.
+ * O_NONBLOCK prevents a substituted FIFO from hanging open; O_NOFOLLOW refuses a final symlink.
+ * ENOENT is preserved so stores can distinguish an absent document from an invalid one.
+ */
+export function readBoundedStoreFile(path: string, maxBytes: number): string {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0 || maxBytes >= 0x7fffffff) throw new Error("invalid store read limit");
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const info = fstatSync(fd);
+    if (!info.isFile()) throw new Error("store document is not a regular file");
+    if (info.size > maxBytes) throw new Error("store document exceeds size limit");
+    // A concurrent append after fstat must still be bounded. Read one extra byte to
+    // distinguish exact-limit EOF from a file that grew; never reread the pathname.
+    const data = Buffer.alloc(maxBytes + 1);
+    let size = 0;
+    while (size < data.length) {
+      const count = readSync(fd, data, size, data.length - size, size);
+      if (count === 0) break;
+      size += count;
+    }
+    if (size > maxBytes) throw new Error("store document exceeds size limit");
+    return data.subarray(0, size).toString("utf8");
+  } finally { closeSync(fd); }
+}
 
 export type StoreFailure = (message: string, statusCode?: number) => Error;
 

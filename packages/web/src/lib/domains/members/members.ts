@@ -2,6 +2,7 @@
 
 import type { MessageKey } from "../../i18n.ts";
 import { isRecord } from "./answer.ts";
+import { readIdentities, type IdentityRow } from "./account.ts";
 
 export const MEMBERS_PATH = "/api/members";
 export const INVITES_PATH = "/api/members/invites";
@@ -22,14 +23,15 @@ export const STATUS_KEY: Record<string, MessageKey> = {
   deleted: "m.mmDeleted",
 };
 
-export type MemberAction = "roles" | "suspend" | "unsuspend" | "delete" | "otp-user" | "cert-cns" | "password-reset";
+export type MemberAction = "roles" | "suspend" | "unsuspend" | "delete" | "otp-user" | "cert-cns" | "password-reset" | "solo-approve";
 
 /** What a member's panel asks the screen to send. */
 export type PanelRequest =
   | { action: "roles"; roles: string[] }
   | { action: "suspend" | "unsuspend" | "delete" | "password-reset" }
   | { action: "otp-user"; otpUserId: string | null }
-  | { action: "cert-cns"; change: { add: string } | { remove: string } };
+  | { action: "cert-cns"; change: { add: string } | { remove: string } }
+  | { action: "solo-approve"; soloApprove: boolean };
 
 export interface MemberRow {
   id: string;
@@ -43,6 +45,8 @@ export interface MemberRow {
   certCNs: string[];
   hasPassword: boolean;
   mustChange: boolean;
+  soloApprove: boolean;
+  identities: IdentityRow[];
 }
 
 const strings = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : []);
@@ -62,6 +66,8 @@ export function readMember(m: unknown): MemberRow | null {
     certCNs: strings(m.certCNs),
     hasPassword: m.hasPassword === true,
     mustChange: m.mustChange === true,
+    soloApprove: m.soloApprove === true,
+    identities: readIdentities(m.identities),
   };
 }
 
@@ -80,7 +86,7 @@ export function memberPath(id: string, action: MemberAction): string {
 export function actionsFor(m: Pick<MemberRow, "status">): MemberAction[] {
   if (m.status === "deleted") return [];
   const toggle: MemberAction = m.status === "suspended" ? "unsuspend" : "suspend";
-  return ["roles", toggle, "otp-user", "cert-cns", "password-reset", "delete"];
+  return ["roles", toggle, "otp-user", "cert-cns", "solo-approve", "password-reset", "delete"];
 }
 
 /** Roles in the order the store lists them, whatever order the boxes were ticked in. */
@@ -104,6 +110,10 @@ export function otpUserBody(otpUserId: string | null, otp: string): string {
 
 export function certCnBody(change: { add: string } | { remove: string }, otp: string): string {
   return JSON.stringify("add" in change ? { add: change.add.trim(), otp } : { remove: change.remove, otp });
+}
+
+export function soloBody(soloApprove: boolean, otp: string): string {
+  return JSON.stringify({ soloApprove, otp });
 }
 
 export function otpOnlyBody(otp: string): string {
@@ -161,6 +171,13 @@ export function planRequest(member: Pick<MemberRow, "id" | "username">, request:
         link: null,
       };
     }
+    case "solo-approve":
+      return {
+        path: memberPath(member.id, "solo-approve"),
+        body: (otp) => soloBody(request.soloApprove, otp),
+        what: plain(request.soloApprove ? "m.mmWhatSoloOn" : "m.mmWhatSoloOff"),
+        link: null,
+      };
     case "suspend":
       return { path: memberPath(member.id, "suspend"), body: otpOnlyBody, what: plain("m.mmWhatSuspend"), link: null };
     case "unsuspend":

@@ -6,8 +6,8 @@ import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import {
   activeMember, bindCertCN, confirmOtp, consumeToken, createMember, deleteMember, emptyMemberDocument, findByCertCN, findByEmail,
-  findByIdentity, findByUsername, initializeMemberDocument, issueToken, linkIdentity, loadMemberDocument, MEMBER_TOKEN_PREFIX,
-  MemberError, saveMemberDocument, setOtpUserId, setPassword, setRoles, suspendMember, trimLoginAudit, unbindCertCN, unlinkIdentity,
+  findByIdentity, findByUsername, identityHandle, identityOwner, initializeMemberDocument, issueToken, linkIdentity, loadMemberDocument, MEMBER_TOKEN_PREFIX,
+  MemberError, saveMemberDocument, setOtpUserId, setPassword, setRoles, setSoloApprove, suspendMember, trimLoginAudit, unbindCertCN, unlinkIdentity,
   unsuspendMember, withMemberTransaction, type MemberDocument,
 } from "./member-store.ts";
 
@@ -523,6 +523,33 @@ describe("linked identities", () => {
     raw.identities[0].memberId = "00000000-0000-4000-8000-000000000000";
     writeFileSync(path, JSON.stringify(raw));
     refuses(() => loadMemberDocument(path), 400, /unknown member/);
+  });
+
+  it("identityOwner names a tombstone's member and a suspended one, where findByIdentity names neither", () => {
+    const { document } = withAdmin();
+    const held = createMember(document, { username: "held", status: "active", roles: ["reader"] }, ctx);
+    const gone = createMember(document, { username: "gone2", status: "active", roles: ["reader"] }, ctx);
+    linkIdentity(document, { memberId: held.id, issuer: ISS, subject: "sub-held" }, ctx);
+    linkIdentity(document, { memberId: gone.id, issuer: ISS, subject: "sub-gone2" }, ctx);
+    suspendMember(document, held.id, ctx);
+    deleteMember(document, gone.id, ctx);
+    assert.equal(identityOwner(document, ISS, "sub-held")?.status, "suspended");
+    assert.equal(identityOwner(document, ISS, "sub-gone2")?.status, "deleted");
+    assert.equal(findByIdentity(document, ISS, "sub-gone2"), null);
+    assert.equal(identityOwner(document, ISS, "sub-nobody"), null);
+    assert.match(identityHandle({ issuer: ISS, subject: "sub-held" }), /^[0-9a-f]{16}$/);
+    assert.notEqual(identityHandle({ issuer: ISS, subject: "sub-held" }), identityHandle({ issuer: ISS, subject: "sub-gone2" }));
+  });
+
+  it("setSoloApprove sets the flag with an audit row, and refuses a deleted member", () => {
+    const { document } = withAdmin();
+    const m = createMember(document, { username: "solo", status: "active", roles: ["reader", "writer"] }, ctx);
+    assert.equal(setSoloApprove(document, m.id, true, ctx).soloApprove, true);
+    assert.equal(document.audit.at(-1)?.action, "member.solo-approve.on");
+    assert.equal(setSoloApprove(document, m.id, false, ctx).soloApprove, false);
+    refuses(() => setSoloApprove(document, m.id, "yes" as unknown as boolean, ctx), 400, /soloApprove/);
+    deleteMember(document, m.id, ctx);
+    refuses(() => setSoloApprove(document, m.id, true, ctx), 409, /deleted/);
   });
 
   it("refuses linking an identity bound to another member", () => {

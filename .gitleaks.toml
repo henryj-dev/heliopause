@@ -7,3 +7,13 @@
 
 [extend]
 useDefault = true
+
+# NM keyfile renderer uses this literal setting name/value, not credential material.
+# v8.30.1 generic-api-key misreads the adjacent Python variable/private-key field.
+# Match only this exact non-secret token in this exact source file, including history.
+[[allowlists]]
+description = "NetworkManager static private-key-flags=0 setting"
+condition = "AND"
+paths = ['''^agent/network_nm_profile\.py$''']
+regexTarget = "secret"
+regexes = ['''^private-key-flags=0$''']

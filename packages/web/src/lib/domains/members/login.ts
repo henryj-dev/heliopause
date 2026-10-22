@@ -7,6 +7,7 @@ export const METHODS_PATH = "/auth/methods";
 export const PASSWORD_LOGIN_PATH = "/auth/password/login";
 export const SSO_LOGIN_PATH = "/auth/login";
 export const RESET_REQUEST_PATH = "/auth/password/reset-request";
+export const SSO_OTP_PATH = "/auth/sso/otp";
 const MAX_NEXT = 512;
 
 /** Which sign-ins `/auth/methods` says this manager offers. Anything unreadable offers nothing. */
@@ -121,5 +122,33 @@ export function readResetRequest(status: number, body: unknown): ResetRequestAns
     return { kind: "sent", minutes: typeof m === "number" && Number.isInteger(m) && m > 0 ? m : null };
   }
   const key: MessageKey = status === 429 ? "m.loginTooMany" : status === 400 ? "m.loginBadInput" : status >= 500 ? "m.loginUnavailable" : "m.mbFailed";
+  return { kind: "refused", refusal: { key, detail: errorText(body), problems: [] } };
+}
+
+/**
+ * What `?sso=` on the sign-in page means. The callback sends a writer or admin here with `otp` to
+ * finish with a code, and `unlinked` (with members on) or `refused` when it would not sign them in.
+ */
+export type SsoParam = "otp" | "unlinked" | "refused" | null;
+export function readSsoParam(raw: string | null): SsoParam {
+  return raw === "otp" || raw === "unlinked" || raw === "refused" ? raw : null;
+}
+export const SSO_NOTICE: Record<"unlinked" | "refused", MessageKey> = {
+  unlinked: "m.loginSsoUnlinked",
+  refused: "m.loginSsoRefused",
+};
+
+export function ssoOtpBody(otp: string): string {
+  return JSON.stringify({ otp: otp.trim() });
+}
+
+/**
+ * One answer from `POST /auth/sso/otp`. The server spends the pending sign-in on any attempt, so
+ * every refusal means signing in with SSO again; `next` is where the SSO login was headed.
+ */
+export type SsoOtpAnswer = { kind: "signedIn"; next: string | null } | { kind: "refused"; refusal: Refusal };
+export function readSsoOtp(status: number, body: unknown): SsoOtpAnswer {
+  if (status === 200) return { kind: "signedIn", next: isRecord(body) && typeof body.next === "string" ? body.next : null };
+  const key: MessageKey = status === 429 ? "m.loginTooMany" : status >= 500 ? "m.loginUnavailable" : "m.loginSsoRestart";
   return { kind: "refused", refusal: { key, detail: errorText(body), problems: [] } };
 }

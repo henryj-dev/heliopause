@@ -432,11 +432,12 @@ describe("HELIOPAUSE_MEMBERS", () => {
     assert.equal(membersModeFromEnv({ HELIOPAUSE_MEMBERS: " " }), "off");
     assert.equal(membersModeFromEnv({ HELIOPAUSE_MEMBERS: "off" }), "off");
   });
-  test("accepts shadow", () => {
+  test("accepts shadow and on", () => {
     assert.equal(membersModeFromEnv({ HELIOPAUSE_MEMBERS: "shadow" }), "shadow");
+    assert.equal(membersModeFromEnv({ HELIOPAUSE_MEMBERS: " on " }), "on");
   });
-  test("refuses on until member sign-in exists, and anything else", () => {
-    assert.throws(() => membersModeFromEnv({ HELIOPAUSE_MEMBERS: "on" }), (e: Error) => e instanceof EnvSpecError && /not available yet/.test(e.message));
+  test("refuses anything else", () => {
+    assert.throws(() => membersModeFromEnv({ HELIOPAUSE_MEMBERS: "On" }), (e: Error) => e instanceof EnvSpecError && /off, shadow or on/.test(e.message));
     assert.throws(() => membersModeFromEnv({ HELIOPAUSE_MEMBERS: "Shadow" }), EnvSpecError);
     assert.throws(() => membersModeFromEnv({ HELIOPAUSE_MEMBERS: "true" }), EnvSpecError);
   });

@@ -44,7 +44,7 @@ FROM node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a55
 # it never runs — the same image serves both. A second, git-bearing image would keep it leaner at
 # the price of another thing to pull, another pull credential and another supply chain for one
 # `git clone`, which is the trade this project already weighed once and declined.
-RUN apk add --no-cache openssl git openssh-client
+RUN apk add --no-cache openssl git openssh-client python3
 
 # Not root. The manager reads certificates and talks HTTPS; it needs no privilege beyond that, and
 # the relay and agent are the components that legitimately need more.

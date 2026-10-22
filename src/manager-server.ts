@@ -1,3 +1,12 @@
+import { existsSync } from 'node:fs';
+import { loadJournalArchive } from './network-journal-archive.ts';
+import { planJournalTransition, journalTransitionHash, authorizeJournalTransition, commitManagerJournalTransition, assertJournalEpochBinding, type JournalTransitionDraft } from './network-journal-transition.ts';
+import { NETWORK_EXECUTION_CAPACITY } from './network-execution-state.ts';
+import { issueDurableNetworkCancellation } from './network-execution-cancellation.ts';
+import { issueDurableNetworkConfirm, settleNetworkExecution } from './network-execution-settlement.ts';
+import { buildNetworkChangeSet } from './network-change-set.ts';
+import { authorizeNetworkExecution, validateNetworkVerifierKeys, validateNetworkExecutionDraft, networkExecutionHash, type NetworkSignedEnvelope, type NetworkExecutionDraft } from './network-execution.ts';
+import { networkDigest } from './network-canonical.ts';
 // The manager's HTTP surface (H26): reads the whole site, and is the ordinary way a generation gets
 // published.
 //
@@ -51,9 +60,11 @@ import { createSecureContext, type SecureContext, type TLSSocket } from "node:tl
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { readFile, readdir, realpath } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { createHash, createPublicKey, type KeyObject } from "node:crypto";
+import { createHash, createPublicKey, randomBytes, type KeyObject } from "node:crypto";
 import { peerCN, type FleetView } from "./relay.ts";
-import { readBoundedNodeBody, readBoundedText } from "./bounded-body.ts";
+import { BodyTooLargeError, readBoundedNodeBody, readBoundedText } from "./bounded-body.ts";
+import { NetworkObservationStore, observationFreshness, NETWORK_COLLECTOR_NAMES } from "./network-observation.ts";
+import { NetworkRegistryStore, NetworkRegistryError, MAX_NETWORK_REGISTRY_INPUT_BYTES } from "./network-registry.ts";
 import { MAX_PREVIEW_BYTES } from "./preview-limits.ts";
 import { buildId } from "./build-id.ts";
 
@@ -64,7 +75,7 @@ import { RoleChangeLedger, verifyBackchannelLogout, verifyRoleChange } from "./s
 import {
   checkCsrf, clearCookieHeader, clearLoginCookieHeader, cookieHeader, COOKIE, CSRF_HEADER,
   DEFAULT_LIMITS as DEFAULT_SESSION_LIMITS, LOGIN_COOKIE, loginBinder, loginBinderMatches,
-  loginCookieHeader, readCookie, SessionStore, type Principal,
+  isMemberSession, loginCookieHeader, readCookie, SessionStore, type Principal,
 } from "./session.ts";
 
 import { CONSOLE_ENTRY, consoleAppPath, policyAppPath } from "./app-shell.ts";
@@ -109,7 +120,7 @@ import {
 } from "./host-deregistration-policy-worker.ts";
 import { readRelayStatus, type RelayRead } from "./problem-watch.ts";
 import { startProblemWatch, type ProblemWatchDeps } from "./problem-watch-runner.ts";
-import { siteView, type RelaySource, type RelayResult, type SiteView } from "./manager.ts";
+import { fetchNetworkObservations, siteView, type RelaySource, type RelayResult, type SiteView } from "./manager.ts";
 import { bundleFromPlan, planHash, validateBundle, type PlanBundle } from "./bundle.ts";
 import { zoneMismatch } from "./site-zone.ts";
 import { diffRulesets } from "./ruleset-diff.ts";
@@ -155,7 +166,8 @@ import { certFactsFromPeer, certFactsFromPem, pemCertificateCount, type CertFact
 import { certificateInventory, certificateProblems, prose, type CertificateReport, type FileReading } from "./cert-inventory.ts";
 import type { CertificateRevocation } from "./enrollment-store.ts";
 import type { MembersMode } from "./env-spec.ts";
-import { createMemberAuth } from "./member-auth.ts";
+import { createMemberAuth, type LinkIntent } from "./member-auth.ts";
+import { findByCertCN } from "./member-store.ts";
 import type { MailConfig } from "./mail.ts";
 
 /**
@@ -271,6 +283,7 @@ export function republishRefusal(input: {
 }
 
 export const API_ROUTES: ReadonlySet<string> = new Set([
+  "/network/execution/terminal",
   "/site",
   "/certificates",
   "/authz",
@@ -295,6 +308,9 @@ export const API_ROUTES: ReadonlySet<string> = new Set([
   "/enrollment/tokens",
   "/enrollment/app-tokens",
   "/enrollment/audit",
+  "/network/inventory",
+  "/network/revisions",
+  "/network/observations",
   "/enrollment/revocations",
   "/enrollment/host-deregistrations",
 ]);
@@ -312,6 +328,10 @@ export const API_ROUTES: ReadonlySet<string> = new Set([
  * fleet agent fetches its own certificate from there, through a name in stardust's SNI allowlist.
  */
 export const API_ROUTE_PATTERNS: readonly RegExp[] = [
+  /^\/network\/journal-transition\/(?:propose|review|approve|authorize|commit)$/,
+  /^\/network\/execution\/(?:propose|approve|authorize|confirm|cancel|review|status)$/,
+  /^\/network\/inventory\/[^/]+$/,
+  /^\/network\/observations\/[^/]+\/[^/]+$/,
   /^\/plans\/[^/]+\/changes$/,
   /^\/plans\/[^/]+\/ruleset$/,
   /^\/plans\/[^/]+\/ruleset-diff$/,
@@ -341,6 +361,11 @@ export type PendingOidcLogin = {
    * missing field; `loginBinderMatches` treats `undefined` as no match.
    */
   binder?: string;
+  /**
+   * Set only by `POST /auth/link/start`: this login links the identity to a member instead of
+   * signing anyone in. Kept here, server-side, so no request parameter can ask for it.
+   */
+  intent?: LinkIntent;
 };
 
 /**
@@ -407,6 +432,15 @@ export function consumePendingOidcLogin(
 }
 
 export interface ManagerOptions {
+  /** Opt-in local desired inventory store; never a configuration writer. */
+  networkRegistryFile?: string;
+  /** Separate opt-in writer issuance; identities are deployment trust, never request claims. */
+  networkVerifierKeys?: readonly KeyObject[];
+  /** Pre-staged private archives only; clients cannot submit filesystem paths. */
+  networkJournalArchiveDirectory?: string;
+  networkExecutionTargets?: readonly { source: string; host: string; nodeId: string; journalId: string; certificateSha256: string }[];
+  /** Per-relay cached observations, separate from desired state. */
+  networkObservationsDir?: string;
   port: number;
   hostname?: string;
   /** The relays this manager aggregates — one per VPC. */
@@ -520,6 +554,12 @@ export interface ManagerOptions {
     resetDelayMs?: () => number;
     /** SMTP relay for reset and invite mail (`mailConfigFromEnv`). Absent or null: nothing is mailed. */
     mail?: MailConfig | null;
+    /**
+     * Creating a member on an unlinked SSO sign-in. Not implemented: only `false` (the default) is
+     * accepted and `true` refuses to start. An unlinked SSO account never becomes a member here; an
+     * admin invites the person and they link the account themselves.
+     */
+    jit?: false;
   };
   /** Enrollment store or standalone JSON denylist, reloaded on every authenticated request. */
   revocationFile?: string;
@@ -1235,6 +1275,12 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     throw new Error("oidc.soloApprovalRoles requires otp — solo approval may not run without a second factor");
   }
   const membersOn = (opts.members?.mode ?? "off") !== "off";
+  // @see member-sso-server.test.ts "refuses to start with JIT member creation"
+  if ((opts.members as { jit?: unknown } | undefined)?.jit !== undefined && opts.members?.jit !== false) {
+    throw new Error("members.jit: creating members on SSO sign-in is not implemented — only false is accepted");
+  }
+  /** `on`: the console is for members only, and an unlinked SSO account is refused. */
+  const membersOnly = opts.members?.mode === "on";
   if (membersOn && !opts.members?.storeFile) {
     throw new Error(`members.mode=${opts.members?.mode} requires members.storeFile (HELIOPAUSE_MEMBER_STORE)`);
   }
@@ -1364,6 +1410,10 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     throw new Error("artifact signing authorizationTtlSec must be an integer between 900 and 604800");
   }
   if (opts.artifactSigning) artifactSigningKeyId(createPublicKey(opts.artifactSigning.privateKey));
+  const terminalPins=opts.networkExecutionTargets??[];
+  if(opts.networkRegistryFile&&existsSync(opts.networkRegistryFile)){const store=new NetworkRegistryStore(opts.networkRegistryFile),execution=store.read().execution;if(execution?.journalEpoch||execution?.capacityHold)assertJournalEpochBinding(store,terminalPins);}
+  if(opts.networkExecutionTargets?.some(t=>!/^[a-f0-9]{32}$/.test(t.journalId))||terminalPins.some(t=>!/^[a-f0-9]{64}$/.test(t.certificateSha256!))||new Set(terminalPins.map(t=>t.certificateSha256)).size!==terminalPins.length) throw new Error("invalid or ambiguous network Agent identity pins");
+  if (opts.artifactSigning && opts.networkExecutionTargets?.length) validateNetworkVerifierKeys(opts.networkVerifierKeys ?? [], opts.artifactSigning.privateKey);
   if (opts.tls.public && opts.tls.public.serverNames.length === 0) {
     throw new Error("public serverNames must contain at least one exact DNS name");
   }
@@ -1470,7 +1520,9 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
 
   /** The KeyStone user that answers for this principal's one-time codes, if any. */
   const otpIdentityOf = (p: Principal): string | null =>
-    p.via === "oidc" ? p.sub : p.via === "password" ? (p.otpUserId ?? null) : (opts.otp?.users.get(p.name) ?? null);
+    p.via === "oidc" ? p.sub : isMemberSession(p) ? (p.otpUserId ?? null)
+      // A certificate: its member's KeyStone user when bound to one, else the CN's mapping.
+      : (p.otpUserId ?? opts.otp?.users.get(p.sub) ?? null);
 
   /**
    * Every other name that is the same human as `p`: writer CNs sharing its KeyStone user
@@ -1480,7 +1532,8 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
    * @see "a member and their own certificate are one approver" in member-auth-server.test.ts
    */
   function alsoKnownAsFor(p: Principal): string[] | null {
-    const names = new Set(sameHumanAs.get(p.name) ?? []);
+    // A certificate bound to a member carries the member's name; `sub` is still the CN.
+    const names = new Set([...(sameHumanAs.get(p.name) ?? []), ...(p.via === "certificate" ? sameHumanAs.get(p.sub) ?? [] : [])]);
     const otpId = otpIdentityOf(p);
     if (otpId) for (const [cn, uid] of opts.otp?.users ?? []) if (uid === otpId) names.add(cn);
     if (memberAuth) {
@@ -1540,6 +1593,24 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
   // What it does mean: `POST /publish` for a plan this process never saw answers 409 with "re-propose
   // it", not 404 — an operator whose approval evaporated needs to know which of the two happened.
   const approvals = emptyApprovals();
+  const networkApprovals = emptyApprovals();
+  const networkDrafts = new Map<string, NetworkExecutionDraft>();
+  const journalApprovals=emptyApprovals();
+  const journalDrafts=new Map<string,{draft:JournalTransitionDraft;archiveName:string}>();
+
+  function networkEvidence(draft: NetworkExecutionDraft) {
+    if (!opts.networkRegistryFile || !opts.networkObservationsDir || !opts.relays.some(r => r.name === draft.target.source)) throw new Error("execution evidence unavailable");
+    const registry = new NetworkRegistryStore(opts.networkRegistryFile).read();
+    const cache = new NetworkObservationStore(join(opts.networkObservationsDir, createHash("sha256").update(draft.target.source).digest("hex")));
+    const observation = cache.get(draft.target.host, draft.target.source);
+    if (!observation || networkDigest(observation) !== draft.observation.digest || Date.parse(observation.report.completedAt) !== draft.observation.collectedAt || observationFreshness(observation, now().getTime(), draft.observation.maxAgeMs) !== "fresh") throw new Error("observation changed");
+    const node = registry.resources.find(r => r.id === draft.target.nodeId);
+    if (node?.kind !== "node") throw new Error("target node unavailable");
+    const review = buildNetworkChangeSet({ id: "execution-review", registry, expectedRegistryRevision: draft.registryRevision, now: draft.observation.collectedAt, observations: [observation], bindings: [{ ...draft.target, siteId: node.siteId }] });
+    if (review.contentHash !== draft.reviewHash) throw new Error("review changed");
+    return { observation, review };
+  }
+
   /** Plan hash → the bundle to push. Beside the plan, not inside it — see `POST /plan`. */
   const bundles = new Map<string, PlanBundle>();
   /** Plan hash → relay name. Stored at proposal so publishing cannot redirect the push. */
@@ -2008,6 +2079,20 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       return send(res, 401, { error: "client certificate has been revoked" });
     }
 
+    if (url.pathname === "/network/execution/terminal") {
+      // Machine-only direct mTLS. Operator sessions and Relay assertions cannot settle a fence.
+      if(req.method!=="POST") return send(res,405,{error:"method not allowed"});
+      if(!opts.networkRegistryFile) return send(res,503,{error:"execution ledger unavailable"});
+      const socket=req.socket as TLSSocket, cert=socket.getPeerCertificate();
+      const fingerprint=cert.raw?createHash("sha256").update(cert.raw).digest("hex"):null;
+      const agent=opts.networkExecutionTargets?.find(t=>t.host===cn&&t.certificateSha256===fingerprint);
+      if(!socket.authorized||!cert.ext_key_usage?.includes([1,3,6,1,5,5,7,3,2].join('.'))||!cn||!agent||req.headers.cookie||req.headers.authorization||req.headers.origin||req.headers["sec-fetch-site"]) return send(res,403,{error:"direct pinned Agent mTLS required"});
+      try {
+        const result=JSON.parse((await readNetworkRegistryBody(req)).toString("utf8"));
+        return send(res,200,settleNetworkExecution(new NetworkRegistryStore(opts.networkRegistryFile),result,agent,cn));
+      } catch(e) {return send(res,e instanceof NetworkRegistryError?e.statusCode:400,{error:e instanceof NetworkRegistryError?e.message:"terminal result refused"});}
+    }
+
     // Bootstrap agents have no certificate yet; their one credential is a host-scoped bearer token.
     // These two routes therefore run before operator authentication and expose only that token's CSR.
     if (opts.enrollment && req.method === "POST" && url.pathname === "/infra/node-csrs") {
@@ -2123,9 +2208,9 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     // resolved from the session alone, and a browser that happens to hold a client certificate is
     // sent to the IdP like any other.
     //
-    // The reason is what a certificate cannot say. Authorisation here reads group claims — that is
-    // why `maySoloApprove` requires `via === "oidc"` — and a certificate carries a CN and nothing
-    // else, so an operator arriving that way is a name with no role.
+    // The reason is what a certificate cannot say. Authorisation here reads group claims or a member
+    // record — `maySoloApprove` needs one of them — and a certificate carries a CN and nothing else,
+    // so an operator arriving that way is a name with no role.
     //
     // **Guarded on `oidc` being configured.** With no IdP there is no other way to reach the console,
     // and disabling the one that works would lock the operator out of their own firewall.
@@ -2147,10 +2232,10 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       || typeof req.headers["origin"] === "string";
     const certIsAcceptable = membersOn ? !fromBrowser : !(oidc && wantsHtml);
     const session = sessions ? sessions.get(readCookie(req.headers["cookie"], COOKIE)) : null;
-    // A password session's authority is the member record as it is now, not as it was at sign-in.
+    // A member session's authority (password or SSO) is the member record as it is now, not as it was at sign-in.
     // @see "suspension takes effect on the next request" in member-auth-server.test.ts
     let memberPrincipal: Principal | null = null;
-    if (session && session.principal.via === "password") {
+    if (session && isMemberSession(session.principal)) {
       if (!memberAuth) {
         sessions!.destroy(session.id);
         return send(res, 401, { error: "this session has ended — sign in again" }, { "set-cookie": clearCookieHeader() });
@@ -2161,6 +2246,37 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
           resolved.status === 401 ? { "set-cookie": clearCookieHeader() } : {});
       }
       memberPrincipal = resolved.principal;
+    }
+    // ## A certificate CN bound to a member is that member
+    //
+    // Its name is the member's principalName, its KeyStone user the member's, and it is refused while
+    // the member is not active. Its authority stays `operatorCNs`/`writerCNs` on the CN. An unbound CN
+    // is unchanged. Shadow and on alike; with members off there is no store to read.
+    //
+    // This lookup deliberately fails closed for every certificate request, reads included, when the
+    // member store cannot be read. Otherwise a suspended member-bound certificate would regain its
+    // old CN authority precisely while the store which records the suspension is unavailable.
+    // @see member-sso-server.test.ts "a certificate read fails closed when the member store is unavailable"
+    // @see member-sso-server.test.ts "a certificate bound to a member signs as that member, and not while they are suspended"
+    let certPrincipal: Principal | null = null;
+    if (cn && certIsAcceptable && !memberPrincipal && !session) {
+      certPrincipal = { name: cn, sub: cn, groups: [], via: "certificate", canWrite: writers.has(cn) };
+      if (memberAuth) {
+        let bound;
+        try { bound = findByCertCN(memberAuth.document(), cn); } catch {
+          return send(res, 503, { error: "the member store is unavailable" });
+        }
+        if (bound && bound.status !== "active") {
+          log(`refused ${url.pathname} for certificate ${cn}: its member ${bound.username} is ${bound.status}`, `인증서 ${cn}의 ${url.pathname} 거부: 회원 ${bound.username}이(가) ${bound.status}`);
+          return send(res, 403, { error: `certificate ${cn} belongs to a member who cannot sign in` });
+        }
+        if (bound) {
+          certPrincipal = {
+            ...certPrincipal, name: bound.principalName, memberId: bound.id,
+            otpUserId: bound.otpUserId, otpConfirmed: bound.otpConfirmedAt !== null,
+          };
+        }
+      }
     }
 
     // ## The session wins, and the `Accept` rule above is not enough on its own
@@ -2173,17 +2289,14 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     // `Accept` rule alone: `curl --cert … /site` with a default `Accept` answered 200.
     //
     // Three things follow from that, and none of them are visible on the screen: the solo-approve
-    // control disappears because `maySoloApprove` needs `via === "oidc"`; `canWrite` comes from
+    // control disappears because `maySoloApprove` never holds for a certificate; `canWrite` comes from
     // `writerCNs` rather than from the group decision the session already made; and **the CSRF check
     // is skipped entirely**, because it too is gated on `via === "oidc"`.
     //
     // So the order is session first. A CLI never carries a cookie, which is what makes this safe to
     // state so bluntly: presenting both is a browser, and a browser that has signed in has already
     // said who it is with claims a certificate cannot carry.
-    const principal: Principal | null = memberPrincipal ?? session?.principal
-      ?? (cn && certIsAcceptable
-        ? { name: cn, sub: cn, groups: [], via: "certificate", canWrite: writers.has(cn) }
-        : null);
+    const principal: Principal | null = memberPrincipal ?? session?.principal ?? certPrincipal;
 
     if (!principal) {
       // Every page, not just the console root. `/policy` used to answer 401 JSON to a browser that
@@ -2217,7 +2330,8 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     // Two allowlists, one decision point. A certificate is checked against `operatorCNs`; a session
     // was already checked against the group claims when it was created, and carrying that decision
     // rather than re-deriving it is what keeps one identity from being evaluated two ways.
-    const isOperator = principal.via === "certificate" ? operators.has(principal.name) : true;
+    // `sub` is the CN for a certificate, bound to a member or not.
+    const isOperator = principal.via === "certificate" ? operators.has(principal.sub) : true;
     if (!isOperator) {
       log(`refused ${url.pathname} for ${principal.name}: not an operator`, `${principal.name}의 ${url.pathname} 거부: 운영자가 아님`);
       return send(res, 403, { error: "this certificate is not authorised to read the site view" });
@@ -2265,13 +2379,214 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     // One boolean, one place. Certificates read the live allowlist; sessions carry the decision
     // taken at login — see `Principal.canWrite` for why that is stated rather than hidden.
     const mayWrite = principal.canWrite;
+    const journalMatch=/^\/network\/journal-transition\/(propose|review|approve|authorize|commit)$/.exec(url.pathname);
+    if(journalMatch){
+      if(!opts.networkJournalArchiveDirectory||!opts.networkRegistryFile||!opts.artifactSigning||!opts.networkExecutionTargets?.length)return send(res,503,{error:'journal transition disabled'});
+      const action=journalMatch[1];
+      if(action==='review'&&req.method==='GET'){
+        const entry=journalDrafts.get(url.searchParams.get('hash')??'');
+        return entry?send(res,200,{draft:entry.draft,archiveName:entry.archiveName}):send(res,404,{error:'transition proposal unavailable'});
+      }
+      if(req.method!=='POST')return send(res,405,{error:'method not allowed'});
+      if(!mayWrite)return refuseWrite(res,who,url.pathname,principal.via);
+      if(crossSiteRequest(req))return send(res,403,{error:'cross-site transition refused'});
+      try{
+        const body=JSON.parse((await readNetworkRegistryBody(req)).toString('utf8'));
+        if(action!=='propose'&&(await requireOtp(principal,body,res,url.pathname))==='answered')return;
+        const archiveName=String(body.archiveName??'');
+        if(!/^[a-f0-9]{32}$/.test(archiveName))throw new Error('fixed archive identity required');
+        const archivePath=join(opts.networkJournalArchiveDirectory,archiveName),archive=loadJournalArchive(archivePath);
+        const pin=opts.networkExecutionTargets.find(t=>t.journalId===archive.agent.journalId&&networkDigest({source:t.source,host:t.host,nodeId:t.nodeId})===networkDigest(archive.config.identity));
+        if(!pin)throw new Error('archive target binding refused');
+        const target={source:pin.source,host:pin.host,nodeId:pin.nodeId},at=now();
+        if(action==='commit'){
+          const receipt=commitManagerJournalTransition(new NetworkRegistryStore(opts.networkRegistryFile),archive,body.envelope,[createPublicKey(opts.artifactSigning.privateKey)],opts.artifactSigning.privateKey,archivePath,+at);
+          return send(res,200,{receipt,agentCommitRequired:true,managerBindingRestartRequired:true});
+        }
+        if(action==='propose'){
+          if(journalDrafts.size>=32)throw new Error('transition proposal capacity reached');
+          const draft=planJournalTransition(archive,target,randomBytes(16).toString('hex'),randomBytes(16).toString('hex'),+at),hash=journalTransitionHash(draft);
+          const plan=propose(journalApprovals,{hash,generation:draft.transitionId,summary:{hosts:[{host:target.host,stage:'journal-maintenance',ruleCount:0,rulesetHash:draft.archiveHash}]},by:who,byOtp:otpIdentityOf(principal),now:at});
+          journalDrafts.set(hash,{draft,archiveName});return send(res,201,{hash,plan,draft});
+        }
+        const hash=String(body.hash??''),entry=journalDrafts.get(hash);
+        if(!entry||entry.archiveName!==archiveName)throw new Error('re-propose exact transition archive');
+        if(action==='approve'){
+          const aka=alsoKnownAsFor(principal);if(!aka)return send(res,503,{error:'identity store unavailable'});
+          return send(res,200,{hash,plan:approve(journalApprovals,{hash,by:who,alsoKnownAs:aka,byOtp:otpIdentityOf(principal),now:at})});
+        }
+        const envelope=authorizeJournalTransition(archive,entry.draft,journalApprovals,who,opts.artifactSigning.privateKey,at);
+        journalDrafts.delete(hash);return send(res,200,{envelope});
+      }catch{return send(res,409,{error:'exact quiescent journal transition refused'});}
+    }
+    const networkExecutionMatch = /^\/network\/execution\/(propose|approve|authorize|confirm|cancel|review|status)$/.exec(url.pathname);
+    if (networkExecutionMatch) {
+      if(req.method==="GET"&&networkExecutionMatch[1]==="status") {
+        if(!opts.networkRegistryFile) return send(res,503,{error:"execution ledger unavailable"});
+        try {const snapshot=new NetworkRegistryStore(opts.networkRegistryFile).executionSnapshot(),status=snapshot.execution;
+          const current=status.records.find(r=>r.transactionId===status.fence?.transactionId);
+          const fenceReason=status.capacityHold?'verified archive and journal transition required':!status.fence?null:current?.cancelStatus==='accepted-recovery-required'?'accepted execution requires verified rollback':current?.cancelStatus==='requested'?'Agent cancellation acknowledgment required':'authenticated terminal settlement required';
+          return send(res,200,{...status,capacity:{used:status.records.length,limit:NETWORK_EXECUTION_CAPACITY,remaining:NETWORK_EXECUTION_CAPACITY-status.records.length,...snapshot.storage},fenceReason});}
+        catch {return send(res,409,{error:"execution ledger unavailable or legacy reconciliation required"});}
+      }
+      if(networkExecutionMatch[1]==="cancel") {
+        if(req.method!=="POST") return send(res,405,{error:"method not allowed"});
+        if(!mayWrite) return refuseWrite(res,who,url.pathname,principal.via);
+        if(crossSiteRequest(req)) return send(res,403,{error:"cross-site execution refused"});
+        if(!opts.networkRegistryFile||!opts.artifactSigning) return send(res,503,{error:"cancellation signing unavailable"});
+        try {
+          const body=JSON.parse((await readNetworkRegistryBody(req)).toString("utf8"));
+          if((await requireOtp(principal,body,res,url.pathname))==="answered") return;
+          const envelope=issueDurableNetworkCancellation(new NetworkRegistryStore(opts.networkRegistryFile),body.transactionId,body.authorizationHash,opts.artifactSigning.privateKey,who,now().getTime());
+          return send(res,200,{envelope});
+        } catch(e) {return send(res,e instanceof NetworkRegistryError?e.statusCode:400,{error:"exact execution cancellation refused"});}
+      }
+      if (!opts.networkExecutionTargets?.length || !opts.networkVerifierKeys?.length || !opts.networkRegistryFile || !opts.artifactSigning || !opts.networkObservationsDir) return send(res, 503, { error: "network execution issuance disabled" });
+      if (req.method === "GET" && networkExecutionMatch[1] === "review") {
+        const draft = networkDrafts.get(url.searchParams.get("hash") ?? "");
+        if (!draft) return send(res, 404, { error: "network proposal unavailable" });
+        try { return send(res, 200, { draft, review: networkEvidence(draft).review }); }
+        catch { return send(res, 409, { error: "evidence changed; replan" }); }
+      }
+      if (req.method !== "POST") return send(res, 405, { error: "method not allowed" });
+      if (!mayWrite) return refuseWrite(res, who, url.pathname, principal.via);
+      if (crossSiteRequest(req)) return send(res, 403, { error: "cross-site execution refused" });
+      try {
+        const body = JSON.parse((await readNetworkRegistryBody(req)).toString("utf8"));
+        const action = networkExecutionMatch[1];
+        if (action === "propose") {
+          const draft = body.draft as NetworkExecutionDraft;
+          validateNetworkExecutionDraft(draft);
+          if (!draft || !opts.networkExecutionTargets.some(t => t.source === draft.target?.source && t.host === draft.target?.host && t.nodeId === draft.target?.nodeId && t.journalId === draft.journalId)) return send(res, 403, { error: "untrusted execution identity" });
+          // Reconstruct the target keys rather than rely on request object key ordering.
+          const evidence = networkEvidence(draft);
+          const hash = networkExecutionHash(draft);
+          if (networkDrafts.size >= 32) return send(res, 409, { error: "network proposal capacity reached" });
+          const plan = propose(networkApprovals, { hash, generation: draft.transactionId, summary: { hosts: [{ host: draft.target.host, stage: "gateway", ruleCount: 1, rulesetHash: draft.artifactHash }] }, by: who, byOtp: otpIdentityOf(principal), now: now() });
+          networkDrafts.set(hash, draft);
+          return send(res, 201, { hash, plan, draft, review: evidence.review });
+        }
+        if ((await requireOtp(principal, body, res, url.pathname)) === "answered") return;
+        const hash = String(body.hash ?? "");
+        if (action === "confirm") {
+          const envelope = issueDurableNetworkConfirm(new NetworkRegistryStore(opts.networkRegistryFile),hash,body.verification,opts.networkVerifierKeys,opts.artifactSigning.privateKey,who,now().getTime());
+          return send(res, 200, { envelope });
+        }
+        if(action==="authorize") {
+          const prior=new NetworkRegistryStore(opts.networkRegistryFile).executionStatus().records.find(r=>r.planHash===hash);
+          if(prior) return send(res,200,{envelope:prior.authorization,replayed:true,state:prior.state});
+        }
+        const draft = networkDrafts.get(hash);
+        if (!draft) return send(res, 404, { error: "re-propose network execution" });
+        if (action === "approve") {
+          const aka = alsoKnownAsFor(principal);
+          if (!aka) return send(res, 503, { error: "identity store unavailable" });
+          const plan = approve(networkApprovals, { hash, by: who, now: now(), alsoKnownAs: aka, byOtp: otpIdentityOf(principal) });
+          return send(res, 200, { hash, plan });
+        }
+        if (action === "authorize") {
+          const evidence = networkEvidence(draft);
+          const envelope = authorizeNetworkExecution(new NetworkRegistryStore(opts.networkRegistryFile), networkApprovals, draft, who, opts.artifactSigning.privateKey, evidence, now());
+
+          networkDrafts.delete(hash);
+          return send(res, 200, { envelope });
+        }
+        return send(res, 404, { error: "unknown network execution action" });
+      } catch (e) {
+        if (e instanceof ApprovalError) return sendApprovalError(res, e);
+        return send(res, e instanceof NetworkRegistryError ? e.statusCode : 400, { error: "network execution refused; replan or reconcile fence" });
+      }
+    }
+    const networkInventoryPath = /^\/network\/inventory\/([^/]+)$/.exec(url.pathname);
+    if (url.pathname === "/network/inventory" || url.pathname === "/network/revisions" || networkInventoryPath) {
+      if (!opts.networkRegistryFile) return send(res, 503, { error: "network registry is not configured" });
+      const store = new NetworkRegistryStore(opts.networkRegistryFile);
+      try {
+        const pathId = networkInventoryPath ? decodeURIComponent(networkInventoryPath[1]!) : undefined;
+        if (req.method === "GET") {
+          const doc = store.read();
+          if (url.pathname === "/network/revisions") return send(res, 200, { revision: doc.revision, history: doc.history });
+          if (pathId !== undefined) {
+            const resource = doc.resources.find(r => r.id === pathId);
+            return resource ? send(res, 200, { revision: doc.revision, resource }) : send(res, 404, { error: "resource not found" });
+          }
+          const {execution,...inventory}=doc;
+          return send(res, 200, {...inventory,schemaVersion:1});
+        }
+        if (!["POST", "PUT", "DELETE"].includes(req.method ?? "") || url.pathname === "/network/revisions" || (req.method === "POST" && pathId !== undefined) || (req.method === "DELETE" && pathId === undefined)) return send(res, 405, { error: "method not allowed" });
+        if (crossSiteRequest(req)) return send(res, 403, { error: "cross-site registry writes are refused" });
+        if (!mayWrite) return refuseWrite(res, who, url.pathname, principal.via);
+        const raw = await readNetworkRegistryBody(req);
+        const body: unknown = JSON.parse(raw.toString("utf8"));
+        if (!body || typeof body !== "object" || Array.isArray(body)) throw new NetworkRegistryError("request must be an object");
+        const b = body as Record<string, unknown>;
+        const mutation = req.method === "DELETE" ? { action: "delete" as const, id: pathId! }
+          : req.method === "POST" ? { action: "create" as const, resource: b.resource }
+          : pathId === undefined ? { action: "replace" as const, resources: b.resources }
+          : { action: "update" as const, id: pathId, resource: b.resource };
+        const doc = store.mutate(b.expectedRevision, who, mutation);
+        const {execution,...inventory}=doc;
+        return send(res, req.method === "POST" ? 201 : 200, {...inventory,schemaVersion:1});
+      } catch (e) {
+        if (e instanceof NetworkRegistryError) return send(res, e.statusCode, { error: e.message, ...(e.issues ? { issues: e.issues } : {}) });
+        if (e instanceof SyntaxError || e instanceof URIError) return send(res, 400, { error: "invalid registry request" });
+        if (e instanceof BodyTooLargeError) return send(res, 413, { error: "registry request exceeds size limit" }, { connection: "close" });
+        throw e;
+      }
+    }
+    const networkObservationPath = /^\/network\/observations\/([^/]+)\/([^/]+)$/.exec(url.pathname);
+    if (url.pathname === "/network/observations" || networkObservationPath) {
+      if (req.method !== "GET") return send(res, 405, { error: "observations are read-only" });
+      if (!opts.networkObservationsDir) return send(res, 503, { error: "network observation cache is not configured" });
+      let detail: { source: string; host: string } | undefined;
+      try {
+        if (url.pathname !== "/network/observations") {
+          detail = { source: decodeURIComponent(networkObservationPath![1]!), host: decodeURIComponent(networkObservationPath![2]!) };
+          if (!opts.relays.some(r => r.name === detail!.source)) return send(res, 404, { error: "unknown relay source" });
+        }
+      } catch { return send(res, 400, { error: "invalid observation identity" }); }
+      const sources = opts.relays.filter(r => !detail || r.name === detail.source);
+      const rows = await Promise.all(sources.map(async source => {
+        const cache = new NetworkObservationStore(join(opts.networkObservationsDir!, createHash("sha256").update(source.name).digest("hex")));
+        let status: "available" | "unavailable" = "available";
+        try {
+          const records = await fetchNetworkObservations(source);
+          for (const record of records) cache.put(record.host, record.report, { source: source.name, relayReceivedAt: record.receivedAt });
+        } catch { status = "unavailable"; }
+        try {
+          return { source: source.name, status, observations: cache.list().filter(r => !detail || r.host === detail.host).map(record => {
+            const now = Date.now();
+            const names = NETWORK_COLLECTOR_NAMES;
+            const collectors = Object.fromEntries(names.map(name => {
+              const collector = record.report.observations[name];
+              const ageMs = collector ? now - Date.parse(collector.completedAt) : undefined;
+              return [name, collector ? { status: collector.status, freshness: ageMs! >= 0 && ageMs! <= 10 * 60_000 ? "fresh" : "stale", completedAt: collector.completedAt } : { status: "never-observed", freshness: "never-observed" }];
+            }));
+            return { ...record, source: source.name, freshness: observationFreshness(record, now), collectors };
+          }) };
+        } catch { return { source: source.name, status: "unavailable" as const, observations: [], cacheError: true }; }
+      }));
+      if (detail) {
+        const observation = rows[0]?.observations[0];
+        if (!observation) return send(res, rows[0]?.status === "unavailable" ? 503 : 404, { source: detail.source, host: detail.host, status: rows[0]?.status ?? "unavailable", observation: null, freshness: "never-observed" });
+        return send(res, 200, { relayStatus: rows[0]!.status, observation });
+      }
+      return send(res, 200, { relays: rows.map(({ observations: _observations, ...source }) => source), observations: rows.flatMap(r => r.observations) });
+    }
     // Solo approval is a role, and only ever an OIDC one: a certificate carries no role claim, so a
     // CLI caller can never approve their own plan. That asymmetry is deliberate rather than an
     // oversight — the browser path is the one with a one-time code prompt in front of a person, and
     // the rule this switches off is worth keeping wherever it can be kept.
+    //
+    // A member session may too: the member's `soloApprove` with a confirmed KeyStone user (`resolve`
+    // sets `principal.soloApprove`), in a session that may write — which a member session can only
+    // after passing its sign-in code. Never a certificate, bound or not. Each approval still needs
+    // its own one-time code.
+    // @see member-sso-server.test.ts "solo approval needs soloApprove, a confirmed code and a session that passed it"
     const soloRoles = new Set(opts.oidc?.soloApprovalRoles ?? []);
     const maySoloApprove =
-      principal.via === "oidc" && principal.groups.some((g) => soloRoles.has(g));
+      (principal.via === "oidc" && principal.groups.some((g) => soloRoles.has(g)))
+      || (isMemberSession(principal) && principal.soloApprove === true && principal.canWrite);
 
     if (opts.enrollment && req.method === "GET" && url.pathname === "/enrollment/requests") {
       try {
@@ -4095,30 +4410,24 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
   ): Promise<void> {
     const selfOrigin = `https://${req.headers["host"] ?? ""}`;
 
-    if (req.method === "GET" && url.pathname === "/auth/login") {
+    /** Start an authorization request: the pending record, and where the browser goes with which binder. */
+    async function begin(returnTo: string | null, intent: LinkIntent | null): Promise<{ location: string; setCookie: string }> {
       // Expire only from the oldest end, then evict the oldest live attempt at the hard cap. A full
       // scan on every anonymous request made a login flood quadratic; an unbounded map made it a
       // memory flood. `Map` insertion order gives both operations a bounded oldest-first path.
       const startedAt = Date.now();
       trimPendingOidcLogins(o.pending, startedAt);
-
       const { verifier, challenge } = pkce();
       const state = randomNonce();
       const n = randomNonce();
-      // Stored as given and judged where it is used. **Validating here as well would be a check no
-      // test can reach** — the callback's `safeReturnTo` already refuses everything this one would,
-      // so injecting a defect into the second copy breaks nothing and it is indistinguishable from
-      // dead code. One gate, at the point the value becomes a `Location` header.
-      const next = url.searchParams.get("next");
-      const returnTo = next && next.length <= 512 ? next : null;
       // The value goes to this browser as a cookie; only its digest is kept here. `state` travels
       // through the IdP in a URL and is therefore something an attacker can hold; this is not.
       const binder = loginBinder();
       o.pending.set(state, {
-        verifier, nonce: n, at: startedAt, binder: binder.digest, ...(returnTo ? { returnTo } : {}),
+        verifier, nonce: n, at: startedAt, binder: binder.digest, ...(returnTo ? { returnTo } : {}), ...(intent ? { intent } : {}),
       });
       const d = await o.provider.load();
-      const to = authorizeUrl(d, {
+      const location = authorizeUrl(d, {
         clientId: o.conf.clientId,
         redirectUri: o.conf.redirectUri,
         state,
@@ -4128,14 +4437,33 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
         // without it produces a principal with no groups and no access.
         scopes: ["openid", "profile", "email", "groups"],
       });
+      return { location, setCookie: loginCookieHeader(binder.value) };
+    }
+
+    // ## Linking an SSO account to the member signed in by password
+    //
+    // `member-auth.ts` checks the session, the CSRF token and a fresh password (and a writer's code),
+    // then this starts an ordinary login whose pending record carries the link intent.
+    if (req.method === "POST" && url.pathname === "/auth/link/start") {
+      if (!memberAuth) return send(res, 404, { error: "member accounts are off" });
+      return await memberAuth.linkStart(req, res, (intent) => begin(null, intent));
+    }
+
+    if (req.method === "GET" && url.pathname === "/auth/login") {
+      // Stored as given and judged where it is used. **Validating here as well would be a check no
+      // test can reach** — the callback's `safeReturnTo` already refuses everything this one would,
+      // so injecting a defect into the second copy breaks nothing and it is indistinguishable from
+      // dead code. One gate, at the point the value becomes a `Location` header.
+      const next = url.searchParams.get("next");
+      const returnTo = next && next.length <= 512 ? next : null;
+      const started = await begin(returnTo, null);
       res.writeHead(302, {
-        location: to,
-        "set-cookie": loginCookieHeader(binder.value),
+        location: started.location,
+        "set-cookie": started.setCookie,
         "cache-control": "no-store",
       });
       return void res.end();
     }
-
     if (req.method === "GET" && url.pathname === "/auth/callback") {
       const state = url.searchParams.get("state") ?? "";
       const code = url.searchParams.get("code") ?? "";
@@ -4198,6 +4526,38 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
       } catch (e) {
         log(`login failed: ${(e as Error).message}`, `로그인 실패: ${(e as Error).message}`);
         return send(res, 401, { error: `login failed: ${(e as Error).message}` });
+      }
+
+      // ## Members: the identity is `(issuer, subject)` and nothing else
+      //
+      // The issuer is the configured one, which the ID token's `iss` was just checked against. Email
+      // and username play no part, so an unlinked account whose address is a member's stays unlinked.
+      const back = (location: string, extra: string[] = []): void => {
+        res.writeHead(302, { location, "set-cookie": [...extra, clearLoginCookieHeader()], "cache-control": "no-store" });
+        res.end();
+      };
+      if (found.intent?.kind === "link") {
+        if (!memberAuth) return back(`${CONSOLE_ENTRY}/account?link=ended`);
+        const linked = memberAuth.completeLink(found.intent, o.conf.issuer, identity.sub, req.socket.remoteAddress ?? "unknown");
+        return back(`${CONSOLE_ENTRY}/account?link=${linked.ok ? "ok" : linked.code}`);
+      }
+      if (memberAuth) {
+        const returnTo = safeReturnTo(found.returnTo ?? null);
+        const signIn = memberAuth.ssoSignIn(req, o.conf.issuer, identity.sub, returnTo);
+        if (signIn.kind === "session") return back(returnTo ?? "/", [cookieHeader(signIn.session)]);
+        if (signIn.kind === "otp") {
+          return back(`${CONSOLE_ENTRY}/login?sso=otp${returnTo ? `&next=${encodeURIComponent(returnTo)}` : ""}`, [signIn.cookie]);
+        }
+        if (signIn.kind === "refused") {
+          if (signIn.status === 503) return send(res, 503, { error: signIn.error }, { "set-cookie": clearLoginCookieHeader() });
+          return back(`${CONSOLE_ENTRY}/login?sso=refused`);
+        }
+        // Unlinked. Under `on` that is a refusal; under `shadow` the group-based sign-in below runs.
+        // @see member-sso-server.test.ts "on refuses an unlinked SSO account and admits members and the CLI"
+        if (membersOnly) {
+          log(`SSO sign-in refused for sub ${identity.sub}: not linked to a member`, `sub ${identity.sub}의 SSO 로그인 거부: 회원에 연결되지 않음`);
+          return back(`${CONSOLE_ENTRY}/login?sso=unlinked`);
+        }
       }
 
       const decision = authorize(identity, {
@@ -4357,7 +4717,9 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
 
       // Every session this subject holds. `backchannel_logout_session_required` is off, so the token
       // names a person and not a session — see `verifyBackchannelLogout`.
+      // A linked member's SSO sessions end too; their password sessions are not the IdP's to end.
       const outcome = o.sessions.applyToSubject(logout.sub, () => null);
+      outcome.ended += o.sessions.endIdentity(o.conf.issuer, logout.sub);
       log(`backchannel-logout for sub ${logout.sub}: ${outcome.ended} session(s) ended`, `sub ${logout.sub}의 백채널 로그아웃: 세션 ${outcome.ended}개 종료`);
       // 204 even when nothing matched. A person who is not signed in has been logged out as far as
       // the administrator is concerned, and a 404 here would read as a delivery failure worth
@@ -4772,11 +5134,13 @@ export async function startManager(opts: ManagerOptions): Promise<{ server: Serv
     const otp = opts.otp;
     if (!otp) return "ok";
 
-    const userId = p.via === "oidc" ? p.sub : p.via === "password" ? (p.otpUserId ?? undefined) : otp.users.get(p.name);
-    // A password session whose otpUserId is not (or no longer) confirmed by a sign-in code. Admin
-    // changes end the member's sessions; a store edit outside the API does not, and lands here.
+    const userId = p.via === "oidc" ? p.sub : isMemberSession(p) ? (p.otpUserId ?? undefined)
+      : (p.otpUserId ?? otp.users.get(p.sub));
+    // A member's otpUserId (a session's, or a bound certificate's) that is not (or no longer)
+    // confirmed by a sign-in code. Admin changes end the member's sessions; a store edit outside the
+    // API does not, and lands here.
     // @see "an unconfirmed otpUserId refuses the approval code" in member-auth-server.test.ts
-    if (p.via === "password" && userId && !p.otpConfirmed) {
+    if (p.memberId !== undefined && p.otpUserId && userId === p.otpUserId && !p.otpConfirmed) {
       log(`${path} REFUSED for ${p.name}: otpUserId not confirmed`, `${p.name}의 ${path} 거부: otpUserId 미확인`);
       return answered(res, 403, "confirm your one-time code by signing in again");
     }
@@ -5113,6 +5477,27 @@ function countRules(artifact: string | undefined): number {
  * exporting it would make the manager depend on the relay module for a five-line utility. The bound is
  * the part that matters and it is stated here.
  */
+/** Request overflow must leave the response writable so clients receive a useful 413.
+ * The shared relay-response reader destroys its stream on overflow, which is wrong for requests. */
+function readNetworkRegistryBody(req: IncomingMessage): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    const cleanup = () => { req.off("data", data); req.off("end", end); req.off("error", error); req.off("aborted", aborted); };
+    const fail = (e: Error) => { cleanup(); req.pause(); reject(e); };
+    const error = () => fail(new NetworkRegistryError("cannot read registry request"));
+    const aborted = () => fail(new NetworkRegistryError("registry request aborted"));
+    const data = (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > MAX_NETWORK_REGISTRY_INPUT_BYTES) return fail(new BodyTooLargeError("registry request exceeds size limit"));
+      chunks.push(chunk);
+    };
+    const end = () => { cleanup(); resolve(Buffer.concat(chunks, size)); };
+    if (Number(req.headers["content-length"]) > MAX_NETWORK_REGISTRY_INPUT_BYTES) return fail(new BodyTooLargeError("registry request exceeds size limit"));
+    req.on("data", data); req.on("end", end); req.on("error", error); req.on("aborted", aborted);
+  });
+}
+
 async function readBody(req: IncomingMessage, limit = 256 * 1024): Promise<string> {
   const chunks: Buffer[] = [];
   let size = 0;

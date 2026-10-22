@@ -3887,19 +3887,28 @@ _EMPTY_STATE = {
 }
 
 
+_state_read_problem = False
+
+
 def _load_state_unlocked():
+    global _state_read_problem
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             saved = json.load(f)
+            if not isinstance(saved, dict):
+                raise ValueError("state must be an object")
     except FileNotFoundError:
         return dict(_EMPTY_STATE)
     except (OSError, ValueError) as e:
         # Reporting `none` here would be a lie that reads as "this host was never configured",
         # and would invite a re-apply of something already live. Say the state is unreadable.
-        log(f"state file unreadable ({e}) — reporting unknown")
+        if not _state_read_problem:
+            log("state file unreadable — reporting unknown; new writer admission blocked")
+        _state_read_problem = True
         st = dict(_EMPTY_STATE)
         st["detail"] = f"state file unreadable: {e}"
         return st
+    _state_read_problem = False
     st = dict(_EMPTY_STATE)
     st.update({k: saved.get(k, v) for k, v in _EMPTY_STATE.items()})
     return st
@@ -3917,6 +3926,9 @@ def _save_state_unlocked(st):
     tmp = None
     try:
         os.makedirs(directory, mode=0o700, exist_ok=True)
+        if _lifecycle is not None and not os.path.exists(STATE_FILE + ".required"):
+            if not _write_private_json(STATE_FILE + ".required", {"required": True}):
+                return False
         fd, tmp = tempfile.mkstemp(prefix=f".{os.path.basename(STATE_FILE)}.", suffix=".tmp", dir=directory)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             fd = None  # ownership transferred to the file object
@@ -5559,6 +5571,9 @@ def _has_live_commitment(st):
     )
 
 
+_lifecycle = None
+
+
 def main():
     missing = [
         name
@@ -5629,17 +5644,49 @@ def main():
     # So this runs first only because it is cheap and reads settled state. **If a recovery path ever
     # produces `confirmed`, this call has to move below it** — that is the invariant to check, not
     # the position.
-    backfill_current_authorization()
-    recover_commitment()
+    backfill_allowed = True
+    if _lifecycle is not None:
+        try:
+            _lifecycle.firewall_state()
+        except Exception:
+            _lifecycle.error('firewall-journal', 'firewall-journal-unreadable')
+            backfill_allowed = False
+    if backfill_allowed:
+        backfill_current_authorization()
+    if _lifecycle is None:
+        recover_commitment()
     # Same reasoning for the workload half, and it needs its own call because the two commitments have
     # separate deadlines. A no-op on every host that is not the applier.
-    recover_workload_commitment()
-    reconcile_recovered_commitments()
+    if _lifecycle is None:
+        recover_workload_commitment()
+        reconcile_recovered_commitments()
     # A reboot took the table; put back what was confirmed without waiting for the relay (#139).
     # After the commitment recoveries (they handle prepared/pending/rollback-failed; the restore acts
     # only on `confirmed`), and before the monitor
     # starts, so the restore is not observed as a change this agent did not make. Writes no state.
-    _boot_restore()
+    if backfill_allowed:
+        try:
+            _boot_restore()
+        except Exception:
+            if _lifecycle is None:
+                raise
+            _lifecycle.error('firewall-boot-restore', 'confirmed-firewall-restoration-unresolved')
+    if _lifecycle is not None:
+        _lifecycle.start()
+
+    # Entire discovery/parser/upload runs in a separate bounded process after recovery. It
+    # cannot acquire the policy state/apply locks and its uploads are never confirmation signals.
+    if os.environ.get("HELIOPAUSE_NETWORK_DISCOVERY", "") == "1":
+        try:
+            from network_discovery_lifecycle import start_discovery_worker
+            start_discovery_worker(
+                _stop, enabled=True,
+                interval=int(os.environ.get("HELIOPAUSE_NETWORK_DISCOVERY_INTERVAL", "300")),
+                budget=int(os.environ.get("HELIOPAUSE_NETWORK_DISCOVERY_BUDGET", "45")),
+                result=_lifecycle.discovery if _lifecycle is not None else None,
+            )
+        except (ImportError, ValueError, OSError, RuntimeError):
+            log("network discovery unavailable; policy heartbeat continues")
 
     # Watches the ruleset for changes this agent did not make. Daemon, so a wedged monitor can
     # never keep the process alive; the heartbeat loop is what must not stop.
@@ -5655,6 +5702,8 @@ def main():
             reply = post_heartbeat(build_heartbeat(st))
         except Exception as e:  # noqa: BLE001 — the loop must outlive every transport failure
             failures += 1
+            if _lifecycle is not None:
+                _lifecycle.heartbeat(False)
             # Logged every time rather than deduplicated: a heartbeat that stops landing is the
             # signal rollback will key on, so the record of when it stopped has to be complete.
             log(f"heartbeat failed ({failures} consecutive): {e}")
@@ -5677,7 +5726,23 @@ def main():
         # copy loaded before the request would see `pending` for a host that had already reverted,
         # and re-apply the very generation that just locked it out, every interval, forever.
         st = load_state()
-        handle_reply_safely(st, reply)
+        if _lifecycle is not None:
+            _lifecycle.heartbeat(True)
+            try:
+                st = _lifecycle.firewall_state()
+            except Exception:
+                _lifecycle.error("firewall-journal", "firewall-journal-unreadable")
+                sleep_interval()
+                continue
+        if _lifecycle is None or _has_live_commitment(st):
+            handle_reply_safely(st, reply)
+        elif _lifecycle.begin_firewall():
+            try:
+                handle_reply_safely(st, reply)
+            finally:
+                _lifecycle.end_firewall()
+        elif isinstance(reply, dict) and reply.get("generation") and reply.get("generation") != st.get("generation"):
+            _lifecycle.defer_firewall(reply["generation"])
         if _has_live_commitment(load_state()):
             continue
         sleep_interval()
@@ -5686,5 +5751,67 @@ def main():
     return 0
 
 
+def run_writer_mode():
+    """One persistent process/host lock; network work is admitted beside the firewall loop."""
+    import fcntl
+    from network_lifecycle import Lifecycle
+    from network_executor import read_json, atomic, assert_active_journal, check_admission_epoch
+    global _lifecycle
+    directory = os.path.dirname(STATE_FILE)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    lock_path = os.environ.get("HELIOPAUSE_WRITER_LOCK", os.path.join(directory, "writer.lock"))
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        log("another Agent writer owns this gateway")
+        return 2
+    try:
+        _lifecycle = Lifecycle(sys.modules.get(__name__) or __import__("types").SimpleNamespace(**globals()))
+        # Firewall recovery is attempted before reading potentially corrupt network configuration.
+        _lifecycle.recover_firewall()
+        locator_path = os.path.join(os.path.dirname(lock_path), "network-writer-locator.json")
+        requested = os.environ.get("HELIOPAUSE_NETWORK_EXECUTOR", "") == "1"
+        config_path = os.environ.get("HELIOPAUSE_NETWORK_EXECUTOR_CONFIG", "/etc/heliopause/network-executor.json")
+        network_dir = os.environ.get("HELIOPAUSE_NETWORK_EXECUTOR_STATE_DIR", "/var/lib/heliopause/network-executor")
+        try:
+            if sys.argv[1:2] == ["--network-executor"]:
+                import argparse
+                parser = argparse.ArgumentParser()
+                parser.add_argument("--config", required=True)
+                parser.add_argument("--state-dir", required=True)
+                args = parser.parse_args(sys.argv[2:])
+                requested = True
+                config_path, network_dir = os.path.abspath(args.config), os.path.abspath(args.state_dir)
+            if os.path.exists(locator_path):
+                locator = read_json(locator_path)
+                if set(locator) != {"config", "stateDir"} or not all(isinstance(v, str) and os.path.isabs(v) for v in locator.values()):
+                    raise ValueError("invalid network writer locator")
+                if requested and (locator["config"] != os.path.abspath(config_path) or locator["stateDir"] != os.path.abspath(network_dir)):
+                    raise ValueError("network path migration requires offline reconciliation")
+                config_path, network_dir = locator["config"], locator["stateDir"]
+            if requested or os.path.exists(locator_path) or os.path.exists(os.path.join(network_dir, "transactions.json")):
+                # A known pending/retired transition must not recreate its absent successor.
+                assert_active_journal(network_dir)
+                cfg = read_json(config_path)
+                previous_errors = dict(_lifecycle.errors)
+                _lifecycle = Lifecycle(sys.modules.get(__name__) or __import__("types").SimpleNamespace(**globals()), cfg, network_dir, requested)
+                _lifecycle.errors.update(previous_errors)
+                # Existing journals are mandatory even when new acceptance is disabled.
+                _lifecycle.executor.load()
+                _lifecycle.recover()
+                atomic(locator_path, {"config": os.path.abspath(config_path), "stateDir": os.path.abspath(network_dir)})
+                check_admission_epoch(network_dir)
+        except Exception:
+            _lifecycle.error("network-configuration", "network-binding-or-journal-unavailable")
+        try:
+            return main()
+        finally:
+            _lifecycle.close()
+    finally:
+        os.close(fd)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run_writer_mode())

@@ -58,7 +58,8 @@ export interface NavCaller {
 
 function shows(item: AppNavItem, caller: NavCaller | null): boolean {
   if (item.for === "admin") return caller?.isAdmin === true;
-  if (item.for === "member") return caller?.via === "password";
+  // A member session, signed in by password or by a linked SSO account.
+  if (item.for === "member") return caller?.via === "password" || caller?.via === "sso";
   return true;
 }
 

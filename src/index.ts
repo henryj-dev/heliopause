@@ -323,3 +323,55 @@ export {
   type Plan,
   type PlanSummary,
 } from "./approval.ts";
+
+export {
+  validateNetworkInventory,
+  type NetworkManagement,
+  type NetworkResource,
+  type NetworkInventoryResource,
+  type NetworkInventoryIssue,
+  type InventorySite,
+  type InventoryNode,
+  type InventoryGateway,
+  type InventoryNetwork,
+  type InventorySubnet,
+  type InventoryAddressPool,
+  type InventoryInterface,
+  type InventoryRoute,
+  type InventoryRoutingDomain,
+  type InventoryDomainConnection,
+  type InventoryLearnedRoute,
+  type NetworkPurpose,
+  type AddressPoolPurpose,
+} from "./network-inventory.ts";
+
+export {
+  NetworkRegistryStore,
+  NetworkRegistryError,
+  MAX_NETWORK_REGISTRY_RESOURCES,
+  MAX_NETWORK_REGISTRY_INPUT_BYTES,
+  type NetworkRegistryDocument,
+  type NetworkRegistryRevision,
+  type NetworkRegistryMutation,
+} from "./network-registry.ts";
+
+export {
+  NetworkObservationStore,
+  validateNetworkObservation,
+  observationFreshness,
+  NETWORK_COLLECTOR_NAMES,
+  type NetworkObservationReport,
+  type NetworkObservationRecord,
+  type NetworkCollectorObservation,
+  type CollectorStatus,
+} from "./network-observation.ts";
+
+export { matchNetworkInventory, type NetworkIdentityBinding, type NetworkMatchStatus, type NetworkMatch, type NetworkMatchEvidence, type NetworkMatchingInput, type NetworkMatchingResult } from "./network-matching.ts";
+export { buildNetworkPlan, type NetworkPlanInput, type NetworkPlan, type NetworkPlanBlocker, type NetworkDependency } from "./network-planner.ts";
+export { compileWireGuard, type WireGuardSpec, type WireGuardGatewaySpec, type WireGuardCompilation } from "./network-wireguard.ts";
+export { compileFrr, type FrrSpec, type FrrPeerSpec, type FrrCompilation } from "./network-frr.ts";
+
+export { buildNetworkChangeSet, type NetworkChangeSetInput, type NetworkChangeSet, type NetworkChangeOperation } from "./network-change-set.ts";
+export { validatePrefixPolicy, type NetworkPrefixPolicy, type PrefixPermission } from "./network-prefix-policy.ts";
+
+export { authorizeNetworkExecution, networkExecutionHash, type NetworkExecutionDraft, type NetworkWireGuardOperation, type NetworkSignedEnvelope } from "./network-execution.ts";

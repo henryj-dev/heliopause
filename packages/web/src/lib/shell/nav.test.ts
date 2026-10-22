@@ -16,6 +16,7 @@ describe("app nav", () => {
     assert.deepEqual(keys({ via: "certificate", isAdmin: false }).slice(-2), ["routing", "policy"]);
     assert.deepEqual(keys({ via: "oidc", isAdmin: false }).slice(-2), ["routing", "policy"]);
     assert.deepEqual(keys({ via: "password", isAdmin: false }).slice(-2), ["policy", "account"]);
+    assert.deepEqual(keys({ via: "sso", isAdmin: false }).slice(-2), ["policy", "account"]);
     assert.deepEqual(keys({ via: "password", isAdmin: true }).slice(-2), ["account", "members"]);
     assert.deepEqual(navGroups({ via: "password", isAdmin: true }).map((g) => g.label), ["fleet", "evidence", "policy", "account"]);
   });

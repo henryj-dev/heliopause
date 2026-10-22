@@ -1,0 +1,800 @@
+{
+  "schemaVersion": 1,
+  "evidenceCases": [
+    {
+      "name": "plain source commit",
+      "field": "sourceCommit",
+      "value": "cccccccccccccccccccccccccccccccccccccccc",
+      "accepted": true
+    },
+    {
+      "name": "array source commit",
+      "field": "sourceCommit",
+      "value": [
+        "cccccccccccccccccccccccccccccccccccccccc"
+      ],
+      "accepted": false
+    },
+    {
+      "name": "null source commit",
+      "field": "sourceCommit",
+      "value": null,
+      "accepted": false
+    },
+    {
+      "name": "array transaction identity",
+      "field": "transactionId",
+      "value": [
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      ],
+      "accepted": false
+    },
+    {
+      "name": "array image hash",
+      "field": "imageSha256",
+      "value": [
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      ],
+      "accepted": false
+    },
+    {
+      "name": "array authorization hash",
+      "field": "authorizationHash",
+      "value": [
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      ],
+      "accepted": false
+    },
+    {
+      "name": "array module hash",
+      "field": "moduleManifestSha256",
+      "value": [
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      ],
+      "accepted": false
+    }
+  ],
+  "emptyJournalCounterCases": [
+    {
+      "name": "acceptedSequence zero",
+      "field": "acceptedSequence",
+      "value": 0,
+      "accepted": true
+    },
+    {
+      "name": "acceptedSequence boolean false",
+      "field": "acceptedSequence",
+      "value": false,
+      "accepted": false
+    },
+    {
+      "name": "acceptedSequence boolean true",
+      "field": "acceptedSequence",
+      "value": true,
+      "accepted": false
+    },
+    {
+      "name": "acceptedSequence null",
+      "field": "acceptedSequence",
+      "value": null,
+      "accepted": false
+    },
+    {
+      "name": "acceptedSequence string zero",
+      "field": "acceptedSequence",
+      "value": "0",
+      "accepted": false
+    },
+    {
+      "name": "acceptedSequence array",
+      "field": "acceptedSequence",
+      "value": [],
+      "accepted": false
+    },
+    {
+      "name": "acceptedSequence object",
+      "field": "acceptedSequence",
+      "value": {},
+      "accepted": false
+    },
+    {
+      "name": "acceptedSequence negative",
+      "field": "acceptedSequence",
+      "value": -1,
+      "accepted": false
+    },
+    {
+      "name": "acceptedSequence fraction",
+      "field": "acceptedSequence",
+      "value": 0.5,
+      "accepted": false
+    },
+    {
+      "name": "acceptedSequence unsafe integer",
+      "field": "acceptedSequence",
+      "value": 9007199254740992,
+      "accepted": false
+    },
+    {
+      "name": "terminalSequence zero",
+      "field": "terminalSequence",
+      "value": 0,
+      "accepted": true
+    },
+    {
+      "name": "terminalSequence boolean false",
+      "field": "terminalSequence",
+      "value": false,
+      "accepted": false
+    },
+    {
+      "name": "terminalSequence boolean true",
+      "field": "terminalSequence",
+      "value": true,
+      "accepted": false
+    },
+    {
+      "name": "terminalSequence null",
+      "field": "terminalSequence",
+      "value": null,
+      "accepted": false
+    },
+    {
+      "name": "terminalSequence string zero",
+      "field": "terminalSequence",
+      "value": "0",
+      "accepted": false
+    },
+    {
+      "name": "terminalSequence array",
+      "field": "terminalSequence",
+      "value": [],
+      "accepted": false
+    },
+    {
+      "name": "terminalSequence object",
+      "field": "terminalSequence",
+      "value": {},
+      "accepted": false
+    },
+    {
+      "name": "terminalSequence negative",
+      "field": "terminalSequence",
+      "value": -1,
+      "accepted": false
+    },
+    {
+      "name": "terminalSequence fraction",
+      "field": "terminalSequence",
+      "value": 0.5,
+      "accepted": false
+    },
+    {
+      "name": "terminalSequence unsafe integer",
+      "field": "terminalSequence",
+      "value": 9007199254740992,
+      "accepted": false
+    },
+    {
+      "name": "lastClock zero",
+      "field": "lastClock",
+      "value": 0,
+      "accepted": true
+    },
+    {
+      "name": "lastClock boolean false",
+      "field": "lastClock",
+      "value": false,
+      "accepted": false
+    },
+    {
+      "name": "lastClock boolean true",
+      "field": "lastClock",
+      "value": true,
+      "accepted": false
+    },
+    {
+      "name": "lastClock null",
+      "field": "lastClock",
+      "value": null,
+      "accepted": false
+    },
+    {
+      "name": "lastClock string zero",
+      "field": "lastClock",
+      "value": "0",
+      "accepted": false
+    },
+    {
+      "name": "lastClock array",
+      "field": "lastClock",
+      "value": [],
+      "accepted": false
+    },
+    {
+      "name": "lastClock object",
+      "field": "lastClock",
+      "value": {},
+      "accepted": false
+    },
+    {
+      "name": "lastClock negative",
+      "field": "lastClock",
+      "value": -1,
+      "accepted": false
+    },
+    {
+      "name": "lastClock fraction",
+      "field": "lastClock",
+      "value": 0.5,
+      "accepted": false
+    },
+    {
+      "name": "lastClock unsafe integer",
+      "field": "lastClock",
+      "value": 9007199254740992,
+      "accepted": false
+    },
+    {
+      "name": "finite future watermark",
+      "field": "lastClock",
+      "value": 8000000000000000,
+      "accepted": true
+    }
+  ],
+  "rawCounterTokenCases": [
+    {
+      "name": "zero integer token",
+      "field": "acceptedSequence",
+      "token": "0",
+      "records": 0,
+      "accepted": true
+    },
+    {
+      "name": "negative zero integer token",
+      "field": "terminalSequence",
+      "token": "-0",
+      "records": 0,
+      "accepted": true
+    },
+    {
+      "name": "nonempty integer accepted sequence",
+      "field": "acceptedSequence",
+      "token": "1",
+      "records": 1,
+      "accepted": true
+    },
+    {
+      "name": "nonempty integer terminal sequence",
+      "field": "terminalSequence",
+      "token": "1",
+      "records": 1,
+      "accepted": true
+    },
+    {
+      "name": "maximum future watermark token",
+      "field": "lastClock",
+      "token": "9007199254740991",
+      "records": 1,
+      "accepted": true
+    },
+    {
+      "name": "maximum watermark exceeded",
+      "field": "lastClock",
+      "token": "9007199254740992",
+      "records": 1,
+      "accepted": false
+    },
+    {
+      "name": "acceptedSequence unsupported token 0.0",
+      "field": "acceptedSequence",
+      "token": "0.0",
+      "records": 0,
+      "accepted": false
+    },
+    {
+      "name": "acceptedSequence unsupported token 0e0",
+      "field": "acceptedSequence",
+      "token": "0e0",
+      "records": 0,
+      "accepted": false
+    },
+    {
+      "name": "acceptedSequence unsupported token -0.0",
+      "field": "acceptedSequence",
+      "token": "-0.0",
+      "records": 0,
+      "accepted": false
+    },
+    {
+      "name": "acceptedSequence unsupported token 0e-999",
+      "field": "acceptedSequence",
+      "token": "0e-999",
+      "records": 0,
+      "accepted": false
+    },
+    {
+      "name": "acceptedSequence unsupported token 1.0",
+      "field": "acceptedSequence",
+      "token": "1.0",
+      "records": 1,
+      "accepted": false
+    },
+    {
+      "name": "acceptedSequence unsupported token 1e0",
+      "field": "acceptedSequence",
+      "token": "1e0",
+      "records": 1,
+      "accepted": false
+    },
+    {
+      "name": "acceptedSequence unsupported token 1.00000000000000000000001",
+      "field": "acceptedSequence",
+      "token": "1.00000000000000000000001",
+      "records": 1,
+      "accepted": false
+    },
+    {
+      "name": "terminalSequence unsupported token 0.0",
+      "field": "terminalSequence",
+      "token": "0.0",
+      "records": 0,
+      "accepted": false
+    },
+    {
+      "name": "terminalSequence unsupported token 0e0",
+      "field": "terminalSequence",
+      "token": "0e0",
+      "records": 0,
+      "accepted": false
+    },
+    {
+      "name": "terminalSequence unsupported token -0.0",
+      "field": "terminalSequence",
+      "token": "-0.0",
+      "records": 0,
+      "accepted": false
+    },
+    {
+      "name": "terminalSequence unsupported token 0e-999",
+      "field": "terminalSequence",
+      "token": "0e-999",
+      "records": 0,
+      "accepted": false
+    },
+    {
+      "name": "terminalSequence unsupported token 1.0",
+      "field": "terminalSequence",
+      "token": "1.0",
+      "records": 1,
+      "accepted": false
+    },
+    {
+      "name": "terminalSequence unsupported token 1e0",
+      "field": "terminalSequence",
+      "token": "1e0",
+      "records": 1,
+      "accepted": false
+    },
+    {
+      "name": "terminalSequence unsupported token 1.00000000000000000000001",
+      "field": "terminalSequence",
+      "token": "1.00000000000000000000001",
+      "records": 1,
+      "accepted": false
+    },
+    {
+      "name": "lastClock unsupported token 0.0",
+      "field": "lastClock",
+      "token": "0.0",
+      "records": 0,
+      "accepted": false
+    },
+    {
+      "name": "lastClock unsupported token 0e0",
+      "field": "lastClock",
+      "token": "0e0",
+      "records": 0,
+      "accepted": false
+    },
+    {
+      "name": "lastClock unsupported token -0.0",
+      "field": "lastClock",
+      "token": "-0.0",
+      "records": 0,
+      "accepted": false
+    },
+    {
+      "name": "lastClock unsupported token 0e-999",
+      "field": "lastClock",
+      "token": "0e-999",
+      "records": 0,
+      "accepted": false
+    },
+    {
+      "name": "lastClock unsupported token 1.0",
+      "field": "lastClock",
+      "token": "1.0",
+      "records": 1,
+      "accepted": false
+    },
+    {
+      "name": "lastClock unsupported token 1e0",
+      "field": "lastClock",
+      "token": "1e0",
+      "records": 1,
+      "accepted": false
+    },
+    {
+      "name": "lastClock unsupported token 1.00000000000000000000001",
+      "field": "lastClock",
+      "token": "1.00000000000000000000001",
+      "records": 1,
+      "accepted": false
+    }
+  ],
+  "rawCommittedNumberCases": [
+    {
+      "name": "agent/transactions/$tx/authorization/registryRevision integer",
+      "store": "agent",
+      "path": [
+        "transactions",
+        "$tx",
+        "authorization",
+        "registryRevision"
+      ],
+      "reserved": false,
+      "encoding": "integer",
+      "accepted": true
+    },
+    {
+      "name": "agent/transactions/$tx/authorization/registryRevision decimal",
+      "store": "agent",
+      "path": [
+        "transactions",
+        "$tx",
+        "authorization",
+        "registryRevision"
+      ],
+      "reserved": false,
+      "encoding": "decimal",
+      "accepted": false
+    },
+    {
+      "name": "agent/transactions/$tx/authorization/registryRevision exponent",
+      "store": "agent",
+      "path": [
+        "transactions",
+        "$tx",
+        "authorization",
+        "registryRevision"
+      ],
+      "reserved": false,
+      "encoding": "exponent",
+      "accepted": false
+    },
+    {
+      "name": "agent/transactions/$tx/terminalResult/sequence integer",
+      "store": "agent",
+      "path": [
+        "transactions",
+        "$tx",
+        "terminalResult",
+        "sequence"
+      ],
+      "reserved": false,
+      "encoding": "integer",
+      "accepted": true
+    },
+    {
+      "name": "agent/transactions/$tx/terminalResult/sequence decimal",
+      "store": "agent",
+      "path": [
+        "transactions",
+        "$tx",
+        "terminalResult",
+        "sequence"
+      ],
+      "reserved": false,
+      "encoding": "decimal",
+      "accepted": false
+    },
+    {
+      "name": "agent/transactions/$tx/terminalResult/sequence exponent",
+      "store": "agent",
+      "path": [
+        "transactions",
+        "$tx",
+        "terminalResult",
+        "sequence"
+      ],
+      "reserved": false,
+      "encoding": "exponent",
+      "accepted": false
+    },
+    {
+      "name": "identity/capacityCancellation/authorization/registryRevision integer",
+      "store": "identity",
+      "path": [
+        "capacityCancellation",
+        "authorization",
+        "registryRevision"
+      ],
+      "reserved": true,
+      "encoding": "integer",
+      "accepted": true
+    },
+    {
+      "name": "identity/capacityCancellation/authorization/registryRevision decimal",
+      "store": "identity",
+      "path": [
+        "capacityCancellation",
+        "authorization",
+        "registryRevision"
+      ],
+      "reserved": true,
+      "encoding": "decimal",
+      "accepted": false
+    },
+    {
+      "name": "identity/capacityCancellation/authorization/registryRevision exponent",
+      "store": "identity",
+      "path": [
+        "capacityCancellation",
+        "authorization",
+        "registryRevision"
+      ],
+      "reserved": true,
+      "encoding": "exponent",
+      "accepted": false
+    },
+    {
+      "name": "identity/capacityCancellation/terminalResult/sequence integer",
+      "store": "identity",
+      "path": [
+        "capacityCancellation",
+        "terminalResult",
+        "sequence"
+      ],
+      "reserved": true,
+      "encoding": "integer",
+      "accepted": true
+    },
+    {
+      "name": "identity/capacityCancellation/terminalResult/sequence decimal",
+      "store": "identity",
+      "path": [
+        "capacityCancellation",
+        "terminalResult",
+        "sequence"
+      ],
+      "reserved": true,
+      "encoding": "decimal",
+      "accepted": false
+    },
+    {
+      "name": "identity/capacityCancellation/terminalResult/sequence exponent",
+      "store": "identity",
+      "path": [
+        "capacityCancellation",
+        "terminalResult",
+        "sequence"
+      ],
+      "reserved": true,
+      "encoding": "exponent",
+      "accepted": false
+    },
+    {
+      "name": "outbox/0/sequence integer",
+      "store": "outbox",
+      "path": [
+        "0",
+        "sequence"
+      ],
+      "reserved": false,
+      "encoding": "integer",
+      "accepted": true
+    },
+    {
+      "name": "outbox/0/sequence decimal",
+      "store": "outbox",
+      "path": [
+        "0",
+        "sequence"
+      ],
+      "reserved": false,
+      "encoding": "decimal",
+      "accepted": false
+    },
+    {
+      "name": "outbox/0/sequence exponent",
+      "store": "outbox",
+      "path": [
+        "0",
+        "sequence"
+      ],
+      "reserved": false,
+      "encoding": "exponent",
+      "accepted": false
+    },
+    {
+      "name": "manager/execution/records/0/result/sequence integer",
+      "store": "manager",
+      "path": [
+        "execution",
+        "records",
+        "0",
+        "result",
+        "sequence"
+      ],
+      "reserved": false,
+      "encoding": "integer",
+      "accepted": true
+    },
+    {
+      "name": "manager/execution/records/0/result/sequence decimal",
+      "store": "manager",
+      "path": [
+        "execution",
+        "records",
+        "0",
+        "result",
+        "sequence"
+      ],
+      "reserved": false,
+      "encoding": "decimal",
+      "accepted": false
+    },
+    {
+      "name": "manager/execution/records/0/result/sequence exponent",
+      "store": "manager",
+      "path": [
+        "execution",
+        "records",
+        "0",
+        "result",
+        "sequence"
+      ],
+      "reserved": false,
+      "encoding": "exponent",
+      "accepted": false
+    },
+    {
+      "name": "evidence/files/$firstFile/bytes integer",
+      "store": "evidence",
+      "path": [
+        "files",
+        "$firstFile",
+        "bytes"
+      ],
+      "reserved": false,
+      "encoding": "integer",
+      "accepted": true
+    },
+    {
+      "name": "evidence/files/$firstFile/bytes decimal",
+      "store": "evidence",
+      "path": [
+        "files",
+        "$firstFile",
+        "bytes"
+      ],
+      "reserved": false,
+      "encoding": "decimal",
+      "accepted": false
+    },
+    {
+      "name": "evidence/files/$firstFile/bytes exponent",
+      "store": "evidence",
+      "path": [
+        "files",
+        "$firstFile",
+        "bytes"
+      ],
+      "reserved": false,
+      "encoding": "exponent",
+      "accepted": false
+    },
+    {
+      "name": "evidence/schemaVersion integer",
+      "store": "evidence",
+      "path": [
+        "schemaVersion"
+      ],
+      "reserved": false,
+      "encoding": "integer",
+      "accepted": true
+    },
+    {
+      "name": "evidence/schemaVersion decimal",
+      "store": "evidence",
+      "path": [
+        "schemaVersion"
+      ],
+      "reserved": false,
+      "encoding": "decimal",
+      "accepted": false
+    },
+    {
+      "name": "evidence/schemaVersion exponent",
+      "store": "evidence",
+      "path": [
+        "schemaVersion"
+      ],
+      "reserved": false,
+      "encoding": "exponent",
+      "accepted": false
+    }
+  ],
+  "rawUtf8ArchiveCases": [
+    {
+      "name": "real replacement character",
+      "hex": "7b22646961676e6f73746963223a22efbfbd227d",
+      "expected": {
+        "diagnostic": "\ufffd"
+      },
+      "managerArchiveParserAccepted": true,
+      "agentDecoderAccepted": true
+    },
+    {
+      "name": "multibyte Unicode",
+      "hex": "7b22646961676e6f73746963223a22ed959ceab88020f09f9a80227d",
+      "expected": {
+        "diagnostic": "\ud55c\uae00 \ud83d\ude80"
+      },
+      "managerArchiveParserAccepted": true,
+      "agentDecoderAccepted": true
+    },
+    {
+      "name": "stray byte",
+      "hex": "7b22646961676e6f73746963223a22ff227d",
+      "managerArchiveParserAccepted": false,
+      "agentDecoderAccepted": false
+    },
+    {
+      "name": "truncated sequence",
+      "hex": "7b22646961676e6f73746963223a22e282227d",
+      "managerArchiveParserAccepted": false,
+      "agentDecoderAccepted": false
+    },
+    {
+      "name": "overlong sequence",
+      "hex": "7b22646961676e6f73746963223a22c0af227d",
+      "managerArchiveParserAccepted": false,
+      "agentDecoderAccepted": false
+    },
+    {
+      "name": "encoded surrogate",
+      "hex": "7b22646961676e6f73746963223a22eda080227d",
+      "managerArchiveParserAccepted": false,
+      "agentDecoderAccepted": true,
+      "expected": {
+        "diagnostic": "\ud800"
+      }
+    },
+    {
+      "name": "above Unicode maximum",
+      "hex": "7b22646961676e6f73746963223a22f4908080227d",
+      "managerArchiveParserAccepted": false,
+      "agentDecoderAccepted": false
+    },
+    {
+      "name": "utf-16 with BOM",
+      "hex": "fffe7b00220064006900610067006e006f00730074006900630022003a00200022006c0065006700610063007900200065006e0063006f00640069006e0067002000660069007800740075007200650022007d00",
+      "managerArchiveParserAccepted": false,
+      "agentDecoderAccepted": true,
+      "expected": {
+        "diagnostic": "legacy encoding fixture"
+      }
+    },
+    {
+      "name": "utf-32 with BOM",
+      "hex": "fffe00007b00000022000000640000006900000061000000670000006e0000006f00000073000000740000006900000063000000220000003a00000020000000220000006c000000650000006700000061000000630000007900000020000000650000006e000000630000006f00000064000000690000006e000000670000002000000066000000690000007800000074000000750000007200000065000000220000007d000000",
+      "managerArchiveParserAccepted": false,
+      "agentDecoderAccepted": true,
+      "expected": {
+        "diagnostic": "legacy encoding fixture"
+      }
+    }
+  ]
+}

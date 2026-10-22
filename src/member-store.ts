@@ -76,7 +76,11 @@ export interface MemberContext {
 
 export class MemberError extends Error {
   readonly statusCode: number;
-  constructor(message: string, statusCode = 400) { super(message); this.statusCode = statusCode; }
+  /** A refusal a caller branches on, so it never has to parse `message`. Set only where one does. */
+  readonly code: "identity-tombstone" | "identity-taken" | undefined;
+  constructor(message: string, statusCode = 400, code?: "identity-tombstone" | "identity-taken") {
+    super(message); this.statusCode = statusCode; this.code = code;
+  }
 }
 const memberFailure = (message: string, statusCode?: number): Error => new MemberError(message, statusCode);
 
@@ -401,7 +405,9 @@ export function findByEmail(document: MemberDocument, email: string): Member | n
   return normalized === null ? null : document.members.find((m) => m.email === normalized) ?? null;
 }
 /**
- * Exact string match on issuer and subject; no URL normalization. Returns only a member that is not
+ * Exact string match on issuer and subject; no URL normalization. OIDC requires the configured,
+ * discovery and token issuer strings to match exactly. Changing a trailing slash is therefore an
+ * identity-key migration, not an alias this store accepts. Returns only a member that is not
  * deleted: a deleted member's identities are tombstones that block linking and identify no one.
  * @see member-store.test.ts "keeps a deleted member's identities as tombstones that cannot be linked again"
  */
@@ -409,6 +415,14 @@ export function findByIdentity(document: MemberDocument, issuer: string, subject
   const identity = document.identities.find((i) => i.issuer === issuer && i.subject === subject);
   const member = identity ? document.members.find((m) => m.id === identity.memberId) ?? null : null;
   return member && member.status !== "deleted" ? member : null;
+}
+/**
+ * The member an identity row names, in any status — deleted included. For sign-in, where a tombstone
+ * or a suspended member must refuse rather than fall through to the unlinked path.
+ */
+export function identityOwner(document: MemberDocument, issuer: string, subject: string): Member | null {
+  const identity = document.identities.find((i) => i.issuer === issuer && i.subject === subject);
+  return identity ? document.members.find((m) => m.id === identity.memberId) ?? null : null;
 }
 export function findByCertCN(document: MemberDocument, cn: string): Member | null {
   return document.members.find((m) => m.certCNs.includes(cn)) ?? null;
@@ -601,6 +615,22 @@ export function setOtpUserId(document: MemberDocument, memberId: string, value: 
   return member;
 }
 
+/**
+ * Allow or stop the member approving their own plans. The manager honours it only for a member
+ * session that passed its sign-in code with a confirmed otpUserId (`maySoloApprove`).
+ */
+export function setSoloApprove(document: MemberDocument, memberId: string, value: boolean, ctx: MemberContext): Member {
+  const member = requireNotDeleted(document, memberId);
+  member.soloApprove = bool(value, "soloApprove"); member.updatedAt = nowIso(ctx.now);
+  audit(document, ctx, value ? "member.solo-approve.on" : "member.solo-approve.off", memberId);
+  return member;
+}
+
+/** A short, stable handle for one identity, for routes and screens; it says nothing about the subject. */
+export function identityHandle(identity: Pick<MemberIdentity, "issuer" | "subject">): string {
+  return sha256(`${identity.issuer}\u0000${identity.subject}`).slice(0, 16);
+}
+
 function otpUserTaken(document: MemberDocument, value: string, exceptId: string | null): boolean {
   return document.members.some((m) => m.id !== exceptId && m.status !== "deleted" && m.otpUserId === value);
 }
@@ -643,7 +673,9 @@ export function linkIdentity(document: MemberDocument, input: { memberId: string
   const existing = document.identities.find((i) => i.issuer === issuer && i.subject === subject);
   if (existing && existing.memberId !== input.memberId) {
     const deleted = document.members.find((m) => m.id === existing.memberId)?.status === "deleted";
-    throw new MemberError(deleted ? "this identity belonged to a deleted member and cannot be linked again" : "this identity is linked to another member", 409);
+    throw deleted
+      ? new MemberError("this identity belonged to a deleted member and cannot be linked again", 409, "identity-tombstone")
+      : new MemberError("this identity is linked to another member", 409, "identity-taken");
   }
   if (existing) return existing;
   const identity: MemberIdentity = { issuer, subject, memberId: input.memberId, linkedAt: nowIso(ctx.now), linkedBy: actorName(ctx.actor) };

@@ -36,6 +36,7 @@ cd "$(dirname "$0")/.."
 # the real count moves comfortably past — a floor that equals the count fails on the next commit.
 VALIDATE_FLOOR=250
 ENROLL_FLOOR=14
+DISCOVERY_FLOOR=18
 
 log="$(mktemp)"
 trap 'rm -f "$log"' EXIT
@@ -76,5 +77,29 @@ check_suite "test_validate.py" "$VALIDATE_FLOOR" || rc=1
 
 python3 agent/test_enroll.py 2>&1 | tee "$log"
 check_suite "test_enroll.py" "$ENROLL_FLOOR" || rc=1
+
+python3 agent/test_network_discovery.py 2>&1 | tee "$log"
+check_suite "test_network_discovery.py" "$DISCOVERY_FLOOR" || rc=1
+
+python3 agent/test_network_discovery_worker.py 2>&1 | tee "$log"
+check_suite "test_network_discovery_worker.py" 10 || rc=1
+
+python3 agent/test_network_nm_undo.py 2>&1 | tee "$log"
+check_suite "test_network_nm_undo.py" 9 || rc=1
+
+python3 agent/test_network_nm_executor.py 2>&1 | tee "$log"
+check_suite "test_network_nm_executor.py" 16 || rc=1
+
+python3 agent/test_network_nm_profile.py 2>&1 | tee "$log"
+check_suite "test_network_nm_profile.py" 14 || rc=1
+
+python3 agent/test_network_executor.py 2>&1 | tee "$log"
+check_suite "test_network_executor.py" 64 || rc=1
+
+python3 agent/test_network_lifecycle.py 2>&1 | tee "$log"
+check_suite "test_network_lifecycle.py" 25 || rc=1
+
+python3 agent/test_network_cancellation.py 2>&1 | tee "$log"
+check_suite "test_network_cancellation.py" 16 || rc=1
 
 exit "$rc"

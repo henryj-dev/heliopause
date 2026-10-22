@@ -8,8 +8,8 @@ import { closeSync, openSync, readSync, writeSync } from "node:fs";
 import { isatty } from "node:tty";
 import { parsePairs } from "../src/env-spec.ts";
 import {
-  createMember, findByUsername, initializeMemberDocument, loadMemberDocument, normalizeEmail, normalizeMemberName,
-  passwordCredential, recordAudit, setPassword, suspendMember, unsuspendMember, withMemberTransaction, type MemberContext,
+  createMember, findByUsername, identityHandle, initializeMemberDocument, loadMemberDocument, normalizeEmail, normalizeMemberName,
+  passwordCredential, recordAudit, setPassword, setSoloApprove, suspendMember, unlinkIdentity, unsuspendMember, withMemberTransaction, type MemberContext,
 } from "../src/member-store.ts";
 import { installCliLanguage } from "../src/operator-i18n.ts";
 import { checkPasswordPolicy, hashPassword } from "../src/password.ts";
@@ -23,6 +23,8 @@ const usage = `usage:
   heliopause-members reset-password --store <members.json> --username NAME [--no-must-change] [--break-glass]
   heliopause-members suspend --store <members.json> --username NAME [--break-glass]
   heliopause-members unsuspend --store <members.json> --username NAME [--break-glass]
+  heliopause-members solo-approve --store <members.json> --username NAME --value on|off
+  heliopause-members unlink-identity --store <members.json> --username NAME --handle ID
   heliopause-members import --dry-run
 
 Passwords are read from the terminal without echo, or from stdin when it is not a terminal.
@@ -31,7 +33,11 @@ HELIOPAUSE_OTP_USERS and prints a draft; it never writes a file.
 A writer or admin signs in to the console with a one-time code checked against --otp-user-id
 (the KeyStone user id); without one the manager refuses that member's sign-in.
 --break-glass skips the "last admin who can sign in" rule (never the "last active admin" rule) and
-records a member.break-glass audit row.`;
+records a member.break-glass audit row.
+solo-approve lets a member approve their own plans; the manager honours it only for a session that
+passed its sign-in code with a confirmed --otp-user-id, and every approval still needs a code.
+unlink-identity removes one linked SSO identity; --handle is the id list --json and the console show.
+A member's last way in, and a deleted member's identities, are refused.`;
 
 /** The flags each command accepts; anything else is refused. */
 const COMMAND_FLAGS: Record<string, readonly string[]> = {
@@ -41,6 +47,8 @@ const COMMAND_FLAGS: Record<string, readonly string[]> = {
   "reset-password": ["store", "username", "no-must-change", "break-glass"],
   "suspend": ["store", "username", "break-glass"],
   "unsuspend": ["store", "username", "break-glass"],
+  "solo-approve": ["store", "username", "value"],
+  "unlink-identity": ["store", "username", "handle"],
   "import": ["dry-run"],
 };
 const BOOLEAN_FLAGS = new Set(["json", "dry-run", "no-must-change", "break-glass", "help"]);
@@ -234,10 +242,10 @@ try {
         const rows = document.members.map((m) => ({
           id: m.id, username: m.username, principalName: m.principalName, status: m.status, roles: m.roles,
           hasCredential: passwordCredential(document, m.id) !== null,
-          identities: document.identities.filter((i) => i.memberId === m.id).length,
+          identities: document.identities.filter((i) => i.memberId === m.id).map((i) => ({ id: identityHandle(i), issuer: i.issuer })),
         }));
         if (flags.has("json")) console.log(JSON.stringify({ members: rows }, null, 2));
-        else for (const r of rows) console.log(`${r.id}\t${r.username}\t${r.principalName}\t${r.status}\t${r.roles.join(",")}\tcredential=${r.hasCredential}\tidentities=${r.identities}`);
+        else for (const r of rows) console.log(`${r.id}\t${r.username}\t${r.principalName}\t${r.status}\t${r.roles.join(",")}\tcredential=${r.hasCredential}\tidentities=${r.identities.map((i) => i.id).join(",")}`);
       } else if (command === "reset-password") {
         const member = memberFor(store, required("username"));
         if (member.status === "deleted") throw new Error(`member ${member.username} is deleted`);
@@ -247,6 +255,21 @@ try {
           setPassword(document, member.id, hash, { mustChange: !flags.has("no-must-change") }, glassCtx());
         });
         console.log(`password reset for ${member.username}`);
+      } else if (command === "solo-approve") {
+        const value = required("value");
+        if (value !== "on" && value !== "off") throw usageError("--value must be on or off");
+        const id = memberFor(store, required("username")).id;
+        const member = withMemberTransaction(store, (document) => setSoloApprove(document, id, value === "on", ctx));
+        console.log(`${member.username}: solo approval ${member.soloApprove ? "on" : "off"}`);
+      } else if (command === "unlink-identity") {
+        const handle = required("handle");
+        const member = memberFor(store, required("username"));
+        withMemberTransaction(store, (document) => {
+          const target = document.identities.find((i) => i.memberId === member.id && identityHandle(i) === handle);
+          if (!target) throw new Error(`member ${member.username} has no linked identity ${handle}`);
+          unlinkIdentity(document, { memberId: member.id, issuer: target.issuer, subject: target.subject }, ctx);
+        });
+        console.log(`identity ${handle} unlinked from ${member.username}`);
       } else {
         const id = memberFor(store, required("username")).id;
         const member = withMemberTransaction(store, (document) => {
