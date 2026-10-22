@@ -891,5 +891,69 @@
       },
       "managerError": "Unexpected token"
     }
+  ],
+  "signedPayloadUtf8Cases": [
+    {
+      "name": "valid-replacement-scalar",
+      "domain": "heliopause-network-execution-v2",
+      "publicKey": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAyo/VkCZ0HFIt4yye2B/MMLD7ViM0JS8M2xRmBj/ZKQU=\n-----END PUBLIC KEY-----\n",
+      "envelope": {
+        "version": "heliopause-ed25519-v1",
+        "algorithm": "Ed25519",
+        "keyId": "sha256:88bba27dfdd783f95d8a0accee7726ff726d7694c6ab7fa4f2beab242691b698",
+        "payload": "eyJhcHByb3ZhbCI6eyJwbGFuSGFzaCI6InNoYTI1NjpkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkIn0sImFydGlmYWN0SGFzaCI6ImNjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2MiLCJqb3VybmFsSWQiOiJhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsIm5vdGUiOiLvv70iLCJyZWdpc3RyeVJldmlzaW9uIjoxLCJzY2hlbWFWZXJzaW9uIjoyLCJ0YXJnZXQiOnsiaG9zdCI6ImdhdGV3YXkiLCJub2RlSWQiOiJnYXRld2F5Iiwic291cmNlIjoibGFiIn0sInRyYW5zYWN0aW9uSWQiOiJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYiJ9",
+        "signature": "hkGxDYDvKu7f02mYOqSht7fs3wnmZmNdn8LlVrvJCThOMMi9a9kUppBYpDqhzrsx4rBxAwONXtf2_zuUdbEYDQ"
+      },
+      "decoded": {
+        "schemaVersion": 2,
+        "transactionId": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "journalId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "target": {
+          "source": "lab",
+          "host": "gateway",
+          "nodeId": "gateway"
+        },
+        "registryRevision": 1,
+        "artifactHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "approval": {
+          "planHash": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+        },
+        "note": "\ufffd"
+      },
+      "managerAccepted": true,
+      "agentSignedDecoderAccepted": true,
+      "scope": "Preserved synthetic public-only fixture, valid raw-byte signature; decoder boundary, not full schema equivalence."
+    },
+    {
+      "name": "invalid-utf8-signed-bytes",
+      "domain": "heliopause-network-execution-v2",
+      "publicKey": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAf+U7NyM9xtmgjxGmcfuUSA8i87TI1uE2+IGMUw8THGM=\n-----END PUBLIC KEY-----\n",
+      "envelope": {
+        "version": "heliopause-ed25519-v1",
+        "algorithm": "Ed25519",
+        "keyId": "sha256:134f0c80dc93e1b1071d57b2b02836837780fb4a885bec2ea3520bebd2555b38",
+        "payload": "eyJhcHByb3ZhbCI6eyJwbGFuSGFzaCI6InNoYTI1NjpkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkIn0sImFydGlmYWN0SGFzaCI6ImNjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2MiLCJqb3VybmFsSWQiOiJhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsIm5vdGUiOiL_IiwicmVnaXN0cnlSZXZpc2lvbiI6MSwic2NoZW1hVmVyc2lvbiI6MiwidGFyZ2V0Ijp7Imhvc3QiOiJnYXRld2F5Iiwibm9kZUlkIjoiZ2F0ZXdheSIsInNvdXJjZSI6ImxhYiJ9LCJ0cmFuc2FjdGlvbklkIjoiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmIifQ",
+        "signature": "cyPBUUXxFZdgp-b0i2E0HOvJ2-Lq-O2htx2F2VlEzO30UQw2qaSMxa8dRMH-FfsSSSrgieM_BxNrIk0P02u-Aw"
+      },
+      "decoded": {
+        "schemaVersion": 2,
+        "transactionId": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "journalId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "target": {
+          "source": "lab",
+          "host": "gateway",
+          "nodeId": "gateway"
+        },
+        "registryRevision": 1,
+        "artifactHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "approval": {
+          "planHash": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+        },
+        "note": "\ufffd"
+      },
+      "managerAccepted": false,
+      "agentSignedDecoderAccepted": false,
+      "scope": "Preserved synthetic public-only fixture, valid raw-byte signature; decoder boundary, not full schema equivalence."
+    }
   ]
 }

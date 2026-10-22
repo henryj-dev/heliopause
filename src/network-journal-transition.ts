@@ -5,6 +5,7 @@ import { validateJournalEvidence, type JournalEvidenceManifest } from './network
  * No confirmed ownership transfer, partial pruning, unlock, or implicit certificate rebinding.
  */
 import { isIP } from 'node:net';
+import { isUtf8 } from 'node:buffer';
 import { isAbsolute, normalize } from 'node:path';
 import { createHash, createPublicKey, verify, type KeyObject } from 'node:crypto';
 import { artifactSigningKeyId } from './artifact-signature.ts';
@@ -135,7 +136,11 @@ export function verifyJournalMessage(envelope:NetworkSignedEnvelope,domain:strin
   if(!key||signature.length!==64)throw new Error('untrusted transition signature');
   const signatureValid=verify(null,Buffer.concat([frame(Buffer.from(domain)),frame(Buffer.from(envelope.keyId)),frame(payload)]),key,signature);
   if(!signatureValid)throw new Error('untrusted transition signature');
-  const parsed=JSON.parse(payload.toString());need(canonicalNetworkJson(parsed)===payload.toString(),'noncanonical transition message');return parsed;
+  // A signed raw byte sequence must survive decoding without replacement characters.
+  // The outer archive UTF-8 guard cannot inspect bytes inside a base64 payload.
+  need(isUtf8(payload),'invalid signed journal payload UTF-8');
+  const parsed=JSON.parse(payload.toString('utf8'));
+  need(Buffer.from(canonicalNetworkJson(parsed),'utf8').equals(payload),'noncanonical transition message');return parsed;
 }
 
 /** The exact archive is approved before any capacity is reclaimed. Existing Registry kernel

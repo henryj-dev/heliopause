@@ -495,4 +495,24 @@ for index,entry in enumerate(CONTRACT['rawUtf8ArchiveCases']):
     setattr(ArchiveUtf8Decoding,'test_shared_utf8_archive_'+str(index),utf8_archive_contract_test(entry))
 
 
+class SignedPayloadUtf8Decoding(unittest.TestCase):
+    """Fixed payload decoder contract; no process/socket calls."""
+
+
+def signed_utf8_contract_test(entry):
+    def run(self):
+        raw=base64.urlsafe_b64decode(entry['envelope']['payload']+'==')
+        with patch.object(subprocess,'Popen',side_effect=AssertionError('decoder process escaped')),patch.object(socket,'socket',side_effect=AssertionError('decoder socket escaped')):
+            provider=REAL_CRYPTO_HELPERS('.')
+            if entry['agentSignedDecoderAccepted']:
+                self.assertEqual(provider._strict_json(raw),entry['decoded'])
+            else:
+                with self.assertRaises(UnicodeDecodeError):provider._strict_json(raw)
+    return run
+
+
+for index,entry in enumerate(CONTRACT['signedPayloadUtf8Cases']):
+    setattr(SignedPayloadUtf8Decoding,'test_shared_signed_payload_utf8_'+str(index),signed_utf8_contract_test(entry))
+
+
 if __name__=='__main__':unittest.main()

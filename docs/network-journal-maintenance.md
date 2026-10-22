@@ -247,3 +247,10 @@ Manager archive creation, loading, evidence attachment validation and signed tra
 If encoding validation fails, preserve the original archive and reconcile its provenance. Do not repair the bytes in place, approve a normalized copy as the original, or clear the old journal. A paired compatible rollout and the existing full-archive/two-person transition checks remain required.
 
 The shared byte fixtures record decoder-specific outcomes. Python's existing byte JSON decoder also accepts UTF-16/32 with a BOM and UTF-8 encoded surrogate bytes; Manager archive parsing refuses them. This stricter Manager behavior prevents approval of bytes the Agent would later reject without changing the Agent's common config/mailbox/journal decoder. It does not claim that every byte representation accepted by either decoder is a supported archive. Any Agent-wide encoding restriction requires separate compatibility qualification.
+
+
+### Signed payload byte boundary
+
+Manager journal verification checks strict UTF-8 on the original signed payload bytes before decoding them, then compares canonical UTF-8 bytes directly with those signed bytes. The outer archive encoding check does not inspect a base64-encoded payload. A malformed payload is refused even if its raw-byte signature is valid; it is never repaired by replacement decoding. An actual U+FFFD scalar remains valid where its field permits it. Historical execution/cancellation/confirmation verification and transition commit share this boundary.
+
+The shared fixed fixtures contain public material from a synthetic test and record the Manager and Agent signed-decoder outcomes separately. This change leaves the Agent decoder, base64 representation policy and byte budgets unchanged; it does not establish whole-schema or whole-decoder equivalence. Preserve unsupported original archives and reconcile their provenance instead of normalizing them. Standard regression checks cover repeated commit refusal with unchanged Registry/archive bytes; actual VM rollout and boot qualification remain separate.
