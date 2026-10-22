@@ -5,7 +5,7 @@ import { mkdtempSync, readFileSync, writeFileSync, rmSync, unlinkSync, symlinkSy
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { generateKeyPairSync, createHash } from 'node:crypto';
-import { createJournalArchive, loadJournalArchive } from './network-journal-archive.ts';
+import { createJournalArchive, loadJournalArchive, parseJournalArchiveFile } from './network-journal-archive.ts';
 import { NetworkRegistryStore } from './network-registry.ts';
 import { emptyApprovals, propose, approve } from './approval.ts';
 import { signNetworkMessage } from './network-execution.ts';
@@ -266,5 +266,46 @@ for(const stage of ['create','load'] as const)test('archive '+stage+' refuses ma
    assert.throws(()=>loadJournalArchive(f.archiveDirectory),/UTF-8/);assert.deepEqual(readFileSync(join(f.archiveDirectory,'evidence',name)),raw);
   }
   assert.deepEqual(readFileSync(f.store.path),before);
+ }finally{f.cleanup();}
+});
+
+
+for (const [name,history] of [
+ ['missing history',undefined],['empty history',[]],['extra entry',[{state:'cancelled-before-accept',at:1},{state:'cancelled-before-accept',at:2}]],
+ ['wrong state',[{state:'confirmed',at:1}]],['extra field',[{state:'cancelled-before-accept',at:1,padding:'synthetic'}]],
+ ['boolean timestamp',[{state:'cancelled-before-accept',at:false}]],['fraction timestamp',[{state:'cancelled-before-accept',at:1.5}]],
+ ['negative timestamp',[{state:'cancelled-before-accept',at:-1}]],['unsafe timestamp',[{state:'cancelled-before-accept',at:Number.MAX_SAFE_INTEGER+1}]],
+] as const)test('capacity history refuses '+name+' without changing Manager state',()=>{
+ const f=capacityArchive();try{
+  const before=readFileSync(f.store.path);f.archive.identity.capacityCancellation.history=history;f.sync();
+  assert.throws(()=>validateQuiescentArchive(f.archive,f.target),/capacity|integer JSON token/);assert.deepEqual(readFileSync(f.store.path),before);
+ }finally{f.cleanup();}
+});
+for(const at of [0,Number.MAX_SAFE_INTEGER])test('capacity history accepts producer integer bound '+at,()=>{
+ const f=capacityArchive();try{f.archive.identity.capacityCancellation.history[0].at=at;f.sync();validateQuiescentArchive(f.archive,f.target);}finally{f.cleanup();}
+});
+for(const token of ['1.0','1e0'])test('signed raw capacity history '+token+' cannot commit or alter original archive',()=>{
+ const f=capacityArchive();try{
+  const draft=f.draft(),before=readFileSync(f.store.path);f.archive.identity.capacityCancellation.history[0].at=1;f.sync();
+  const raw=Buffer.from(f.archive.rawFiles.identity,'base64url').toString().replace('"at":1','"at":'+token);
+  assert.notEqual(raw,Buffer.from(f.archive.rawFiles.identity,'base64url').toString());f.archive.rawFiles.identity=Buffer.from(raw).toString('base64url');f.archive.identity=JSON.parse(raw);
+  assert.throws(()=>parseJournalArchiveFile('identity',Buffer.from(raw)),/integer JSON token/);
+  const path=join(f.archiveDirectory,'journal-identity.json'),manifestPath=join(f.archiveDirectory,'manifest.json'),manifest=JSON.parse(readFileSync(manifestPath,'utf8'));
+  writeFileSync(path,raw);manifest.files['journal-identity.json']={sha256:createHash('sha256').update(raw).digest('hex'),bytes:Buffer.byteLength(raw)};writeFileSync(manifestPath,JSON.stringify(manifest));
+  const manifestBefore=readFileSync(manifestPath);draft.archiveHash=networkDigest(f.archive.rawFiles);
+  const authority=signNetworkMessage(JOURNAL_TRANSITION_DOMAIN,{...draft,approval:{mode:'two-person',planHash:journalTransitionHash(draft),proposedBy:'alice',approvedBy:'bob',approvedAt:f.now}},f.keys.privateKey);
+  for(let i=0;i<2;i++)assert.throws(()=>commitManagerJournalTransition(f.store,f.archive,authority,[f.keys.publicKey],f.keys.privateKey,f.archiveDirectory,f.now),/integer JSON token/);
+  assert.deepEqual(readFileSync(f.store.path),before);assert.equal(readFileSync(path,'utf8'),raw);assert.deepEqual(readFileSync(manifestPath),manifestBefore);
+ }finally{f.cleanup();}
+});
+test('signed unused config surrogate cannot retire Manager state',()=>{
+ const f=fixture();try{
+  const draft=f.draft(),before=readFileSync(f.store.path);f.archive.config.terminalDelivery={url:'https://192.0.2.1:8443/api/network/execution/terminal',caFile:'/etc/heliopause/ca.pem',certFile:'/etc/heliopause/\ud800.pem',keyFile:'/etc/heliopause/leaf.key'};f.sync();
+  const raw=Buffer.from(f.archive.rawFiles.config,'base64url'),path=join(f.archiveDirectory,'network-executor-config.json'),manifestPath=join(f.archiveDirectory,'manifest.json'),manifest=JSON.parse(readFileSync(manifestPath,'utf8'));
+  writeFileSync(path,raw);manifest.files['network-executor-config.json']={sha256:createHash('sha256').update(raw).digest('hex'),bytes:raw.length};writeFileSync(manifestPath,JSON.stringify(manifest));
+  draft.archiveHash=networkDigest(f.archive.rawFiles);draft.configHash=manifest.files['network-executor-config.json'].sha256;
+  const authority=signNetworkMessage(JOURNAL_TRANSITION_DOMAIN,{...draft,approval:{mode:'two-person',planHash:journalTransitionHash(draft),proposedBy:'alice',approvedBy:'bob',approvedAt:f.now}},f.keys.privateKey);
+  for(let i=0;i<2;i++)assert.throws(()=>commitManagerJournalTransition(f.store,f.archive,authority,[f.keys.publicKey],f.keys.privateKey,f.archiveDirectory,f.now),/surrogate/);
+  assert.deepEqual(readFileSync(f.store.path),before);assert.deepEqual(readFileSync(path),raw);
  }finally{f.cleanup();}
 });

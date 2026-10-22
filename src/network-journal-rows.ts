@@ -9,6 +9,10 @@ export function journalRows(agent:any,identity:any):Record<string,any> {
   if(!Object.hasOwn(identity,'capacityCancellation'))return rows;
   if(Buffer.byteLength(JSON.stringify(identity))>512*1024)fail();
   const row=identity.capacityCancellation,a=row?.authorization,r=row?.terminalResult,c=row?.cancellation;
+  // The Agent creates exactly one timestamped cancellation entry. Arbitrary history values
+  // can have different canonical byte lengths in Python and JavaScript near the sidecar bound.
+  const history=row?.history;
+  if(!Array.isArray(history)||history.length!==1||!history[0]||typeof history[0]!=='object'||Array.isArray(history[0])||Object.keys(history[0]).sort().join(' ')!=='at state'||history[0].state!=='cancelled-before-accept'||!Number.isSafeInteger(history[0].at)||history[0].at<0)fail();
   if(!row||Object.keys(row).sort().join(' ')!=='authorization authorizationHash cancellation history state terminalResult'||!a||!r||!c||!/^[a-f0-9]{32}$/.test(a.transactionId)||a.journalId!==agent.journalId||Object.hasOwn(rows,a.transactionId)||Object.keys(rows).length>=1024||Object.values(rows).some((v:any)=>!['rolled-back','cancelled-before-accept'].includes(v.state)||['bootRestore','before','paths'].some(k=>Object.hasOwn(v,k))))fail();
   if(Object.keys(r).sort().join(' ')!=='artifactHash authorizationHash domain fenceId journalId proof registryRevision schemaVersion sequence state stateHash target transactionId')fail();
   if(row.state!=='cancelled-before-accept'||row.authorizationHash!==networkDigest(a)||r.schemaVersion!==3||r.domain!==NETWORK_CAPACITY_RESULT_DOMAIN||r.state!==row.state||r.authorizationHash!==networkDigest(a)||r.sequence!==agent.terminalSequence+1||!Number.isSafeInteger(r.sequence)||r.sequence>1024||r.sequence<1||r.fenceId!==a.transactionId)fail();

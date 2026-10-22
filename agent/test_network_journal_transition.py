@@ -482,6 +482,9 @@ def utf8_archive_contract_test(entry):
         raw=bytes.fromhex(entry['hex'])
         if entry['agentDecoderAccepted']:
             self.assertEqual(n.decode_json(raw),entry['expected'])
+        elif 'agentError' in entry:
+            with self.assertRaisesRegex(ValueError,entry['agentError']):
+                n.decode_json(raw)
         else:
             with self.assertRaises(UnicodeDecodeError):
                 n.decode_json(raw)
