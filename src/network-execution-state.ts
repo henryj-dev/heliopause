@@ -4,12 +4,13 @@ import type { NetworkSignedEnvelope } from './network-execution.ts';
 export const NETWORK_EXECUTION_CAPACITY=256;
 export const NETWORK_TERMINAL_DOMAIN='heliopause-network-terminal-mtls-v1';
 export const NETWORK_CANCELLATION_RESULT_DOMAIN='heliopause-network-cancellation-mtls-v1';
+export const NETWORK_CAPACITY_RESULT_DOMAIN='heliopause-network-capacity-stop-mtls-v1';
 export interface NetworkTarget { source:string;host:string;nodeId:string }
 export interface NetworkTerminalResult {
-  schemaVersion:1|2;domain:typeof NETWORK_TERMINAL_DOMAIN|typeof NETWORK_CANCELLATION_RESULT_DOMAIN;transactionId:string;fenceId:string;
+  schemaVersion:1|2|3;domain:typeof NETWORK_TERMINAL_DOMAIN|typeof NETWORK_CANCELLATION_RESULT_DOMAIN|typeof NETWORK_CAPACITY_RESULT_DOMAIN;transactionId:string;fenceId:string;
   target:NetworkTarget;journalId:string;authorizationHash:string;artifactHash:string;registryRevision:number;
   state:'confirmed'|'rolled-back'|'cancelled-before-accept'|'cancellation-rejected';sequence:number;stateHash:string;
-  proof:{confirmationHash:string;verificationHash:string}|{removalVerified:true}|{cancellationHash:string;acceptancePrevented:true}|{cancellationHash:string;acceptedState:string};
+  proof:{confirmationHash:string;verificationHash:string}|{removalVerified:true}|{cancellationHash:string;acceptancePrevented:true}|{cancellationHash:string;acceptedState:string}|{cancellationHash:string;acceptancePrevented:true;maintenanceRequired:true};
 }
 export interface NetworkExecutionRecord {
   sequence:number;transactionId:string;fenceId:string;planHash:string;authorization:NetworkSignedEnvelope;
@@ -22,7 +23,8 @@ export interface NetworkExecutionRecord {
   audit:Array<{action:string;actor:string;at:number;reason?:string}>;
 }
 export interface NetworkExecutionState {
-  schemaVersion:1;nextSequence:number;
+  schemaVersion:1|2;nextSequence:number;
+  capacityHold?:{target:NetworkTarget;journalId:string;transactionId:string;authorizationHash:string;resultHash:string};
   fence:null|{transactionId:string;fenceId:string;authorizationHash:string;registryRevision:number};
   records:NetworkExecutionRecord[];
   /** Scope-A retirement tombstones, never pruned. After transition this Registry is single-target. */
@@ -30,7 +32,7 @@ export interface NetworkExecutionState {
 }
 const hex=(v:unknown)=>typeof v==='string'&&/^[a-f0-9]{64}$/.test(v);
 export function validateExecutionState(state:NetworkExecutionState):void {
-  if(!state||state.schemaVersion!==1||!Array.isArray(state.records)||state.records.length>NETWORK_EXECUTION_CAPACITY||state.nextSequence!==state.records.length+1) throw new Error('invalid execution ledger');
+  if(!state||![1,2].includes(state.schemaVersion)||!Array.isArray(state.records)||state.records.length>NETWORK_EXECUTION_CAPACITY||state.nextSequence!==state.records.length+1) throw new Error('invalid execution ledger');
   if(state.journalEpoch) {
     const e=state.journalEpoch,retired=new Set<string>();let prior:string|undefined;
     if(!/^[a-f0-9]{32}$/.test(e.journalId)||!e.target||Object.keys(e.target).sort().join(' ')!=='host nodeId source'||Object.values(e.target).some(v=>typeof v!=='string'||!/^[A-Za-z0-9_.-]{1,64}$/.test(v))||!Array.isArray(e.transitions)||!e.transitions.length||e.transitions.length>256) throw new Error('invalid journal epoch');
@@ -57,6 +59,16 @@ export function validateExecutionState(state:NetworkExecutionState):void {
     } else if(r.cancelStatus||r.cancellationResponse||r.cancellationResponseHash) throw new Error('orphan cancellation state');
     if(r.state==='settled'&&(!r.result||networkDigest(r.result)!==r.resultHash||!Number.isSafeInteger(r.settledAt)||!r.settledBy)) throw new Error('invalid settlement');
     ids.add(r.transactionId);
+  }
+  // A schema bump is intentional: older Managers must reject this durable issuance hold.
+  if(state.schemaVersion===1&&state.capacityHold||state.schemaVersion===2&&!state.capacityHold)throw new Error('capacity schema/hold mismatch');
+  const stops=state.records.filter(r=>r.result?.schemaVersion===3||r.result?.domain===NETWORK_CAPACITY_RESULT_DOMAIN);
+  if(stops.length&&(stops.length!==1||!state.capacityHold||state.schemaVersion!==2||stops[0]!==state.records.at(-1)||stops[0]!.transactionId!==state.capacityHold.transactionId))throw new Error('capacity result requires final durable hold');
+  if(state.capacityHold) {
+    const h=state.capacityHold,r=state.records.find(r=>r.transactionId===h.transactionId);
+    if(state.records.some(prior=>prior!==r&&(prior.state!=='settled'||!prior.result||!['rolled-back','cancelled-before-accept'].includes(prior.result.state))))throw new Error('capacity hold requires resource-free settled history');
+    if(r?.result){const {stateHash,...committed}=r.result;if(stateHash!==networkDigest(committed))throw new Error('capacity result persistence mismatch');}
+    if(Object.keys(h).sort().join(' ')!=='authorizationHash journalId resultHash target transactionId'||!r||r.state!=='settled'||!r.result||r.result.schemaVersion!==3||r.result.domain!==NETWORK_CAPACITY_RESULT_DOMAIN||r.result.state!=='cancelled-before-accept'||!r.cancellation||networkDigest(r.result.proof)!==networkDigest({cancellationHash:networkDigest(JSON.parse(Buffer.from(r.cancellation.payload,'base64url').toString())),acceptancePrevented:true,maintenanceRequired:true})||r.authorizationHash!==h.authorizationHash||r.resultHash!==h.resultHash||r.journalId!==h.journalId||networkDigest(r.target)!==networkDigest(h.target)||state.fence!==null)throw new Error('invalid capacity maintenance hold');
   }
   const pending=state.records.filter(r=>r.state!=='settled');
   if(state.fence===null?pending.length!==0:pending.length!==1||pending[0]!.transactionId!==state.fence.transactionId||pending[0]!.fenceId!==state.fence.fenceId||pending[0]!.authorizationHash!==state.fence.authorizationHash||pending[0]!.registryRevision!==state.fence.registryRevision) throw new Error('execution fence/record mismatch');

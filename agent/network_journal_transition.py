@@ -60,7 +60,7 @@ def read_archive(path):
             raw=read_at(fd,file,(4 if name=='manager' else 8)*1024*1024)
             need(manifest['files'][file]=={'sha256':hashlib.sha256(raw).hexdigest(),'bytes':len(raw)},'archive file hash mismatch')
             parsed[name]=n.decode_json(raw);reject_credentials(parsed[name]);raw_files[name]=base64.urlsafe_b64encode(raw).decode().rstrip('=')
-        validate_evidence(parsed['evidence'],parsed['agent']['transactions'])
+        validate_evidence(parsed['evidence'],n.capacity_rows(parsed['agent'],parsed['identity']))
         evidence_fd=secure_directory(Path(path)/'evidence')
         try:
             need(set(os.listdir(evidence_fd))==set(parsed['evidence']['files']),'missing/extra execution evidence files')
@@ -139,14 +139,38 @@ def validate_authority(config,archive,envelope,receipt,provider):
     return t
 
 
+def integer_contract_encoding(value):
+    """Committed execution/cancellation/result objects define only integer numbers.
+
+    Decimal/exponent tokens parse as float even when mathematically integral. Do not
+    normalize them: that would change the original bytes and Python's committed digest.
+    History/monotonic measurements are deliberately outside these exact substructures.
+    """
+    need(type(value) is not float,'unsupported committed integer JSON token encoding')
+    if isinstance(value,dict):
+        for child in value.values():integer_contract_encoding(child)
+    elif isinstance(value,list):
+        for child in value:integer_contract_encoding(child)
+
+
 def validate_quiescent_core(archive,target,old_id):
     old=archive['agent'];manager=archive['manager']['execution']
-    need(old['schemaVersion']==2 and old['journalId']==old_id and archive['identity']=={'journalId':old_id} and manager['fence'] is None,'quiescent identities/fence required')
-    need(len(old['transactions'])==old['acceptedSequence']==old['terminalSequence']==len(manager['records'])==len(archive['outbox'])==len(archive['acknowledgments']),'complete terminal archive required')
-    need(len({r['transactionId'] for r in manager['records']})==len(manager['records']) and {r['transactionId'] for r in manager['records']}==set(old['transactions']),'Manager/Agent record identities differ')
+    need(n.valid_replay_counters(old),'invalid Agent replay counters or clock')
+    rows=n.capacity_rows(old,archive['identity'])
+    for row in rows.values():
+        for field in ['authorization','cancellation','terminalResult','cancellationResponse']:
+            if field in row:integer_contract_encoding(row[field])
+    for result in archive['outbox']:integer_contract_encoding(result)
+    for record in manager['records']:
+        if 'sequence' in record:integer_contract_encoding(record['sequence'])
+        for field in ['result','cancellationResponse']:
+            if field in record:integer_contract_encoding(record[field])
+    need(old['schemaVersion']==2 and old['journalId']==old_id and manager['fence'] is None,'quiescent identities/fence required')
+    need(len(old['transactions'])==old['acceptedSequence']==old['terminalSequence'] and len(rows)==len(manager['records'])==len(archive['outbox'])==len(archive['acknowledgments']),'complete terminal archive required')
+    need(len({r['transactionId'] for r in manager['records']})==len(manager['records']) and {r['transactionId'] for r in manager['records']}==set(rows),'Manager/Agent record identities differ')
     outbox={row['transactionId']:row for row in archive['outbox']};need(len(outbox)==len(archive['outbox']),'duplicate outbox identity')
     for record in manager['records']:
-        row=old['transactions'][record['transactionId']];result=record['result']
+        row=rows[record['transactionId']];result=record['result']
         need(row['state'] in {'rolled-back','cancelled-before-accept'} and record['state']=='settled' and row.get('bootRestore') is None and 'before' not in row and 'paths' not in row,'confirmed resources or recovery debt forbid scope A')
         need(record['journalId']==old['journalId'] and record['target']==target and row['authorization']['target']==target and row['authorization']['journalId']==old['journalId'],'archive target mismatch')
         need(row['authorization']==n.decode_json(base64.urlsafe_b64decode(record['authorization']['payload']+'==')) and n.digest(row['authorization'])==record['authorizationHash'],'archive authorization mismatch')
@@ -216,8 +240,8 @@ def inspect_agent(config_path,directory,archive_path,writer_lock,absence=resourc
         for name in ['agent','identity','outbox','acknowledgments']:
             need(n.read_file(str(directory/FILES[name]))==base64.urlsafe_b64decode(archive['rawFiles'][name]+'=='),'Agent changed since archive')
         need(n.Executor(config,str(directory)).load()==archive['agent'],'Agent/archive mismatch')
-        for row in archive['agent']['transactions'].values():need(row['state'] in {'rolled-back','cancelled-before-accept'} and row.get('bootRestore') is None and 'before' not in row and 'paths' not in row,'confirmed resources or recovery debt forbid scope A')
-        absence(config,archive['agent'])
+        for row in n.capacity_rows(archive['agent'],archive['identity']).values():need(row['state'] in {'rolled-back','cancelled-before-accept'} and row.get('bootRestore') is None and 'before' not in row and 'paths' not in row,'confirmed resources or recovery debt forbid scope A')
+        absence(config,{**archive['agent'],'transactions':n.capacity_rows(archive['agent'],archive['identity'])})
         return {'readOnly':True,'oldJournalId':config['journalId'],'archiveHash':n.digest(archive['rawFiles']),'evidenceHash':hashlib.sha256(base64.urlsafe_b64decode(archive['rawFiles']['evidence']+'==')).hexdigest(),'readyForManagerReview':True}
     finally:
         if executor is not None:os.close(executor)
@@ -268,13 +292,14 @@ def apply_agent(config_path,directory,archive_path,envelope,receipt,writer_lock,
             need(progress['authorization']==envelope and progress['receipt']==receipt,'different pending transition refused')
             if progress['phase']=='complete':
                 need(config['journalId']==t['newJournalId'] and n.read_json(str(directory/'journal-identity.json'))=={'journalId':t['newJournalId']},'completed transition drift')
+                n.durable_admission_epoch(str(directory))
                 return {'committed':True,'duplicate':True,'journalId':t['newJournalId']}
-            absence(config,archive['agent'])
+            absence(config,{**archive['agent'],'transactions':n.capacity_rows(archive['agent'],archive['identity'])})
         else:
             need(config['journalId']==t['oldJournalId'] and hashlib.sha256(n.read_file(str(directory/'transactions.json'))).hexdigest()==t['agentHash'],'Agent changed since approved archive')
             current=n.Executor(config,str(directory))
             need(current.load()==archive['agent'],'current Agent/archive mismatch')
-            absence(config,archive['agent'])
+            absence(config,{**archive['agent'],'transactions':n.capacity_rows(archive['agent'],archive['identity'])})
             progress={'transitionHash':n.digest(t),'authorization':envelope,'receipt':receipt,'phase':'prepared'};n.atomic(str(marker),progress)
             event('intent-saved')
         def phase(value):

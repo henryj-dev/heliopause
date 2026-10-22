@@ -3,6 +3,9 @@
 Current key policy, read-only inventory and full24-hour baseline procedure are in
 [the lifecycle policy](../../docs/network-lifecycle-policy.md). Tool existence is not a completed
 long-duration or key-rotation result. Baseline and fault/rotation runs have separate identities.
+The baseline validates initial and subsequent Agent/Manager settlement agreement, including exact
+terminal results, outbox and acknowledgments; frozen file hashes alone are insufficient. Its replay
+inspection uses production read-only load and never initializes, repairs or recovers a journal.
 
 ## Persistent backend development (Phase 10)
 

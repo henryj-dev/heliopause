@@ -17,6 +17,8 @@ sys.path.insert(0,'/opt/heliopause/agent')
 sys.path.insert(0,'/source/agent')
 import network_executor as n
 from guest_fixture import guard
+from soak_inputs import source_modules, frozen_inputs
+from soak_settlement import agent_view, manager_view
 
 
 def command(args):
@@ -48,28 +50,40 @@ def process(unit):
     return result
 
 
+def load_journal(config, directory):
+    # No constructor/lock/save/recover: collection must never initialize or repair.
+    n.check_admission_epoch(str(directory))
+    reader=object.__new__(n.Executor);reader.config=config;reader.directory=str(directory);reader.path=str(directory/'transactions.json')
+    journal=reader.load()
+    if journal['schemaVersion']!=2:raise ValueError('baseline inventory requires schema2 journal')
+    return journal
+
+
 def snapshot(role):
     result={'at':time.time(),'bootId':n.current_boot_id(),'role':role,
             'systemdVersion':command(['rpm','-q','systemd']), 'clockTicksPerSecond':os.sysconf('SC_CLK_TCK'),
             'pageBytes':os.sysconf('SC_PAGE_SIZE')}
     base=Path('/var/lib/heliopause-vm-lab')
     if role=='peer':
-        registry=n.read_json(str(base/'registry.json'));state=registry['execution']
+        registry=n.read_json(str(base/'registry.json'));state=registry['execution'];cfg=n.read_json(str(base/'config.json'))
         result.update(manager=process('heliopause-vm-lab-manager.service'),relay=process('heliopause-vm-lab-relay.service'),
+                      settlement=manager_view(state['records'],n.digest),deployedModules=source_modules('/source'),frozenInputs=frozen_inputs(role,cfg),targetBinding={'journalId':cfg['journalId'],'identity':cfg['identity']},
                       ledger={'commitment':commitment(base/'registry.json'),'nextSequence':state['nextSequence'],
-                              'records':len(state['records']),'fence':state['fence'],
+                              'records':len(state['records']),'fence':state['fence'],'capacityHold':state.get('capacityHold'),'executionSchemaVersion':state['schemaVersion'],
                               'results':{r['transactionId']:r.get('resultHash') for r in state['records']}})
         result['at']=time.time()
         return result
     cfg=n.read_json('/etc/heliopause/network-executor.json');directory=Path('/var/lib/heliopause/network-executor')
-    journal=n.read_json(str(directory/'transactions.json'));provider=n.crypto_helpers(str(directory))
+    journal=load_journal(cfg,directory)
+    provider=n.crypto_helpers(str(directory))
     # _load_artifact_key_dir reads only public keys and invokes bounded OpenSSL pkey -pubin.
     trust={role:[row[0] for row in provider._load_artifact_key_dir(cfg[role+'Keys'],'manager')] for role in ['manager','verifier']}
     modulebase=Path('/opt/heliopause/agent');package=n.read_json('/source/package.json')
     modules={Path(name).name:commitment(modulebase/Path(name).name)['sha256'] for name in package['files'] if name.startswith('agent/') and name.endswith('.py')}
     status=n.read_json('/var/lib/heliopause-agent/lifecycle-status.json')
     rows={}
-    for tx,row in journal['transactions'].items():
+    identity=n.read_json(str(directory/'journal-identity.json'));effective=n.capacity_rows(journal,identity)
+    for tx,row in effective.items():
         rows[tx]={'state':row['state'],'bootRestore':{k:v for k,v in row.get('bootRestore',{}).items() if k in {'bootId','state','reason','recovery','currentConnectivity','diagnostic'}},
                   'diagnostic':row.get('diagnostic'),'authorizationHash':row.get('authorizationHash')}
         if row['state']=='confirmed' and row['authorization']['operation']['driver']==n.PERSISTENT_DRIVER:
@@ -86,9 +100,10 @@ def snapshot(role):
         except FileNotFoundError:files[name]={'missing':True}
     status=n.read_json('/var/lib/heliopause-agent/lifecycle-status.json')
     result.update(agent=process('heliopause-agent.service'),courier=process('heliopause-network-terminal.service'),
-                  networkManager=process('NetworkManager.service'),journalId=journal['journalId'],
-                  acceptedSequence=journal['acceptedSequence'],terminalSequence=journal['terminalSequence'],transactions=rows,
-                  files=files,journalContentHash=n.digest({k:v for k,v in journal.items() if k!='lastClock'}),trust=trust,deployedModules=modules,lifecycle=status)
+                  networkManager=process('NetworkManager.service'),targetBinding={'journalId':cfg['journalId'],'identity':cfg['identity']},journalId=journal['journalId'],
+                  acceptedSequence=journal['acceptedSequence'],terminalSequence=journal['terminalSequence'],effectiveAcceptedSequence=len(effective),effectiveTerminalSequence=journal['terminalSequence']+int('capacityCancellation' in identity),maintenanceRequired='capacityCancellation' in identity,transactions=rows,
+                  settlement=agent_view(effective,n.read_json(str(directory/'terminal-results.json')),n.read_json(str(directory/'terminal-acks.json')),n.digest),
+                  files=files,frozenInputs=frozen_inputs(role,cfg),journalContentHash=n.digest({k:v for k,v in journal.items() if k!='lastClock'}),trust=trust,deployedModules=modules,lifecycle=status)
     result['at']=time.time()
     return result
 

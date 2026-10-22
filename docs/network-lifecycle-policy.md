@@ -61,6 +61,10 @@ checks are separate from actual VM/storage-pressure qualification and independen
 Scope B (confirmed ownership/restoration carried across identity) remains unsupported. Never
 empty the journal because terminal delivery is done: confirmed ownership still depends on it.
 Manager256/Agent1024 and byte limits are finite; reserve workload budget before admission.
+Normal Agent admission stops at 1023 primary records; one bounded, resource-free
+never-accepted cancellation can use the last replay identity and persist a Manager
+issuance hold. See [the paired-rollout capacity-stop contract](network-journal-maintenance.md#capacity-stop-reservation-paired-rollout-required).
+Confirmed resources or recovery debt forbid that emergency reservation and scope-A retirement.
 No pruning, force-unlock or blind identity reuse is allowed.
 
 ## 24-hour baseline procedure
@@ -81,6 +85,35 @@ failure, journal reserve or process budget violation. The final monitor tail is 
 A crash/incomplete archive cannot produce a successful final result. Resource budgets are in the
 created plan; peak process bounds and average CPU checks are limited by the collection interval.
 Transient peaks between samples are not disproved.
+
+Both roles' installed runtime source commitments are compared with the clean source checkout,
+including the Manager/relay source and observation tools, package metadata and i18n dependencies.
+Configuration/public certificate and public trust commitments must remain equal to the initial
+sample. The collector refuses declared private-key inode aliases before opening a public input;
+it does not export private key material or establish that arbitrary source/config bytes are safe
+for publication. Reads require stable file identity/size/metadata before and after collection.
+Manager and Agent target/journal bindings must agree, and lifecycle status must belong to the
+current Agent PID. These disk measurements do not attest the running process memory or
+untracked dependency bytes. Repeated sampling cannot disprove changes between samples.
+
+Initial settlement is checked before the baseline is accepted, then again on every sample.
+A read-only production `Executor.load()` validates the Agent replay state without constructing
+an executor, taking a writer lock, saving, repairing or running recovery. Legacy recovery-only
+journals remain recoverable by the Agent, but cannot enter this baseline. The observer requires
+identical transaction sets, target/journal/authority/artifact/revision bindings, closed Agent states,
+settled Manager records, contiguous sequences, exact terminal result and outbox hashes, and
+literal-true acknowledgments. An unchanged initial file hash alone does not establish settlement.
+A retained acknowledgment for an intermediate cancellation response is permitted only when the
+Manager retains that exact cached response. An intermediate response replaced by the final outbox
+result need not have been delivered; it cannot carry an unexplained acknowledgment. These checks
+establish cross-store agreement, not external PKI provenance or whole-schema equivalence.
+
+The default console SSH ports remain22220/22221. For an explicitly identified pair on other
+ports, pass `--gateway-ssh-port PORT --peer-ssh-port PORT` to the production runner; the two
+ports must be distinct valid integers. Guest nonce checks still apply. Do not monkeypatch the
+transport or accidentally observe a different retained lab. These checks are prerequisites for a
+new final-source baseline; synthetic tests do not qualify a real24-hour run.
+
 
 This is a **zero-issuance baseline**, consuming0new ledger slots. Certificate rotation/fault injection
 must run separately, before/after this baseline, and retain their own identities and failure history.

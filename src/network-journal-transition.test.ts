@@ -1,16 +1,17 @@
 import { settleNetworkExecution } from './network-execution-settlement.ts';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, writeFileSync, rmSync, unlinkSync, symlinkSync, chmodSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, rmSync, unlinkSync, symlinkSync, chmodSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { generateKeyPairSync, createHash } from 'node:crypto';
-import { createJournalArchive } from './network-journal-archive.ts';
+import { createJournalArchive, loadJournalArchive } from './network-journal-archive.ts';
 import { NetworkRegistryStore } from './network-registry.ts';
 import { emptyApprovals, propose, approve } from './approval.ts';
 import { signNetworkMessage } from './network-execution.ts';
 import { artifactSigningKeyId } from './artifact-signature.ts';
 import { networkDigest } from './network-canonical.ts';
+import { validateJournalEvidence } from './network-journal-evidence.ts';
 import { networkLabInput } from '../examples/network-lab.ts';
 import { planJournalTransition, authorizeJournalTransition, validateQuiescentArchive, journalTransitionHash, commitManagerJournalTransition, verifyJournalMessage, JOURNAL_TRANSITION_DOMAIN, JOURNAL_TRANSITION_RECEIPT_DOMAIN, type JournalArchive } from './network-journal-transition.ts';
 
@@ -56,6 +57,66 @@ test('scope A commits a new epoch and retains retirement receipt; retry never pr
   }finally{f.cleanup();}
 });
 test('empty quiescent journal is explicitly supported',()=>{const f=fixture(0);try{validateQuiescentArchive(f.archive,f.target);}finally{f.cleanup();}});
+const validationContract=JSON.parse(readFileSync(new URL('../scripts/network-transaction-lab/fixtures/journal-validation-v1.json',import.meta.url),'utf8'));
+for(const entry of validationContract.evidenceCases)test('shared evidence contract: '+entry.name,()=>{
+ const f=fixture();try{
+  (f.archive.evidence.runs[0] as any)[entry.field]=entry.value;
+  // Validate without row lookup too: attachment loading uses this public boundary.
+  if(entry.accepted)validateJournalEvidence(f.archive.evidence);
+  else assert.throws(()=>validateJournalEvidence(f.archive.evidence));
+ }finally{f.cleanup();}
+});
+for(const entry of validationContract.emptyJournalCounterCases)test('shared replay counter contract: '+entry.name,()=>{
+ const f=fixture(0);try{
+  (f.archive.agent as any)[entry.field]=entry.value;f.sync();
+  if(entry.accepted)validateQuiescentArchive(f.archive,f.target);
+  else assert.throws(()=>validateQuiescentArchive(f.archive,f.target));
+ }finally{f.cleanup();}
+});
+test('a previously signed malformed counter cannot clear the Manager before Agent refusal',()=>{
+ const f=fixture(0);try{
+  const draft=f.draft(),before=readFileSync(f.store.path);
+  (f.archive.agent as any).terminalSequence=false;f.sync();
+  draft.archiveHash=networkDigest(f.archive.rawFiles);
+  draft.agentHash=createHash('sha256').update(Buffer.from(f.archive.rawFiles.agent,'base64url')).digest('hex');
+  const malformedDirectory=join(f.dir,'malformed-counter');
+  createJournalArchive(malformedDirectory,Object.fromEntries(Object.entries(f.archive.rawFiles).map(([name,encoded])=>[name,Buffer.from(encoded,'base64url')])) as any);
+  const authorization=signNetworkMessage(JOURNAL_TRANSITION_DOMAIN,{...draft,approval:{mode:'two-person',planHash:journalTransitionHash(draft),proposedBy:'alice',approvedBy:'bob',approvedAt:f.now}},f.keys.privateKey);
+  assert.throws(()=>commitManagerJournalTransition(f.store,f.archive,authorization,[f.keys.publicKey],f.keys.privateKey,malformedDirectory,f.now),/replay counters/);
+  assert.deepEqual(readFileSync(f.store.path),before);
+ }finally{f.cleanup();}
+});
+for(const entry of validationContract.rawCounterTokenCases)test('shared raw counter encoding: '+entry.name,()=>{
+ const f=fixture(entry.records);try{
+  const raw=JSON.stringify(f.archive.agent).replace(new RegExp('"'+entry.field+'":-?[0-9]+'), '"'+entry.field+'":'+entry.token);
+  f.archive.rawFiles.agent=Buffer.from(raw).toString('base64url');f.archive.agent=JSON.parse(raw);
+  const before=readFileSync(f.store.path),input=Buffer.from(f.archive.rawFiles.agent,'base64url');
+  if(entry.accepted)validateQuiescentArchive(f.archive,f.target);
+  else assert.throws(()=>validateQuiescentArchive(f.archive,f.target));
+  assert.deepEqual(readFileSync(f.store.path),before);
+  assert.deepEqual(Buffer.from(f.archive.rawFiles.agent,'base64url'),input);
+  if(!entry.accepted&&/[.eE]/.test(entry.token)){
+   const destination=join(f.dir,'unsupported-number');
+   assert.throws(()=>createJournalArchive(destination,Object.fromEntries(Object.entries(f.archive.rawFiles).map(([name,encoded])=>[name,Buffer.from(encoded,'base64url')])) as any),/integer JSON token/);
+   assert.throws(()=>readFileSync(join(destination,'transactions.json')),/ENOENT/);
+  }
+ }finally{f.cleanup();}
+});
+test('signed exponent counter cannot commit a retained pre-upgrade archive or mutate Registry bytes',()=>{
+ const f=fixture(1);try{
+  const draft=f.draft(),before=readFileSync(f.store.path);
+  const raw=Buffer.from(f.archive.rawFiles.agent,'base64url').toString().replace(/"lastClock":\d+/,'"lastClock":1e0');
+  f.archive.rawFiles.agent=Buffer.from(raw).toString('base64url');f.archive.agent=JSON.parse(raw);
+  draft.archiveHash=networkDigest(f.archive.rawFiles);draft.agentHash=createHash('sha256').update(raw).digest('hex');
+  // Simulate an exact retained archive produced by the older validator, not a new archive.
+  const path=join(f.archiveDirectory,'transactions.json'),manifestPath=join(f.archiveDirectory,'manifest.json');
+  writeFileSync(path,raw);const manifest=JSON.parse(readFileSync(manifestPath,'utf8'));
+  manifest.files['transactions.json']={sha256:draft.agentHash,bytes:Buffer.byteLength(raw)};writeFileSync(manifestPath,JSON.stringify(manifest));
+  const authorization=signNetworkMessage(JOURNAL_TRANSITION_DOMAIN,{...draft,approval:{mode:'two-person',planHash:journalTransitionHash(draft),proposedBy:'alice',approvedBy:'bob',approvedAt:f.now}},f.keys.privateKey);
+  for(let i=0;i<2;i++)assert.throws(()=>commitManagerJournalTransition(f.store,f.archive,authorization,[f.keys.publicKey],f.keys.privateKey,f.archiveDirectory,f.now),/integer JSON token/);
+  assert.deepEqual(readFileSync(f.store.path),before);assert.equal(readFileSync(path,'utf8'),raw);
+ }finally{f.cleanup();}
+});
 for(const [name,change,pattern] of [
   ['confirmed resource',(f:any)=>{f.archive.agent.transactions['b'.repeat(32)].state='confirmed';},/confirmed/],
   ['rollback debt',(f:any)=>{f.archive.agent.transactions['b'.repeat(32)].state='rollback-failed';},/confirmed or nonterminal/],
@@ -119,5 +180,91 @@ test('Manager restart preserves the exact full transition authority and receipt 
  const restarted=new NetworkRegistryStore(f.store.path),saved=restarted.executionStatus().journalEpoch!.transitions[0]!;
  assert.deepEqual(saved.authorization,envelope);assert.deepEqual(saved.receipt,receipt);
  assert.deepEqual(commitManagerJournalTransition(restarted,f.archive,saved.authorization,[f.keys.publicKey],f.keys.privateKey,f.archiveDirectory,f.now+3600001),receipt);
+ }finally{f.cleanup();}
+});
+
+function capacityArchive() {
+  const f=fixture(),tx='b'.repeat(32),row=f.archive.agent.transactions[tx],a=row.authorization;
+  const cancellation={schemaVersion:1,transactionId:tx,fenceId:tx,target:a.target,journalId:a.journalId,authorizationHash:networkDigest(a),artifactHash:a.artifactHash,registryRevision:a.registryRevision,requestedAt:f.now,requestedBy:'alice',authorization:f.archive.manager.execution!.records[0]!.authorization};
+  const signedCancel=signNetworkMessage('heliopause-network-cancel-v1',cancellation,f.keys.privateKey);
+  const body={...row.terminalResult,schemaVersion:3,domain:'heliopause-network-capacity-stop-mtls-v1',state:'cancelled-before-accept',proof:{cancellationHash:networkDigest(cancellation),acceptancePrevented:true,maintenanceRequired:true}};delete body.stateHash;
+  const result={...body,stateHash:networkDigest(body)},resultHash=networkDigest(result);
+  f.store.executionTransaction(state=>{const record=state.records[0]!;record.cancellation=signedCancel;record.cancelStatus='settled';record.result=result;record.resultHash=resultHash;state.schemaVersion=2;state.capacityHold={target:f.target,journalId:f.journal,transactionId:tx,authorizationHash:networkDigest(a),resultHash};});
+  f.archive.manager=f.store.read();f.archive.agent.transactions={};f.archive.agent.acceptedSequence=f.archive.agent.terminalSequence=0;
+  f.archive.identity.capacityCancellation={authorization:a,cancellation,state:'cancelled-before-accept',history:[{state:'cancelled-before-accept',at:f.now}],authorizationHash:networkDigest(a),terminalResult:result};
+  f.archive.outbox=[result];f.archive.acknowledgments={[resultHash]:true};f.sync();
+  const attachments=Object.fromEntries(Object.keys(f.archive.evidence.files).map(name=>[name,readFileSync(join(f.archiveDirectory,'evidence',name))]));
+  rmSync(f.archiveDirectory,{recursive:true});createJournalArchive(f.archiveDirectory,Object.fromEntries(Object.entries(f.archive.rawFiles).map(([k,v])=>[k,Buffer.from(v,'base64url')])) as any,attachments);
+  return f;
+}
+for(const entry of validationContract.rawCommittedNumberCases)test('shared committed integer encoding: '+entry.name,()=>{
+ const f=entry.reserved?capacityArchive():fixture();try{
+  const value=structuredClone((f.archive as any)[entry.store]),path=entry.path.map((part:string)=>part==='$tx'?'b'.repeat(32):part==='$firstFile'?Object.keys(f.archive.evidence.files)[0]:part);
+  let parent=value;for(const part of path.slice(0,-1))parent=parent[part];
+  const field=path.at(-1),number=parent[field],token=String(number)+(entry.encoding==='decimal'?'.0':entry.encoding==='exponent'?'e0':'');
+  assert.equal(typeof number,'number');parent[field]='__raw_integer_contract_token__';
+  const raw=JSON.stringify(value).replace('"__raw_integer_contract_token__"',token),before=readFileSync(f.store.path);
+  (f.archive.rawFiles as any)[entry.store]=Buffer.from(raw).toString('base64url');(f.archive as any)[entry.store]=JSON.parse(raw);
+  if(entry.accepted)validateQuiescentArchive(f.archive,f.target);
+  else assert.throws(()=>validateQuiescentArchive(f.archive,f.target),/integer JSON token/);
+  assert.deepEqual(readFileSync(f.store.path),before);
+  assert.equal(Buffer.from((f.archive.rawFiles as any)[entry.store],'base64url').toString(),raw);
+ }finally{f.cleanup();}
+});
+test('verified full archive retires capacity reservation and hold together without pruning original identity',()=>{
+  const f=capacityArchive();try {
+    validateQuiescentArchive(f.archive,f.target);const oldIdentity=structuredClone(f.archive.identity),authority=f.issue();
+    commitManagerJournalTransition(f.store,f.archive,authority,[f.keys.publicKey],f.keys.privateKey,f.archiveDirectory,f.now);
+    const state=f.store.executionStatus();assert.equal(state.schemaVersion,1);assert.equal(state.capacityHold,undefined);assert.equal(state.records.length,0);
+    assert.deepEqual(f.archive.identity,oldIdentity);assert.equal(f.archive.agent.terminalSequence,0);assert.equal(f.archive.outbox.length,1);
+    assert.equal(state.journalEpoch!.transitions[0]!.oldJournalId,f.journal);
+  }finally{f.cleanup();}
+});
+for(const damage of ['missing-identity','bad-sequence','wrong-cancel','missing-ack','missing-evidence'] as const)test('capacity archive refuses '+damage,()=>{
+  const f=capacityArchive();try {
+    if(damage==='missing-identity')delete f.archive.identity.capacityCancellation;
+    else if(damage==='bad-sequence')f.archive.identity.capacityCancellation.terminalResult.sequence=1+f.archive.agent.terminalSequence+1;
+    else if(damage==='wrong-cancel')f.archive.identity.capacityCancellation.cancellation.authorizationHash='0'.repeat(64);
+    else if(damage==='missing-ack')f.archive.acknowledgments={};
+    else f.archive.evidence.runs=[];
+    f.sync();assert.throws(()=>validateQuiescentArchive(f.archive,f.target));
+  }finally{f.cleanup();}
+});
+
+test('malformed UTF-8 archive cannot clear Manager state even with a signed transition',()=>{
+ const f=fixture();try{
+  const draft=f.draft(),before=readFileSync(f.store.path),row=Object.values(f.archive.agent.transactions)[0] as any;
+  row.diagnostic='utf8-marker';f.sync();
+  const original=Buffer.from(f.archive.rawFiles.agent,'base64url'),index=original.indexOf(Buffer.from('utf8-marker'));assert.ok(index>=0);
+  const raw=Buffer.concat([original.subarray(0,index),Buffer.from([0xff]),original.subarray(index+'utf8-marker'.length)]);
+  f.archive.rawFiles.agent=raw.toString('base64url');row.diagnostic='\ufffd';
+  const path=join(f.archiveDirectory,'transactions.json'),manifestPath=join(f.archiveDirectory,'manifest.json'),manifest=JSON.parse(readFileSync(manifestPath,'utf8'));
+  writeFileSync(path,raw);manifest.files['transactions.json']={sha256:createHash('sha256').update(raw).digest('hex'),bytes:raw.length};writeFileSync(manifestPath,JSON.stringify(manifest));
+  draft.archiveHash=networkDigest(f.archive.rawFiles);draft.agentHash=manifest.files['transactions.json'].sha256;
+  const envelope=signNetworkMessage(JOURNAL_TRANSITION_DOMAIN,{...draft,approval:{mode:'two-person',planHash:journalTransitionHash(draft),proposedBy:'alice',approvedBy:'bob',approvedAt:f.now}},f.keys.privateKey);
+  for(let i=0;i<2;i++){
+   assert.throws(()=>commitManagerJournalTransition(f.store,f.archive,envelope,[f.keys.publicKey],f.keys.privateKey,f.archiveDirectory,f.now),/UTF-8/);
+   assert.deepEqual(readFileSync(f.store.path),before);assert.deepEqual(readFileSync(path),raw);
+  }
+ }finally{f.cleanup();}
+});
+
+for(const stage of ['create','load'] as const)test('archive '+stage+' refuses malformed UTF-8 evidence despite matching commitments',()=>{
+ const f=fixture();try{
+  const name=Object.keys(f.archive.evidence.files).find(name=>name.startsWith('history-'))!,raw=Buffer.concat([Buffer.from('{"diagnostic":"'),Buffer.from([0xff]),Buffer.from('"}')]);
+  const entry=f.archive.evidence.files[name]!;entry.sha256=createHash('sha256').update(raw).digest('hex');entry.bytes=raw.length;f.sync();
+  const before=readFileSync(f.store.path);
+  if(stage==='create'){
+   const attachments=Object.fromEntries(Object.keys(f.archive.evidence.files).map(file=>[file,file===name?raw:readFileSync(join(f.archiveDirectory,'evidence',file))]));
+   const destination=join(f.dir,'malformed-evidence');
+   assert.throws(()=>createJournalArchive(destination,Object.fromEntries(Object.entries(f.archive.rawFiles).map(([key,value])=>[key,Buffer.from(value,'base64url')])) as any,attachments),/UTF-8/);
+   assert.equal(existsSync(destination),false);
+  }else{
+   writeFileSync(join(f.archiveDirectory,'evidence',name),raw);
+   const evidence=Buffer.from(f.archive.rawFiles.evidence,'base64url'),manifestPath=join(f.archiveDirectory,'manifest.json'),manifest=JSON.parse(readFileSync(manifestPath,'utf8'));
+   writeFileSync(join(f.archiveDirectory,'execution-evidence.json'),evidence);manifest.files['execution-evidence.json']={sha256:createHash('sha256').update(evidence).digest('hex'),bytes:evidence.length};writeFileSync(manifestPath,JSON.stringify(manifest));
+   assert.throws(()=>loadJournalArchive(f.archiveDirectory),/UTF-8/);assert.deepEqual(readFileSync(join(f.archiveDirectory,'evidence',name)),raw);
+  }
+  assert.deepEqual(readFileSync(f.store.path),before);
  }finally{f.cleanup();}
 });

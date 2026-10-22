@@ -25,12 +25,38 @@ EXECUTION = 'heliopause-network-execution-v2'
 TERMINAL_DOMAIN = 'heliopause-network-terminal-mtls-v1'
 CANCEL = 'heliopause-network-cancel-v1'
 CANCELLATION_RESULT_DOMAIN = 'heliopause-network-cancellation-mtls-v1'
+CAPACITY_RESULT_DOMAIN = 'heliopause-network-capacity-stop-mtls-v1'
+ADMISSION_RECORD_LIMIT = 1023
+CAPACITY_IDENTITY_LIMIT = 512*1024
 CONFIRM = 'heliopause-network-confirm-v1'
 VERIFY = 'heliopause-network-verification-v1'
 DRIVER = 'linux-wireguard-v1'
 PERSISTENT_DRIVER = 'networkmanager-wireguard-1.56-v1'
 TERMINAL = {'confirmed', 'rolled-back', 'cancelled-before-accept'}
 CHECKS = ['interface', 'address', 'route', 'handshake', 'fib', 'forward', 'reverse', 'management', 'protected']
+
+
+def capacity_rows(data, identity):
+    """The emergency slot is part of replay identity, never a removable ledger entry."""
+    if not isinstance(identity,dict) or set(identity) not in ({'journalId'},{'journalId','capacityCancellation'}) or identity.get('journalId')!=data.get('journalId'):
+        raise ValueError('invalid transaction replay identity')
+    rows=dict(data['transactions'])
+    if 'capacityCancellation' not in identity:return rows
+    if len(canonical(identity).encode())>CAPACITY_IDENTITY_LIMIT:raise ValueError('capacity identity too large')
+    row=identity['capacityCancellation']
+    exact(row,'authorization cancellation state history authorizationHash terminalResult')
+    a=row['authorization'];c=row['cancellation'];r=row['terminalResult']
+    if not isinstance(a,dict) or not isinstance(c,dict) or not isinstance(r,dict):raise ValueError('invalid capacity reservation')
+    transaction=a.get('transactionId')
+    if not re.fullmatch(r'[a-f0-9]{32}',str(transaction)) or transaction in rows or len(rows)>=1024 or any(v.get('state') not in {'rolled-back','cancelled-before-accept'} or any(k in v for k in ('bootRestore','before','paths')) for v in rows.values()):raise ValueError('capacity reservation requires closed primary ledger')
+    exact(r,'schemaVersion domain transactionId fenceId target journalId authorizationHash artifactHash registryRevision state sequence stateHash proof')
+    if a.get('schemaVersion')!=2 or a.get('journalId')!=data['journalId'] or row['state']!='cancelled-before-accept' or row['authorizationHash']!=digest(a) or r['schemaVersion']!=3 or r['domain']!=CAPACITY_RESULT_DOMAIN or r['sequence']!=data['terminalSequence']+1 or not integer(r['sequence'],1,1024) or r['state']!=row['state'] or r['authorizationHash']!=digest(a) or r['stateHash']!=digest({k:v for k,v in r.items() if k!='stateHash'}) or r['proof']!={'cancellationHash':digest(c),'acceptancePrevented':True,'maintenanceRequired':True}:
+        raise ValueError('invalid capacity result commitment')
+    for k in ('transactionId','target','journalId','artifactHash','registryRevision'):
+        if r[k]!=a[k]:raise ValueError('capacity result binding mismatch')
+    if r['fenceId']!=transaction:raise ValueError('capacity fence mismatch')
+    rows[transaction]=row
+    return rows
 
 
 def current_boot_id():
@@ -73,6 +99,12 @@ def kernel_multicast_route(row, dev):
 
 def integer(value, low, high):
     return type(value) is int and low <= value <= high
+
+
+def valid_replay_counters(data):
+    return (integer(data.get('acceptedSequence'),0,1024)
+            and integer(data.get('terminalSequence'),0,1024)
+            and integer(data.get('lastClock'),0,2**53-1))
 
 
 def name(value):
@@ -137,6 +169,85 @@ def journal_transition_pending(directory):
 
 def assert_active_journal(directory):
     if journal_transition_pending(directory):raise ValueError('journal retired or offline transition pending')
+
+
+def epoch_payload(envelope):
+    # Protected evidence was verified by the offline transition. Do not require
+    # historical public keys again: revocation remains effective for boot authority.
+    exact(envelope,'version algorithm keyId payload signature')
+    if (envelope['version']!='heliopause-ed25519-v1' or envelope['algorithm']!='Ed25519'
+            or not isinstance(envelope['keyId'],str) or not re.fullmatch(r'sha256:[a-f0-9]{64}',envelope['keyId'])
+            or not isinstance(envelope['signature'],str) or not re.fullmatch(r'[A-Za-z0-9_-]{86}',envelope['signature'])
+            or len(base64.urlsafe_b64decode(envelope['signature']+'=='))!=64):
+        raise ValueError('invalid offline transition envelope')
+    encoded=envelope['payload']
+    if not isinstance(encoded,str) or len(encoded)>192*1024 or not re.fullmatch(r'[A-Za-z0-9_-]+',encoded):
+        raise ValueError('invalid offline transition payload')
+    raw=base64.urlsafe_b64decode(encoded+'='*((-len(encoded))%4))
+    value=decode_json(raw)
+    if len(raw)>128*1024 or raw!=canonical(value).encode() or base64.urlsafe_b64encode(raw).decode().rstrip('=')!=encoded:
+        raise ValueError('noncanonical offline transition payload')
+    return value
+
+
+def check_admission_epoch(directory, durable=False):
+    """Check completion before new identities or confirmed activation, under executor lock.
+
+    Owned undo and terminal reporting remain independent of this admission barrier.
+    No historical trust key is reinstalled or required.
+    """
+    directory=os.path.abspath(directory)
+    parent=os.open(os.path.dirname(directory),os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    opened=[]
+    try:
+        active=os.open(os.path.basename(directory),os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent)
+        opened.append(active)
+        def read_at(base,name,maximum=512*1024):
+            fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=base)
+            opened.append(fd);info=os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.geteuid() or info.st_mode&0o022 or info.st_nlink!=1:
+                raise ValueError('unsafe offline transition file')
+            raw=os.read(fd,maximum+1)
+            if len(raw)>maximum:raise ValueError('offline transition file exceeds limit')
+            return decode_json(raw)
+        try:read_at(active,'retired-journal.json')
+        except FileNotFoundError:pass
+        else:raise ValueError('offline transition journal retired')
+        try:marker=read_at(parent,os.path.basename(directory)+'.transition.json')
+        except FileNotFoundError:
+            try:read_at(active,'transition-owner.json')
+            except FileNotFoundError:return
+            raise ValueError('missing offline transition marker')
+        for fd in [parent,active]:
+            info=os.fstat(fd)
+            if info.st_uid!=os.geteuid() or info.st_mode&0o022:
+                raise ValueError('unsafe offline transition directory')
+        if not isinstance(marker,dict) or marker.get('phase')!='complete':
+            raise ValueError('offline transition incomplete')
+        owner=read_at(active,'transition-owner.json')
+        identity=read_at(active,'journal-identity.json')
+        authority=epoch_payload(marker.get('authorization'))
+        receipt=epoch_payload(marker.get('receipt'))
+        commitment=digest(authority)
+        if (not isinstance(authority,dict) or not isinstance(receipt,dict)
+                or marker['authorization']['keyId']!=marker['receipt']['keyId']
+                or marker.get('transitionHash')!=commitment
+                or owner!={'transitionHash':commitment}
+                or identity.get('journalId')!=authority.get('newJournalId')
+                or receipt.get('transitionHash')!=commitment
+                or any(receipt.get(key)!=authority.get(key) for key in ['oldJournalId','newJournalId','target','archiveHash','evidenceHash'])):
+            raise ValueError('offline transition identity or ownership mismatch')
+        if durable:
+            for fd in opened[1:]:os.fsync(fd)
+            os.fsync(active)
+            os.fsync(parent)
+    finally:
+        for fd in reversed(opened):os.close(fd)
+        os.close(parent)
+
+
+def durable_admission_epoch(directory):
+    check_admission_epoch(directory,durable=True)
 
 
 def crypto_helpers(directory):
@@ -565,8 +676,10 @@ class Executor:
             return data
         exact(data,'schemaVersion journalId terminalSequence acceptedSequence transactions lastClock')
         identity=read_json(os.path.join(self.directory,'journal-identity.json'))
-        if data['schemaVersion']!=2 or identity!={'journalId':data['journalId']} or not re.fullmatch(r'[a-f0-9]{32}',str(data['journalId'])) or (self.config.get('journalId') is not None and data['journalId']!=self.config['journalId']) or not integer(data['terminalSequence'],0,1024) or not isinstance(data['transactions'],dict) or len(data['transactions'])>1024 or data['acceptedSequence']!=len(data['transactions']):
+        if data['schemaVersion']!=2 or not re.fullmatch(r'[a-f0-9]{32}',str(data['journalId'])) or (self.config.get('journalId') is not None and data['journalId']!=self.config['journalId']) or not valid_replay_counters(data) or not isinstance(data['transactions'],dict) or len(data['transactions'])>1024 or data['acceptedSequence']!=len(data['transactions']):
             raise ValueError('invalid transaction replay journal')
+        capacity_rows(data,identity)
+        if 'capacityCancellation' in identity:self.cancellation_binding(identity['capacityCancellation']['cancellation'],identity['capacityCancellation']['authorization'])
         terminal=[]
         for transaction,row in data['transactions'].items():
             if row.get('authorization',{}).get('transactionId')!=transaction or row['authorization'].get('journalId')!=data['journalId'] or row.get('state') not in TERMINAL|{'prepared','applying','awaiting-verification','awaiting-confirm','rolling-back','rollback-failed'}:
@@ -721,6 +834,7 @@ class Executor:
                 try:
                     if time.monotonic() >= deadline:
                         raise ValueError('boot restoration budget exhausted')
+                    durable_admission_epoch(self.directory)
                     self.validate_restore_authority(row, data['journalId'])
                     self.select_driver(row['authorization']['operation'], row)
                     self.driver.deadline = None
@@ -815,7 +929,8 @@ class Executor:
                 return prior['state']
             if now<data['lastClock']:
                 raise ValueError('clock moved behind durable replay watermark')
-            if len(data['transactions'])>=1024:
+            if 'capacityCancellation' in read_json(os.path.join(self.directory,'journal-identity.json')):raise ValueError('capacity maintenance required; new acceptance refused')
+            if len(data['transactions'])>=ADMISSION_RECORD_LIMIT:
                 raise ValueError('transaction replay ledger capacity reached')
             if any(r['state'] not in TERMINAL or (r.get('bootRestore', {}).get('recovery') == 'rollback-failed' or r.get('bootRestore', {}).get('state') == 'attempting') for r in data['transactions'].values()):
                 raise ValueError('unsettled network transaction')
@@ -824,6 +939,7 @@ class Executor:
             self.driver.deadline=None
             if len(canonical(data).encode())>6*1024*1024:
                 raise ValueError('transaction journal capacity reached')
+            durable_admission_epoch(self.directory)
             started_mono=time.monotonic()
             self.driver.command_deadline=started_mono+(a['expiresAt']-now)/1000
             try:
@@ -908,11 +1024,30 @@ class Executor:
                 row['cancelRequested']=True;row['cancellationResponse']={**response,'stateHash':digest(response)}
                 self.save(data)
                 return 'cancellation-rejected'
-            if len(data['transactions'])>=1024 or len(canonical(data).encode())>6*1024*1024:raise ValueError('cancellation replay ledger capacity reached')
+            identity=read_json(os.path.join(self.directory,'journal-identity.json'))
+            reserved=identity.get('capacityCancellation')
+            if reserved:
+                if reserved['authorizationHash']==digest(a) and digest(reserved['cancellation'])==digest(c):return reserved['state']
+                raise ValueError('capacity maintenance required; cancellation slot already reserved')
+            durable_admission_epoch(self.directory)
             row={'authorization':a,'cancellation':c,'state':'cancelled-before-accept','history':[]}
+            # Include the complete terminal result and history in the admission measurement.
+            result={'schemaVersion':2,'domain':CANCELLATION_RESULT_DOMAIN,'transactionId':a['transactionId'],'fenceId':a['transactionId'],'target':a['target'],'journalId':data['journalId'],'authorizationHash':digest(a),'artifactHash':a['artifactHash'],'registryRevision':a['registryRevision'],'state':row['state'],'sequence':data['terminalSequence']+1,'proof':{'cancellationHash':digest(c),'acceptancePrevented':True}}
+            preview=json.loads(canonical(data));preview['transactions'][a['transactionId']]={**row,'authorizationHash':digest(a),'history':[{'state':row['state'],'at':2**53-1}],'terminalResult':{**result,'stateHash':digest(result)}};preview['acceptedSequence']+=1;preview['terminalSequence']+=1
+            if len(data['transactions'])>=ADMISSION_RECORD_LIMIT or len(canonical(preview).encode())>6*1024*1024:
+                if len(data['transactions'])>=1024 or any(r['state'] not in {'rolled-back','cancelled-before-accept'} or any(k in r for k in ('bootRestore','before','paths')) for r in data['transactions'].values()):raise ValueError('cancellation replay ledger capacity reached with recovery debt or confirmed resources')
+                result.update(schemaVersion=3,domain=CAPACITY_RESULT_DOMAIN)
+                result['proof']['maintenanceRequired']=True
+                row.update(authorizationHash=digest(a),history=[{'state':row['state'],'at':int(time.time()*1000)}],terminalResult={**result,'stateHash':digest(result)})
+                successor={'journalId':data['journalId'],'capacityCancellation':row}
+                capacity_rows(data,successor)
+                self.current_transaction=a['transactionId']
+                self.event('before-capacity-save')
+                atomic(os.path.join(self.directory,'journal-identity.json'),successor)
+                self.event('capacity-reserved')
+                return row['state']
             data['transactions'][a['transactionId']]=row
-            data['acceptedSequence']+=1  # Historical name: counts reserved replay identities, not proof of apply.
-            if len(canonical(data).encode())>6*1024*1024:raise ValueError('prospective cancellation exceeds reserved journal capacity')
+            data['acceptedSequence']+=1  # Counts replay identities, not proof of apply.
             self.event('before-cancel-save')
             self.save(data,row,'cancelled-before-accept')
             return row['state']
@@ -965,7 +1100,12 @@ class Executor:
             fd=os.open(self.directory,os.O_RDONLY|os.O_DIRECTORY)
             try:os.fsync(fd)
             finally:os.close(fd)
-            return [row['terminalResult'] if row['state'] in TERMINAL else row['cancellationResponse'] for row in data['transactions'].values() if row['state'] in TERMINAL or row.get('cancellationResponse')]
+            identity_path=os.path.join(self.directory,'journal-identity.json')
+            fd=os.open(identity_path,os.O_RDONLY|os.O_NOFOLLOW)
+            try:os.fsync(fd)
+            finally:os.close(fd)
+            rows=capacity_rows(data,read_json(identity_path))
+            return [row['terminalResult'] if row['state'] in TERMINAL else row['cancellationResponse'] for row in rows.values() if row['state'] in TERMINAL or row.get('cancellationResponse')]
 
     def publish_results(self):
         # Protected local outbox only. A separate read-only courier owns all network I/O.

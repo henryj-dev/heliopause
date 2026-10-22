@@ -22,11 +22,14 @@ def run(argv, data=None, timeout=30):
 
 
 class Lab:
-    def __init__(self, root):
+    def __init__(self, root, ssh_ports=None):
         self.root=root.resolve();self.manifest=json.loads((self.root/'environment.json').read_text())
         self.nonce=self.manifest['labNonce']
+        self.ssh_ports={'gateway':22220,'peer':22221} if ssh_ports is None else dict(ssh_ports)
+        if set(self.ssh_ports)!={'gateway','peer'} or any(type(port)is not int or not 1<=port<=65535 for port in self.ssh_ports.values()) or len(set(self.ssh_ports.values()))!=2:
+            raise ValueError('two distinct valid SSH ports required')
     def ssh(self, role, *args, data=None, timeout=30):
-        return run(['ssh','-i',str(self.root/'lab-key'),'-o','BatchMode=yes','-o','UserKnownHostsFile='+str(self.root/'known_hosts'),'-o','ConnectTimeout=3','-p',str(22220 if role=='gateway' else 22221),'lab@127.0.0.1',shlex.join(args)],data,timeout)
+        return run(['ssh','-i',str(self.root/'lab-key'),'-o','BatchMode=yes','-o','UserKnownHostsFile='+str(self.root/'known_hosts'),'-o','ConnectTimeout=3','-p',str(self.ssh_ports[role]),'lab@127.0.0.1',shlex.join(args)],data,timeout)
     def guard(self, role):
         code="import json,os,stat;from pathlib import Path;p=Path('/etc/heliopause-disposable-lab');s=p.lstat();assert stat.S_ISREG(s.st_mode) and s.st_uid==0 and stat.S_IMODE(s.st_mode)==0o600;print(p.read_text())"
         marker=json.loads(self.ssh(role,'sudo','python3','-c',code))

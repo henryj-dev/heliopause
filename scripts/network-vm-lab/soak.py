@@ -13,8 +13,13 @@ from pathlib import Path
 import subprocess
 import time
 import uuid
+import sys
 from concurrent.futures import ThreadPoolExecutor
-from boot_cycle import Lab, run, fresh_packets
+from boot_cycle import Lab, run
+from soak_inputs import source_modules
+from soak_settlement import require_settled
+sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'agent'))
+from network_executor import digest
 
 HOURS = 24
 INTERVAL = 60
@@ -36,10 +41,17 @@ def assess(sample, initial, expected_modules, expected_tx):
         raise ValueError('trust or semantic journal drift')
     for name in ['journal-identity.json','terminal-results.json','terminal-acks.json']:
         if gateway['files'][name].get('missing') or gateway['files'][name]!=initial['gateway']['files'][name]:raise ValueError('identity/outbox/ack drift')
+    if gateway.get('maintenanceRequired') or peer['ledger'].get('capacityHold'):raise ValueError('capacity maintenance excludes stability baseline')
     if peer['ledger']['fence'] is not None:raise ValueError('unsettled Manager fence')
     if gateway['bootId']!=initial['gateway']['bootId'] or peer['bootId']!=initial['peer']['bootId']:
         raise ValueError('unexpected reboot during baseline')
-    if gateway['deployedModules']!=expected_modules:raise ValueError('deployed module drift')
+    for role in ['gateway','peer']:
+        if sample[role]['deployedModules']!=expected_modules[role]:raise ValueError(role+' deployed module drift')
+        if not sample[role].get('frozenInputs') or sample[role]['frozenInputs']!=initial[role].get('frozenInputs'):
+            raise ValueError(role+' configuration or public trust drift')
+    if gateway['targetBinding']!=peer['targetBinding'] or gateway['targetBinding']['journalId']!=gateway['journalId']:
+        raise ValueError('Manager/Agent target or journal binding mismatch')
+    require_settled(gateway,peer,expected_tx,digest)
     if peer['ledger']!=initial['peer']['ledger']:raise ValueError('Manager ledger drift or new fence')
     for role,key,rss_limit in [('gateway','agent',512),('gateway','courier',256),('gateway','networkManager',512),('peer','manager',768),('peer','relay',256)]:
         process=sample[role][key]
@@ -52,6 +64,8 @@ def assess(sample, initial, expected_modules, expected_tx):
         if elapsed>0 and (process['cpuTicks']-initial[role][key]['cpuTicks'])/sample[role]['clockTicksPerSecond']/elapsed>1.0:
             raise ValueError('process average CPU budget exceeded')
     status=gateway['lifecycle']
+    if type(status.get('agentPid'))is not int or status['agentPid']!=gateway['agent']['pid']:
+        raise ValueError('lifecycle process identity mismatch')
     if not 0<=gateway['at']-status.get('reportedAt',0)<=15:raise ValueError('stale lifecycle inventory')
     heartbeat=status.get('heartbeat',{});discovery=status.get('discovery',{})
     if not -1<=gateway['at']-heartbeat.get('lastSuccess',0)<=20 or heartbeat.get('lastFailure',0)>initial['gateway']['lifecycle'].get('heartbeat',{}).get('lastFailure',0):
@@ -85,20 +99,21 @@ def next_delay(started, count, now):
 
 
 def main():
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--root',type=Path,required=True);p.add_argument('--transaction',required=True);p.add_argument('--output',type=Path,required=True);a=p.parse_args()
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--root',type=Path,required=True);p.add_argument('--transaction',required=True);p.add_argument('--output',type=Path,required=True);p.add_argument('--gateway-ssh-port',type=int,default=22220);p.add_argument('--peer-ssh-port',type=int,default=22221);a=p.parse_args()
     if not re.fullmatch('[a-f0-9]{32}',a.transaction):raise ValueError('exact confirmed transaction required')
     source=Path(__file__).resolve().parents[2]
     if run(['git','-C',str(source),'status','--porcelain']).strip():raise ValueError('clean committed source required')
     head=run(['git','-C',str(source),'rev-parse','HEAD']).decode().strip()
     package=json.loads((source/'package.json').read_text());expected={Path(n).name:hashlib.sha256((source/n).read_bytes()).hexdigest() for n in package['files'] if n.startswith('agent/') and n.endswith('.py')}
+    expected={'gateway':expected,'peer':source_modules(source)}
     # Private output parent is supplied explicitly. Originals are never modified/deleted.
     info=a.output.parent.lstat()
     if a.output.parent.is_symlink() or info.st_uid!=os.geteuid() or info.st_mode&0o077:raise ValueError('private output parent required')
     a.output.mkdir(mode=0o700)
-    lab=Lab(a.root)
+    lab=Lab(a.root,ssh_ports={'gateway':a.gateway_ssh_port,'peer':a.peer_ssh_port})
     for role in ['gateway','peer']:lab.guard(role)
     for role in ['gateway','peer']:
-        for name in ['lifecycle_snapshot.py','soak_peer.py','monitor.py','guest_fixture.py']:
+        for name in ['lifecycle_snapshot.py','soak_inputs.py','soak_settlement.py','soak_peer.py','monitor.py','guest_fixture.py']:
             expected_sha=hashlib.sha256((source/'scripts/network-vm-lab'/name).read_bytes()).hexdigest()
             observed=lab.ssh(role,'sudo','sha256sum','/source/scripts/network-vm-lab/'+name).decode().split()[0]
             if observed!=expected_sha:raise ValueError('deployed observation tool mismatch')
@@ -109,7 +124,7 @@ def main():
           'stopCriteria':'any packet loss, drift/debt, service/PID/boot change, stale inventory, resource budget or collection failure',
           'resourcesMiB':{'agent':512,'courier':256,'NetworkManager':512,'manager':768,'relay':256},'maxFds':256,'maxChildren':8,'maxAverageCpuCoresPerProcess':1,'heartbeatMaxAgeSeconds':20,'discoveryMaxAgeSeconds':360,
           'scope':'24-hour isolated baseline; no longer-term reliability or fault-exercise success implied',
-          'deployedAgentModulesExpected':expected,'startedAt':time.time()}
+          'deployedModulesExpected':expected,'sshPorts':lab.ssh_ports,'frozenInputScope':'configuration and public trust/certificates; private keys not read; disk hashes do not attest loaded memory','startedAt':time.time()}
     write(a.output/'plan.json',plan)
     lab.ssh('peer','sudo','systemd-run','--unit='+unit,'--collect','--property=RuntimeMaxSec=90000','--property=MemoryMax=128M',
             '/usr/bin/python3','/source/scripts/network-vm-lab/soak_peer.py','--nonce',lab.nonce,'--id',run_id,'--seconds','90000')

@@ -4,7 +4,7 @@ import hashlib
 import os
 import threading
 import time
-from network_executor import Executor, TERMINAL, atomic, read_file, read_json, decode_json, safe_diagnostic, validate_execution_config
+from network_executor import Executor, TERMINAL, atomic, read_file, read_json, decode_json, safe_diagnostic, validate_execution_config, capacity_rows, ADMISSION_RECORD_LIMIT
 
 DEBT = {'prepared', 'pending', 'rollback-failed', 'rollback-incident'}
 
@@ -167,7 +167,9 @@ class Lifecycle:
 
     def refresh(self):
         data = self.executor.load()
-        rows = data['transactions']
+        identity=read_json(os.path.join(self.directory,'journal-identity.json')) if data.get('schemaVersion')==2 else None
+        maintenance=identity is not None and 'capacityCancellation' in identity
+        rows = capacity_rows(data,identity) if identity is not None else data['transactions']
         pending = [(tx, row) for tx, row in rows.items() if row['state'] not in TERMINAL or row.get('bootRestore', {}).get('recovery') == 'rollback-failed' or row.get('bootRestore', {}).get('state') == 'attempting']
         with self.gate:
             if pending:
@@ -197,11 +199,12 @@ class Lifecycle:
                 finally:
                     self.executor.driver.command_deadline = None
         with self.status_lock:
-            self.snapshot['network'] = {'state': 'recovery-debt' if pending else 'idle',
+            self.snapshot['network'] = {'state': 'recovery-debt' if pending else 'capacity-maintenance' if maintenance else 'idle',
                 'transactions': [{'transactionId': tx, 'state': row['state'],
                                   **({'bootRestore': {key:value for key,value in row['bootRestore'].items() if key in {'bootId','state','currentConnectivity','reason','recovery'}}} if 'bootRestore' in row else {})}
                                  for tx, row in rows.items()],
-                'ledger': {'used': len(rows), 'limit': 1024, 'remaining': 1024-len(rows),
+                'maintenanceRequired':maintenance,
+                'ledger': {'primaryUsed':len(data['transactions']),'effectiveTerminalSequence':data.get('terminalSequence',0)+int(maintenance),'admissionLimit':ADMISSION_RECORD_LIMIT,'admissionRemaining':0 if maintenance else max(0,ADMISSION_RECORD_LIMIT-len(rows)), 'used': len(rows), 'limit': 1024, 'remaining': 1024-len(rows),
                            'bytes':len(__import__('network_executor').canonical(data).encode()),'admissionByteLimit':6*1024*1024,'byteLimit':8*1024*1024},
                 'confirmedKernel': copy.deepcopy(observed), 'observedAt': time.time()}
 

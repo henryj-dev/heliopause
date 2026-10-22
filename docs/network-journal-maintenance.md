@@ -37,6 +37,35 @@ An unused journal explicitly has empty runs/files and an empty evidence director
 exactly cover the archived Agent transactions. Module commitment binds the first modules file.
 The manifest SHA256 is included in approval, Manager receipt and permanent epoch tombstone.
 
+Evidence identities and commitments must be JSON strings; a single-element array that
+looks like a hash is invalid. Replay counters must be integers from 0 through 1,024,
+and the saved clock must be a nonnegative safe integer. Both languages use the shared
+`scripts/network-transaction-lab/fixtures/journal-validation-v1.json` contract cases.
+A finite future clock watermark remains valid for clock-rollback detection. Malformed
+values are refused without rounding, clearing history or repairing an identity in place.
+Retain the original bytes and fence/transition evidence for inspection. A Manager commit
+does not make an Agent-side refusal safe to bypass; resume only the same valid authority
+after the exact refusal has been understood. Deploy compatible validators on both sides
+before journal maintenance.
+
+The stored top-level `acceptedSequence`, `terminalSequence` and `lastClock` use integer
+JSON tokens (optional minus sign, decimal digits only). Although `1.0` and `1e0` are valid
+JSON numbers with the same mathematical value, they are unsupported encodings for these
+three fields. The same integer-token rule applies inside the explicitly committed execution
+authorization, cancellation, terminal result and cancellation response objects, including
+their reserved-identity and Manager/outbox copies. Otherwise a decoded `registryRevision:1.0`
+or `sequence:1e0` can match JavaScript's digest but fail Python's. Manager record sequence
+tokens are checked too. Python rejects the floating-point parse result; Manager checks the
+original tokens before JavaScript loses that distinction. Escaped property names receive
+the same check. Execution-evidence schema version and attachment byte counters use the
+same integer-token rule. Other stored values, including monotonic floating-point history, retain
+their existing representation. This is not a whole-document canonicalization rule.
+Archive creation/loading and Manager plan/commit validation refuse unsupported counter
+encoding; Agent load and offline transition refuse it without rewriting the source.
+Preserve any pre-upgrade archive that uses it and the exact refusal. Do not normalize it
+to obtain a new authority or clear a partial transition. This narrow encoding contract
+does not prove equivalence of every TypeScript/Python schema or integer field.
+
 Attachments are flat, fixed relative lowercase JSON names, with exact kind/byte/SHA256 metadata:
 no recursion, absolute paths, traversal, duplicate runs/references, extra/missing files, symlink or
 hardlink adoption. Limits are4096files,4MiB each,128MiB total, and64files per role/run. Both the
@@ -122,3 +151,80 @@ OpenSSL subprocess; replacing the entire helper would hide that filesystem bound
 operator authentication and two-person approval, receipt retry and retired-binding startup refusal.
 Those tests do not establish Rocky VM crash recovery, storage-pressure survival or remote custody.
 Confirmed-resource scope B remains unsupported and blocks a trial that requires that migration.
+
+## Capacity-stop reservation (paired rollout required)
+
+Normal Agent admission stops at 1,023 primary records and the existing 6 MiB admission
+budget. The 1,024th replay identity is reserved for one Manager-signed cancellation of
+an authority that was never accepted. If its complete terminal record would exceed
+the admission budget, the Agent atomically preserves that record in
+`journal-identity.json` (`capacityCancellation`, whole identity at most 512 KiB).
+The primary journal bytes and counters remain unchanged. The effective record set and
+terminal sequence include the reservation. All primary operations must already be
+rolled back or cancelled before acceptance, with no confirmed resource or recovery debt; existing undo, reporting and acknowledgments continue. This is bounded
+logical capacity protection, not a guarantee against physical storage failure.
+
+The reservation produces terminal schema 3, domain
+`heliopause-network-capacity-stop-mtls-v1`, with the original cancellation hash and
+`acceptancePrevented=true, maintenanceRequired=true`. Direct pinned Agent mTLS still
+authenticates delivery. The Manager atomically settles the exact fence and persists
+an issuance hold. Execution-ledger schema 2 makes older Managers refuse this state;
+older Agents refuse the extended identity. Deploy both versions before enabling new
+work. A mixed-version rejection retains debt and requires the compatible binaries;
+never downgrade the terminal result or remove the hold/identity field by hand.
+
+Retries export the identical result/hash/sequence, including a restart between identity
+persistence and outbox publication. A duplicate result cannot release the hold. New
+Agent acceptance and Manager issuance remain stopped until the normal two-person,
+full-archive scope-A transition retires the complete primary-plus-reserved history.
+Its archive commits the raw identity and primary journal separately and preserves both
+original files. No partial pruning or timeout clears this condition.
+
+A pre-existing legacy primary ledger with 1,024 rows has no free emergency slot and
+fails closed; existing accepted undo/report/settlement remain available. A confirmed
+resource, including one in an otherwise terminal ledger, forbids the emergency reservation
+and scope A. Capacity refusal then retains the Manager fence; existing recovery and
+settlement remain available. The capacity stop does not transfer its ownership or restore authority. Such
+a target needs a separately specified scope-B transition or an approved exit procedure
+before its lifetime budget is exhausted. Do not present this reservation as that feature.
+
+Implementation validation and real VM capacity-pressure results must be reported
+separately. Synthetic padding and synthetic full-ledger fixtures do not establish the
+size of legitimate operational history or the completion of 1,024 real operations.
+
+
+## Completed epoch durability and recovery
+
+A visible `complete` marker is not proof that its rename reached durable storage if
+parent-directory fsync failed. Before admitting a new execution or a new preaccept
+cancellation identity, the Agent checks the protected completion marker, successor
+owner, identity, authority payload and receipt commitments, then fsyncs the same open
+files and directories through the marker parent. A repeated completed transition also
+performs this barrier without resetting any successor records. Confirmed boot activation
+uses the barrier; interrupted restore undo remains independent.
+
+Missing or inconsistent completion evidence refuses new admission and confirmed
+activation. For missing complete markers or inconsistent complete-marker ownership/payload binding,
+startup attempts existing owned unconfirmed undo and publishes terminal results before
+recording the completion-evidence error. The existing known pending/retired
+startup guard remains in place so startup cannot recreate an absent successor during an
+offline transition. Keep the original archive, receipt, marker, sidecars and partial paths;
+resume only the same approved transition. No timeout, pruning or local ownership rewrite
+repairs missing evidence.
+
+This local check binds previously verified protected payloads; it does not revalidate
+historical signatures or establish independent custody. It does not require reinstalling
+revoked keys. Same-length signature corruption cannot be detected by payload commitments
+alone; the full archive/signature verifier and offline transition retry remain separate.
+Boot restoration continues to verify its Manager/verifier authority against current trust.
+The fsync barrier reserves no physical storage. If it fails, existing owned undo, terminal
+export and identical-result retries remain available; new identities stay refused.
+
+
+### Archive byte encoding
+
+Manager archive creation, loading, evidence attachment validation and signed transition validation reject malformed UTF-8 before JSON decoding. Invalid bytes are not replaced with Unicode replacement characters or rewritten. Valid UTF-8, including an actual U+FFFD character, remains accepted where its field permits it. The existing Manager refusal of a UTF-8 BOM is retained; this does not add other JSON encodings or establish whole-schema equivalence with the Agent.
+
+If encoding validation fails, preserve the original archive and reconcile its provenance. Do not repair the bytes in place, approve a normalized copy as the original, or clear the old journal. A paired compatible rollout and the existing full-archive/two-person transition checks remain required.
+
+The shared byte fixtures record decoder-specific outcomes. Python's existing byte JSON decoder also accepts UTF-16/32 with a BOM and UTF-8 encoded surrogate bytes; Manager archive parsing refuses them. This stricter Manager behavior prevents approval of bytes the Agent would later reject without changing the Agent's common config/mailbox/journal decoder. It does not claim that every byte representation accepted by either decoder is a supported archive. Any Agent-wide encoding restriction requires separate compatibility qualification.
