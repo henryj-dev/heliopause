@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, writeFileSync, rmSync, unlinkSync, symlinkSync, chmodSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { generateKeyPairSync, createHash } from 'node:crypto';
+import { generateKeyPairSync, createHash, createPublicKey } from 'node:crypto';
 import { createJournalArchive, loadJournalArchive, parseJournalArchiveFile } from './network-journal-archive.ts';
 import { NetworkRegistryStore } from './network-registry.ts';
 import { emptyApprovals, propose, approve } from './approval.ts';
@@ -307,5 +307,31 @@ test('signed unused config surrogate cannot retire Manager state',()=>{
   const authority=signNetworkMessage(JOURNAL_TRANSITION_DOMAIN,{...draft,approval:{mode:'two-person',planHash:journalTransitionHash(draft),proposedBy:'alice',approvedBy:'bob',approvedAt:f.now}},f.keys.privateKey);
   for(let i=0;i<2;i++)assert.throws(()=>commitManagerJournalTransition(f.store,f.archive,authority,[f.keys.publicKey],f.keys.privateKey,f.archiveDirectory,f.now),/surrogate/);
   assert.deepEqual(readFileSync(f.store.path),before);assert.deepEqual(readFileSync(path),raw);
+ }finally{f.cleanup();}
+});
+
+for(const entry of validationContract.signedPayloadUtf8Cases)test('shared signed payload UTF-8: '+entry.name,()=>{
+ const key=createPublicKey(entry.publicKey);
+ if(entry.managerAccepted)assert.deepEqual(verifyJournalMessage(entry.envelope,entry.domain,[key]),entry.decoded);
+ else assert.throws(()=>verifyJournalMessage(entry.envelope,entry.domain,[key]),/signed journal payload UTF-8/);
+});
+
+test('retained signed invalid UTF-8 cannot commit or alter Registry/archive bytes',()=>{
+ const f=fixture();try{
+  const draft=f.draft(),entry=validationContract.signedPayloadUtf8Cases.find((row:any)=>!row.managerAccepted)!,a=entry.decoded,tx=a.transactionId,authorizationHash=networkDigest(a);
+  const row=f.archive.agent.transactions[tx],{stateHash:ignored,...prior}=row.terminalResult,base={...prior,authorizationHash},result={...base,stateHash:networkDigest(base)},resultHash=networkDigest(result);
+  row.authorization=a;row.terminalResult=result;f.archive.outbox=[result];f.archive.acknowledgments={[resultHash]:true};f.archive.evidence.runs[0]!.authorizationHash=authorizationHash;
+  f.archive.trust.manager[entry.envelope.keyId]=entry.publicKey;
+  f.store.executionTransaction(state=>{const record=state.records[0]!;record.authorization=entry.envelope;record.authorizationHash=authorizationHash;record.result=result;record.resultHash=resultHash;});
+  f.archive.manager=f.store.read();f.sync();
+  Object.assign(draft,{archiveHash:networkDigest(f.archive.rawFiles),managerHash:createHash('sha256').update(Buffer.from(f.archive.rawFiles.manager,'base64url')).digest('hex'),agentHash:createHash('sha256').update(Buffer.from(f.archive.rawFiles.agent,'base64url')).digest('hex'),evidenceHash:createHash('sha256').update(Buffer.from(f.archive.rawFiles.evidence,'base64url')).digest('hex')});
+  const directory=join(f.dir,'retained-signed-utf8'),attachments=Object.fromEntries(Object.keys(f.archive.evidence.files).map(name=>[name,readFileSync(join(f.archiveDirectory,'evidence',name))]));
+  createJournalArchive(directory,Object.fromEntries(Object.entries(f.archive.rawFiles).map(([name,encoded])=>[name,Buffer.from(encoded,'base64url')]))as any,attachments);
+  const envelope=signNetworkMessage(JOURNAL_TRANSITION_DOMAIN,{...draft,approval:{mode:'two-person',planHash:journalTransitionHash(draft),proposedBy:'alice',approvedBy:'bob',approvedAt:f.now}},f.keys.privateKey);
+  const before=readFileSync(f.store.path),original=readFileSync(join(directory,'manager.json'));
+  for(let attempt=0;attempt<2;attempt++){
+   assert.throws(()=>commitManagerJournalTransition(f.store,f.archive,envelope,[f.keys.publicKey],f.keys.privateKey,directory,f.now),/signed journal payload UTF-8/);
+   assert.deepEqual(readFileSync(f.store.path),before);assert.deepEqual(readFileSync(join(directory,'manager.json')),original);
+  }
  }finally{f.cleanup();}
 });
