@@ -1,5 +1,7 @@
 import { settleNetworkExecution } from './network-execution-settlement.ts';
 import { test } from 'node:test';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, writeFileSync, rmSync, unlinkSync, symlinkSync, chmodSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
@@ -10,7 +12,7 @@ import { NetworkRegistryStore } from './network-registry.ts';
 import { emptyApprovals, propose, approve } from './approval.ts';
 import { signNetworkMessage } from './network-execution.ts';
 import { artifactSigningKeyId } from './artifact-signature.ts';
-import { networkDigest } from './network-canonical.ts';
+import { canonicalNetworkJson, networkDigest } from './network-canonical.ts';
 import { validateJournalEvidence } from './network-journal-evidence.ts';
 import { networkLabInput } from '../examples/network-lab.ts';
 import { planJournalTransition, authorizeJournalTransition, validateQuiescentArchive, journalTransitionHash, commitManagerJournalTransition, verifyJournalMessage, JOURNAL_TRANSITION_DOMAIN, JOURNAL_TRANSITION_RECEIPT_DOMAIN, type JournalArchive } from './network-journal-transition.ts';
@@ -334,4 +336,129 @@ test('retained signed invalid UTF-8 cannot commit or alter Registry/archive byte
    assert.deepEqual(readFileSync(f.store.path),before);assert.deepEqual(readFileSync(join(directory,'manager.json')),original);
   }
  }finally{f.cleanup();}
+});
+
+function acceptedCancellation(f:ReturnType<typeof fixture>) {
+  const tx='b'.repeat(32),row=f.archive.agent.transactions[tx],a=row.authorization;
+  const record=f.archive.manager.execution!.records[0]!;
+  const cancellation={schemaVersion:1,transactionId:tx,fenceId:tx,target:a.target,journalId:a.journalId,authorizationHash:networkDigest(a),artifactHash:a.artifactHash,registryRevision:a.registryRevision,requestedAt:f.now,requestedBy:'alice',authorization:record.authorization};
+  const base={schemaVersion:2,domain:'heliopause-network-cancellation-mtls-v1',transactionId:tx,fenceId:tx,target:a.target,journalId:a.journalId,authorizationHash:networkDigest(a),artifactHash:a.artifactHash,registryRevision:a.registryRevision,state:'cancellation-rejected',sequence:1,proof:{cancellationHash:networkDigest(cancellation),acceptedState:'awaiting-confirm'}};
+  row.cancelRequested=true;row.cancellationResponse={...base,stateHash:networkDigest(base)};
+  record.cancellation=signNetworkMessage('heliopause-network-cancel-v1',cancellation,f.keys.privateKey);record.cancelStatus='settled';
+  record.cancellationResponse=row.cancellationResponse;record.cancellationResponseHash=networkDigest(row.cancellationResponse);
+}
+function persistModifiedArchive(f:ReturnType<typeof fixture>) {
+  f.store.executionTransaction(state=>Object.assign(state,structuredClone(f.archive.manager.execution)));
+  f.sync();
+  const manifestPath=join(f.archiveDirectory,'manifest.json'),manifest=JSON.parse(readFileSync(manifestPath,'utf8'));
+  const names={manager:'manager.json',agent:'transactions.json',identity:'journal-identity.json',outbox:'terminal-results.json',acknowledgments:'terminal-acks.json',trust:'audit-public-keys.json',config:'network-executor-config.json',evidence:'execution-evidence.json'};
+  for(const [name,file] of Object.entries(names)){const raw=Buffer.from(f.archive.rawFiles[name as keyof typeof f.archive.rawFiles],'base64url');writeFileSync(join(f.archiveDirectory,file),raw);manifest.files[file]={sha256:createHash('sha256').update(raw).digest('hex'),bytes:raw.length};}
+  writeFileSync(manifestPath,JSON.stringify(manifest));
+}
+function fixtureArchiveBytes(f:ReturnType<typeof fixture>) {
+  // Fixed eight cores, manifest, and exactly the five known fixture attachments.
+  const paths=['manager.json','transactions.json','journal-identity.json','terminal-results.json','terminal-acks.json','audit-public-keys.json','network-executor-config.json','execution-evidence.json','manifest.json',
+    ...['report','inventory','packets','modules','history'].map(kind=>'evidence/'+kind+'-'+'b'.repeat(32)+'.json')];
+  return Object.fromEntries(paths.map(path=>[path,readFileSync(join(f.archiveDirectory,path))]));
+}
+for(const [name,change] of [
+  ['state hash',(row:any)=>{row.cancellationResponse.stateHash='0'.repeat(64);}],
+  ['missing flag',(row:any)=>{delete row.cancelRequested;}],
+  ['false flag',(row:any)=>{row.cancelRequested=false;}],
+  ['null pair',(row:any)=>{row.cancelRequested=null;row.cancellationResponse=null;}],
+  ['proof extra',(row:any)=>{row.cancellationResponse.proof.extra=true;}],
+  ['response binding',(row:any)=>{row.cancellationResponse.fenceId='0'.repeat(32);}],
+  ['schema',(row:any)=>{row.cancellationResponse.schemaVersion=1;}],
+  ['domain',(row:any)=>{row.cancellationResponse.domain='heliopause-network-terminal-mtls-v1';}],
+  ['sequence zero',(row:any)=>{row.cancellationResponse.sequence=0;}],
+  ['sequence over limit',(row:any)=>{row.cancellationResponse.sequence=1025;}],
+  ['unsupported accepted state',(row:any)=>{row.cancellationResponse.proof.acceptedState='confirmed';}],
+  ['null proof',(row:any)=>{row.cancellationResponse.proof=null;}],
+  ['flag without response',(row:any)=>{delete row.cancellationResponse;}],
+] as const)test('accepted cancellation ingress refuses '+name+' without Manager mutation',()=>{
+ const f=fixture();try{
+  acceptedCancellation(f);persistModifiedArchive(f);validateQuiescentArchive(f.archive,f.target);const draft=f.draft();
+  const row=f.archive.agent.transactions['b'.repeat(32)];change(row);
+  // Keep every other commitment coherent so schema/proof/binding negatives reach
+  // the admission rule under test, rather than merely a stale hash.
+  if(name!=='state hash'&&row.cancellationResponse){const {stateHash,...base}=row.cancellationResponse;row.cancellationResponse.stateHash=networkDigest(base);}
+  const record=f.archive.manager.execution!.records[0]!;record.cancellationResponse=row.cancellationResponse;record.cancellationResponseHash= row.cancellationResponse?networkDigest(row.cancellationResponse):undefined;
+  persistModifiedArchive(f);draft.archiveHash=networkDigest(f.archive.rawFiles);draft.managerHash=createHash('sha256').update(Buffer.from(f.archive.rawFiles.manager,'base64url')).digest('hex');draft.agentHash=createHash('sha256').update(Buffer.from(f.archive.rawFiles.agent,'base64url')).digest('hex');
+  const envelope=signNetworkMessage(JOURNAL_TRANSITION_DOMAIN,{...draft,approval:{mode:'two-person',planHash:journalTransitionHash(draft),proposedBy:'alice',approvedBy:'bob',approvedAt:f.now}},f.keys.privateKey),before=readFileSync(f.store.path),archiveBefore=fixtureArchiveBytes(f);
+  for(let i=0;i<2;i++){assert.throws(()=>commitManagerJournalTransition(f.store,f.archive,envelope,[f.keys.publicKey],f.keys.privateKey,f.archiveDirectory,f.now));assert.deepEqual(readFileSync(f.store.path),before);assert.deepEqual(fixtureArchiveBytes(f),archiveBefore);}
+ }finally{f.cleanup();}
+});
+test('archive key ordering rejects recursively incompatible raw objects and signed payloads',()=>{
+ const f=fixture();try{
+  for(const value of [{nested:{'\u{10000}':1,'\uffff':2}},[{nested:{'\u{10000}':1,'\ue000':2}}]]){
+   assert.throws(()=>parseJournalArchiveFile('identity',Buffer.from(JSON.stringify(value))),/key order/);
+   const envelope=signNetworkMessage(JOURNAL_TRANSITION_DOMAIN,value,f.keys.privateKey);
+   assert.throws(()=>verifyJournalMessage(envelope,JOURNAL_TRANSITION_DOMAIN,[f.keys.publicKey]),/key order/);
+  }
+ }finally{f.cleanup();}
+});
+test('compatible Unicode values and key sets retain archive and signed-message acceptance',()=>{
+ const f=fixture();try{
+  const value={'\u{10000}':{'\u{10001}':'\u2028\u2029\u{1f642}'},ascii:'\uffff'};
+  assert.deepEqual(parseJournalArchiveFile('identity',Buffer.from(JSON.stringify(value))),value);
+  assert.deepEqual(verifyJournalMessage(signNetworkMessage(JOURNAL_TRANSITION_DOMAIN,value,f.keys.privateKey),JOURNAL_TRANSITION_DOMAIN,[f.keys.publicKey]),value);
+  acceptedCancellation(f);persistModifiedArchive(f);const envelope=f.issue();commitManagerJournalTransition(f.store,f.archive,envelope,[f.keys.publicKey],f.keys.privateKey,f.archiveDirectory,f.now);assert.equal(f.store.read().execution!.records.length,0);
+ }finally{f.cleanup();}
+});
+
+function agentLoad(f:ReturnType<typeof fixture>) {
+  // Construct only the loader object: no Executor constructor, driver, crypto provider,
+  // admission, network commands or operational paths are used by this HOST fixture.
+  return spawnSync('python3',['-c',`
+import os,sys
+sys.path.insert(0,sys.argv[1])
+from network_executor import Executor
+executor=object.__new__(Executor)
+executor.directory=sys.argv[2]
+executor.path=os.path.join(executor.directory,'transactions.json')
+executor.config={'journalId':sys.argv[3]}
+executor.load()
+`,fileURLToPath(new URL('../agent',import.meta.url)),f.archiveDirectory,f.journal],{encoding:'utf8',timeout:10000});
+}
+test('production Agent loader accepts supported cancellation baseline and rejects commitments Manager now refuses',()=>{
+ const f=fixture();try{
+  acceptedCancellation(f);persistModifiedArchive(f);
+  let loaded=agentLoad(f);assert.equal(loaded.status,0,loaded.stderr);validateQuiescentArchive(f.archive,f.target);
+  const row=f.archive.agent.transactions['b'.repeat(32)],original=structuredClone(row);
+  for(const mutate of [(r:any)=>{r.cancellationResponse.stateHash='0'.repeat(64);},(r:any)=>{delete r.cancelRequested;},(r:any)=>{r.cancelRequested=false;},(r:any)=>{r.cancellationResponse.proof.acceptedState='confirmed';const {stateHash,...base}=r.cancellationResponse;r.cancellationResponse.stateHash=networkDigest(base);}]){
+   Object.keys(row).forEach(k=>delete row[k]);Object.assign(row,structuredClone(original));mutate(row);
+   const record=f.archive.manager.execution!.records[0]!;record.cancellationResponse=row.cancellationResponse;record.cancellationResponseHash=networkDigest(row.cancellationResponse);
+   persistModifiedArchive(f);loaded=agentLoad(f);assert.equal(loaded.status,1);assert.match(loaded.stderr,/accepted cancellation/);assert.throws(()=>validateQuiescentArchive(f.archive,f.target));
+  }
+ }finally{f.cleanup();}
+});
+
+function authorizationExtension(f:ReturnType<typeof fixture>,extension:Record<string,unknown>) {
+  const row=f.archive.agent.transactions['b'.repeat(32)],record=f.archive.manager.execution!.records[0]!;
+  Object.assign(row.authorization,extension);record.authorizationHash=networkDigest(row.authorization);
+  record.authorization=signNetworkMessage('heliopause-network-execution-v2',row.authorization,f.keys.privateKey);
+  const {stateHash,...base}=row.terminalResult;base.authorizationHash=record.authorizationHash;
+  row.terminalResult={...base,stateHash:networkDigest(base)};record.result=row.terminalResult;record.resultHash=networkDigest(record.result);
+  f.archive.outbox=[record.result];f.archive.acknowledgments={[record.resultHash]:true};f.archive.evidence.runs[0]!.authorizationHash=record.authorizationHash;
+  persistModifiedArchive(f);
+}
+for(const conflict of [false,true])test('Unicode authorization archive commit '+(conflict?'refuses divergent key order without changing Manager':'retains compatible Unicode acceptance'),()=>{
+ const f=fixture();try{
+  const draft=f.draft();authorizationExtension(f,conflict?{extension:{'\u{10000}':1,'\uffff':2}}:{extension:{'\u{10000}':'\u2028\u2029\u{1f642}','\u{10001}':'fine'}});
+  // Build an already signed retained archive without invoking today's admission gate.
+  for(const field of ['manager','agent','evidence'] as const)draft[(field+'Hash') as 'managerHash'|'agentHash'|'evidenceHash']=createHash('sha256').update(Buffer.from(f.archive.rawFiles[field],'base64url')).digest('hex');
+  draft.archiveHash=networkDigest(f.archive.rawFiles);
+  const envelope=signNetworkMessage(JOURNAL_TRANSITION_DOMAIN,{...draft,approval:{mode:'two-person',planHash:journalTransitionHash(draft),proposedBy:'alice',approvedBy:'bob',approvedAt:f.now}},f.keys.privateKey),before=readFileSync(f.store.path),archiveBefore=fixtureArchiveBytes(f);
+  const loaded=agentLoad(f);
+  if(conflict){assert.equal(loaded.status,1);assert.match(loaded.stderr,/terminal journal commitment/);for(let i=0;i<2;i++){assert.throws(()=>commitManagerJournalTransition(f.store,f.archive,envelope,[f.keys.publicKey],f.keys.privateKey,f.archiveDirectory,f.now),/key order/);assert.deepEqual(readFileSync(f.store.path),before);assert.deepEqual(fixtureArchiveBytes(f),archiveBefore);}}
+  else{assert.equal(loaded.status,0,loaded.stderr);commitManagerJournalTransition(f.store,f.archive,envelope,[f.keys.publicKey],f.keys.privateKey,f.archiveDirectory,f.now);assert.equal(f.store.read().execution!.records.length,0);}
+ }finally{f.cleanup();}
+});
+
+for(const entry of validationContract.archiveKeyOrderCases)test('shared archive key-order bytes: '+entry.name,()=>{
+  assert.equal(entry.scope,'decoder/canonical only');
+  const raw=Buffer.from(entry.rawHex,'hex'),decoded=JSON.parse(raw.toString('utf8'));
+  assert.equal(Buffer.from(canonicalNetworkJson(decoded)).toString('hex'),entry.nodeCanonicalHex);
+  if(entry.managerAccepted)assert.deepEqual(parseJournalArchiveFile('identity',raw),decoded);
+  else assert.throws(()=>parseJournalArchiveFile('identity',raw),/key order/);
 });

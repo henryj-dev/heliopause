@@ -955,5 +955,43 @@
       "agentSignedDecoderAccepted": false,
       "scope": "Preserved synthetic public-only fixture, valid raw-byte signature; decoder boundary, not full schema equivalence."
     }
+  ],
+  "archiveKeyOrderCases": [
+    {
+      "name": "conflicting supplementary and BMP keys",
+      "rawHex": "7b22f0908080223a312c22efbfbf223a327d",
+      "nodeCanonicalHex": "7b22f0908080223a312c22efbfbf223a327d",
+      "agentCanonicalHex": "7b22efbfbf223a322c22f0908080223a317d",
+      "managerAccepted": false,
+      "agentDecoderAccepted": true,
+      "scope": "decoder/canonical only"
+    },
+    {
+      "name": "nested conflicting keys",
+      "rawHex": "7b226e6573746564223a5b7b22f0908080223a312c22ee8080223a327d5d7d",
+      "nodeCanonicalHex": "7b226e6573746564223a5b7b22f0908080223a312c22ee8080223a327d5d7d",
+      "agentCanonicalHex": "7b226e6573746564223a5b7b22ee8080223a322c22f0908080223a317d5d7d",
+      "managerAccepted": false,
+      "agentDecoderAccepted": true,
+      "scope": "decoder/canonical only"
+    },
+    {
+      "name": "compatible astral and ASCII keys",
+      "rawHex": "7b22f0908080223a312c226173636969223a327d",
+      "nodeCanonicalHex": "7b226173636969223a322c22f0908080223a317d",
+      "agentCanonicalHex": "7b226173636969223a322c22f0908080223a317d",
+      "managerAccepted": true,
+      "agentDecoderAccepted": true,
+      "scope": "decoder/canonical only"
+    },
+    {
+      "name": "Unicode scalar values",
+      "rawHex": "7b2276616c7565223a22e280a8e280a9f09f9982227d",
+      "nodeCanonicalHex": "7b2276616c7565223a22e280a8e280a9f09f9982227d",
+      "agentCanonicalHex": "7b2276616c7565223a22e280a8e280a9f09f9982227d",
+      "managerAccepted": true,
+      "agentDecoderAccepted": true,
+      "scope": "decoder/canonical only"
+    }
   ]
 }

@@ -16,6 +16,20 @@ function archiveText(raw:Buffer):string {
   if(!isUtf8(raw))throw new Error('invalid archive UTF-8');
   return raw.toString('utf8');
 }
+/** Historical digests use Node's UTF-16 key order. Refuse only archive objects
+ * whose keys Python would sort differently; never rewrite signed or stored bytes. */
+export function requireArchiveKeyOrder(value:unknown):void {
+  if(Array.isArray(value)){value.forEach(requireArchiveKeyOrder);return;}
+  if(!value||typeof value!=='object')return;
+  const keys=Object.keys(value),nodeOrder=[...keys].sort();
+  const pythonOrder=[...keys].sort((a,b)=>{
+    const left=Array.from(a,c=>c.codePointAt(0)!),right=Array.from(b,c=>c.codePointAt(0)!);
+    for(let i=0;i<Math.min(left.length,right.length);i++)if(left[i]!==right[i])return left[i]!-right[i]!;
+    return left.length-right.length;
+  });
+  if(nodeOrder.some((key,i)=>key!==pythonOrder[i]))throw new Error('unsupported archive Unicode key order');
+  Object.values(value).forEach(requireArchiveKeyOrder);
+}
 /** JSON.parse alone silently accepts duplicate keys, unlike the production Agent decoder. */
 export function parseArchiveJson(raw:string,integerToken:(path:readonly string[])=>boolean=()=>false):any {
   const parsed=JSON.parse(raw),stack:Array<{object:boolean;key:boolean;field?:string;path:string[];seen:Set<string>}>=[];
@@ -33,6 +47,7 @@ export function parseArchiveJson(raw:string,integerToken:(path:readonly string[]
     else if(value.startsWith('"')&&frame?.object&&frame.key){const key=JSON.parse(value);if(frame.seen.has(key))throw new Error('duplicate archive JSON key');frame.seen.add(key);frame.field=key;}
     else if(frame&&(!frame.object||!frame.key)&&/^-?\d/.test(value)&&integerToken([...frame.path,frame.object?frame.field!:'[]'])&&!/^-?(?:0|[1-9]\d*)$/.test(value))throw new Error('unsupported replay counter encoding: integer JSON token required');
   }
+  requireArchiveKeyOrder(parsed);
   return parsed;
 }
 /** Python's replay validator requires int, while JSON.parse collapses 1.0/1e0 to 1.

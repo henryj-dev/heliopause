@@ -254,3 +254,29 @@ The shared byte fixtures record decoder-specific outcomes. Python's existing byt
 Manager journal verification checks strict UTF-8 on the original signed payload bytes before decoding them, then compares canonical UTF-8 bytes directly with those signed bytes. The outer archive encoding check does not inspect a base64-encoded payload. A malformed payload is refused even if its raw-byte signature is valid; it is never repaired by replacement decoding. An actual U+FFFD scalar remains valid where its field permits it. Historical execution/cancellation/confirmation verification and transition commit share this boundary.
 
 The shared fixed fixtures contain public material from a synthetic test and record the Manager and Agent signed-decoder outcomes separately. This change leaves the Agent decoder, base64 representation policy and byte budgets unchanged; it does not establish whole-schema or whole-decoder equivalence. Preserve unsupported original archives and reconcile their provenance instead of normalizing them. Standard regression checks cover repeated commit refusal with unchanged Registry/archive bytes; actual VM rollout and boot qualification remain separate.
+
+
+## Archive key ordering and accepted-cancellation commitments
+
+Archive admission supports object keys only when the existing JavaScript UTF-16
+lexicographic order agrees with Python Unicode code-point order. A conflicting
+key set is refused at the archive JSON boundary, including decoded signed journal
+payloads. The global network canonicalization, historical digests and signed bytes
+are unchanged. Ordinary Unicode values, U+2028/U+2029, and supplementary-character
+keys whose ordering agrees remain supported. Do not normalize, resort or rewrite
+an unsupported original archive to make it pass.
+
+For an accepted cancellation, the Agent row must contain both `cancelRequested`
+and `cancellationResponse`, with the flag exactly `true`, or contain neither. The
+response must retain its supported schema, authorization/target/journal bindings,
+accepted-state proof and recomputed `stateHash`; equality of the Manager and Agent
+copies alone is insufficient. This is a producer-shaped Manager admission subset:
+legacy null placeholder pairs tolerated by the Agent loader are not supported for
+a new archive transition. The Agent's existing owned-recovery behavior is unchanged.
+
+These checks prevent Manager retirement from preceding a predictable Agent
+archive or journal-load refusal. They do not establish whole-schema decoder
+equivalence, validate unavailable historical evidence, or qualify a runtime
+rollout, boot restoration or 24-hour observation. Refusal must preserve the original
+Registry, replay identity, fence and archive bytes, including on repeated commit
+attempts with an otherwise valid signed transition.

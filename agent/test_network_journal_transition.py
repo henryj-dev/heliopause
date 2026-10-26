@@ -515,4 +515,22 @@ for index,entry in enumerate(CONTRACT['signedPayloadUtf8Cases']):
     setattr(SignedPayloadUtf8Decoding,'test_shared_signed_payload_utf8_'+str(index),signed_utf8_contract_test(entry))
 
 
+class ArchiveKeyOrderDecoding(unittest.TestCase):
+    """Shared exact-byte decoder/canonical vectors, not full archive equivalence."""
+
+
+def archive_key_order_contract_test(entry):
+    def run(self):
+        self.assertEqual(entry['scope'],'decoder/canonical only')
+        self.assertIs(entry['agentDecoderAccepted'],True)
+        with patch.object(subprocess,'Popen',side_effect=AssertionError('decoder process escaped')),patch.object(socket,'socket',side_effect=AssertionError('decoder socket escaped')):
+            decoded=n.decode_json(bytes.fromhex(entry['rawHex']))
+            self.assertEqual(n.canonical(decoded).encode('utf-8').hex(),entry['agentCanonicalHex'])
+    return run
+
+
+for index,entry in enumerate(CONTRACT['archiveKeyOrderCases']):
+    setattr(ArchiveKeyOrderDecoding,'test_shared_archive_key_order_'+str(index),archive_key_order_contract_test(entry))
+
+
 if __name__=='__main__':unittest.main()

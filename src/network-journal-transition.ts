@@ -9,7 +9,7 @@ import { isUtf8 } from 'node:buffer';
 import { isAbsolute, normalize } from 'node:path';
 import { createHash, createPublicKey, verify, type KeyObject } from 'node:crypto';
 import { artifactSigningKeyId } from './artifact-signature.ts';
-import { loadJournalArchive, parseJournalArchiveFile } from './network-journal-archive.ts';
+import { loadJournalArchive, parseJournalArchiveFile, requireArchiveKeyOrder } from './network-journal-archive.ts';
 import { readBoundedStoreFile } from './json-store.ts';
 import { canonicalNetworkJson, networkDigest } from './network-canonical.ts';
 import { claimForPublish, settle, type ApprovalState } from './approval.ts';
@@ -98,6 +98,17 @@ export function validateQuiescentArchive(archive:JournalArchive,target:NetworkTa
     if(record.cancellation){const cancelled=verifyJournalMessage(record.cancellation,NETWORK_CANCEL_DOMAIN,auditKeys.manager);need(equal(row.cancellation??null,cancelled)||!!row.cancellationResponse,'cancellation archive mismatch');}
     if(record.confirmation){const confirm=verifyJournalMessage(record.confirmation,NETWORK_CONFIRM_DOMAIN,auditKeys.manager);verifyJournalMessage(confirm.verification,NETWORK_VERIFY_DOMAIN,auditKeys.verifier);}
     need(equal(row.authorization,signed)&&record.authorizationHash===networkDigest(row.authorization),'authorization archive mismatch');
+    const requested=Object.hasOwn(row,'cancelRequested'),responded=Object.hasOwn(row,'cancellationResponse');
+    need(requested===responded,'orphan accepted cancellation commitment');
+    if(responded){
+      const response=row.cancellationResponse,authorization=row.authorization;
+      need(row.cancelRequested===true&&exact(response,'schemaVersion domain transactionId fenceId target journalId authorizationHash artifactHash registryRevision state sequence stateHash proof'),'invalid accepted cancellation commitment');
+      need(response.schemaVersion===2&&response.domain==='heliopause-network-cancellation-mtls-v1'&&response.state==='cancellation-rejected'&&response.authorizationHash===networkDigest(authorization)&&response.fenceId===authorization.transactionId&&Number.isSafeInteger(response.sequence)&&response.sequence>=1&&response.sequence<=1024,'invalid accepted cancellation commitment');
+      need(['transactionId','target','journalId','artifactHash','registryRevision'].every(key=>equal(response[key],authorization[key])),'accepted cancellation binding mismatch');
+      const {stateHash,...committed}=response;
+      need(stateHash===networkDigest(committed),'accepted cancellation state commitment mismatch');
+      need(exact(response.proof,'cancellationHash acceptedState')&&hash(response.proof.cancellationHash)&&['prepared','applying','awaiting-verification','awaiting-confirm','rolling-back','rollback-failed'].includes(response.proof.acceptedState),'invalid accepted cancellation evidence');
+    }
     need(equal(row.cancellationResponse??null,record.cancellationResponse??null),'accepted cancellation response archive mismatch');
     need(row.authorization.journalId===a.journalId&&equal(row.authorization.target,target),'Agent target archive mismatch');
     need(equal(row.terminalResult,result)&&equal(outbox.get(record.transactionId),result)&&record.resultHash===networkDigest(result)&&archive.acknowledgments[record.resultHash!]===true,'exact archived settlement/ack required');
@@ -140,6 +151,7 @@ export function verifyJournalMessage(envelope:NetworkSignedEnvelope,domain:strin
   // The outer archive UTF-8 guard cannot inspect bytes inside a base64 payload.
   need(isUtf8(payload),'invalid signed journal payload UTF-8');
   const parsed=JSON.parse(payload.toString('utf8'));
+  requireArchiveKeyOrder(parsed);
   need(Buffer.from(canonicalNetworkJson(parsed),'utf8').equals(payload),'noncanonical transition message');return parsed;
 }
 
