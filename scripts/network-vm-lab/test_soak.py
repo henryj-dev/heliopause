@@ -308,6 +308,31 @@ class FrozenInputBoundaries(unittest.TestCase):
         path=self.root/'key';path.write_text('private');info=path.stat()
         with patch('soak_inputs.os.open',side_effect=AssertionError('private path opened')):
             with self.assertRaisesRegex(ValueError,'private key alias'):file_commitment(path,forbidden={(info.st_dev,info.st_ino)})
+    def test_peer_opt_in_service_public_inputs_and_private_stat_only(self):
+        base=self.root/'peer';base.mkdir();(base/'pki').mkdir()
+        (base/'config.json').write_text('{}')
+        for name in ['ca.pem','gateway.pem','manager.pem']:
+            (base/'pki'/name).write_text('-----BEGIN CERTIFICATE-----\npublic')
+        for role in ['manager','verifier']:
+            (base/role).mkdir();(base/role/'public.pem').write_text('-----BEGIN PUBLIC KEY-----\npublic')
+        operator=base/'relay-operator-pki';operator.mkdir(mode=0o700)
+        for name in ['ca.pem','operator-hp-manager.pem']:(operator/name).write_text('-----BEGIN CERTIFICATE-----\npublic')
+        key=operator/'operator-hp-manager.key';key.write_text('must not open');key.chmod(0o600)
+        original=os.open
+        def guarded(path,*args,**kwargs):
+            if Path(path)==key:raise AssertionError('opened service private key')
+            return original(path,*args,**kwargs)
+        with patch('soak_inputs.os.open',side_effect=guarded):result=frozen_inputs('peer',{'lifecycleObservationTransport':True},base=base)
+        self.assertIn(str(operator/'ca.pem'),result['files'])
+        self.assertIn(str(operator/'operator-hp-manager.pem'),result['files'])
+        self.assertNotIn(str(key),result['files'])
+        self.assertEqual(result['serviceOperatorPrivateKeyMetadata'][str(key)]['inode'],key.stat().st_ino)
+        self.assertEqual(result['serviceOperatorDirectoryMetadata'][str(operator)]['st_ino'],operator.stat().st_ino)
+        extra=operator/'extra.pem';extra.write_text('not selected')
+        with self.assertRaisesRegex(ValueError,'directory coverage'):frozen_inputs('peer',{'lifecycleObservationTransport':True},base=base)
+        extra.unlink()
+        key.chmod(0o644)
+        with self.assertRaisesRegex(ValueError,'protected service operator'):frozen_inputs('peer',{'lifecycleObservationTransport':True},base=base)
     def test_change_during_read_refused_without_hash(self):
         path=self.root/'config';path.write_text('before');original=os.fstat;calls=0
         def altered(fd):
