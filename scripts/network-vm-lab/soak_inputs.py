@@ -71,6 +71,8 @@ def public_directory(path, forbidden=()):
 
 def frozen_inputs(role, config, etc=Path('/etc/heliopause'), base=Path('/var/lib/heliopause-vm-lab')):
     """Fixed lab configuration/public inputs; explicit key files are stat-only."""
+    service_key_stats = None
+    service_directory_stats = None
     if role == 'gateway':
         delivery = config['terminalDelivery']
         certificates = {etc / 'pki/ca.pem', etc / 'pki/gateway.pem', Path(delivery['caFile']), Path(delivery['certFile'])}
@@ -84,6 +86,24 @@ def frozen_inputs(role, config, etc=Path('/etc/heliopause'), base=Path('/var/lib
         if config.get('lifecycleRevocations') is True:
             files.add(base / 'lifecycle-revocations.json')
         key_paths = [base / 'manager.key', base / 'verifier.key'] + [base / 'pki' / name for name in ('ca.key','gateway.key','manager.key')]
+        if config.get('lifecycleObservationTransport') is True:
+            # Separate service identity; never silently choose Alice/Bob's credential.
+            operator = base / 'relay-operator-pki'
+            directory_info = operator.lstat()
+            if not stat.S_ISDIR(directory_info.st_mode) or stat.S_IMODE(directory_info.st_mode) != 0o700 or directory_info.st_uid not in (0, os.geteuid()):
+                raise ValueError('protected service operator directory required')
+            names = sorted(path.name for path in operator.iterdir())
+            if names != ['ca.pem','operator-hp-manager.key','operator-hp-manager.pem']:
+                raise ValueError('exact service operator directory coverage required')
+            service_directory_stats = {str(operator): {**{name: getattr(directory_info, name) for name in ('st_dev','st_ino','st_uid','st_gid','st_mode')}, 'names': names}}
+            certificates |= {operator / 'ca.pem', operator / 'operator-hp-manager.pem'}
+            files |= certificates
+            service_key = operator / 'operator-hp-manager.key'
+            key_info = service_key.lstat()
+            if not stat.S_ISREG(key_info.st_mode) or stat.S_IMODE(key_info.st_mode) != 0o600 or key_info.st_nlink != 1 or key_info.st_uid not in (0, os.geteuid()):
+                raise ValueError('protected service operator private key required')
+            service_key_stats = {str(service_key): dict(zip(('device','inode','bytes','mtimeNs','ctimeNs','mode','uid','gid','nlink'), stat_identity(key_info)))}
+            key_paths.append(service_key)
         directories = {name: base / name for name in ('manager', 'verifier')}
     else:
         raise ValueError('unknown disposable role')
@@ -102,4 +122,8 @@ def frozen_inputs(role, config, etc=Path('/etc/heliopause'), base=Path('/var/lib
         if (info.st_dev,info.st_ino) in forbidden:
             raise ValueError('declared private key alias is not a public input')
     trust = {name: public_directory(path,forbidden) for name,path in directories.items()}
-    return {'files': {str(path): file_commitment(path,b'CERTIFICATE' if path in certificates else None,forbidden) for path in sorted(files)}, 'publicTrust': trust}
+    result = {'files': {str(path): file_commitment(path,b'CERTIFICATE' if path in certificates else None,forbidden) for path in sorted(files)}, 'publicTrust': trust}
+    if service_key_stats is not None:
+        result['serviceOperatorPrivateKeyMetadata'] = service_key_stats
+        result['serviceOperatorDirectoryMetadata'] = service_directory_stats
+    return result

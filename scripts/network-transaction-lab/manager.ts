@@ -3,9 +3,10 @@ import { readFileSync, writeFileSync, existsSync, unlinkSync } from 'node:fs';
 import { createHash, X509Certificate, createPrivateKey, createPublicKey } from 'node:crypto';
 import { join } from 'node:path';
 import { startManager } from '../../src/manager-server.ts';
+import { observationRelays } from './manager-options.ts';
 const dir=process.argv[2]!,cfg=JSON.parse(readFileSync(join(dir,'config.json'),'utf8'));
 const pki=join(dir,'pki');
-const manager=await startManager({hostname:'192.0.2.1',port:8443,relays:[],
+const manager=await startManager({hostname:'192.0.2.1',port:8443,relays:observationRelays(dir,cfg),
   tls:{certFile:join(pki,'manager.pem'),keyFile:join(pki,'manager.key'),caFile:join(pki,'ca.pem')},
   revocationFile:cfg.lifecycleRevocations===true?join(dir,'lifecycle-revocations.json'):undefined,
   networkJournalArchiveDirectory:cfg.lifecycleJournalMaintenance===true?join(dir,'journal-archives'):undefined,
