@@ -35,7 +35,10 @@ export interface InventoryDomainConnection extends NetworkResource {
   allowManagement?: boolean;
 }
 export type NetworkPurpose = "application" | "infrastructure" | "management" | "backbone" | "kubernetes";
-export type AddressPoolPurpose = "infrastructure" | "kubernetes-pod" | "kubernetes-service" | "tunnel" | "management";
+/** `kubernetes-loadbalancer` is a VIP pool for an in-cluster allocator such as Cilium LB IPAM.
+ * It must sit outside the Service CIDR: the API server does not know that pool and may hand the
+ * same address out as a ClusterIP. */
+export type AddressPoolPurpose = "infrastructure" | "kubernetes-pod" | "kubernetes-service" | "kubernetes-loadbalancer" | "tunnel" | "management";
 /** Legacy siteId-only documents retain an implicit domain per network. Mixing with v2 is rejected. */
 export type InventoryNetwork = NetworkResource & { kind: "network" } & (
   | { siteId: string; scope?: never; routingDomainId?: never; purpose?: never }
@@ -88,9 +91,72 @@ export interface InventoryLearnedRoute extends NetworkResource {
   stage: "learned" | "selected" | "installed";
   nextHop?: string;
 }
+/** One address inside a pool. `managed` means Heliopause chose it, so the pool's allocation
+ * authority must be `heliopause`; `external` records an address another allocator chose.
+ * Kubernetes Pod/Service pools reject both: Kubernetes allocates those addresses itself. */
+export interface InventoryAddressAllocation extends NetworkResource {
+  kind: "address-allocation";
+  poolId: string;
+  address: string;
+  state: "reserved" | "allocated";
+  /** Optional reference to the resource that uses the address. */
+  consumerId?: string;
+}
+/** A BGP speaker. `gateway` routers form the inter-site fabric; `cluster` routers are in-site
+ * speakers such as Cilium nodes that peer only with their own site's gateways. */
+export interface InventoryBgpRouter extends NetworkResource {
+  kind: "bgp-router";
+  nodeId: string;
+  role: "gateway" | "cluster";
+  asn: number;
+  routerId: string;
+  /** Session address for in-site peering. Required on cluster routers and on any gateway whose
+   * site has cluster routers. */
+  address?: string;
+  /** Gateway only: the site blocks this router is authoritative for. Peers accept nothing else
+   * from this site, so adding a subnet inside a block changes no other gateway. */
+  originSubnetIds?: string[];
+  /** Gateway only: subnets this router originates. Each must sit inside an origin block. */
+  advertiseSubnetIds?: string[];
+  /** Gateway only: stable small integer used to derive per-peer listen ports. */
+  fabricIndex?: number;
+}
+export interface InventoryFabricTransport {
+  networkId: string;
+  preference: "primary" | "secondary";
+  /** `static-fallback` installs no BGP session; remote blocks get high-metric static routes. */
+  mode: "bgp" | "static-fallback";
+  listenPortBase?: number;
+  persistentKeepalive?: number;
+  mtu?: number;
+}
+/** Inter-site BGP fabric. Membership comes from fabric-attachment records, so adding a site is
+ * one router plus its attachments; the fabric record itself does not change. */
+export interface InventoryBgpFabric extends NetworkResource {
+  kind: "bgp-fabric";
+  topology: "full-mesh";
+  transports: InventoryFabricTransport[];
+  bfd?: boolean;
+}
+/** One gateway router's presence on one fabric transport. */
+export interface InventoryFabricAttachment extends NetworkResource {
+  kind: "fabric-attachment";
+  fabricId: string;
+  routerId: string;
+  networkId: string;
+  /** Address allocation inside a tunnel pool of the transport network. */
+  tunnelAllocationId: string;
+  /** Native WireGuard transport: public identity and an opaque private-key reference. */
+  endpoint?: string;
+  publicKey?: string;
+  privateKeyRef?: { provider: string; reference: string };
+  /** External transport: the existing, externally managed interface the routes use. */
+  interfaceId?: string;
+}
 export type NetworkInventoryResource = InventorySite | InventoryNode | InventoryGateway |
   InventoryNetwork | InventorySubnet | InventoryAddressPool | InventoryInterface | InventoryRoute |
-  InventoryRoutingDomain | InventoryDomainConnection | InventoryLearnedRoute;
+  InventoryRoutingDomain | InventoryDomainConnection | InventoryLearnedRoute |
+  InventoryAddressAllocation | InventoryBgpRouter | InventoryBgpFabric | InventoryFabricAttachment;
 export interface NetworkInventoryIssue { resourceId: string; message: string }
 
 const text = (v: unknown): v is string => typeof v === "string" && v.trim().length > 0;
@@ -104,10 +170,19 @@ const fields: Record<string, string[]> = {
   route: ["interfaceId", "destination", "table", "routingDomainId", "nextHop", "metric", "preferredSource", "routeType", "protocol"],
   "learned-route": ["interfaceId", "routingDomainId", "destination", "table", "protocol", "source", "stage", "nextHop"],
   "routing-domain": ["name", "isolation", "vrf"], "domain-connection": ["domainIds", "allowManagement"],
+  "address-allocation": ["poolId", "address", "state", "consumerId"],
+  "bgp-router": ["nodeId", "role", "asn", "routerId", "address", "originSubnetIds", "advertiseSubnetIds", "fabricIndex"],
+  "bgp-fabric": ["topology", "transports", "bfd"],
+  "fabric-attachment": ["fabricId", "routerId", "networkId", "tunnelAllocationId", "endpoint", "publicKey", "privateKeyRef", "interfaceId"],
 };
 const commonFields = ["id", "kind", "owner", "management", "generation", "observedGeneration"];
 const unknownFields = (v: Record<string, unknown>, allowed: string[]) => Object.keys(v).some(k => !allowed.includes(k));
-const kinds = new Set(["site", "node", "gateway", "network", "subnet", "address-pool", "interface", "route", "routing-domain", "domain-connection", "learned-route"]);
+const kinds = new Set(["site", "node", "gateway", "network", "subnet", "address-pool", "interface", "route", "routing-domain", "domain-connection", "learned-route",
+  "address-allocation", "bgp-router", "bgp-fabric", "fabric-attachment"]);
+const poolPurposes = ["infrastructure", "kubernetes-pod", "kubernetes-service", "kubernetes-loadbalancer", "tunnel", "management"];
+/** RFC 6996 private ranges. Public ASNs are refused so a typo cannot impersonate a real network. */
+export const isPrivateAsn = (v: unknown): boolean => Number.isSafeInteger(v) &&
+  ((Number(v) >= 64512 && Number(v) <= 65534) || (Number(v) >= 4200000000 && Number(v) <= 4294967294));
 
 function prefix(value: unknown) {
   if (typeof value !== "string" || !/^[^\s/]+\/(0|[1-9]\d*)$/.test(value)) return null;
@@ -208,7 +283,7 @@ export function validateNetworkInventory(input: unknown): NetworkInventoryIssue[
       case "address-pool":
         ref(r, "subnetId", "subnet");
         if (!text(r.allocationAuthority)) add(id, "allocationAuthority must be explicit");
-        if ((v2 || r.purpose !== undefined) && (typeof r.purpose !== "string" || !["infrastructure", "kubernetes-pod", "kubernetes-service", "tunnel", "management"].includes(r.purpose))) add(id, "pool requires a valid purpose");
+        if ((v2 || r.purpose !== undefined) && (typeof r.purpose !== "string" || !poolPurposes.includes(r.purpose))) add(id, "pool requires a valid purpose");
         if ((r.purpose === "kubernetes-pod" || r.purpose === "kubernetes-service") && r.allocationAuthority !== "kubernetes") add(id, "Kubernetes pools must retain kubernetes allocation authority");
         break;
       case "interface": {
@@ -334,5 +409,183 @@ export function validateNetworkInventory(input: unknown): NetworkInventoryIssue[
       add(idOf(other), `CIDR overlaps ${idOf(r)} in the same or connected routing domain`);
     }
   }
+  validateRoutingResources(records, lookup, ranges, connected, subnetDomain, add);
   return issues;
+}
+
+type Range = NonNullable<ReturnType<typeof prefix>>;
+const hostAddress = (v: unknown): v is string => typeof v === "string" && !v.includes("/") && !v.includes("%") && isIP(v) !== 0;
+const hostRange = (v: string): Range => cidrRange(v)!;
+const within = (outer: Range, inner: Range) => outer.family === inner.family && outer.first <= inner.first && outer.last >= inner.last;
+const ifaceName = /^[a-zA-Z0-9_=+.-]{1,15}$/;
+
+/** Allocations, BGP routers and the fabric. Kept apart from the prefix walk above because these
+ * records reference prefixes rather than claim them. */
+function validateRoutingResources(
+  records: Record<string, unknown>[],
+  lookup: (v: unknown) => Record<string, unknown> | undefined,
+  ranges: Map<Record<string, unknown>, Range>,
+  connected: (a: string | undefined, b: string | undefined) => boolean,
+  subnetDomain: (r: Record<string, unknown>) => string | undefined,
+  add: (id: string, message: string) => void,
+): void {
+  const idOf = (r: Record<string, unknown>) => text(r.id) ? r.id : "";
+  const is = (v: unknown, kind: string) => lookup(v)?.kind === kind;
+  const siteOfNode = (nodeId: unknown) => lookup(nodeId)?.siteId;
+  const poolDomain = (pool: Record<string, unknown> | undefined) => pool ? subnetDomain(lookup(pool.subnetId) ?? {}) : undefined;
+  const subnetSite = (subnet: Record<string, unknown> | undefined) => {
+    const network = subnet && lookup(subnet.networkId);
+    return network?.kind === "network" && network.scope !== "transit" && network.scope !== "overlay" ? network.siteId : undefined;
+  };
+
+  // Address allocations.
+  const taken: Array<{ r: Record<string, unknown>; range: Range; domain: string | undefined }> = [];
+  for (const r of records.filter(r => r.kind === "address-allocation")) {
+    const id = idOf(r);
+    const pool = lookup(r.poolId);
+    if (pool?.kind !== "address-pool") { add(id, "poolId must reference a address-pool"); continue; }
+    if (r.state !== "reserved" && r.state !== "allocated") add(id, "allocation state must be reserved or allocated");
+    if (r.consumerId !== undefined && !lookup(r.consumerId)) add(id, "consumerId must reference an existing resource");
+    if (pool.purpose === "kubernetes-pod" || pool.purpose === "kubernetes-service") add(id, "Kubernetes allocates Pod and Service addresses; inventory may not allocate them");
+    const m = r.management;
+    if (object(m) && m.mode !== "external" && pool.allocationAuthority !== "heliopause") add(id, "a managed allocation requires a pool whose allocationAuthority is heliopause");
+    if (!hostAddress(r.address)) { add(id, "allocation address must be a single IPv4 or IPv6 address"); continue; }
+    const range = hostRange(r.address);
+    const poolRange = ranges.get(pool);
+    if (poolRange && !within(poolRange, range)) add(id, "allocation address must be inside its pool");
+    const domain = poolDomain(pool);
+    for (const other of taken) {
+      if (other.range.family === range.family && other.range.first === range.first && connected(other.domain, domain)) add(id, `address is already allocated by ${idOf(other.r)} in the same or connected routing domain`);
+    }
+    taken.push({ r, range, domain });
+  }
+
+  // BGP routers.
+  const routers = records.filter(r => r.kind === "bgp-router");
+  const gatewayNodes = new Set(records.filter(r => r.kind === "gateway").map(r => r.nodeId));
+  for (const r of routers) {
+    const id = idOf(r);
+    if (!is(r.nodeId, "node")) add(id, "nodeId must reference a node");
+    if (r.role !== "gateway" && r.role !== "cluster") add(id, "router role must be gateway or cluster");
+    if (!isPrivateAsn(r.asn)) add(id, "asn must be a private ASN (64512-65534 or 4200000000-4294967294)");
+    if (!hostAddress(r.routerId) || isIP(r.routerId) !== 4) add(id, "routerId must be an IPv4 address");
+    if (r.address !== undefined && !hostAddress(r.address)) add(id, "router address must be a single IP address");
+    const m = r.management;
+    if (r.role === "gateway") {
+      if (!gatewayNodes.has(r.nodeId)) add(id, "gateway router node must be a declared gateway");
+      if (object(m) && m.mode !== "external" && (m.provider !== "frr" || m.driver !== "frr")) add(id, "a managed gateway router requires the frr provider and driver");
+      if (!Array.isArray(r.originSubnetIds) || r.originSubnetIds.length === 0) add(id, "gateway router requires at least one origin subnet");
+      if (r.fabricIndex !== undefined && (!Number.isInteger(r.fabricIndex) || Number(r.fabricIndex) < 1 || Number(r.fabricIndex) > 4096)) add(id, "fabricIndex must be an integer between 1 and 4096");
+    } else if (r.role === "cluster") {
+      if (!object(m) || m.mode !== "external") add(id, "cluster routers are owned by the cluster; record them as external");
+      if (r.address === undefined) add(id, "cluster router requires a session address");
+      for (const f of ["originSubnetIds", "advertiseSubnetIds", "fabricIndex"]) if (r[f] !== undefined) add(id, `${f} is a gateway router field`);
+    }
+    const blocks: Range[] = [];
+    for (const field of ["originSubnetIds", "advertiseSubnetIds"]) {
+      const value = r[field];
+      if (value === undefined) continue;
+      if (!Array.isArray(value) || new Set(value).size !== value.length) { add(id, `${field} must be a list of unique subnet ids`); continue; }
+      for (const subnetId of value) {
+        const subnet = lookup(subnetId);
+        const range = subnet && ranges.get(subnet);
+        if (subnet?.kind !== "subnet" || !range) { add(id, `${field} must reference subnets`); continue; }
+        if (subnetSite(subnet) !== siteOfNode(r.nodeId)) add(id, `${field} must be site-local subnets of the router's own site`);
+        if (lookup(subnet.networkId)?.purpose === "management") add(id, "management space is never originated into the fabric");
+        if (field === "originSubnetIds") blocks.push(range);
+        else if (!blocks.some(b => within(b, range))) add(id, "advertised subnet must be inside an origin subnet");
+      }
+    }
+    for (const network of records.filter(n => n.kind === "network" && n.purpose === "management")) {
+      for (const subnet of records.filter(s => s.kind === "subnet" && s.networkId === network.id)) {
+        const range = ranges.get(subnet);
+        if (range && blocks.some(b => b.family === range.family && b.first <= range.last && range.first <= b.last)) add(id, `origin subnet overlaps management subnet ${idOf(subnet)}`);
+      }
+    }
+  }
+  const gateways = routers.filter(r => r.role === "gateway");
+  const seen = (field: string, rows: Record<string, unknown>[], message: string) => {
+    const values = new Map<string, string>();
+    for (const r of rows) {
+      if (r[field] === undefined) continue;
+      const key = String(r[field]);
+      if (values.has(key)) add(idOf(r), `${message} ${values.get(key)}`); else values.set(key, idOf(r));
+    }
+  };
+  seen("routerId", routers, "routerId is already used by");
+  seen("fabricIndex", gateways, "fabricIndex is already used by");
+  // eBGP between sites: one ASN per site, never shared across sites or with in-site clusters.
+  const asnSite = new Map<number, unknown>();
+  for (const r of gateways) {
+    const site = siteOfNode(r.nodeId);
+    if (asnSite.has(Number(r.asn)) && asnSite.get(Number(r.asn)) !== site) add(idOf(r), "gateway ASN is already used by another site");
+    asnSite.set(Number(r.asn), site);
+    if (gateways.some(o => o !== r && siteOfNode(o.nodeId) === site && o.asn !== r.asn)) add(idOf(r), "gateway routers in one site must share the site ASN");
+  }
+  for (const r of routers.filter(r => r.role === "cluster")) {
+    if (asnSite.has(Number(r.asn))) add(idOf(r), "cluster ASN must differ from every gateway ASN");
+    const site = siteOfNode(r.nodeId);
+    const siteGateways = gateways.filter(g => siteOfNode(g.nodeId) === site);
+    if (!siteGateways.length) add(idOf(r), "cluster router site has no gateway router to peer with");
+    for (const g of siteGateways) if (g.address === undefined) add(idOf(g), "gateway router needs a session address because its site has cluster routers");
+  }
+
+  // Fabrics and attachments.
+  for (const r of records.filter(r => r.kind === "bgp-fabric")) {
+    const id = idOf(r);
+    if (r.topology !== "full-mesh") add(id, "only full-mesh fabrics are supported");
+    if (r.bfd !== undefined && typeof r.bfd !== "boolean") add(id, "bfd must be boolean");
+    const ts = r.transports;
+    if (!Array.isArray(ts) || ts.length === 0 || ts.length > 4) { add(id, "fabric requires one to four transports"); continue; }
+    const networks = new Set<unknown>();
+    for (const t of ts) {
+      if (!object(t) || Object.keys(t).some(k => !["networkId", "preference", "mode", "listenPortBase", "persistentKeepalive", "mtu"].includes(k))) { add(id, "unknown fabric transport field"); continue; }
+      const network = lookup(t.networkId);
+      if (network?.kind !== "network" || network.scope !== "overlay" || network.purpose !== "backbone") add(id, "fabric transport must reference a backbone overlay network");
+      if (networks.has(t.networkId)) add(id, "fabric transport network is listed twice");
+      networks.add(t.networkId);
+      if (t.preference !== "primary" && t.preference !== "secondary") add(id, "transport preference must be primary or secondary");
+      if (t.mode !== "bgp" && t.mode !== "static-fallback") add(id, "transport mode must be bgp or static-fallback");
+      if (t.mode === "static-fallback" && t.preference !== "secondary") add(id, "static-fallback is only for a secondary transport");
+      const native = object(network?.management) && network.management.mode !== "external";
+      if (native && (!Number.isInteger(t.listenPortBase) || Number(t.listenPortBase) < 1024 || Number(t.listenPortBase) > 60000)) add(id, "native transport requires listenPortBase between 1024 and 60000");
+      if (!native && t.listenPortBase !== undefined) add(id, "external transport ports belong to their provider");
+      if (t.persistentKeepalive !== undefined && (!Number.isInteger(t.persistentKeepalive) || Number(t.persistentKeepalive) < 1 || Number(t.persistentKeepalive) > 65535)) add(id, "persistentKeepalive must be 1-65535 seconds");
+      if (t.mtu !== undefined && (!Number.isInteger(t.mtu) || Number(t.mtu) < 1280 || Number(t.mtu) > 9000)) add(id, "transport mtu must be 1280-9000");
+    }
+    if (ts.filter(t => object(t) && t.preference === "primary").length !== 1) add(id, "fabric requires exactly one primary transport");
+  }
+  const attachmentKeys = new Set<string>();
+  for (const r of records.filter(r => r.kind === "fabric-attachment")) {
+    const id = idOf(r);
+    const fabric = lookup(r.fabricId);
+    const router = lookup(r.routerId);
+    const network = lookup(r.networkId);
+    if (fabric?.kind !== "bgp-fabric") add(id, "fabricId must reference a bgp-fabric");
+    if (router?.kind !== "bgp-router" || router.role !== "gateway") add(id, "routerId must reference a gateway bgp-router");
+    else if (!Number.isInteger(router.fabricIndex)) add(id, "attached router requires a fabricIndex");
+    const transport = fabric && Array.isArray(fabric.transports) ? fabric.transports.find(t => object(t) && t.networkId === r.networkId) : undefined;
+    if (!transport) add(id, "networkId must be one of the fabric transports");
+    if (network?.kind === "network" && router && Array.isArray(network.siteIds) && !network.siteIds.includes(siteOfNode(router.nodeId))) add(id, "router site is not a member of the transport network");
+    const key = JSON.stringify([r.fabricId, r.routerId, r.networkId]);
+    if (attachmentKeys.has(key)) add(id, "router is already attached to this transport");
+    attachmentKeys.add(key);
+    const allocation = lookup(r.tunnelAllocationId);
+    const pool = allocation?.kind === "address-allocation" ? lookup(allocation.poolId) : undefined;
+    const poolSubnet = pool && lookup(pool.subnetId);
+    if (allocation?.kind !== "address-allocation" || pool?.purpose !== "tunnel" || poolSubnet?.networkId !== r.networkId) add(id, "tunnelAllocationId must reference an allocation in a tunnel pool of the transport network");
+    const native = object(network?.management) && network.management.mode !== "external";
+    if (native) {
+      if (!hostAddress(r.endpoint)) add(id, "native attachment requires a literal endpoint address");
+      if (typeof r.publicKey !== "string" || !/^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw480]=$/.test(r.publicKey)) add(id, "native attachment requires a WireGuard public key");
+      const ref = r.privateKeyRef;
+      if (!object(ref) || Object.keys(ref).some(k => k !== "provider" && k !== "reference") || !text(ref.provider) || !text(ref.reference)) add(id, "native attachment requires a privateKeyRef with provider and reference");
+      if (r.interfaceId !== undefined) add(id, "native attachment interfaces are derived per peer, not referenced");
+    } else {
+      for (const f of ["endpoint", "publicKey", "privateKeyRef"]) if (r[f] !== undefined) add(id, `external transport ${f} belongs to its provider`);
+      const iface = lookup(r.interfaceId);
+      if (iface?.kind !== "interface" || !router || iface.nodeId !== router.nodeId || iface.networkId !== r.networkId || !ifaceName.test(String(iface.name))) add(id, "external attachment requires the router node's interface on the transport network");
+      else if (!object(iface.management) || iface.management.mode !== "external") add(id, "external transport interface must stay externally managed");
+    }
+  }
 }

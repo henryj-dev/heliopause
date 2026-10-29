@@ -278,3 +278,55 @@ The reviewed syntax follows the official FRR stable-8.5 and stable-10.2 BGP/rout
 ### Remaining execution work
 
 The compilers are separate offline previews; they are not yet bound into one signed, approved executable ChangeSet. A future planner must bind exact compiler artifacts, independent reachability evidence, secret versions and per-driver recovery requirements before any execution protocol can accept them. Next gates are: WireGuard driver with local secret resolution and explicit host routes; NetworkManager/nmstate persistence; FRR driver with config validation and durable undo; dependency-ordered multi-site changes; independent management checks; dual-backbone withdrawal/failover rehearsals; restart recovery; and staged operational migration. Rollback must remain local when manager/relay connectivity is lost. Network Overview UI is deferred until these analysis contracts are stable.
+
+## Dynamic routing fabric (BGP-driven)
+
+### Why the direction changed
+
+The Phase 4 previews put routing decisions into configuration that every gateway carries. `compileWireGuard` uses one interface per gateway with per-peer `allowedPrefixes` and refuses overlapping peer ranges, so WireGuard itself decides which remote prefixes reach which peer. `compileFrr` gives each peer exact `importSubnetIds`/`exportSubnetIds` lists. In that shape a new subnet, Service VIP or site requires regenerating and redeploying every gateway, and BGP cannot move traffic between backbones because the tunnel refuses destinations outside its AllowedIPs.
+
+The fabric model moves path selection to BGP and leaves configuration to describe identity and limits:
+
+| Concern | Phase 4 preview | Fabric model |
+| --- | --- | --- |
+| WireGuard | One interface, peer AllowedIPs = remote prefixes | One interface per peer, `AllowedIPs = 0.0.0.0/0, ::/0`, `Table = off`; the tunnel binds a key to a path only |
+| Which prefixes use which tunnel | WireGuard AllowedIPs | FRR-installed kernel routes |
+| Peer filters | Exact per-peer subnet lists | Derived from each site's **origin blocks**: management and tunnel pools denied, Service and load-balancer pools host routes only, block `le 32` permitted, AS path limited to the peer ASN optionally followed by its own cluster ASNs |
+| New subnet or VIP inside a block | Every gateway changes | Only the owning gateway changes (if it originates it), or nothing (if a cluster speaker announces it) |
+| New site | Every gateway changes | Every existing gateway gains one peer (full mesh), one gateway is added; existing tunnel names and ports do not change |
+| Secondary backbone | eBGP over it | eBGP at local-pref 100, or `static-fallback`: remote blocks at kernel metric 200 so FRR's eBGP routes (metric 20) win while they exist |
+| Firewall | Not coupled | Still not coupled. A learned route is never an access grant; firewall policy keeps referencing declared zones |
+
+### Implemented in this change
+
+`src/network-inventory.ts` adds four resource kinds and one pool purpose, all inventory only:
+
+- `address-allocation`: one address in a pool, `reserved` or `allocated`, optional consumer. A managed allocation requires a pool whose `allocationAuthority` is `heliopause`; an external one records another allocator's choice. Kubernetes Pod/Service pools reject both. Duplicate addresses are refused within connected routing domains. Free-address selection and leases are still not implemented.
+- `bgp-router`: `gateway` (FRR-managed or external) or `cluster` (always external, e.g. Cilium). Private ASNs only. One ASN per site, distinct across sites, and cluster ASNs distinct from every gateway ASN. Gateways declare `originSubnetIds` (site-local, non-management) and `advertiseSubnetIds` inside them, plus a stable `fabricIndex`.
+- `bgp-fabric`: `full-mesh` topology, one primary and optional secondary transports over backbone overlay networks, `bgp` or `static-fallback`, `listenPortBase` for native transports, optional BFD.
+- `fabric-attachment`: one gateway router on one transport, with a tunnel address allocation from a `tunnel` pool of that network. Native attachments carry endpoint, public key and an opaque private-key reference; external attachments reference the existing externally managed interface and carry no keys.
+- Pool purpose `kubernetes-loadbalancer` for in-cluster VIP allocators. Such a pool must not overlap the Service pool: the API server does not know it and may allocate the same address as a ClusterIP. The existing pool-overlap check enforces this.
+
+`src/network-fabric.ts` adds `planBgpFabric` and `diffBgpFabricPlans`, exposed through `node bin/heliopause-network-compile.ts fabric INPUT.json` (`INPUT`: `registry`, `expectedRegistryRevision`, `fabricId`, optional `previous` plan). The plan is `dry-run`/`executable: false` and contains, per gateway, the per-peer WireGuard interfaces (template without `PrivateKey`), listen ports, FRR configuration text, fallback routes and a content hash. Listen port on gateway A toward B is `listenPortBase + B.fabricIndex`; B's endpoint port for A is therefore `listenPortBase + A.fabricIndex`, so adding a site never renumbers existing tunnels. Interface names are `hpf` plus twelve hex digits derived from fabric, transport and the two routers.
+
+In-site cluster speakers peer only with their own site's gateways: inbound they may announce Pod pool prefixes and host routes from Service/load-balancer pools; outbound they receive nothing (`RM-DENY-ALL`). Gateways re-export cluster-originated paths, and peers accept them through the AS-path filter.
+
+`src/network-fabric.test.ts` covers the shapes above, including the site-addition and subnet-addition change scopes. The single-point mutations used to check those assertions, and the test each one turned red, are listed in the pull request that introduced the module.
+
+### Not established
+
+- **Syntax only.** Generated text for the test fixture's four gateways was accepted by `vtysh --dryrun` in image `quay.io/frrouting/frr@sha256:e47e67bd612030cb1bedee2bde85b73913f2ea021573b749deb21d94940f03c1` (FRR 10.2.1; no network, read-only root, no capabilities), in two variants: BGP secondary with a cluster speaker, and static-fallback secondary with BFD. A deliberately invalid control file was rejected (exit 2), so the check discriminates. FRR 8.5.6 was not checked. No daemon loaded the configuration: sessions, route-map behaviour, FIB installation, BFD and failover were not exercised.
+- **The existing WireGuard execution drivers cannot run this shape.** `agent/network_executor.py` (`validate_operation`) accepts only `/32` AllowedIPs equal to its installed routes, and the persistent NM driver derives interface names from its profile UUID. Executing a fabric needs a new driver operation (AllowedIPs `0.0.0.0/0, ::/0`, peer host route only, routes owned by FRR), with its own recovery tests.
+- Intra-site iBGP between two gateways of one site is not generated (a warning is emitted). Dual gateways per site need that, or an equivalent, before they can carry traffic for each other.
+- Whether BGP can run over the external secondary overlay, and how that overlay currently installs its routes (table and metric), remain discovery gates. A metric-0 route to a remote block beats every BGP route.
+- Cluster-side BGP objects (for example Cilium BGP peer and advertisement resources) stay owned by the cluster. The plan states the peer address and ASN they must match; nothing compares them yet.
+- `compileWireGuard`/`compileFrr` and the unified ChangeSet still use the Phase 4 shape. They are unchanged by this work and should be retired or rebased onto the fabric plan once a fabric driver exists.
+
+### Revised next steps
+
+1. Syntax-check generated FRR text in a disposable FRR container; then two-to-four namespace/VM gateways with real sessions, kernel route installation and packet tests, including primary loss, fallback and recovery.
+2. Fabric WireGuard driver operation and recovery (new driver identity, AllowedIPs `0/0`, peer host routes, FRR-owned destinations), reusing the existing signed execution, journal and confirmation path.
+3. FRR driver: write `frr.conf` fragments with validation (`vtysh --dryrun` or equivalent), durable undo and confirmation.
+4. Bind the fabric plan into the signed ChangeSet in place of the Phase 4 WireGuard/FRR previews; stage rollout gateway by gateway, keeping the existing backbone until the new path is independently verified.
+5. Cluster integration: compare declared cluster routers with observed BGP peers, then optionally generate the cluster-side manifests for the cluster owner to apply.
+6. Free-address selection on `heliopause`-authority pools (tunnel addresses, fabric indices) and firewall zone references derived from inventory.
