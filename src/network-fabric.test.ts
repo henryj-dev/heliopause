@@ -139,7 +139,8 @@ test("peer filters accept the site block but no tunnel, management or Service ag
   assert.match(frr, /set local-preference 100/);
   assert.match(frr, /^ bgp ebgp-requires-policy$/m);
   // Tunnel peers are /32 host routes; single-hop eBGP needs the connected check disabled.
-  for (const peer of ["10.90.0.2", "10.90.0.3", "10.90.0.4", "10.91.0.2"]) assert.match(frr, new RegExp(`^ neighbor ${peer.replace(/\./g, "\\.")} disable-connected-check$`, "m"));
+  const frrLines = frr.split("\n");
+  for (const peer of ["10.90.0.2", "10.90.0.3", "10.90.0.4", "10.91.0.2"]) assert.ok(frrLines.includes(` neighbor ${peer} disable-connected-check`), peer);
   assert.doesNotMatch(frr, /redistribute/);
 });
 
