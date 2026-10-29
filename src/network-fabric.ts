@@ -282,7 +282,9 @@ export function planBgpFabric(input: {
     const ordered = sorted(neighbors, n => n.address);
     for (const n of ordered) {
       frr.push(` neighbor ${n.address} remote-as ${n.asn}`, ` neighbor ${n.address} description ${n.description}`);
-      if (n.source) frr.push(` neighbor ${n.address} update-source ${n.source}`);
+      // Fabric peers sit behind /32 host routes, not a connected subnet. Without this FRR refuses to
+      // open single-hop eBGP ("No path to specified Neighbor"); TTL stays 1, unlike ebgp-multihop.
+      if (n.source) frr.push(` neighbor ${n.address} update-source ${n.source}`, ` neighbor ${n.address} disable-connected-check`);
       if (n.bfd) frr.push(` neighbor ${n.address} bfd`);
     }
     const advertised = (local.advertiseSubnetIds ?? []).map(subnetCidr).sort(compareNetworkText);
