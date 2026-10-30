@@ -2063,6 +2063,99 @@ class TestWorkloadApply(unittest.TestCase):
         self.assertEqual(hp._workload_refs(saved["workloadApplied"]), ["util/hp-dev-p700"])
         self.assertIsNone(hp._wl_timer)
 
+    # ## Pruning — an object dropped from a generation must not outlive it
+    #
+    # Measured on dev 2026-10-30: 30 `egressDeny` objects from c01ad39 stayed after 5e0fc1b/afc39cc
+    # dropped them, and Cilium kept enforcing them because deny wins over every allow.
+
+    def gen(self, generation, name="hp-dev-p700"):
+        obj = cnp(name)
+        obj["metadata"]["annotations"]["heliopause.io/generation"] = generation
+        obj["spec"]["description"] = f"{generation} {name}"
+        return obj
+
+    def apply_gen(self, generation, names):
+        art = self.artifact([self.gen(generation, n) for n in names])
+        art["generation"] = generation
+        return hp.apply_workload(art)
+
+    def confirm(self):
+        self.assertTrue(hp.confirm_workload(hp.load_state()))
+
+    def test_confirmed_objects_dropped_from_the_next_generation_are_pruned(self):
+        self.assertTrue(self.apply_gen("g1", ["hp-dev-p700", "hp-dev-p701"])[0])
+        self.confirm()
+        b_uid = self.cluster["util/hp-dev-p701"]["metadata"]["uid"]
+        ok, state, _ = self.apply_gen("g2", ["hp-dev-p700"])
+        self.assertTrue(ok)
+        self.assertEqual(state, "pending")
+        self.assertNotIn("util/hp-dev-p701", self.cluster)
+        self.assertEqual([d[:2] for d in self.deleted], [("util/hp-dev-p701", b_uid)])
+        pending = hp.load_state()
+        self.assertEqual([r["ref"] for r in pending["workloadPruned"]], ["util/hp-dev-p701"])
+        self.confirm()
+        saved = hp.load_state()
+        self.assertIsNone(saved["workloadPruned"])
+        self.assertEqual(saved["workloadConfirmed"]["generation"], "g2")
+        self.assertEqual(hp._workload_refs(saved["workloadConfirmed"]["records"]), ["util/hp-dev-p700"])
+
+    def test_rollback_recreates_what_the_failed_generation_pruned(self):
+        self.apply_gen("g1", ["hp-dev-p700", "hp-dev-p701"])
+        self.confirm()
+        before = hp._clean_workload_object(self.cluster["util/hp-dev-p701"])
+        self.apply_gen("g2", ["hp-dev-p700"])
+        self.assertNotIn("util/hp-dev-p701", self.cluster)
+        self.assertTrue(hp.rollback_workload("confirmation timed out", "g2"))
+        self.assertIn("util/hp-dev-p701", self.cluster)
+        after = hp._clean_workload_object(self.cluster["util/hp-dev-p701"])
+        self.assertEqual(hp._without_uid(after), hp._without_uid(before))
+        self.assertEqual(
+            self.cluster["util/hp-dev-p700"]["metadata"]["annotations"]["heliopause.io/generation"], "g1",
+        )
+        saved = hp.load_state()
+        self.assertEqual(saved["workloadState"], "rolled-back")
+        self.assertIsNone(saved["workloadPruned"])
+
+    def test_a_failed_prune_rolls_the_generation_back(self):
+        self.apply_gen("g1", ["hp-dev-p700", "hp-dev-p701"])
+        self.confirm()
+        real = self.delete
+        def refuse(ref, uid, rv, deadline=None):
+            if ref == "util/hp-dev-p701":
+                return False, "precondition failed"
+            return real(ref, uid, rv, deadline)
+        hp._delete_workload_object = refuse
+        ok, state, detail = self.apply_gen("g2", ["hp-dev-p700"])
+        self.assertFalse(ok)
+        self.assertEqual(state, "rolled-back")
+        self.assertIn("cannot prune util/hp-dev-p701", detail)
+        self.assertIn("util/hp-dev-p701", self.cluster)
+        self.assertEqual(
+            self.cluster["util/hp-dev-p700"]["metadata"]["annotations"]["heliopause.io/generation"], "g1",
+        )
+
+    def test_never_prunes_an_object_that_is_no_longer_unmistakably_ours(self):
+        self.apply_gen("g1", ["hp-dev-p700", "hp-dev-p701"])
+        self.confirm()
+        self.cluster["util/hp-dev-p701"]["metadata"]["annotations"]["heliopause.io/applier"] = "someone-else"
+        ok, state, detail = self.apply_gen("g2", ["hp-dev-p700"])
+        self.assertTrue(ok)
+        self.assertIn("util/hp-dev-p701", self.cluster)
+        self.assertEqual(self.deleted, [])
+        self.assertIn("not pruned", detail)
+
+    def test_prunes_against_the_last_confirmed_set_even_after_a_rollback(self):
+        # A rollback clears `workloadApplied`; the confirmed set is what still describes the cluster.
+        self.apply_gen("g1", ["hp-dev-p700", "hp-dev-p701"])
+        self.confirm()
+        self.apply_gen("g2", ["hp-dev-p700"])
+        self.assertTrue(hp.rollback_workload("confirmation timed out", "g2"))
+        self.assertIn("util/hp-dev-p701", self.cluster)
+        self.deleted.clear()
+        ok, _, _ = self.apply_gen("g3", ["hp-dev-p700"])
+        self.assertTrue(ok)
+        self.assertEqual([d[0] for d in self.deleted], ["util/hp-dev-p701"])
+
     def test_a_restart_inside_the_window_re_arms_rather_than_forgetting(self):
         # The objects are live in the cluster and nothing else would remove them.
         st = {**hp._EMPTY_STATE, "workloadState": "pending", "workloadGeneration": "g1",
