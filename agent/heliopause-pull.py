@@ -3152,6 +3152,7 @@ def _wl_persist(records, deadline, generation, policies_hash=None, pruned=None):
         st["workloadDetail"] = None
         st["workloadApplied"] = records
         st["workloadPruned"] = pruned or None
+        st["workloadRollbackOfConfirmed"] = None
         st["workloadRollbackAt"] = deadline
 
     _, saved = update_state(mutate)
@@ -3194,6 +3195,9 @@ def rollback_workload(reason, expected_generation=None, allow_confirmed=False):
             )
             # As with the nft timer, a stale callback must not cancel a newer generation's timer.
             return None
+        undoing_confirmed = bool(
+            st.get("workloadState") == "confirmed" or st.get("workloadRollbackOfConfirmed")
+        )
         _wl_rollback_owed = generation
         if _wl_timer is not None:
             _wl_timer.cancel()
@@ -3329,10 +3333,16 @@ def rollback_workload(reason, expected_generation=None, allow_confirmed=False):
             # retries. An ownership/UID mismatch becomes rollback-incident and is never auto-deleted.
             fresh["workloadApplied"] = records if problems else None
             fresh["workloadPruned"] = pruned if problems else None
-            # Rolling back the confirmed generation itself puts the cluster back on the one before it,
-            # so that is now the set the next generation prunes against.
+            # Rolling back the confirmed apply itself puts the cluster back on the generation before it,
+            # so that is now the set the next generation prunes against. Decided by where the rollback
+            # started, not by generation id: a failed re-apply of the confirmed generation (after a
+            # reboot, or when objects went missing) returns the cluster to that same generation.
+            fresh["workloadRollbackOfConfirmed"] = True if (problems and undoing_confirmed) else None
             confirmed = fresh.get("workloadConfirmed")
-            if not problems and isinstance(confirmed, dict) and confirmed.get("generation") == generation:
+            if (
+                not problems and undoing_confirmed and isinstance(confirmed, dict)
+                and confirmed.get("generation") == generation
+            ):
                 fresh["workloadConfirmed"] = confirmed.get("previous")
             fresh["workloadRollbackAt"] = (
                 time.time() + ROLLBACK_RETRY_SEC if retryable else None
@@ -4028,6 +4038,10 @@ _EMPTY_STATE = {
     # Prior-generation objects this pending apply deletes, with snapshots. Rollback recreates them;
     # confirmation makes the deletion final and clears the field.
     "workloadPruned": None,
+    # True while a rollback that started from a *confirmed* half is unfinished, so a retry after
+    # `rollback-failed` still knows it is undoing the confirmed apply (and not a failed re-apply of
+    # the same generation, which leaves the confirmed set as it is).
+    "workloadRollbackOfConfirmed": None,
     # Latest signed authorization ever accepted and the one backing the current generation.
     # The watermark is written before *any* nft/kubectl commitment or side effect. Equal timestamps
     # are accepted only for the exact same payload/key/mode; older ones are relay replay attempts.

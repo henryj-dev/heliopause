@@ -2193,6 +2193,21 @@ class TestWorkloadApply(unittest.TestCase):
         self.assertTrue(self.apply_gen("g3", ["hp-dev-p702"])[0])
         self.assertEqual(sorted(d[0] for d in self.deleted), ["util/hp-dev-p700", "util/hp-dev-p701"])
 
+    def test_a_failed_re_apply_of_the_confirmed_generation_keeps_the_confirmed_set(self):
+        # `handle_reply` re-applies a confirmed generation when objects go missing or after a reboot.
+        # If that re-apply rolls back, the cluster is still on the confirmed generation.
+        self.apply_gen("g1", ["hp-dev-p700", "hp-dev-p701"])
+        self.confirm()
+        self.apply_gen("g2", ["hp-dev-p700", "hp-dev-p702"])
+        self.confirm()
+        del self.cluster["util/hp-dev-p702"]
+        self.assertTrue(self.apply_gen("g2", ["hp-dev-p700", "hp-dev-p702"])[0])
+        self.assertTrue(hp.rollback_workload("confirmation timed out", "g2"))
+        self.assertEqual(hp.load_state()["workloadConfirmed"]["generation"], "g2")
+        self.deleted.clear()
+        self.assertTrue(self.apply_gen("g3", ["hp-dev-p703"])[0])
+        self.assertIn("util/hp-dev-p700", [d[0] for d in self.deleted])
+
     def test_an_unreadable_prune_candidate_is_reported_not_fatal(self):
         self.apply_gen("g1", ["hp-dev-p700", "hp-dev-p701"])
         self.confirm()
