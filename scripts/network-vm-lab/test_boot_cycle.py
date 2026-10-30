@@ -126,9 +126,9 @@ class ProbePairs(unittest.TestCase):
         import sys
         sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'agent'))
         import monitor
-        args=monitor.parse(monitor_argv('n'*32,'i'*32,['192.0.2.130/32','198.51.100.6/32'])[2:])
+        args,pair=monitor.parse(monitor_argv('n'*32,'i'*32,['192.0.2.130/32','198.51.100.6/32'])[2:],self.path)
         self.assertEqual(args.route,['192.0.2.130/32','198.51.100.6/32'])
-        self.assertEqual(pair_for(args.route,self.path),(('p6-client','198.51.100.2'),('p6-workload','198.51.100.6')))
+        self.assertEqual(pair,(('p6-client','198.51.100.2'),('p6-workload','198.51.100.6')))
 
 
 if __name__=='__main__':unittest.main()

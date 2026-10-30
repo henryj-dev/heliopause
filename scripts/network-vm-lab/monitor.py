@@ -23,17 +23,18 @@ def ping(namespace, source, destination):
     except subprocess.TimeoutExpired:return False
 
 
-def parse(argv=None):
+def parse(argv=None, pairs=None):
+    """Arguments and the probe pair for every --route (first route with a pair, never a fallback)."""
     parser=argparse.ArgumentParser();parser.add_argument('--nonce',required=True);parser.add_argument('--id',required=True);parser.add_argument('--route',action='append',required=True)
-    return parser.parse_args(argv)
+    args=parser.parse_args(argv)
+    return args,(pair_for(args.route) if pairs is None else pair_for(args.route,pairs))
 
 
 def main():
-    args=parse()
+    args,((client_ns,client),(workload_ns,workload))=parse()
     if os.geteuid()!=0 or not re.fullmatch('[a-f0-9]{32}',args.id) or n.read_json('/etc/heliopause-disposable-lab')!={'role':'peer','nonce':args.nonce}:raise ValueError('marked disposable peer required')
     directory=Path('/var/lib/heliopause-vm-lab/observations');directory.mkdir(mode=0o700,exist_ok=True)
     fd=os.open(directory/(args.id+'.jsonl'),os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
-    (client_ns,client),(workload_ns,workload)=pair_for(args.route)
     boot=n.current_boot_id();deadline=time.monotonic()+900
     stop=threading.Event();signal.signal(signal.SIGTERM,lambda *_:stop.set())
     with os.fdopen(fd,'w') as stream,ThreadPoolExecutor(max_workers=3) as pool:
