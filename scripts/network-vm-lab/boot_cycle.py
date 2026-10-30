@@ -56,6 +56,16 @@ for row in d['transactions'].values():
  try:
   s=p.lstat();profiles.append({'uuid':u,'mode':s.st_mode,'uid':s.st_uid,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()})
  except FileNotFoundError:profiles.append({'uuid':u,'missing':True})
+def listing(name):
+ # Names, types and link targets only; never contents. NM leaves `<uuid>.nmmeta -> /dev/null`
+ # tombstones here, and a rolled-back case must not leave one for its own profile.
+ out=[]
+ try:entries=sorted(os.scandir(name),key=lambda e:e.name)
+ except FileNotFoundError:return None
+ for e in entries[:256]:
+  kind='symlink' if e.is_symlink() else 'dir' if e.is_dir(follow_symlinks=False) else 'file'
+  out.append({'name':e.name,'type':kind,'target':os.readlink(e.path) if kind=='symlink' else None})
+ return out
 nm_profiles=r(['nmcli','-t','-f','UUID','connection','show'])
 if nm_profiles.returncode:raise RuntimeError('NM inventory unavailable')
 print(json.dumps({'at':time.time(),'bootId':pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
@@ -67,6 +77,7 @@ print(json.dumps({'at':time.time(),'bootId':pathlib.Path('/proc/sys/kernel/rando
 'kernel':r(['uname','-r']).stdout.decode().strip(),
 'packages':r(['rpm','-q','NetworkManager','NetworkManager-libnm','systemd','python3','iproute','wireguard-tools','nftables']).stdout.decode().splitlines(),
 'nmProfiles':nm_profiles.stdout.decode().splitlines(),
+'nmDirectories':{d:listing(d) for d in ['/etc/NetworkManager/system-connections','/run/NetworkManager/system-connections']},
 'nmDevices':r(['nmcli','-t','-f','UUID,TYPE,DEVICE','connection','show','--active']).stdout.decode().splitlines(),
 'service':r(['systemctl','show','heliopause-agent.service','-p','MainPID','-p','ActiveState','-p','SubState','-p','ExecStart','-p','UnitFileState','-p','After','-p','CapabilityBoundingSet','-p','ReadWritePaths']).stdout.decode(),
 'links':json.loads(r(['ip','-j','-d','link','show']).stdout),
@@ -78,10 +89,10 @@ print(json.dumps({'at':time.time(),'bootId':pathlib.Path('/proc/sys/kernel/rando
         code="import json;from pathlib import Path;p=Path('/var/lib/heliopause-vm-lab/registry.json');raw=p.read_bytes();assert len(raw)<=8*1024*1024;print(json.dumps(json.loads(raw)['execution']))"
         return json.loads(self.ssh('peer','sudo','python3','-c',code))
 
-    def monitor_start(self):
+    def monitor_start(self, route):
         identity=uuid.uuid4().hex
         unit='heliopause-vm-observer-'+identity
-        self.ssh('peer','sudo','systemd-run','--unit='+unit,'--collect','--property=KillMode=mixed','/usr/bin/python3','/source/scripts/network-vm-lab/monitor.py','--nonce',self.nonce,'--id',identity)
+        self.ssh('peer','sudo','systemd-run','--unit='+unit,'--collect','--property=KillMode=mixed','/usr/bin/python3','/source/scripts/network-vm-lab/monitor.py','--nonce',self.nonce,'--id',identity,'--route',route)
         end=time.monotonic()+30
         while time.monotonic()<end:
             try:
@@ -123,6 +134,23 @@ print(json.dumps({'at':time.time(),'bootId':pathlib.Path('/proc/sys/kernel/rando
         subprocess.run(expected,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=10,check=True)
 
 
+SIGNED_OBSERVATION_CHECK='''import json,os,sys,tempfile,time
+sys.path.insert(0,'/opt/heliopause/agent')
+import network_executor as n
+from pathlib import Path
+transaction=sys.argv[1];envelope=json.load(sys.stdin)
+journal=json.loads(Path('/var/lib/heliopause/network-executor/transactions.json').read_text())
+row=journal['transactions'][transaction]
+with tempfile.TemporaryDirectory() as state:
+ value=n.verify(envelope,'heliopause-network-boot-observation-v1','/etc/heliopause/trust/verifier',n.crypto_helpers(state))
+if set(value)!={'authorizationHash','bootId','observedAt','checks'}:raise ValueError('signed observation fields')
+if value['authorizationHash']!=n.digest(row['authorization']):raise ValueError('signed observation names another authorization')
+if value['bootId']!=Path('/proc/sys/kernel/random/boot_id').read_text().strip():raise ValueError('signed observation is from another boot')
+if not 0<=time.time()*1000-value['observedAt']<=30000:raise ValueError('signed observation is stale')
+print(json.dumps(value))
+'''
+
+
 def recovery_complete(journal, transaction, boot, expected):
     target=journal['transactions'][transaction];restore=target.get('bootRestore',{})
     if expected=='restored':
@@ -139,7 +167,8 @@ def recovery_complete(journal, transaction, boot, expected):
 def removed_profile(after, transaction):
     op=after['journal']['transactions'][transaction]['authorization']['operation'];dev=op['interfaceName']
     current=next(row for row in after['profiles'] if row['uuid']==op['profileUuid'])
-    return current.get('missing') is True and not any(row['ifname']==dev for row in after['links']) and not any(row.get('dev')==dev for row in after['routes']) and isinstance(after.get('nmProfiles'),list) and op['profileUuid'] not in after['nmProfiles'] and not any(line.startswith(op['profileUuid']+':') for line in after.get('nmDevices',[]))
+    leftovers=[entry for entries in (after.get('nmDirectories') or {}).values() for entry in (entries or []) if op['profileUuid'] in entry['name']]
+    return not leftovers and current.get('missing') is True and not any(row['ifname']==dev for row in after['links']) and not any(row.get('dev')==dev for row in after['routes']) and isinstance(after.get('nmProfiles'),list) and op['profileUuid'] not in after['nmProfiles'] and not any(line.startswith(op['profileUuid']+':') for line in after.get('nmDevices',[]))
 
 
 def rollback_progress(before, after, transaction):
@@ -195,7 +224,8 @@ def main():
     if target['state'] not in allowed:raise ValueError('scenario pre-reboot transaction state mismatch')
     if args.output.exists():raise ValueError('existing evidence file refused')
     args.output.parent.mkdir(parents=True,exist_ok=True)
-    monitor_id,monitor_unit,ready=lab.monitor_start()
+    # Probe this transaction's own path (probe_pairs.py), not the primary pair.
+    monitor_id,monitor_unit,ready=lab.monitor_start(target['authorization']['operation']['routes'][0])
     if ready['peerBootId']!=report['peerBootBefore']:raise ValueError('peer monitor boot mismatch')
     request_clock=lab.peer_clock()
     if request_clock['bootId']!=report['peerBootBefore']:raise ValueError('monitor peer changed boot')
@@ -239,16 +269,23 @@ def main():
             report['connectivityAttempts']=[]
             for attempt in range(3):
                 try:
-                    lab.ssh('peer','sudo','/opt/node/bin/node','/source/scripts/network-vm-lab/verify.ts','observe',timeout=60)
+                    lab.ssh('peer','sudo','/opt/node/bin/node','/source/scripts/network-vm-lab/verify.ts','observe',args.transaction,timeout=60)
                     probe=json.loads(lab.ssh('peer','sudo','cat','/var/lib/heliopause-vm-lab/current-probes.json'))
                     report['connectivityAttempts'].append(probe)
                     if probe.get('transactionId')==args.transaction and fresh_packets(probe,boot,time.time()*1000):
+                        # The contract asks for a new independently *signed* observation, not the
+                        # unsigned probe file. The gateway checks it with the Agent's own verifier
+                        # trust: signature, this transaction's authorization hash, this boot, fresh.
+                        envelope=json.loads(lab.ssh('peer','sudo','cat','/var/lib/heliopause-vm-lab/boot-observation.json'))
+                        signed=json.loads(lab.ssh('gateway','sudo','python3','-c',SIGNED_OBSERVATION_CHECK,args.transaction,data=json.dumps(envelope).encode()))
+                        if signed['checks']!=probe['checks']:raise ValueError('signed observation checks differ from the probe')
                         report['currentProbes']=probe
+                        report['signedObservation']={'envelope':envelope,'payload':signed}
                         break
                 except subprocess.CalledProcessError as error:
                     # Preserve a fixed diagnostic code; never export arbitrary stderr/key material.
                     text=(error.stderr or b'').decode(errors='replace')
-                    known=['stale collector result','collector span exceeds proof freshness','TimeoutError','probe command failed']
+                    known=['stale collector result','collector span exceeds proof freshness','TimeoutError','probe command failed','authorization does not name the case transaction','no lab probe pair','signed observation']
                     report['connectivityAttempts'].append({'error':next((label for label in known if label in text),'independent-command-failed'),'stderrSha256':hashlib.sha256(error.stderr or b'').hexdigest()})
             else:raise ValueError('fresh independent connectivity failed')
         report['passed']=True
@@ -265,8 +302,12 @@ def main():
             if args.expected in {'degraded-unchanged','rollback-failed','inactive'} and not all(row['management'] is True and row['forward'] is False and row['reverse'] is False for row in report['packetTimeline'][-3:]):raise ValueError('negative-case independent packet result mismatch')
         except Exception:
             report['passed']=False;report['monitorError']='independent-monitor-unavailable'
+        body=(json.dumps(report,indent=2)+'\n').encode()
         fd=os.open(args.output,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
-        with os.fdopen(fd,'w') as stream:json.dump(report,stream,indent=2);stream.write('\n')
+        with os.fdopen(fd,'wb') as stream:stream.write(body);stream.flush();os.fsync(stream.fileno())
+        # Written once, beside the report, so a later copy can be checked against the original.
+        fd=os.open(str(args.output)+'.sha256',os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+        with os.fdopen(fd,'w') as stream:stream.write(hashlib.sha256(body).hexdigest()+'  '+args.output.name+'\n')
     if not report['passed']:raise RuntimeError('boot evidence did not satisfy all requirements')
 
 

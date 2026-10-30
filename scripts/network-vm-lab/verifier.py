@@ -17,6 +17,8 @@ import sys
 import time
 import urllib.request
 
+from probe_pairs import pair_for
+
 BASE=Path('/var/lib/heliopause-vm-lab')
 
 
@@ -85,8 +87,10 @@ def main():
     opener=urllib.request.build_opener(urllib.request.ProxyHandler({}),urllib.request.HTTPSHandler(context=context),NoRedirect())
     code=gateway_probe_code({'role':'gateway','nonce':marker['nonce']},dev,op['routes'])
     gateway=json.loads(ssh('sudo','python3','-',data=code.encode()))
-    traffic={'forward':ping('p6-client','198.51.100.2','198.51.100.6'),
-             'reverse':ping('p6-workload','198.51.100.6','198.51.100.2'),
+    # This transaction's own path, never the primary pair by default (probe_pairs.py).
+    (client_ns,client),(workload_ns,workload)=pair_for(op['routes'])
+    traffic={'forward':ping(client_ns,client,workload),
+             'reverse':ping(workload_ns,workload,client),
              'management':ping(None,'192.0.2.1','192.0.2.2')}
     checks=evaluate(gateway,op,traffic)
     result={'kind':'probe','transactionId':a['transactionId'],'observedAt':int(time.time()*1000),'checks':checks,'gateway':gateway,'traffic':traffic}

@@ -4,7 +4,7 @@ import { readFileSync, writeFileSync, openSync, fstatSync, closeSync, constants 
 import { createPrivateKey, randomBytes } from 'node:crypto';
 import { signNetworkMessage, NETWORK_VERIFY_DOMAIN } from '../../src/network-execution.ts';
 import { networkDigest } from '../../src/network-canonical.ts';
-const base='/var/lib/heliopause-vm-lab',mode=process.argv[2];
+const base='/var/lib/heliopause-vm-lab',mode=process.argv[2],expectedTransaction=process.argv[3];
 if(!['confirm','observe'].includes(mode??'')||process.getuid?.()!==0)throw new Error('marked peer verifier required');
 const markerFd=openSync('/etc/heliopause-disposable-lab',constants.O_RDONLY|constants.O_NOFOLLOW);
 try {
@@ -13,6 +13,9 @@ try {
 } finally { closeSync(markerFd); }
 const authorization=JSON.parse(readFileSync(base+'/authorization.json','utf8'));
 const a=JSON.parse(Buffer.from(authorization.payload,'base64url').toString());
+// The authorization on disk is whatever was issued last. A case names its own transaction so a
+// probe and its signed observation can never silently describe another one (2026-10-30 review).
+if(expectedTransaction!==undefined&&a.transactionId!==expectedTransaction)throw new Error('authorization does not name the case transaction');
 const verifier=createPrivateKey(readFileSync(base+'/verifier.key'));
 const child=spawn('/usr/bin/python3',['/source/scripts/network-vm-lab/verifier.py',mode!],{stdio:['pipe','pipe','inherit']});
 let buffer='',observed=false,delivered=false;
