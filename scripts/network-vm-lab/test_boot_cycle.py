@@ -1,7 +1,7 @@
 """Report acceptance must reject in-progress recovery and stale/empty packet evidence."""
 import copy
 import unittest
-from boot_cycle import recovery_complete, fresh_packets, inactive_preserved, service_inactive, removed_profile, timeline_valid, rollback_progress
+from boot_cycle import monitor_argv, recovery_complete, fresh_packets, inactive_preserved, service_inactive, removed_profile, timeline_valid, rollback_progress
 import json
 import tempfile
 from pathlib import Path
@@ -120,6 +120,15 @@ class ProbePairs(unittest.TestCase):
                     {'198.51.100.18/32':{'client':['a','198.51.100.1']}}]:
             self.path.write_text(json.dumps(bad))
             with self.assertRaises(ValueError,msg=json.dumps(bad)):load_pairs(self.path)
+
+    def test_the_monitor_gets_every_route_and_finds_the_primary_pair(self):
+        # The primary operation's first route is the peer tunnel address, which has no pair.
+        import sys
+        sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'agent'))
+        import monitor
+        args,pair=monitor.parse(monitor_argv('n'*32,'i'*32,['192.0.2.130/32','198.51.100.6/32'])[2:],self.path)
+        self.assertEqual(args.route,['192.0.2.130/32','198.51.100.6/32'])
+        self.assertEqual(pair,(('p6-client','198.51.100.2'),('p6-workload','198.51.100.6')))
 
 
 if __name__=='__main__':unittest.main()

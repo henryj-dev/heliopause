@@ -21,6 +21,13 @@ def run(argv, data=None, timeout=30):
     return subprocess.run(argv,input=data,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout,check=True).stdout
 
 
+def monitor_argv(nonce, identity, routes):
+    """Every route of the transaction: the monitor picks the probe pair the way the verifier does.
+    Passing only the first route failed on the primary set, whose first route is the peer's tunnel
+    address and has no pair (lab C, 2026-10-31)."""
+    return ['/usr/bin/python3','/source/scripts/network-vm-lab/monitor.py','--nonce',nonce,'--id',identity,*[arg for route in routes for arg in ('--route',route)]]
+
+
 class Lab:
     def __init__(self, root, ssh_ports=None):
         self.root=root.resolve();self.manifest=json.loads((self.root/'environment.json').read_text())
@@ -89,10 +96,10 @@ print(json.dumps({'at':time.time(),'bootId':pathlib.Path('/proc/sys/kernel/rando
         code="import json;from pathlib import Path;p=Path('/var/lib/heliopause-vm-lab/registry.json');raw=p.read_bytes();assert len(raw)<=8*1024*1024;print(json.dumps(json.loads(raw)['execution']))"
         return json.loads(self.ssh('peer','sudo','python3','-c',code))
 
-    def monitor_start(self, route):
+    def monitor_start(self, routes):
         identity=uuid.uuid4().hex
         unit='heliopause-vm-observer-'+identity
-        self.ssh('peer','sudo','systemd-run','--unit='+unit,'--collect','--property=KillMode=mixed','/usr/bin/python3','/source/scripts/network-vm-lab/monitor.py','--nonce',self.nonce,'--id',identity,'--route',route)
+        self.ssh('peer','sudo','systemd-run','--unit='+unit,'--collect','--property=KillMode=mixed',*monitor_argv(self.nonce,identity,routes))
         end=time.monotonic()+30
         while time.monotonic()<end:
             try:
@@ -225,7 +232,7 @@ def main():
     if args.output.exists():raise ValueError('existing evidence file refused')
     args.output.parent.mkdir(parents=True,exist_ok=True)
     # Probe this transaction's own path (probe_pairs.py), not the primary pair.
-    monitor_id,monitor_unit,ready=lab.monitor_start(target['authorization']['operation']['routes'][0])
+    monitor_id,monitor_unit,ready=lab.monitor_start(target['authorization']['operation']['routes'])
     if ready['peerBootId']!=report['peerBootBefore']:raise ValueError('peer monitor boot mismatch')
     request_clock=lab.peer_clock()
     if request_clock['bootId']!=report['peerBootBefore']:raise ValueError('monitor peer changed boot')
