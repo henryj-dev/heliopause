@@ -987,7 +987,7 @@ def _validate_workload_rule(rule, direction, where):
         elif key in {"fromEntities", "toEntities"}:
             reason = "" if (
                 isinstance(value, list) and len(value) == 1 and
-                all(v in {"all", "world", "host", "remote-node"} for v in value)
+                all(v in {"all", "world", "host", "remote-node", "cluster"} for v in value)
             ) else f"{where}.{key} contains an unsupported entity"
         elif key == "toPorts":
             reason = _validate_port_sets(value, f"{where}.toPorts")

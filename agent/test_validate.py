@@ -1563,11 +1563,11 @@ class TestWorkloadValidation(unittest.TestCase):
             return doc
 
         for direction, field in (("ingress", "fromEntities"), ("egress", "toEntities")):
-            for entity in ("all", "world", "host", "remote-node"):
+            for entity in ("all", "world", "host", "remote-node", "cluster"):
                 ok = one_direction(cnp(), direction, [{field: [entity]}])
                 self.assertIsNotNone(validate_wl(wl(ok))[0], (direction, entity))
 
-            for entity in ("cluster", "kube-apiserver", "remote-nodes", "Remote-Node"):
+            for entity in ("kube-apiserver", "remote-nodes", "Remote-Node", "Cluster"):
                 bad = one_direction(cnp(), direction, [{field: [entity]}])
                 doc, reason = validate_wl(wl(bad))
                 self.assertIsNone(doc, (direction, entity))

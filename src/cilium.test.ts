@@ -73,7 +73,7 @@ describe("policy model — workload endpoint kinds (H14)", () => {
         src: { kind: "k8s-entity", value: "world" },
         dst: { kind: "k8s-namespace", value: "heliopause" },
       }), "P051"),
-      /must be host or remote-node/,
+      /must be host, remote-node or cluster/,
     );
   });
   it("accepts the remote-node Cilium entity on either side", () => {
@@ -88,14 +88,26 @@ describe("policy model — workload endpoint kinds (H14)", () => {
     }), "P053");
     assert.deepEqual(dst.dst, { kind: "k8s-entity", value: "remote-node" });
   });
-  it("still refuses Cilium entities other than host and remote-node", () => {
-    for (const value of ["world", "all", "cluster", "remote-nodes", "Remote-Node", "kube-apiserver"]) {
+  it("accepts the cluster Cilium entity on either side", () => {
+    const src = normalizePolicy(policy({
+      src: { kind: "k8s-entity", value: "cluster" },
+      dst: { kind: "k8s-namespace", value: "heliopause" },
+    }), "P055");
+    assert.deepEqual(src.src, { kind: "k8s-entity", value: "cluster" });
+    const dst = normalizePolicy(policy({
+      src: { kind: "k8s-namespace", value: "heliopause" },
+      dst: { kind: "k8s-entity", value: "cluster" },
+    }), "P056");
+    assert.deepEqual(dst.dst, { kind: "k8s-entity", value: "cluster" });
+  });
+  it("still refuses Cilium entities other than host, remote-node and cluster", () => {
+    for (const value of ["world", "all", "Cluster", "remote-nodes", "Remote-Node", "kube-apiserver"]) {
       assert.throws(
         () => normalizePolicy(policy({
           src: { kind: "k8s-entity", value },
           dst: { kind: "k8s-namespace", value: "heliopause" },
         }), "P054"),
-        /must be host or remote-node/,
+        /must be host, remote-node or cluster/,
         value,
       );
     }
@@ -602,6 +614,28 @@ describe("renderer — direction decides which side becomes the selector", () =>
     assert.deepEqual(rule?.fromEntities, ["remote-node"]);
     assert.equal(rule?.fromCIDR, undefined);
     assert.deepEqual(rule?.toPorts, [{ ports: [{ port: "8444", protocol: "TCP" }] }]);
+  });
+
+  it("maps every in-cluster endpoint to the cluster entity on both directions", () => {
+    const ingress = plan([{ policy: policy({
+      id: "P609",
+      src: { kind: "k8s-entity", value: "cluster" },
+      dst: { kind: "k8s-label", value: `${NS}=heliopause,app=heliopause-manager` },
+      proto: "any",
+      ports: "",
+    }) }]).policies[0]!.spec;
+    assert.deepEqual(ingress.ingress?.[0]?.fromEntities, ["cluster"]);
+    assert.equal(ingress.ingress?.[0]?.fromCIDR, undefined);
+    assert.equal(ingress.ingress?.[0]?.toPorts, undefined);
+    const egress = plan([{ policy: policy({
+      id: "P610",
+      src: { kind: "k8s-namespace", value: "heliopause" },
+      dst: { kind: "k8s-entity", value: "cluster" },
+      proto: "any",
+      ports: "",
+    }) }]).policies[0]!.spec;
+    assert.deepEqual(egress.egress?.[0]?.toEntities, ["cluster"]);
+    assert.equal(egress.egress?.[0]?.toCIDR, undefined);
   });
 
   it("maps a workload egress to another node as toEntities remote-node", () => {
