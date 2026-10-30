@@ -2,6 +2,10 @@
 import copy
 import unittest
 from boot_cycle import recovery_complete, fresh_packets, inactive_preserved, service_inactive, removed_profile, timeline_valid, rollback_progress
+import json
+import tempfile
+from pathlib import Path
+from probe_pairs import pair_for, load_pairs
 
 class ReportAcceptance(unittest.TestCase):
     def test_restored_requires_terminal_matching_boot_without_other_debt(self):
@@ -43,6 +47,14 @@ class ReportAcceptance(unittest.TestCase):
         after['links']=[];after['profiles'][0]['sha256']='changed'
         self.assertFalse(inactive_preserved(before,after,'tx'))
 
+    def test_rollback_report_refuses_a_leftover_nm_entry_for_the_profile(self):
+        # NM leaves `<uuid>.nmmeta -> /dev/null` tombstones; a rolled-back case must not keep one.
+        after={'journal':{'transactions':{'tx':{'authorization':{'operation':{'profileUuid':'id','interfaceName':'hp-owned'}}}}},'profiles':[{'uuid':'id','missing':True}],'links':[],'routes':[],'nmDevices':[],'nmProfiles':[],
+               'nmDirectories':{'/etc/NetworkManager/system-connections':[{'name':'other.nmconnection','type':'file','target':None}],'/run/NetworkManager/system-connections':None}}
+        self.assertTrue(removed_profile(after,'tx'))
+        after['nmDirectories']['/etc/NetworkManager/system-connections'].append({'name':'id.nmmeta','type':'symlink','target':'/dev/null'})
+        self.assertFalse(removed_profile(after,'tx'))
+
     def test_rollback_report_requires_file_cache_and_kernel_absence(self):
         after={'journal':{'transactions':{'tx':{'authorization':{'operation':{'profileUuid':'id','interfaceName':'hp-owned'}}}}},'profiles':[{'uuid':'id','missing':True}],'links':[],'routes':[],'nmDevices':[],'nmProfiles':[]}
         self.assertTrue(removed_profile(after,'tx'))
@@ -80,5 +92,34 @@ class ReportAcceptance(unittest.TestCase):
         for checks in [{},{**probe['checks'],'extra':True},{**probe['checks'],'forward':1},{**probe['checks'],'reverse':False}]:
             bad=copy.deepcopy(probe);bad['checks']=checks
             self.assertFalse(fresh_packets(bad,'new',2000))
+
+
+
+class ProbePairs(unittest.TestCase):
+    """Probes follow the transaction's route; a route with no pair fails closed (2026-10-30 review M2)."""
+
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+        self.path=Path(self.tmp.name)/'probe-pairs.json'
+
+    def test_the_two_built_in_address_sets(self):
+        self.assertEqual(pair_for(['198.51.100.6/32'],self.path),(('p6-client','198.51.100.2'),('p6-workload','198.51.100.6')))
+        self.assertEqual(pair_for(['198.51.100.14/32'],self.path),(('p6-client','198.51.100.10'),('p6-workload','198.51.100.14')))
+
+    def test_an_unknown_route_never_falls_back_to_the_primary(self):
+        with self.assertRaisesRegex(ValueError,'no lab probe pair'):
+            pair_for(['198.51.100.18/32'],self.path)
+
+    def test_a_lab_file_adds_an_address_set(self):
+        self.path.write_text(json.dumps({'198.51.100.18/32':{'client':['p6-client3','198.51.100.17'],'workload':['p6-workload3','198.51.100.18']}}))
+        self.assertEqual(pair_for(['198.51.100.18/32'],self.path),(('p6-client3','198.51.100.17'),('p6-workload3','198.51.100.18')))
+
+    def test_a_malformed_lab_file_is_refused(self):
+        for bad in [{'198.51.100.0/24':{'client':['a','198.51.100.1'],'workload':['b','198.51.100.2']}},
+                    {'198.51.100.18/32':{'client':['Bad Name','198.51.100.1'],'workload':['b','198.51.100.2']}},
+                    {'198.51.100.18/32':{'client':['a','198.51.100.1']}}]:
+            self.path.write_text(json.dumps(bad))
+            with self.assertRaises(ValueError,msg=json.dumps(bad)):load_pairs(self.path)
+
 
 if __name__=='__main__':unittest.main()
