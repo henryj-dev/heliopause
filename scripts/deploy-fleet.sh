@@ -59,7 +59,6 @@ k3s-01.dev-icn-vtr=10.17.0.10
 mailer-01.dev-icn-vtr=10.17.101.12
 mailer-02.dev-icn-vtr=10.17.77.135
 mailer-03.dev-icn-vtr=10.17.82.134
-web-01.dev-icn-vtr=10.17.47.52
 gw-01.az01-icn-own=10.112.0.1
 k3s-01.az01-icn-own=10.112.0.10
 storage-01.az01-icn-own=10.112.0.11
@@ -218,7 +217,7 @@ EOS
 # looking at the fleet between hosts; this mode is for the ordinary case, where the code changed and
 # the protocol did not.
 RELAY_ORDER="gw-01.util-icn-vtr gw-01.prod-icn-vtr gw-01.dev-icn-vtr gw-01.az01-icn-own"
-AGENT_ORDER="k3s-01.dev-icn-vtr gw-01.dev-icn-vtr gw-01.prod-icn-vtr gw-01.util-icn-vtr mailer-01.dev-icn-vtr mailer-02.dev-icn-vtr mailer-03.dev-icn-vtr web-01.dev-icn-vtr k3s-01.az01-icn-own gw-01.az01-icn-own storage-01.az01-icn-own"
+AGENT_ORDER="k3s-01.dev-icn-vtr gw-01.dev-icn-vtr gw-01.prod-icn-vtr gw-01.util-icn-vtr mailer-01.dev-icn-vtr mailer-02.dev-icn-vtr mailer-03.dev-icn-vtr k3s-01.az01-icn-own gw-01.az01-icn-own storage-01.az01-icn-own"
 
 deploy_all() {
   for name in $RELAY_ORDER; do deploy relay "$name"; done
