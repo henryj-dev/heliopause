@@ -150,21 +150,30 @@ class NetworkManagerWireGuard(LinuxWireGuard):
                 raise
             # The client timing out says nothing about NM: the activation may have completed. Read the
             # real NM/kernel state instead of deciding from the child's exit; never re-activate.
-            if not self.activation_settled(op):
-                raise
+            settled, last = self.activation_settled(op)
+            if not settled:
+                raise RuntimeError(f'{error}; activation state not settled: {last}') from None
         self.check_file(op, self.row['owner'])
 
     def activation_settled(self, op):
-        """True once NM and the kernel show exactly the approved activation, within NM_SETTLE_SEC."""
-        settle_until = time.monotonic() + NM_SETTLE_SEC
+        """(True, "") once NM and the kernel show exactly the approved activation, else (False, reason).
+
+        Bounded by NM_SETTLE_SEC **and** by the operation's own deadlines: the loop is not a child, so
+        `command_timeout` does not bound it. A budget/deadline error from a read ends it at once.
+        """
+        limits = [v for v in (self.deadline, self.command_deadline) if v is not None]
+        settle_until = min([time.monotonic() + NM_SETTLE_SEC] + limits)
         while True:
             try:
                 self.configuration_matches(op, self.row['owner'])
-                return True
-            except (ValueError, RuntimeError):
+                return True, ''
+            except (ValueError, RuntimeError, KeyError, IndexError) as error:
+                last = str(error) or type(error).__name__
+                if 'budget elapsed' in last or 'deadline elapsed' in last:
+                    return False, last
                 if time.monotonic() >= settle_until:
-                    return False
-            time.sleep(NM_SETTLE_POLL_SEC)
+                    return False, last
+            time.sleep(max(0.0, min(NM_SETTLE_POLL_SEC, settle_until - time.monotonic())))
 
     def routes(self, op):
         # NM activates the exact approved addresses/routes together with the connection.

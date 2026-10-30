@@ -69,6 +69,27 @@ class ActivationUndo(unittest.TestCase):
                 self.driver.configure(self.op)
         self.assertEqual(len(ups),1)
 
+    def test_settling_never_outlives_the_operation_deadline(self):
+        # Review of #230: a child clamped by a nearly spent budget times out too, and the settle loop
+        # is not a child, so it must stop at the deadline itself.
+        ups=self.activation('network command unavailable or timed out: nmcli --wait',ValueError('persistent activation incomplete'))
+        now=[100.0]
+        def sleep(sec): now[0]+=sec
+        self.driver.deadline=101.0
+        with patch('network_nm_wireguard.time.sleep',side_effect=sleep),patch('network_nm_wireguard.time.monotonic',side_effect=lambda:now[0]):
+            with self.assertRaisesRegex(RuntimeError,'not settled: persistent activation incomplete'):
+                self.driver.configure(self.op)
+        self.assertLessEqual(now[0],101.0)
+        self.assertEqual(len(ups),1)
+
+    def test_a_spent_budget_ends_settling_at_once(self):
+        ups=self.activation('network command unavailable or timed out: nmcli --wait',RuntimeError('network operation budget elapsed'))
+        with patch('network_nm_wireguard.time.sleep') as sleep:
+            with self.assertRaisesRegex(RuntimeError,'budget elapsed'):
+                self.driver.configure(self.op)
+        sleep.assert_not_called()
+        self.assertEqual(self.driver.configuration_matches.call_count,1)
+
     def test_a_failed_activation_is_not_reinterpreted(self):
         ups=self.activation('network command failed: nmcli --wait',None)
         with self.assertRaisesRegex(RuntimeError,'command failed'):
