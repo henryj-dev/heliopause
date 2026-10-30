@@ -1607,6 +1607,7 @@ class TestWorkloadApply(unittest.TestCase):
         hp.save_state(dict(hp._EMPTY_STATE))
         self.host = hp.HOST_ID
         self.cluster = {}
+        self.uid_seq = 0
         self.deleted = []
         self.stub()
         hp._delete_workload_object = self.delete
@@ -1639,9 +1640,10 @@ class TestWorkloadApply(unittest.TestCase):
                 ref = f"{obj['metadata']['namespace']}/{obj['metadata']['name']}"
                 if ref in self.cluster:
                     return 1, "", "AlreadyExists"
-                self.cluster[ref] = self.live(
-                    obj, uid=f"uid-{len(self.cluster) + 1}", rv="2"
-                )
+                # A real API server never reuses a UID; `len(cluster)` did after a delete, and that
+                # hid a prune defect (review of #229).
+                self.uid_seq += 1
+                self.cluster[ref] = self.live(obj, uid=f"uid-{self.uid_seq}", rv="2")
                 return 0, "", ""
             if args[0] == "replace":
                 obj = json.loads(stdin)
@@ -2095,8 +2097,10 @@ class TestWorkloadApply(unittest.TestCase):
         self.assertEqual([r["ref"] for r in pending["workloadPruned"]], ["util/hp-dev-p701"])
         self.confirm()
         saved = hp.load_state()
-        self.assertIsNone(saved["workloadPruned"])
+        # Kept through confirmation: the host layer can still roll a confirmed half back.
+        self.assertEqual([r["ref"] for r in saved["workloadPruned"]], ["util/hp-dev-p701"])
         self.assertEqual(saved["workloadConfirmed"]["generation"], "g2")
+        self.assertEqual(saved["workloadConfirmed"]["previous"]["generation"], "g1")
         self.assertEqual(hp._workload_refs(saved["workloadConfirmed"]["records"]), ["util/hp-dev-p700"])
 
     def test_rollback_recreates_what_the_failed_generation_pruned(self):
@@ -2155,6 +2159,53 @@ class TestWorkloadApply(unittest.TestCase):
         ok, _, _ = self.apply_gen("g3", ["hp-dev-p700"])
         self.assertTrue(ok)
         self.assertEqual([d[0] for d in self.deleted], ["util/hp-dev-p701"])
+
+    def test_a_pruned_object_that_rollback_recreated_is_pruned_by_a_later_generation(self):
+        self.apply_gen("g1", ["hp-dev-p700", "hp-dev-p701"])
+        self.confirm()
+        old_uid = self.cluster["util/hp-dev-p701"]["metadata"]["uid"]
+        self.apply_gen("g2", ["hp-dev-p700"])
+        self.assertTrue(hp.rollback_workload("confirmation timed out", "g2"))
+        self.assertNotEqual(self.cluster["util/hp-dev-p701"]["metadata"]["uid"], old_uid)
+        self.deleted.clear()
+        ok, _, detail = self.apply_gen("g3", ["hp-dev-p700"])
+        self.assertTrue(ok, detail)
+        self.assertNotIn("util/hp-dev-p701", self.cluster)
+        self.confirm()
+        self.assertEqual([d[0] for d in self.deleted], ["util/hp-dev-p701"])
+
+    def test_rolling_back_a_confirmed_generation_recreates_what_it_pruned(self):
+        # The host layer can roll back a confirmed workload half (`allow_confirmed=True`).
+        self.apply_gen("g1", ["hp-dev-p700", "hp-dev-p701"])
+        self.confirm()
+        self.apply_gen("g2", ["hp-dev-p700"])
+        self.confirm()
+        self.assertNotIn("util/hp-dev-p701", self.cluster)
+        self.assertTrue(hp.rollback_workload("host layer failed", "g2", allow_confirmed=True))
+        self.assertIn("util/hp-dev-p701", self.cluster)
+        self.assertEqual(
+            self.cluster["util/hp-dev-p700"]["metadata"]["annotations"]["heliopause.io/generation"], "g1",
+        )
+        saved = hp.load_state()
+        self.assertEqual(saved["workloadConfirmed"]["generation"], "g1")
+        # And the generation after it prunes against g1, not against the rolled-back g2.
+        self.deleted.clear()
+        self.assertTrue(self.apply_gen("g3", ["hp-dev-p702"])[0])
+        self.assertEqual(sorted(d[0] for d in self.deleted), ["util/hp-dev-p700", "util/hp-dev-p701"])
+
+    def test_an_unreadable_prune_candidate_is_reported_not_fatal(self):
+        self.apply_gen("g1", ["hp-dev-p700", "hp-dev-p701"])
+        self.confirm()
+        def forbidden(args, stdin):
+            if "get" in args and "hp-dev-p701" in args:
+                return 1, "", "Error from server (Forbidden)"
+            return None
+        self.stub(forbidden)
+        ok, state, detail = self.apply_gen("g2", ["hp-dev-p700"])
+        self.assertTrue(ok, detail)
+        self.assertIn("cannot read", detail)
+        self.assertIn("util/hp-dev-p701", self.cluster)
+        self.assertEqual(self.deleted, [])
 
     def test_a_restart_inside_the_window_re_arms_rather_than_forgetting(self):
         # The objects are live in the cluster and nothing else would remove them.

@@ -2830,8 +2830,8 @@ def _preflight_prune(st, doc, cluster, deadline=None):
 
     Candidates come from this agent's own confirmed records, never from a cluster listing — the
     applier role has no `list` on CiliumNetworkPolicy. Each candidate is read and must still be
-    unmistakably ours, at the confirmed UID and generation. Anything else is left in place and
-    reported, not deleted. A read failure refuses the whole apply rather than guessing.
+    unmistakably ours and still at the confirmed generation. Anything else, including an object that
+    cannot be read, is left in place and reported, not deleted.
     """
     previous, prior_generation = _confirmed_workload_records(st)
     keep = set(workload_objects(doc))
@@ -2849,17 +2849,21 @@ def _preflight_prune(st, doc, cluster, deadline=None):
             continue
         current, missing, detail = _read_workload_object(ref, deadline)
         if detail:
-            return None, skipped, f"cannot read prune candidate {ref}: {detail}"
+            # Not knowing must not delete, and must not block every later generation either: before
+            # pruning existed a document that no longer named this namespace never read it.
+            skipped.append(f"{ref}: cannot read ({detail}); not pruned")
+            continue
         if missing:
             continue
         owner_error = _owned_object_error(current, ref, cluster, prior_generation)
         if owner_error:
             skipped.append(f"{ref}: {owner_error}; not pruned")
             continue
+        # Not the confirmed UID: rollback recreates a pruned object with `create`, which always gets a
+        # new UID, and requiring the old one would keep that object forever. Ownership, applier,
+        # policy-id name and the exact confirmed generation decide; the delete itself is bound to the
+        # UID read here.
         uid = current["metadata"]["uid"]
-        if item.get("uid") is not None and uid != item["uid"]:
-            skipped.append(f"{ref}: UID changed since it was confirmed; not pruned")
-            continue
         rv = current["metadata"].get("resourceVersion")
         if not isinstance(rv, str) or not rv:
             skipped.append(f"{ref}: no resourceVersion; not pruned")
@@ -3325,6 +3329,11 @@ def rollback_workload(reason, expected_generation=None, allow_confirmed=False):
             # retries. An ownership/UID mismatch becomes rollback-incident and is never auto-deleted.
             fresh["workloadApplied"] = records if problems else None
             fresh["workloadPruned"] = pruned if problems else None
+            # Rolling back the confirmed generation itself puts the cluster back on the one before it,
+            # so that is now the set the next generation prunes against.
+            confirmed = fresh.get("workloadConfirmed")
+            if not problems and isinstance(confirmed, dict) and confirmed.get("generation") == generation:
+                fresh["workloadConfirmed"] = confirmed.get("previous")
             fresh["workloadRollbackAt"] = (
                 time.time() + ROLLBACK_RETRY_SEC if retryable else None
             )
@@ -3598,13 +3607,18 @@ def confirm_workload(state):
                 raise RuntimeError("workload is not durably pending and cannot be confirmed")
             fresh["workloadState"] = "confirmed"
             fresh["workloadDetail"] = None
-            # The deletions are final once the generation is confirmed, and this set is what the next
-            # generation prunes against.
+            # This set is what the next generation prunes against.
+            # `workloadPruned` is kept: a confirmed half can still be rolled back by the host layer
+            # (`rollback_generation`, `reconcile_recovered_commitments`, `handle_reply`), and that
+            # rollback must recreate what this generation pruned. The next apply replaces it.
+            previous = fresh.get("workloadConfirmed")
+            if isinstance(previous, dict):
+                previous = {k: previous.get(k) for k in ("generation", "records")}
             fresh["workloadConfirmed"] = {
                 "generation": fresh.get("workloadGeneration"),
                 "records": fresh.get("workloadApplied") or [],
+                "previous": previous if isinstance(previous, dict) else None,
             }
-            fresh["workloadPruned"] = None
             # The identity records are kept for drift reporting. No rollback timer is allowed to use
             # them once the commitment is cleared.
             fresh["workloadRollbackAt"] = None
