@@ -161,18 +161,27 @@ class NetworkManagerWireGuard(LinuxWireGuard):
         Bounded by NM_SETTLE_SEC **and** by the operation's own deadlines: the loop is not a child, so
         `command_timeout` does not bound it. A budget/deadline error from a read ends it at once.
         """
+        settled, error = self._settle(lambda: self.configuration_matches(op, self.row['owner']))
+        return settled, '' if settled else (str(error) or type(error).__name__)
+
+    def _settle(self, probe):
+        """(True, None) once `probe` stops raising, else (False, last error).
+
+        NM finishes activation and device deletion asynchronously, so a check made right after the
+        nmcli call can see the previous state. Bounded by NM_SETTLE_SEC and by the operation's own
+        deadlines (this loop is not a child, so `command_timeout` does not bound it). A
+        budget/deadline error from a read ends it at once.
+        """
         limits = [v for v in (self.deadline, self.command_deadline) if v is not None]
         settle_until = min([time.monotonic() + NM_SETTLE_SEC] + limits)
         while True:
             try:
-                self.configuration_matches(op, self.row['owner'])
-                return True, ''
+                probe()
+                return True, None
             except (ValueError, RuntimeError, KeyError, IndexError) as error:
                 last = str(error) or type(error).__name__
-                if 'budget elapsed' in last or 'deadline elapsed' in last:
-                    return False, last
-                if time.monotonic() >= settle_until:
-                    return False, last
+                if 'budget elapsed' in last or 'deadline elapsed' in last or time.monotonic() >= settle_until:
+                    return False, error
             time.sleep(max(0.0, min(NM_SETTLE_POLL_SEC, settle_until - time.monotonic())))
 
     def routes(self, op):
@@ -229,8 +238,14 @@ class NetworkManagerWireGuard(LinuxWireGuard):
         if cached:
             self.run(['nmcli', '--wait', str(NM_WAIT_SEC), 'connection', 'delete', 'uuid', op['profileUuid']])
         self.store.remove(op['profileUuid'], self.row['persistence']['profileHash'])
-        if op['profileUuid'] in self.profiles() or any(link['ifname'] == op['interfaceName'] for link in self.ip('-d', 'link', 'show')):
-            raise ValueError('persistent rollback removal unverified')
+        def gone():
+            if op['profileUuid'] in self.profiles() or any(link['ifname'] == op['interfaceName'] for link in self.ip('-d', 'link', 'show')):
+                raise ValueError('persistent rollback removal unverified')
+        # NM deletes the device after `connection delete` returns; a check made at once wrote a
+        # durable rollback-failed that a retry under 1 s later cleared (2026-10-30 lab, review M6).
+        removed, error = self._settle(gone)
+        if not removed:
+            raise error
         try:
             self.store.read(op['profileUuid'])
         except FileNotFoundError:
