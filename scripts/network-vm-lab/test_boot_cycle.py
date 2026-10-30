@@ -1,7 +1,7 @@
 """Report acceptance must reject in-progress recovery and stale/empty packet evidence."""
 import copy
 import unittest
-from boot_cycle import monitor_argv, recovery_complete, fresh_packets, inactive_preserved, service_inactive, removed_profile, timeline_valid, rollback_progress
+from boot_cycle import REBOOT_WAIT_SECONDS, AGENT_STOP_TIMEOUT_SECONDS, monitor_argv, recovery_complete, fresh_packets, inactive_preserved, service_inactive, removed_profile, timeline_valid, rollback_progress
 import json
 import tempfile
 from pathlib import Path
@@ -93,6 +93,15 @@ class ReportAcceptance(unittest.TestCase):
             bad=copy.deepcopy(probe);bad['checks']=checks
             self.assertFalse(fresh_packets(bad,'new',2000))
 
+
+
+class RebootWait(unittest.TestCase):
+    def test_the_reboot_wait_outlasts_the_agent_stop_timeout(self):
+        # The gateway installs this drop-in (guest_fixture.py); its TimeoutStopSec overrides the unit's.
+        conf=(Path(__file__).resolve().parents[2]/'packaging/systemd/heliopause-agent-network.conf').read_text()
+        stop=[int(line.split('=',1)[1].rstrip('s')) for line in conf.splitlines() if line.startswith('TimeoutStopSec=')]
+        self.assertEqual(stop,[AGENT_STOP_TIMEOUT_SECONDS])
+        self.assertGreaterEqual(REBOOT_WAIT_SECONDS-AGENT_STOP_TIMEOUT_SECONDS,240)
 
 
 class ProbePairs(unittest.TestCase):

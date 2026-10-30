@@ -17,6 +17,14 @@ import time
 import uuid
 
 
+# A graceful reboot waits for the Agent to stop: up to its TimeoutStopSec (300 s in
+# packaging/systemd/heliopause-agent-network.conf), then SIGKILL, then the boot (51-132 s measured).
+# The old 240 s bound ended every graceful case whose Agent thread was held at a boundary before
+# the reboot happened (lab C, 2026-10-31). @see test_the_reboot_wait_outlasts_the_agent_stop_timeout
+AGENT_STOP_TIMEOUT_SECONDS=300
+REBOOT_WAIT_SECONDS=AGENT_STOP_TIMEOUT_SECONDS+240
+
+
 def run(argv, data=None, timeout=30):
     return subprocess.run(argv,input=data,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout,check=True).stdout
 
@@ -246,7 +254,7 @@ def main():
                 # Only an independently observed changed boot ID proves reboot below.
                 if error.returncode!=255:raise
         else:lab.power_cut()
-        end=time.monotonic()+240
+        end=time.monotonic()+REBOOT_WAIT_SECONDS
         while time.monotonic()<end:
             try:
                 boot=lab.boot('gateway')
