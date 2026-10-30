@@ -342,6 +342,10 @@ def validate_operation(op):
         raise ValueError('endpoint recursion')
 
 
+class ConfirmationDeadline(Exception):
+    """A confirm decision that would become durable at or after its deadline."""
+
+
 class LinuxWireGuard:
     """No shell, wg-quick hooks, FRR, NetworkManager profiles, or existing-interface adoption."""
     def __init__(self, secrets):
@@ -705,7 +709,7 @@ class Executor:
             raise ValueError('terminal replay sequence missing')
         return data
 
-    def save(self, data, row=None, state=None):
+    def save(self, data, row=None, state=None, gate=None):
         backup=json.loads(canonical(data))
         transaction=row['authorization']['transactionId'] if row else None
         if transaction is not None:
@@ -728,9 +732,15 @@ class Executor:
             row.pop('verification',None)
         for item in data['transactions'].values():
             item['history']=item.get('history',[])[-16:]
-        if len(canonical(data).encode())>8*1024*1024:
-            raise ValueError('transaction journal capacity exceeded')
-        try:atomic(self.path,data)
+        try:
+            # `gate` runs after the new state is in memory and before the write starts, so a decision
+            # cannot go stale between its check and the start of the write (see `confirm`). A stall
+            # inside the write itself (rename, fsync) is not covered. Raising here, or from the
+            # capacity check, restores row and data from the backup below, exactly like a write error.
+            if gate is not None:gate()
+            if len(canonical(data).encode())>8*1024*1024:
+                raise ValueError('transaction journal capacity exceeded')
+            atomic(self.path,data)
         except BaseException:
             if row is not None and transaction in backup['transactions']:
                 row.clear();row.update(backup['transactions'][transaction]);backup['transactions'][transaction]=row
@@ -1082,11 +1092,22 @@ class Executor:
                 row['restorationAuthority']['confirmation'] = envelope
                 row['bootIdAtConfirm'] = current_boot_id()
                 row['confirmedAt'] = int(time.time()*1000)
-            final_now=int(time.time()*1000)
-            if final_now<data['lastClock'] or final_now>=min(c['expiresAt'],v['expiresAt'],a['rollbackAt']) or (time.monotonic()-row['mono'])*1000>=a['rollbackAt']-row['acceptedAt']:
+            deadline=min(c['expiresAt'],v['expiresAt'],a['rollbackAt'])
+            def within_deadline():
+                # Checked inside `save`, after the confirmed state is built and before the write
+                # starts. Checked earlier, a stall between the check and the write (VM pause, a
+                # frozen thread, building the journal) let `confirmed` become durable after the
+                # receipt and even the rollback deadline had passed — measured in the Rocky TCG lab
+                # 2026-10-30: decision 04:30:09.4, expiry 04:30:15.0, durable 04:30:26.1. A stall
+                # inside the write itself is still possible; that window is the write, not the logic.
+                final_now=int(time.time()*1000)
+                if final_now<data['lastClock'] or final_now>=deadline or (time.monotonic()-row['mono'])*1000>=a['rollbackAt']-row['acceptedAt']:
+                    raise ConfirmationDeadline('confirmation deadline elapsed')
+            try:
+                self.save(data,row,'confirmed',gate=within_deadline)
+            except ConfirmationDeadline:
                 self.rollback(data,row)
-                raise ValueError('confirmation deadline elapsed')
-            self.save(data,row,'confirmed')
+                raise ValueError('confirmation deadline elapsed') from None
             self.driver.deadline=None
             return row['state']
 
