@@ -29,11 +29,52 @@ class ActivationUndo(unittest.TestCase):
         self.driver.run=run
     def test_cold_nm_command_cap_never_exceeds_shared_deadline(self):
         with patch('network_nm_wireguard.time.monotonic',return_value=100):
-            self.assertEqual(self.driver.command_timeout(),10)
+            # `nmcli --wait 10` plus client start-up headroom; never more than the shared budgets.
+            self.assertEqual(self.driver.command_timeout(),20)
             self.driver.deadline=108;self.driver.command_deadline=103
             self.assertEqual(self.driver.command_timeout(),3)
             self.driver.command_deadline=99
             with self.assertRaisesRegex(RuntimeError,'budget elapsed'):self.driver.command_timeout()
+
+    def test_the_child_cap_leaves_headroom_above_the_nm_wait(self):
+        import network_nm_wireguard as nm
+        self.assertGreater(nm.NM_WAIT_SEC+nm.NM_CLIENT_HEADROOM_SEC, nm.NM_WAIT_SEC)
+        with patch('network_nm_wireguard.time.monotonic',return_value=100):
+            self.assertGreater(self.driver.command_timeout(), nm.NM_WAIT_SEC)
+
+    def activation(self, up_error, settled):
+        ups=[]
+        def run(args,*unused,**kwargs):
+            if args[3:5]==['connection','up']:
+                ups.append(args)
+                raise RuntimeError(up_error)
+            return ''
+        self.driver.run=run
+        self.driver.configuration_matches=Mock(side_effect=settled)
+        return ups
+
+    def test_a_timed_out_activation_that_nm_completed_is_accepted(self):
+        # Measured in the TCG lab: NM activated in ~1.1 s, the nmcli child was killed at its cap.
+        ups=self.activation('network command unavailable or timed out: nmcli --wait',[ValueError('activating'),None])
+        with patch('network_nm_wireguard.time.sleep'):
+            self.driver.configure(self.op)
+        self.assertEqual(len(ups),1,'activation must never be re-issued')
+        self.assertEqual(self.driver.configuration_matches.call_count,2)
+
+    def test_a_timed_out_activation_that_never_settles_still_fails(self):
+        ups=self.activation('network command unavailable or timed out: nmcli --wait',ValueError('persistent activation incomplete'))
+        clock=iter(range(100,1000))
+        with patch('network_nm_wireguard.time.sleep'),patch('network_nm_wireguard.time.monotonic',side_effect=lambda:next(clock)):
+            with self.assertRaisesRegex(RuntimeError,'timed out'):
+                self.driver.configure(self.op)
+        self.assertEqual(len(ups),1)
+
+    def test_a_failed_activation_is_not_reinterpreted(self):
+        ups=self.activation('network command failed: nmcli --wait',None)
+        with self.assertRaisesRegex(RuntimeError,'command failed'):
+            self.driver.configure(self.op)
+        self.driver.configuration_matches.assert_not_called()
+        self.assertEqual(len(ups),1)
 
     def test_foreign_fwmark_and_keepalive_block_owned_removal(self):
         public=self.op['peers'][0]['publicKey']

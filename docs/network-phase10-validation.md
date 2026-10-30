@@ -97,7 +97,7 @@ attempt. Unit configuration is not itself proof of measured boot ordering.
 The existing mailbox worker and common writer gate execute restore; no independent network
 writer bypasses heartbeat/watchdog/discovery arbitration. Synchronous startup recovery never
 iterates confirmed undo debts. Worker restore has shared 120-second activation/180-second total
-recovery budgets and a ten-second NM child-command cap; tick retries one confirmed undo debt with twenty seconds, never reactivating
+recovery budgets and a NM child-command cap of `nmcli --wait` (10 s) plus 10 s client start-up headroom — a timed-out activation is judged by reading NM/kernel state, never re-issued; tick retries one confirmed undo debt with twenty seconds, never reactivating
 in the same boot. Read-only preparation may retry a transient child timeout at most three
 times within that same shared budget; foreign/unsupported material fails immediately and
 activation is never retried. Admission is blocked while recovery is unresolved. Capacity is checked

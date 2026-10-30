@@ -8,6 +8,19 @@ from network_executor import LinuxWireGuard
 from network_nm_profile import DRIVER, ProfileStore, render
 
 
+# `nmcli --wait` is how long NM itself may take. The child process needs more than that: the client
+# has to start (libnm/GI) and reach D-Bus before the wait even begins. With the cap equal to the wait
+# there was no headroom, and a slow boot timed out an activation NM had finished in about a second
+# (measured in the Rocky 10.2 TCG lab, 2026-10-30: activated at +1.1 s, the Agent deactivated it at
+# +10.3 s). The operation's absolute budgets still bound every child.
+NM_WAIT_SEC = 10
+NM_CLIENT_HEADROOM_SEC = 10
+# After a timed-out `connection up`, how long to keep reading the real state. Read-only; activation is
+# never re-issued.
+NM_SETTLE_SEC = NM_WAIT_SEC
+NM_SETTLE_POLL_SEC = 0.5
+
+
 class NetworkManagerWireGuard(LinuxWireGuard):
     identity = DRIVER
 
@@ -20,7 +33,7 @@ class NetworkManagerWireGuard(LinuxWireGuard):
         # Cold libnm/GI startup on the measured TCG guest exceeds the kernel driver's
         # five-second command cap. Every child still shares the operation's absolute budget.
         limits=[value-time.monotonic() for value in [self.deadline,self.command_deadline] if value is not None]
-        remaining=min([10]+limits)
+        remaining=min([NM_WAIT_SEC+NM_CLIENT_HEADROOM_SEC]+limits)
         if remaining<=0:raise RuntimeError('network operation budget elapsed')
         return remaining
 
@@ -127,11 +140,31 @@ class NetworkManagerWireGuard(LinuxWireGuard):
         self.check_file(op, self.row['owner'])
         path = os.path.join(self.store.directory, self.store.basename(op['profileUuid']))
         if not self.cached(op):
-            self.run(['nmcli', '--wait', '10', 'connection', 'load', path])
+            self.run(['nmcli', '--wait', str(NM_WAIT_SEC), 'connection', 'load', path])
             if not self.cached(op):
                 raise ValueError('persistent profile load unverified')
-        self.run(['nmcli', '--wait', '10', 'connection', 'up', 'uuid', op['profileUuid']])
+        try:
+            self.run(['nmcli', '--wait', str(NM_WAIT_SEC), 'connection', 'up', 'uuid', op['profileUuid']])
+        except RuntimeError as error:
+            if not str(error).startswith('network command unavailable or timed out:'):
+                raise
+            # The client timing out says nothing about NM: the activation may have completed. Read the
+            # real NM/kernel state instead of deciding from the child's exit; never re-activate.
+            if not self.activation_settled(op):
+                raise
         self.check_file(op, self.row['owner'])
+
+    def activation_settled(self, op):
+        """True once NM and the kernel show exactly the approved activation, within NM_SETTLE_SEC."""
+        settle_until = time.monotonic() + NM_SETTLE_SEC
+        while True:
+            try:
+                self.configuration_matches(op, self.row['owner'])
+                return True
+            except (ValueError, RuntimeError):
+                if time.monotonic() >= settle_until:
+                    return False
+            time.sleep(NM_SETTLE_POLL_SEC)
 
     def routes(self, op):
         # NM activates the exact approved addresses/routes together with the connection.
@@ -185,7 +218,7 @@ class NetworkManagerWireGuard(LinuxWireGuard):
         if present and not self.owned(op, owner):
             raise ValueError('persistent interface ownership unavailable')
         if cached:
-            self.run(['nmcli', '--wait', '10', 'connection', 'delete', 'uuid', op['profileUuid']])
+            self.run(['nmcli', '--wait', str(NM_WAIT_SEC), 'connection', 'delete', 'uuid', op['profileUuid']])
         self.store.remove(op['profileUuid'], self.row['persistence']['profileHash'])
         if op['profileUuid'] in self.profiles() or any(link['ifname'] == op['interfaceName'] for link in self.ip('-d', 'link', 'show')):
             raise ValueError('persistent rollback removal unverified')
@@ -275,7 +308,7 @@ class NetworkManagerWireGuard(LinuxWireGuard):
         # Activation is asynchronous inside NM. Cancel the UUID even before a kernel
         # interface appears; killing nmcli alone does not cancel NM's pending work.
         if observed_active:
-            self.run(['nmcli', '--wait', '10', 'connection', 'down', 'uuid', op['profileUuid']])
+            self.run(['nmcli', '--wait', str(NM_WAIT_SEC), 'connection', 'down', 'uuid', op['profileUuid']])
         active_after = self.run(['nmcli', '-t', '-f', 'UUID,DEVICE', 'connection', 'show', '--active']).splitlines()
         if any(line.split(':', 1)[0] == op['profileUuid'] for line in active_after):
             raise ValueError('boot activation cancellation unverified')
