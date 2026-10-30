@@ -2809,6 +2809,78 @@ def _preflight_workload(doc, cluster, generation, deadline=None):
     return records, ""
 
 
+def _confirmed_workload_records(st):
+    """Identity records of the last confirmed generation, and that generation."""
+    confirmed = st.get("workloadConfirmed")
+    if isinstance(confirmed, dict) and isinstance(confirmed.get("records"), list):
+        return confirmed["records"], confirmed.get("generation")
+    # State written before `workloadConfirmed` existed: the applied records are the confirmed ones
+    # only while the half is still confirmed.
+    if st.get("workloadState") == "confirmed" and isinstance(st.get("workloadApplied"), list):
+        return st["workloadApplied"], st.get("workloadGeneration")
+    return [], None
+
+
+def _preflight_prune(st, doc, cluster, deadline=None):
+    """Prior-generation objects the new document no longer holds. Returns (records, skipped, detail).
+
+    Without this, an object dropped from a generation stays in the cluster forever: apply only
+    creates or replaces. A dropped `egressDeny` keeps denying, because Cilium evaluates deny before
+    every allow (measured on dev 2026-10-30: 30 deny objects from c01ad39 outlived 5e0fc1b/afc39cc).
+
+    Candidates come from this agent's own confirmed records, never from a cluster listing — the
+    applier role has no `list` on CiliumNetworkPolicy. Each candidate is read and must still be
+    unmistakably ours and still at the confirmed generation. Anything else, including an object that
+    cannot be read, is left in place and reported, not deleted.
+    """
+    previous, prior_generation = _confirmed_workload_records(st)
+    keep = set(workload_objects(doc))
+    records, skipped = [], []
+    for item in previous:
+        if not isinstance(item, dict) or not isinstance(item.get("ref"), str):
+            skipped.append(f"{item!r}: confirmed record has no ref; not pruned")
+            continue
+        ref = item["ref"]
+        if ref in keep:
+            continue
+        ns = ref.partition("/")[0]
+        if ns not in WORKLOAD_NAMESPACES:
+            skipped.append(f"{ref}: namespace is no longer in HELIOPAUSE_K8S_NAMESPACES; not pruned")
+            continue
+        current, missing, detail = _read_workload_object(ref, deadline)
+        if detail:
+            # Not knowing must not delete, and must not block every later generation either: before
+            # pruning existed a document that no longer named this namespace never read it.
+            skipped.append(f"{ref}: cannot read ({detail}); not pruned")
+            continue
+        if missing:
+            continue
+        owner_error = _owned_object_error(current, ref, cluster, prior_generation)
+        if owner_error:
+            skipped.append(f"{ref}: {owner_error}; not pruned")
+            continue
+        # Not the confirmed UID: rollback recreates a pruned object with `create`, which always gets a
+        # new UID, and requiring the old one would keep that object forever. Ownership, applier,
+        # policy-id name and the exact confirmed generation decide; the delete itself is bound to the
+        # UID read here.
+        uid = current["metadata"]["uid"]
+        rv = current["metadata"].get("resourceVersion")
+        if not isinstance(rv, str) or not rv:
+            skipped.append(f"{ref}: no resourceVersion; not pruned")
+            continue
+        records.append({
+            "ref": ref, "uid": uid, "resourceVersion": rv, "cluster": cluster,
+            "generation": prior_generation, "previous": _clean_workload_object(current),
+        })
+    return records, skipped, ""
+
+
+def _without_uid(obj):
+    out = json.loads(json.dumps(obj))
+    out.get("metadata", {}).pop("uid", None)
+    return out
+
+
 def _write_workload_objects(doc, records, deadline):
     """Create or conditionally replace each validated object without an upsert race.
 
@@ -3062,7 +3134,7 @@ def _delete_workload_object(ref, uid, resource_version, deadline=None):
     return False, f"API delete returned {response.status}: {raw[:300]!r}"
 
 
-def _wl_persist(records, deadline, generation, policies_hash=None):
+def _wl_persist(records, deadline, generation, policies_hash=None, pruned=None):
     """Record the workload commitment on disk before the cluster is touched.
 
     Same reasoning as `_persist_commitment`: between the apply and the timer being armed this process
@@ -3079,6 +3151,8 @@ def _wl_persist(records, deadline, generation, policies_hash=None):
             st["workloadHash"] = policies_hash
         st["workloadDetail"] = None
         st["workloadApplied"] = records
+        st["workloadPruned"] = pruned or None
+        st["workloadRollbackOfConfirmed"] = None
         st["workloadRollbackAt"] = deadline
 
     _, saved = update_state(mutate)
@@ -3121,6 +3195,9 @@ def rollback_workload(reason, expected_generation=None, allow_confirmed=False):
             )
             # As with the nft timer, a stale callback must not cancel a newer generation's timer.
             return None
+        undoing_confirmed = bool(
+            st.get("workloadState") == "confirmed" or st.get("workloadRollbackOfConfirmed")
+        )
         _wl_rollback_owed = generation
         if _wl_timer is not None:
             _wl_timer.cancel()
@@ -3198,6 +3275,44 @@ def rollback_workload(reason, expected_generation=None, allow_confirmed=False):
                     f"{ref}: restore failed: {(err or out or f'kubectl exited {rc}').strip()}"
                 )
 
+        # Objects this apply pruned from the prior generation: recreate each from its snapshot. Present
+        # at the pruned UID means the delete never happened; present with the snapshot's content under
+        # a new UID means an earlier pass of this rollback already recreated it. Anything else is not
+        # ours to overwrite.
+        pruned = st.get("workloadPruned") or []
+        for record in pruned:
+            ref = record.get("ref") if isinstance(record, dict) else None
+            previous = record.get("previous") if isinstance(record, dict) else None
+            if not isinstance(ref, str) or not isinstance(previous, dict):
+                incidents.append("invalid workload prune record; nothing recreated")
+                continue
+            current, missing, detail = _read_workload_object(ref, rollback_deadline)
+            if detail:
+                retryable.append(f"{ref}: {detail}")
+                continue
+            if not missing:
+                try:
+                    same_uid = current["metadata"]["uid"] == record.get("uid")
+                    restored = _without_uid(_clean_workload_object(current)) == _without_uid(previous)
+                except (KeyError, TypeError):
+                    same_uid = restored = False
+                if not (same_uid or restored):
+                    incidents.append(f"{ref}: replaced since it was pruned; left untouched")
+                continue
+            command_timeout = _deadline_timeout(rollback_deadline)
+            if command_timeout is None:
+                retryable.append("workload rollback exceeded its total budget")
+                break
+            rc, out, err = kubectl(
+                ["create", "--validate=strict", "-f", "-"],
+                stdin=json.dumps(_without_uid(previous), separators=(",", ":")),
+                timeout_sec=command_timeout,
+            )
+            if rc != 0:
+                retryable.append(
+                    f"{ref}: recreate of pruned object failed: {(err or out or f'kubectl exited {rc}').strip()}"
+                )
+
         target_state = (
             "rollback-failed" if retryable else "rollback-incident" if incidents else "rolled-back"
         )
@@ -3217,6 +3332,18 @@ def rollback_workload(reason, expected_generation=None, allow_confirmed=False):
             # Keep incomplete records as incident evidence and for identity-checked transient
             # retries. An ownership/UID mismatch becomes rollback-incident and is never auto-deleted.
             fresh["workloadApplied"] = records if problems else None
+            fresh["workloadPruned"] = pruned if problems else None
+            # Rolling back the confirmed apply itself puts the cluster back on the generation before it,
+            # so that is now the set the next generation prunes against. Decided by where the rollback
+            # started, not by generation id: a failed re-apply of the confirmed generation (after a
+            # reboot, or when objects went missing) returns the cluster to that same generation.
+            fresh["workloadRollbackOfConfirmed"] = True if (problems and undoing_confirmed) else None
+            confirmed = fresh.get("workloadConfirmed")
+            if (
+                not problems and undoing_confirmed and isinstance(confirmed, dict)
+                and confirmed.get("generation") == generation
+            ):
+                fresh["workloadConfirmed"] = confirmed.get("previous")
             fresh["workloadRollbackAt"] = (
                 time.time() + ROLLBACK_RETRY_SEC if retryable else None
             )
@@ -3368,8 +3495,11 @@ def apply_workload(artifact):
         records, detail = _preflight_workload(doc, cluster, generation, preflight_deadline)
         if records is None:
             return False, "unsupported", f"workload preflight refused: {detail}"
+        pruned, prune_skipped, detail = _preflight_prune(load_state(), doc, cluster, preflight_deadline)
+        if pruned is None:
+            return False, "unsupported", f"workload preflight refused: {detail}"
         deadline = time.time() + timeout
-        if not _wl_persist(records, deadline, generation, expected):
+        if not _wl_persist(records, deadline, generation, expected, pruned):
             return False, "rolled-back", "cannot persist workload rollback commitment; cluster was not changed"
         remaining = deadline - time.time()
         if remaining <= 0:
@@ -3395,6 +3525,21 @@ def apply_workload(artifact):
         if not verified:
             rollback_workload(f"cannot verify applied object identity: {detail}", generation)
             return False, "rolled-back", f"cannot verify applied object identity: {detail}"
+        # After the new objects are in place, so a dropped deny never leaves a moment with neither the
+        # old nor the new posture. Before confirmation, so the verifier judges the pruned cluster and
+        # a failed confirmation recreates what was deleted (`rollback_workload`).
+        for record in pruned:
+            ok_delete, detail = _delete_workload_object(
+                record["ref"], record["uid"], record["resourceVersion"], deadline
+            )
+            if not ok_delete:
+                detail = f"cannot prune {record['ref']} from generation {record['generation']}: {detail}"
+                rollback_workload(detail, generation)
+                return False, "rolled-back", detail
+        if pruned:
+            log(f"pruned {len(pruned)} workload object(s) the new generation no longer holds")
+        if prune_skipped:
+            log("workload objects left in place, not pruned: " + "; ".join(prune_skipped))
         empty, detail = _selector_enforcement_gate(doc, deadline)
         if empty is None:
             rollback_workload(f"selector enforcement gate could not run: {detail}", generation)
@@ -3452,6 +3597,9 @@ def apply_workload(artifact):
     # `empty_detail` travels as the pending detail so the relay can surface a selector that matched
     # nothing without treating it as a failure. Empty string when every selector matched, which the
     # relay reads as "nothing to say" rather than as an absent field.
+    if prune_skipped:
+        note = "left in place, not pruned: " + "; ".join(prune_skipped)
+        empty_detail = f"{empty_detail}; {note}" if empty_detail else note
     return True, "pending", empty_detail
 
 
@@ -3469,6 +3617,18 @@ def confirm_workload(state):
                 raise RuntimeError("workload is not durably pending and cannot be confirmed")
             fresh["workloadState"] = "confirmed"
             fresh["workloadDetail"] = None
+            # This set is what the next generation prunes against.
+            # `workloadPruned` is kept: a confirmed half can still be rolled back by the host layer
+            # (`rollback_generation`, `reconcile_recovered_commitments`, `handle_reply`), and that
+            # rollback must recreate what this generation pruned. The next apply replaces it.
+            previous = fresh.get("workloadConfirmed")
+            if isinstance(previous, dict):
+                previous = {k: previous.get(k) for k in ("generation", "records")}
+            fresh["workloadConfirmed"] = {
+                "generation": fresh.get("workloadGeneration"),
+                "records": fresh.get("workloadApplied") or [],
+                "previous": previous if isinstance(previous, dict) else None,
+            }
             # The identity records are kept for drift reporting. No rollback timer is allowed to use
             # them once the commitment is cleared.
             fresh["workloadRollbackAt"] = None
@@ -3871,6 +4031,17 @@ _EMPTY_STATE = {
     "workloadApplied": None,
     "workloadGeneration": None,
     "workloadRollbackAt": None,
+    # The last *confirmed* workload generation's identity records, as {"generation", "records"}.
+    # Kept apart from `workloadApplied` because a rolled-back apply clears that field, and pruning
+    # needs to know what the cluster still holds from the last generation that stuck.
+    "workloadConfirmed": None,
+    # Prior-generation objects this pending apply deletes, with snapshots. Rollback recreates them;
+    # confirmation makes the deletion final and clears the field.
+    "workloadPruned": None,
+    # True while a rollback that started from a *confirmed* half is unfinished, so a retry after
+    # `rollback-failed` still knows it is undoing the confirmed apply (and not a failed re-apply of
+    # the same generation, which leaves the confirmed set as it is).
+    "workloadRollbackOfConfirmed": None,
     # Latest signed authorization ever accepted and the one backing the current generation.
     # The watermark is written before *any* nft/kubectl commitment or side effect. Equal timestamps
     # are accepted only for the exact same payload/key/mode; older ones are relay replay attempts.
