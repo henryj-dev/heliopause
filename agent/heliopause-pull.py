@@ -5546,9 +5546,13 @@ def handle_reply(st, reply):
         wl_gone = _workload_objects_missing(st)
         if observed is not None and not wl_gone:
             return
-        if observed is None and "refresh pending" in (detail or "") and not wl_gone:
-            # Unknown is not absence. The single background snapshot will resolve this without
-            # putting a bounded nft read back on the confirmation-critical thread.
+        if observed is None and host_observation.get("table") != "absent" and not wl_gone:
+            # Unknown is not absence. An unread table — a refresh still pending, or an `nft` read
+            # that failed — is never evidence that the ruleset is gone. Matching only the "refresh
+            # pending" wording let a failed read through: in the Rocky TCG lab (2026-10-30, boot
+            # 39fa97e2) systemd's stop SIGTERMed the `nft` child, the read came back "nft exited
+            # -15", the confirmed generation was re-applied as pending, and the shutdown's lifecycle
+            # recovery rolled it back. Only an observed `absent` table re-applies.
             return
         if wl_gone:
             log(f"generation {wanted} is confirmed but workload objects are absent ({wl_gone}) — re-applying")
