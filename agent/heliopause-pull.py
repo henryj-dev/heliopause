@@ -5556,8 +5556,10 @@ def handle_reply(st, reply):
             return
         if wl_gone:
             log(f"generation {wanted} is confirmed but workload objects are absent ({wl_gone}) — re-applying")
-        if observed is None:
+        if observed is None and host_observation.get("table") == "absent":
             log(f"generation {wanted} is confirmed but the table is absent ({detail}) — re-applying")
+        elif observed is None:
+            log(f"generation {wanted}: ruleset unread ({detail}); re-applying for the workload half only")
         # Fall through to the apply path below. `pending` while it re-confirms, which is correct:
         # the ruleset is being applied again and the rollback timer should cover it again.
     if wanted == st["generation"] and st["state"] in {
