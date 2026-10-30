@@ -135,4 +135,55 @@ class ActivationUndo(unittest.TestCase):
         self.assertFalse(any('down' in command for command in self.commands))
 
 
+
+class RemovalSettles(unittest.TestCase):
+    """NM deletes the device after `connection delete` returns (2026-10-30 lab, review M6)."""
+    def setUp(self):
+        ActivationUndo.setUp(self)
+        self.row['persistence']={'profileHash':'0'*64}
+        self.driver.available=Mock()
+        self.driver.owned=Mock(return_value=OWNER)
+        self.driver.store=Mock()
+        self.driver.store.read.side_effect=FileNotFoundError
+        self.deletes=[]
+        self.driver.run=lambda args,*a,**k:self.deletes.append(args) or ''
+        self.driver.profiles=Mock(return_value=[])
+    def links(self,*present_after_delete):
+        link=[{'ifname':self.op['interfaceName']}]
+        # First read is before the delete; later reads follow it.
+        self.driver.ip=Mock(side_effect=[link]+[link if p else [] for p in present_after_delete])
+
+    def test_a_device_nm_removes_a_moment_later_is_a_clean_removal(self):
+        self.links(True,True,False)
+        with patch('network_nm_wireguard.time.sleep'):
+            self.driver.remove(self.op,OWNER)
+        self.assertEqual(sum(a[3:5]==['connection','delete'] for a in self.deletes),1,'delete must not be re-issued')
+        self.assertEqual(self.driver.ip.call_count,4)
+
+    def test_a_device_that_never_goes_still_fails_removal(self):
+        self.links(*[True]*200)
+        clock=iter(range(100,1000))
+        with patch('network_nm_wireguard.time.sleep'),patch('network_nm_wireguard.time.monotonic',side_effect=lambda:next(clock)):
+            with self.assertRaisesRegex(ValueError,'persistent rollback removal unverified'):
+                self.driver.remove(self.op,OWNER)
+
+    def test_waiting_for_removal_never_outlives_the_operation_deadline(self):
+        self.links(*[True]*200)
+        now=[100.0]
+        def sleep(sec): now[0]+=sec
+        self.driver.command_deadline=101.0
+        with patch('network_nm_wireguard.time.sleep',side_effect=sleep),patch('network_nm_wireguard.time.monotonic',side_effect=lambda:now[0]):
+            with self.assertRaisesRegex(ValueError,'removal unverified'):
+                self.driver.remove(self.op,OWNER)
+        self.assertLessEqual(now[0],101.0)
+
+    def test_a_spent_budget_ends_the_removal_wait_at_once(self):
+        self.links(True)
+        self.driver.profiles=Mock(side_effect=RuntimeError('network operation budget elapsed'))
+        with patch('network_nm_wireguard.time.sleep') as sleep:
+            with self.assertRaisesRegex(RuntimeError,'budget elapsed'):
+                self.driver.remove(self.op,OWNER)
+        sleep.assert_not_called()
+
+
 if __name__=='__main__':unittest.main()
