@@ -619,7 +619,7 @@ class TestRestartWhilePending(unittest.TestCase):
         # A validly signed artifact whose window has closed. The fourth value is `expired`.
         hp.verify_artifact_envelope = lambda envelope: (artifact, dict(record), {}, True)
         hp._host_observation_report = lambda: {
-            "observed": None, "detail": "table inet heliopause is absent",
+            "observed": None, "detail": "table inet heliopause is absent", "table": "absent",
             "foreignFilters": [], "publishedPorts": [],
         }
         try:
@@ -688,7 +688,7 @@ class TestRestartWhilePending(unittest.TestCase):
         hp.accept_artifact_authorization = _REAL_ACCEPT_AUTHORIZATION
         hp.verify_artifact_envelope = lambda envelope: (artifact, dict(record), {}, True)
         hp._host_observation_report = lambda: {
-            "observed": None, "detail": "table inet heliopause is absent",
+            "observed": None, "detail": "table inet heliopause is absent", "table": "absent",
             "foreignFilters": [], "publishedPorts": [],
         }
         try:
@@ -734,7 +734,7 @@ class TestRestartWhilePending(unittest.TestCase):
         }
         # What `nft list table` returns when the table does not exist.
         hp._host_observation_report = lambda: {
-            "observed": None, "detail": "table inet heliopause is absent",
+            "observed": None, "detail": "table inet heliopause is absent", "table": "absent",
             "foreignFilters": [], "publishedPorts": [],
         }
         try:
@@ -748,6 +748,42 @@ class TestRestartWhilePending(unittest.TestCase):
 
         self.assertEqual(seen.get("generation"), "g1",
                          "a confirmed generation whose table has vanished must be re-applied")
+
+    def test_an_unread_ruleset_is_not_taken_for_an_absent_one(self):
+        """A failed `nft` read must never re-apply a confirmed generation.
+
+        Rocky TCG lab, 2026-10-30, boot 39fa97e2: systemd's stop SIGTERMed the agent's `nft` child, the
+        host observation came back `table: unread` with "nft exited -15", and the confirmed generation
+        was re-applied as pending — then the shutdown's lifecycle recovery rolled it back. The check
+        matched only the "refresh pending" wording, so any other unread detail passed as absence.
+        """
+        calls = []
+        real_apply, real_fetch = hp.apply_artifact, hp.fetch_artifact
+        real_report = hp._host_observation_report
+        hp.apply_artifact = lambda a, validated=None: (calls.append(a), (True, "pending", ""))[1]
+        hp.fetch_artifact = lambda: {
+            "generation": "g1", "ruleset": VALID, "rulesetHash": VALID_HASH,
+            "confirmTimeoutSec": hp.NFT_CONFIRM_MIN_SEC,
+        }
+        reports = []
+        def unread():
+            reports.append(True)
+            return {"observed": None, "detail": "nft exited -15", "table": "unread",
+                    "foreignFilters": None, "publishedPorts": None}
+        hp._host_observation_report = unread
+        try:
+            hp.save_state({**hp._EMPTY_STATE, "generation": "g1", "state": "confirmed",
+                           "referenceHash": "sha256:old"})
+            hp.handle_reply(hp.load_state(), {"schemaVersion": hp.SCHEMA_VERSION, "generation": "g1",
+                                              "gate": {"open": True}})
+        finally:
+            hp.apply_artifact, hp.fetch_artifact = real_apply, real_fetch
+            hp._host_observation_report = real_report
+
+        self.assertTrue(reports, "the observation was never consulted — the test is not on that path")
+        self.assertEqual(calls, [], "an unreadable ruleset re-applied the confirmed generation")
+        saved = hp.load_state()
+        self.assertEqual((saved["generation"], saved["state"]), ("g1", "confirmed"))
 
     def test_a_confirmed_generation_still_present_is_left_alone(self):
         """The common case, and the one the fix must not break.
@@ -6495,7 +6531,7 @@ class TestTheExpiryEscapeOnAStateThatWasRun(unittest.TestCase):
         snapshots = iter((([], [], ""), ([{"table": TABLE}], [], "")))
         hp.snapshot = lambda: next(snapshots)
         hp._host_observation_report = lambda: {
-            "observed": None, "detail": "table inet heliopause is absent",
+            "observed": None, "detail": "table inet heliopause is absent", "table": "absent",
             "foreignFilters": [], "publishedPorts": [],
         }
 
