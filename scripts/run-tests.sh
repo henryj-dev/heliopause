@@ -80,6 +80,7 @@ run "@heliopause/agent" npm test -w @heliopause/agent --if-present
 run "VM read-only preflight" python3 scripts/network-vm-lab/test_preflight.py
 run "VM independent verifier" python3 scripts/network-vm-lab/test_verifier.py
 run "VM boot report acceptance" python3 scripts/network-vm-lab/test_boot_cycle.py
+run "VM synchronous fault barrier" python3 scripts/network-vm-lab/test_fault_entry.py
 run "VM 24-hour soak acceptance" python3 scripts/network-vm-lab/test_soak.py
 run "VM lifecycle PKI fixtures" python3 scripts/network-vm-lab/test_lifecycle_pki.py
 run "quiescent journal transition" python3 -m unittest discover -s agent -p test_network_journal_transition.py

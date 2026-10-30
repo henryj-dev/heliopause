@@ -72,7 +72,9 @@ These are a read-only checklist, not a collector that was run on a trial host. D
 
 The peer `monitor.py` records management/forward/reverse packets throughout a boot. A report
 requires fresh post-recovery samples, bounded gaps, matching final peer boot identity and a
-non-expired monitor. `fault_entry.py` freezes only at production durable event boundaries.
+non-expired monitor. `fault_entry.py` freezes only at production durable event boundaries; the thread that
+reaches the boundary also parks there, so a late SIGSTOP or the SIGCONT systemd sends on stop cannot carry it
+past the boundary.
 `faults.py` injects fixed reversible prerequisite faults under a unique fault ID in a marked
 guest; it preserves root-only originals/hashes and never activates or undoes a transaction.
 Only the production Agent performs subsequent restore/undo and authenticated settlement.
