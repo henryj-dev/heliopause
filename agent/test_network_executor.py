@@ -80,6 +80,35 @@ class Transactions(unittest.TestCase):
         self.assertEqual(self.e.accept(self.a),'awaiting-verification')
         self.assertEqual(self.e.confirm(self.confirmation()),'confirmed')
         self.e.recover();self.assertTrue(self.driver.exists)
+    def test_a_stall_before_the_durable_confirm_rolls_back_instead_of_committing_late(self):
+        # Rocky TCG lab 2026-10-30: the confirm decision passed its deadline check, the thread
+        # stalled, and `confirmed` became durable 11 s after the receipt expired. Model the stall
+        # between the decision and the write: the clock jumps when the confirmed save begins.
+        self.assertEqual(self.e.accept(self.a),'awaiting-verification')
+        c=self.confirmation()
+        real_save=self.e.save
+        jumped=[]
+        def stalled_save(data,row=None,state=None,gate=None):
+            if state=='confirmed' and not jumped:
+                jumped.append(True)
+                later=time.time()+60;later_mono=time.monotonic()+60
+                with patch.object(n.time,'time',return_value=later),patch.object(n.time,'monotonic',return_value=later_mono):
+                    return real_save(data,row,state,**({'gate':gate} if gate else {}))
+            return real_save(data,row,state,**({'gate':gate} if gate else {}))
+        self.e.save=stalled_save
+        with self.assertRaisesRegex(ValueError,'confirmation deadline elapsed'):
+            self.e.confirm(c)
+        self.assertTrue(jumped,'the stall never reached the confirmed save')
+        row=self.row()
+        self.assertEqual(row['state'],'rolled-back')
+        self.assertNotIn('confirmed',[h['state'] for h in row['history']],'a late confirm reached the journal')
+        self.assertFalse(self.driver.exists)
+
+    def test_a_confirm_inside_its_deadline_still_commits(self):
+        self.assertEqual(self.e.accept(self.a),'awaiting-verification')
+        self.assertEqual(self.e.confirm(self.confirmation()),'confirmed')
+        self.assertEqual(self.row()['state'],'confirmed')
+
     def test_confirmed_deadline_does_not_poison_next_real_preflight(self):
         self._two_confirmed_transactions()
     def test_terminal_rename_then_fsync_error_does_not_poison_next_real_preflight(self):
