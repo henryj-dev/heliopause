@@ -107,6 +107,34 @@ class ProfileStore:
             raise ValueError('invalid staging owner')
         return '.heliopause-'+identity+'-'+owner.split(':')[2]
 
+    @staticmethod
+    def tombstone_name(identity):
+        ProfileStore.basename(identity)
+        return identity+'.nmmeta'
+
+    def remove_tombstone(self, identity):
+        # When NM cannot delete a keyfile it records the UUID as `<uuid>.nmmeta -> /dev/null`
+        # (2026-10-31 lab, case 05). Only that exact marker is removed, and only after the
+        # keyfile itself is gone: removing it first would let NM load the profile again.
+        name = self.tombstone_name(identity)
+        directory = self.directory_fd()
+        try:
+            try:
+                os.stat(self.basename(identity), dir_fd=directory, follow_symlinks=False)
+                raise ValueError('persistent profile still present')
+            except FileNotFoundError:
+                pass
+            try:
+                info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                return
+            if not stat.S_ISLNK(info.st_mode) or info.st_uid != os.geteuid() or os.readlink(name, dir_fd=directory) != '/dev/null':
+                raise ValueError('foreign NetworkManager metadata for owned profile')
+            os.unlink(name, dir_fd=directory)
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
     def barrier(self):
         directory = self.directory_fd()
         try:
