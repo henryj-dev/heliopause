@@ -25,7 +25,7 @@ private disk ownership and serial-console evidence in the dedicated lab root:
   collector evidence, uses the production Manager mTLS API and delivers its signed envelope
   to the production Agent mailbox. Observe produces a separately signed current boot
   observation and never reuses old verifier proof.
-- `boot_cycle.py --root LAB --mode graceful|power-cut --output NEW_REPORT --transaction TX --expected restored|rolled-back|degraded-unchanged|rollback-failed|inactive` is a boot primitive,
+- `boot_cycle.py --root LAB --mode graceful|power-cut --output NEW_REPORT --transaction TX --expected restored|rolled-back|rolled-back-on-stop|degraded-unchanged|rollback-failed|inactive` is a boot primitive,
   not the thirteen-case suite. It refuses dirty source, mismatched deployed module hashes,
   unmarked guests or a foreign QEMU process. `--require-confirmed-forwarding` requires fresh
   external packet probes after the changed guest boot ID. Virtual SIGKILL power loss differs
@@ -74,7 +74,11 @@ The peer `monitor.py` records management/forward/reverse packets throughout a bo
 requires fresh post-recovery samples, bounded gaps, matching final peer boot identity and a
 non-expired monitor. `fault_entry.py` freezes only at production durable event boundaries; the thread that
 reaches the boundary also parks there, so a late SIGSTOP or the SIGCONT systemd sends on stop cannot carry it
-past the boundary.
+past the boundary. An optional third argument, `stop`, releases that thread when the Agent is asked to
+stop instead, so a graceful reboot runs the Agent's own shutdown from the boundary; with the default
+(`never`) systemd SIGKILLs it at `TimeoutStopSec`. `rolled-back` requires the rollback on the new boot;
+`rolled-back-on-stop` requires it on the old boot after the last pre-reboot snapshot, and a previous-boot
+stop that systemd logged as `Deactivated successfully`.
 `faults.py` injects fixed reversible prerequisite faults under a unique fault ID in a marked
 guest; it preserves root-only originals/hashes and never activates or undoes a transaction.
 Only the production Agent performs subsequent restore/undo and authenticated settlement.

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import threading
 import unittest
-from fault_entry import boundary_event
+from fault_entry import boundary_event, holder, park
 
 
 class SynchronousBarrier(unittest.TestCase):
@@ -31,6 +31,22 @@ class SynchronousBarrier(unittest.TestCase):
         calls, release, passed, thread = self.run_through('configured', 'awaiting-confirm')
         self.assertTrue(passed.wait(2))
         self.assertEqual(calls, [('production', 'configured')])
+
+
+class Release(unittest.TestCase):
+    """`stop` lets a graceful stop run the Agent's own shutdown from the boundary (review MAJOR 2)."""
+
+    def test_never_is_the_permanent_park(self):
+        self.assertIs(holder('never', lambda: self.fail('stop event is not consulted')), park)
+
+    def test_stop_holds_until_the_agent_is_asked_to_stop(self):
+        stop, passed = threading.Event(), threading.Event()
+        event = boundary_event(lambda a: None, 'prepared', lambda a: None, lambda: None, holder('stop', lambda: stop))
+        thread = threading.Thread(target=lambda: (event('prepared'), passed.set()), daemon=True)
+        thread.start()
+        self.assertFalse(passed.wait(0.3), 'thread passed the boundary before the stop')
+        stop.set()
+        self.assertTrue(passed.wait(2), 'stop did not release the boundary')
 
 
 if __name__ == '__main__':
