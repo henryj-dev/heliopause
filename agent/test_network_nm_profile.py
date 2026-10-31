@@ -154,4 +154,44 @@ class Profiles(unittest.TestCase):
         self.store.remove(self.identity, hashlib.sha256(self.content).hexdigest())
 
 
+@unittest.skipUnless(sys.platform == 'linux', 'protected profile directory ancestors')
+class Tombstones(unittest.TestCase):
+    """NM leaves `<uuid>.nmmeta -> /dev/null` when it cannot delete a keyfile (2026-10-31 lab, 05)."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='.nm-tombstone-test-', dir=os.getcwd())
+        self.addCleanup(self.temp.cleanup)
+        self.store = ProfileStore(self.temp.name)
+        self.identity = profile_uuid(TX)
+        self.marker = os.path.join(self.temp.name, self.identity+'.nmmeta')
+        for module, name in [(subprocess, 'run'), (subprocess, 'Popen'), (socket, 'socket')]:
+            guard = patch.object(module, name, side_effect=AssertionError('escaped profile unit boundary'))
+            guard.start(); self.addCleanup(guard.stop)
+
+    def test_the_marker_nm_left_for_a_removed_profile_is_removed(self):
+        os.symlink('/dev/null', self.marker)
+        self.store.remove_tombstone(self.identity)
+        self.assertFalse(os.path.lexists(self.marker))
+
+    def test_no_marker_is_a_clean_removal(self):
+        self.store.remove_tombstone(self.identity)
+        self.assertFalse(os.path.lexists(self.marker))
+
+    def test_the_marker_stays_while_the_keyfile_is_present(self):
+        os.symlink('/dev/null', self.marker)
+        keyfile = os.path.join(self.temp.name, self.store.basename(self.identity))
+        with open(keyfile, 'wb') as stream: stream.write(b'profile')
+        with self.assertRaisesRegex(ValueError, 'still present'): self.store.remove_tombstone(self.identity)
+        self.assertTrue(os.path.islink(self.marker))
+
+    def test_metadata_that_is_not_the_deletion_marker_is_preserved(self):
+        target = os.path.join(self.temp.name, 'elsewhere.nmconnection')
+        for make in [lambda: os.symlink(target, self.marker), lambda: open(self.marker, 'wb').close()]:
+            with self.subTest(make=make):
+                make()
+                with self.assertRaisesRegex(ValueError, 'foreign NetworkManager metadata'):
+                    self.store.remove_tombstone(self.identity)
+                self.assertTrue(os.path.lexists(self.marker))
+                os.unlink(self.marker)
+
+
 if __name__ == '__main__': unittest.main()

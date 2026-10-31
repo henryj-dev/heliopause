@@ -185,5 +185,26 @@ class RemovalSettles(unittest.TestCase):
                 self.driver.remove(self.op,OWNER)
         sleep.assert_not_called()
 
+    def test_the_nm_deletion_marker_is_removed_after_the_keyfile(self):
+        self.links(False)
+        order=[]
+        self.driver.store.remove.side_effect=lambda *a:order.append('keyfile')
+        self.driver.store.remove_tombstone.side_effect=lambda identity:order.append(('marker',identity))
+        self.driver.remove(self.op,OWNER)
+        self.assertEqual(order,['keyfile',('marker',self.op['profileUuid'])])
+
+    def test_a_retry_after_the_keyfile_is_gone_still_removes_the_marker(self):
+        # Case 05: NM tombstoned the UUID, the keyfile was later removed, the marker stayed.
+        self.driver.check_file=Mock(side_effect=FileNotFoundError)
+        self.driver.ip=Mock(return_value=[])
+        self.driver.remove(self.op,OWNER)
+        self.driver.store.remove_tombstone.assert_called_once_with(self.op['profileUuid'])
+
+    def test_a_marker_that_cannot_be_removed_fails_removal(self):
+        self.links(False)
+        self.driver.store.remove_tombstone.side_effect=ValueError('foreign NetworkManager metadata for owned profile')
+        with self.assertRaisesRegex(ValueError,'foreign NetworkManager metadata'):
+            self.driver.remove(self.op,OWNER)
+
 
 if __name__=='__main__':unittest.main()

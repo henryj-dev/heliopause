@@ -230,6 +230,7 @@ class NetworkManagerWireGuard(LinuxWireGuard):
         except FileNotFoundError:
             if present or op['profileUuid'] in self.profiles():
                 raise ValueError('persistent profile missing with remaining objects')
+            self.store.remove_tombstone(op['profileUuid'])
             self.store.barrier()
             return
         cached = self.cached(op)
@@ -249,6 +250,7 @@ class NetworkManagerWireGuard(LinuxWireGuard):
         try:
             self.store.read(op['profileUuid'])
         except FileNotFoundError:
+            self.store.remove_tombstone(op['profileUuid'])
             return
         raise ValueError('persistent rollback file removal unverified')
 
