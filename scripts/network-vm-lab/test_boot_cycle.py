@@ -1,7 +1,7 @@
 """Report acceptance must reject in-progress recovery and stale/empty packet evidence."""
 import copy
 import unittest
-from boot_cycle import REBOOT_WAIT_SECONDS, AGENT_STOP_TIMEOUT_SECONDS, monitor_argv, recovery_complete, fresh_packets, inactive_preserved, service_inactive, removed_profile, timeline_valid, rollback_progress
+from boot_cycle import REBOOT_WAIT_SECONDS, AGENT_STOP_TIMEOUT_SECONDS, monitor_argv, recovery_complete, stopped_cleanly, fresh_packets, inactive_preserved, service_inactive, removed_profile, timeline_valid, rollback_progress
 import json
 import tempfile
 from pathlib import Path
@@ -21,8 +21,38 @@ class ReportAcceptance(unittest.TestCase):
         self.assertFalse(recovery_complete(journal,'tx','new','restored'))
     def test_expected_rollback_does_not_accept_confirmed_or_pending(self):
         for state in ['confirmed','applying','rolling-back','rollback-failed']:
-            self.assertFalse(recovery_complete({'transactions':{'tx':{'state':state}}},'tx','new','rolled-back'))
-        self.assertTrue(recovery_complete({'transactions':{'tx':{'state':'rolled-back'}}},'tx','new','rolled-back'))
+            self.assertFalse(recovery_complete({'transactions':{'tx':{'state':state,'history':[{'state':state,'at':2_000_000}]}}},'tx','new','rolled-back',1000))
+        self.assertTrue(recovery_complete(self.rolled(2_000_000),'tx','new','rolled-back',1000))
+
+    @staticmethod
+    def rolled(at):
+        return {'transactions':{'tx':{'state':'rolled-back','history':[{'state':'prepared','at':1},{'state':'rolled-back','at':at}]}}}
+
+    def test_a_rollback_report_requires_the_rollback_on_the_new_boot(self):
+        # Boot started at 1000 s. A rollback the old boot's shutdown made is not boot recovery.
+        self.assertTrue(recovery_complete(self.rolled(1_000_000),'tx','new','rolled-back',1000))
+        self.assertFalse(recovery_complete(self.rolled(999_999),'tx','new','rolled-back',1000))
+        self.assertFalse(recovery_complete(self.rolled(2_000_000),'tx','new','rolled-back'))
+        journal=self.rolled(2_000_000);journal['transactions']['tx']['history'].append({'state':'rolling-back','at':2_000_001})
+        self.assertFalse(recovery_complete(journal,'tx','new','rolled-back',1000))
+
+    def test_a_rollback_on_stop_must_be_the_old_boots_after_the_reboot_request(self):
+        # Last pre-reboot snapshot at 900 s, new boot at 1000 s.
+        self.assertTrue(recovery_complete(self.rolled(950_000),'tx','new','rolled-back-on-stop',1000,900))
+        for at in [899_999,1_000_000]:
+            self.assertFalse(recovery_complete(self.rolled(at),'tx','new','rolled-back-on-stop',1000,900))
+        self.assertFalse(recovery_complete(self.rolled(950_000),'tx','new','rolled-back-on-stop',1000))
+
+    def test_a_clean_stop_is_an_exit_not_a_kill(self):
+        clean=['1.0 gw systemd[1]: Stopping heliopause-agent.service - x...','1.1 gw python3[9]: [heliopause] stopped','1.2 gw systemd[1]: heliopause-agent.service: Deactivated successfully.']
+        self.assertTrue(stopped_cleanly(clean))
+        killed=clean[:2]+["301 gw systemd[1]: heliopause-agent.service: State 'stop-sigterm' timed out. Killing.",'301 gw systemd[1]: heliopause-agent.service: Killing process 9 (python3) with signal SIGKILL.']
+        self.assertFalse(stopped_cleanly(killed))
+        # Only the last stop counts: an earlier clean restart does not excuse a final kill.
+        self.assertFalse(stopped_cleanly(clean+killed))
+        self.assertTrue(stopped_cleanly(killed+clean))
+        for lines in [None,[],clean[1:]]:
+            self.assertFalse(stopped_cleanly(lines))
     def test_negative_boot_requires_known_safe_degraded_or_preserved_inactive(self):
         row={'state':'confirmed','bootRestore':{'bootId':'new','state':'degraded','recovery':'not-started'}}
         journal={'transactions':{'tx':row}}
